@@ -1,0 +1,26 @@
+CHECK_INTERVAL: 60
+
+TIMEFRAMES:
+  - "M15"
+  - "M30"
+  - "H1"
+  - "H4"
+
+INSTRUMENTS:
+  - "EUR_USD"
+  - "GBP_USD"
+  - "USD_JPY"
+  - "AUD_USD"
+  - "NZD_USD"
+  - "XAU_USD"
+  - "XAG_USD"
+  - "USD_CHF"
+  - "USD_CAD"
+  - "EUR_JPY"
+  - "GBP_JPY"
+  - "AUD_JPY"
+  - "CAD_JPY"
+  - "EUR_GBP"
+  - "SPX500_USD"
+  - "NAS100_USD"
+  - "DE30_EUR"
