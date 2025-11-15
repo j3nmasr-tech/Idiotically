@@ -1,47 +1,68 @@
 import requests
-import csv
-from datetime import datetime
+import datetime
+import time
 
-def get_klines(symbol, tf):
-    tf_map = {
-        "15m": "15",
-        "30m": "30",
-        "1h": "60",
-        "4h": "240",
-        "1d": "d"
-    }
+# Yahoo interval mapping
+TF_MAP = {
+    "15m":  "15m",
+    "30m":  "30m",
+    "1h":   "60m",
+    "4h":   "240m",
+    "1d":   "1d"
+}
 
-    interval = tf_map[tf]
 
-    # Stooq uses lowercase symbols without slash
-    stooq_symbol = symbol.lower().replace("/", "")
+def fetch_ohlc_yahoo(symbol: str, tf: str, limit=200):
+    """
+    Fetches OHLC from Yahoo Finance for Forex.
+    Yahoo format example: EURUSD=X
+    """
 
-    url = f"https://stooq.com/q/d/l/?s={stooq_symbol}&i={interval}"
-
-    r = requests.get(url)
-    if r.status_code != 200:
-        print(f"Error fetching {symbol} {tf}: HTTP {r.status_code}")
+    if tf not in TF_MAP:
+        print(f"[Yahoo] Unsupported TF: {tf}")
         return None
 
-    lines = r.text.strip().split("\n")
-    reader = csv.DictReader(lines)
+    yahoo_symbol = symbol.replace("/", "") + "=X"   # EURUSD -> EURUSD=X
+
+    interval = TF_MAP[tf]
+
+    # build URL
+    url = (
+        "https://query1.finance.yahoo.com/v8/finance/chart/"
+        f"{yahoo_symbol}?interval={interval}&range=60d"
+    )
+
+    try:
+        r = requests.get(url, timeout=10)
+        data = r.json()
+    except Exception as e:
+        print(f"[Yahoo] Failed {symbol} {tf}: {e}")
+        return None
+
+    try:
+        result = data["chart"]["result"][0]
+        timestamps = result["timestamp"]
+        indicators = result["indicators"]["quote"][0]
+    except:
+        print(f"[Yahoo] No data for {symbol} {tf}")
+        return None
 
     candles = []
-    for row in reader:
-        try:
-            candles.append({
-                "time": datetime.strptime(row["Date"], "%Y-%m-%d"),
-                "open": float(row["Open"]),
-                "high": float(row["High"]),
-                "low": float(row["Low"]),
-                "close": float(row["Close"]),
-                "volume": float(row.get("Volume", 0) or 0)
-            })
-        except:
-            continue
+    for i in range(len(timestamps)):
+        candles.append({
+            "time": datetime.datetime.fromtimestamp(timestamps[i]),
+            "open": indicators["open"][i],
+            "high": indicators["high"][i],
+            "low":  indicators["low"][i],
+            "close": indicators["close"][i],
+            "volume": indicators["volume"][i] if "volume" in indicators else 0
+        })
 
-    if len(candles) < 20:
-        print(f"Not enough data for {symbol} {tf}")
+    # Filter out None values
+    candles = [c for c in candles if None not in (c["open"], c["high"], c["low"], c["close"])]
+
+    if len(candles) < 50:
+        print(f"[Yahoo] Not enough data for {symbol} {tf}")
         return None
 
-    return candles
+    return candles[-limit:]
