@@ -3,19 +3,19 @@ import traceback
 from signal_engine import analyze_instruments
 from telegram_sender import send_telegram_message
 from utils import load_config, log
-from oanda_adapter import OandaAPI
 
 CONFIG = load_config()
 CHECK_INTERVAL = int(CONFIG.get("CHECK_INTERVAL", 60))
 
 def main():
-    log("Starting Scalp Forex Alert Bot...")
+    log("Starting Scalp Forex Alert Bot (Stooq Free Data)...")
 
-    oanda = OandaAPI()
+    # No API object needed anymore
+    data_api = None
 
     while True:
         try:
-            signals = analyze_instruments(oanda)
+            signals = analyze_instruments(data_api)
 
             for sig in signals:
                 msg = (
