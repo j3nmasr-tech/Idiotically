@@ -1,3 +1,4 @@
+import pandas as pd
 from indicators import (
     turtle_breakout,
     detect_crt,
@@ -5,23 +6,22 @@ from indicators import (
     atr,
 )
 from utils import log, load_config
+from data_fetch import fetch_ohlc_yahoo   # <-- Yahoo data function
 
+# Load config
 CONFIG = load_config()
-TIMEFRAMES = CONFIG["TIMEFRAMES"]
-INSTRUMENTS = CONFIG["INSTRUMENTS"]
+TIMEFRAMES = CONFIG["TIMEFRAMES"]      # e.g. ["15m", "30m", "1h"]
+INSTRUMENTS = CONFIG["INSTRUMENTS"]    # list of forex pairs
 
 MIN_TF_SCORE = 60
-from config import TIMEFRAMES, INSTRUMENTS
-from data_fetch import get_klines
 
-MIN_TF_SCORE = 60
 
 def to_df(candles):
-    """Convert list of dicts (Stooq format) to a pandas DataFrame."""
+    """Convert list of dicts into DataFrame."""
     return pd.DataFrame(candles)
 
 
-def analyze_instruments(_unused_api):
+def analyze_instruments(_unused_api=None):
     signals = []
 
     for symbol in INSTRUMENTS:
@@ -31,9 +31,11 @@ def analyze_instruments(_unused_api):
         tf_directions = {}
         data = {}
 
-        # -------- FETCH CANDLES FOR EACH TIMEFRAME --------
+        # =======================
+        # FETCH DATA PER TIMEFRAME
+        # =======================
         for tf in TIMEFRAMES:
-            candles = get_klines(symbol, tf)
+            candles = fetch_ohlc_yahoo(symbol, tf)
             if candles is None:
                 log(f"Failed to fetch {symbol} {tf}")
                 continue
@@ -45,17 +47,21 @@ def analyze_instruments(_unused_api):
 
             data[tf] = df
 
-        # If missing TFs, skip
+        # If any timeframe missing → skip symbol
         if len(data) < len(TIMEFRAMES):
             continue
 
-        # -------- PER-TF ANALYSIS --------
+        # =======================
+        # PER-TF ANALYSIS
+        # =======================
         for tf, df in data.items():
+
             crt_b, crt_s = detect_crt(df)
             tb_b, tb_s = turtle_breakout(df)
             bias = smc_bias(df)
-            vol = True  # Forex always OK with tick volume
+            vol = True  # Forex tick volume OK
 
+            # Bull score
             bull_score = (
                 0.40 * (1 if bias == "bull" else 0) +
                 0.25 * (1 if tb_b else 0) +
@@ -63,6 +69,7 @@ def analyze_instruments(_unused_api):
                 0.15 * (1 if vol else 0)
             ) * 100
 
+            # Bear score
             bear_score = (
                 0.40 * (1 if bias == "bear" else 0) +
                 0.25 * (1 if tb_s else 0) +
@@ -79,7 +86,9 @@ def analyze_instruments(_unused_api):
 
             tf_scores[tf] = max(bull_score, bear_score)
 
-        # -------- STRICT-BALANCED: 2 OF 3 TFS MUST AGREE --------
+        # =======================
+        # STRICT-BALANCED: 2 of 3 TF must agree
+        # =======================
         valid = [d for d in tf_directions.values() if d is not None]
         if len(valid) < 2:
             continue
@@ -94,13 +103,21 @@ def analyze_instruments(_unused_api):
         else:
             continue
 
-        # -------- ENTRY PRICE (HIGHEST TF) --------
-        high_tf = TIMEFRAMES[-1]
+        # =======================
+        # ENTRY PRICE (highest TF)
+        # =======================
+        high_tf = TIMEFRAMES[-1]                 # e.g. "1h"
         entry = float(data[high_tf]["close"].iloc[-1])
 
-        # -------- ATR FOR SL & TP --------
-        the_atr = atr(data["1H"])
+        # =======================
+        # ATR from 1h timeframe
+        # =======================
+        atr_tf = "1h" if "1h" in data else TIMEFRAMES[0]
+        the_atr = atr(data[atr_tf])
 
+        # =======================
+        # TP / SL
+        # =======================
         if direction == "BUY":
             sl = entry - the_atr * 1.5
             tp1 = entry + the_atr * 1.0
@@ -112,6 +129,9 @@ def analyze_instruments(_unused_api):
             tp2 = entry - the_atr * 2.0
             tp3 = entry - the_atr * 3.0
 
+        # =======================
+        # BUILD SIGNAL
+        # =======================
         signals.append({
             "symbol": symbol,
             "direction": direction,
