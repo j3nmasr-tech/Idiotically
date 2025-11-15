@@ -1,9 +1,13 @@
-import yaml
-import datetime
+import os
+import logging
 
 def log(msg):
-    print(f"[{datetime.datetime.now()}] {msg}")
+    print(msg)
 
 def load_config():
-    with open("config.yaml", "r") as f:
-        return yaml.safe_load(f)
+    import config
+    return {
+        "CHECK_INTERVAL": config.CHECK_INTERVAL,
+        "TIMEFRAMES": config.TIMEFRAMES,
+        "INSTRUMENTS": config.INSTRUMENTS
+    }
