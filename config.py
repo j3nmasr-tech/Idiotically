@@ -1,17 +1,67 @@
-CHECK_INTERVAL = 60
+CHECK_INTERVAL: 60
 
-TIMEFRAMES = [
-    "15m",
-    "30m",
-    "1h",
-    "4h"
-]
+TIMEFRAMES:
+  - "15m"
+  - "30m"
+  - "1h"
+  - "4h"
 
-INSTRUMENTS = [
-    "eurusd",
-    "gbpusd",
-    "audusd",
-    "nzdusd",
-    "usdjpy",
-    "usdchf"
-]
+INSTRUMENTS:
+  - "EURUSD=X"
+  - "GBPUSD=X"
+  - "AUDUSD=X"
+  - "NZDUSD=X"
+  - "USDJPY=X"
+  - "USDCHF=X"
+  - "USDCAD=X"
+
+  - "EURGBP=X"
+  - "EURJPY=X"
+  - "EURCHF=X"
+  - "EURAUD=X"
+  - "EURNZD=X"
+  - "EURCAD=X"
+
+  - "GBPJPY=X"
+  - "GBPCHF=X"
+  - "GBPAUD=X"
+  - "GBPNZD=X"
+  - "GBPCAD=X"
+
+  - "AUDJPY=X"
+  - "AUDCHF=X"
+  - "AUDCAD=X"
+  - "AUDNZD=X"
+
+  - "NZDJPY=X"
+  - "NZDCHF=X"
+  - "NZDCAD=X"
+
+  - "CADJPY=X"
+  - "CADCHF=X"
+
+  - "CHFJPY=X"
+
+  - "XAUUSD=X"
+  - "XAGUSD=X"
+
+  - "USDSEK=X"
+  - "USDNOK=X"
+  - "USDZAR=X"
+  - "USDTRY=X"
+  - "USDHKD=X"
+  - "USDSGD=X"
+
+  - "EURSEK=X"
+  - "EURNOK=X"
+  - "EURHUF=X"
+  - "EURPLN=X"
+
+  - "GBPSEK=X"
+  - "GBPNOK=X"
+
+  - "AUDSGD=X"
+  - "JPYSGD=X"
+
+  - "ZARJPY=X"
+  - "TRYJPY=X"
