@@ -1,11 +1,16 @@
-import pandas as pd
 from indicators import (
     turtle_breakout,
     detect_crt,
     smc_bias,
     atr,
 )
-from utils import log
+from utils import log, load_config
+
+CONFIG = load_config()
+TIMEFRAMES = CONFIG["TIMEFRAMES"]
+INSTRUMENTS = CONFIG["INSTRUMENTS"]
+
+MIN_TF_SCORE = 60
 from config import TIMEFRAMES, INSTRUMENTS
 from data_fetch import get_klines
 
