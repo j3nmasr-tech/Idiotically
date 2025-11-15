@@ -10,6 +10,10 @@ CHECK_INTERVAL = int(CONFIG.get("CHECK_INTERVAL", 60))
 def main():
     log("Starting Scalp Forex Alert Bot (Stooq Free Data)...")
 
+    # ✅ STARTUP TELEGRAM MESSAGE HERE
+    send_telegram_message("🚀 Scalp Forex Bot Started (Northflank).")
+    log("Startup message sent.")
+
     # No API object needed anymore
     data_api = None
 
