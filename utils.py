@@ -1,13 +1,10 @@
-import os
-import logging
-
-def log(msg):
-    print(msg)
+import json
+import datetime
 
 def load_config():
-    import config
-    return {
-        "CHECK_INTERVAL": config.CHECK_INTERVAL,
-        "TIMEFRAMES": config.TIMEFRAMES,
-        "INSTRUMENTS": config.INSTRUMENTS
-    }
+    from config import CONFIG
+    return CONFIG
+
+def log(msg: str):
+    ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] {msg}", flush=True)
