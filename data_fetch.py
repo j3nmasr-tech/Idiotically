@@ -22,6 +22,30 @@ LAST_UPDATE = {}
 # INTERNAL UTILS
 # ============================================
 
+def normalize_symbol(symbol: str):
+    """
+    Converts symbols into TwelveData format.
+    Example:
+      EURUSD → EUR/USD
+      GBPJPY → GBP/JPY
+      XAUUSD → XAU/USD
+    """
+    if "/" in symbol:
+        return symbol  # already normalized
+
+    # Metals
+    if symbol.startswith("XAU"):
+        return "XAU/USD"
+    if symbol.startswith("XAG"):
+        return "XAG/USD"
+
+    # Convert 6-letter FX pairs
+    if len(symbol) == 6:
+        return f"{symbol[:3]}/{symbol[3:]}"
+
+    return symbol
+
+
 def now_ts():
     return int(time.time())
 
@@ -42,12 +66,15 @@ def cache_expired(symbol: str, timeframe: str):
 
 def fetch_from_api(symbol: str, timeframe: str, limit: int = 200):
     """Fetch klines directly from TwelveData"""
+
+    norm = normalize_symbol(symbol)
+
     if not API_KEY:
         print("[TD] ERROR → TWELVEDATA_KEY missing in environment!")
         return None
 
     params = {
-        "symbol": symbol,
+        "symbol": norm,
         "interval": timeframe,
         "apikey": API_KEY,
         "outputsize": limit,
@@ -59,17 +86,17 @@ def fetch_from_api(symbol: str, timeframe: str, limit: int = 200):
         data = r.json()
 
         if "status" in data and data["status"] == "error":
-            print(f"[TD] API ERROR {symbol} {timeframe}: {data.get('message')}")
+            print(f"[TD] API ERROR {norm} {timeframe}: {data.get('message')}")
             return None
 
         if "values" not in data:
-            print(f"[TD] INVALID RESPONSE for {symbol} {timeframe}")
+            print(f"[TD] INVALID RESPONSE for {norm} {timeframe}")
             return None
 
         return data["values"]
 
     except Exception as e:
-        print(f"[TD] REQUEST ERROR {symbol} {timeframe}: {e}")
+        print(f"[TD] REQUEST ERROR {norm} {timeframe}: {e}")
         return None
 
 
@@ -79,6 +106,7 @@ def fetch_from_api(symbol: str, timeframe: str, limit: int = 200):
 
 def update_cache(symbol: str, timeframe: str):
     """Force refresh cache for one symbol/timeframe"""
+
     print(f"[TD] Fetching {symbol} {timeframe} (refresh)...")
 
     data = fetch_from_api(symbol, timeframe)
@@ -99,19 +127,19 @@ def get_cached_klines(symbol: str, timeframe: str):
       - OR fetches and returns new data
       - OR None on failure
     """
+
     key = cache_key(symbol, timeframe)
 
-    # If we HAVE cache and not expired → return it
+    # If cache exists and is fresh → return it
     if key in LATEST_DATA and not cache_expired(symbol, timeframe):
         return LATEST_DATA[key]
 
-    # Otherwise → try refreshing from API
+    # Otherwise fetch new
     ok = update_cache(symbol, timeframe)
     if ok:
         return LATEST_DATA.get(key)
 
     return None
-
 
 
 # ============================================
@@ -143,7 +171,6 @@ def update_cache_all_timeframes(symbols: list, timeframes: list):
         update_cache_for_tf(symbols, tf)
 
     print("[TD] Cache update complete.")
-
 
 
 # ============================================
