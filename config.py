@@ -1,42 +1,23 @@
-# ===========================
-# TOP 30 FOREX + GOLD (TwelveData Format)
-# ===========================
+CONFIG = {
+    "CHECK_INTERVAL": 60,
+    "BASE_RISK": 1.0,
+    "LEVERAGE": 30,
+    "USE_CACHE": True,
 
-INSTRUMENTS = [
+    "TIMEFRAMES": [
+        "15m",
+        "30m",
+        "1h",
+        "4h",
+        "1d"
+    ],
 
-    # ------- Majors -------
-    "EURUSD",
-    "GBPUSD",
-    "USDJPY",
-    "USDCHF",
-    "USDCAD",
-    "AUDUSD",
-    "NZDUSD",
-
-    # ------- Major Crosses -------
-    "EURJPY",
-    "GBPJPY",
-    "CHFJPY",
-    "AUDJPY",
-    "NZDJPY",
-    "CADJPY",
-
-    "EURGBP",
-    "EURAUD",
-    "EURNZD",
-    "GBPAUD",
-    "GBPNZD",
-
-    # ------- Minors -------
-    "AUDNZD",
-    "AUDCAD",
-    "NZDCAD",
-    "EURCAD",
-    "GBPCAD",
-    "CADCHF",
-    "AUDCHF",
-    "NZDCHF",
-
-    # ------- Metals -------
-    "XAUUSD",   # Gold
-]
+    "INSTRUMENTS": [
+        "EURUSD","GBPUSD","USDJPY","AUDUSD","NZDUSD","USDCHF","USDCAD",
+        "EURJPY","EURGBP","GBPJPY","CHFJPY","AUDJPY","NZDJPY","CADJPY",
+        "EURAUD","EURNZD","GBPAUD","GBPCAD","GBPCHF",
+        "AUDNZD","AUDCHF","NZDCHF","CADCHF","AUDCAD","NZDCAD","EURCHF",
+        "USDSEK","USDNOK","USDZAR",
+        "XAUUSD"
+    ]
+}
