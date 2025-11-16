@@ -2,41 +2,67 @@
 # FOREX BOT CONFIGURATION
 # ===========================
 
-CHECK_INTERVAL = 300  # check every minute
+# Check every 5 minutes (safe for 800 requests/day limit)
+CHECK_INTERVAL = 300   # seconds
 
 # ===========================
-# TIMEFRAMES TO SCAN
+# TIMEFRAMES TO SCAN (TwelveData format)
 # ===========================
 TIMEFRAMES = [
-    "15m",
-    "30m",
+    "15min",
+    "30min",
     "1h",
     "4h"
 ]
 
 # ===========================
 # FOREX INSTRUMENTS TO SCAN
-# (Clean Yahoo-Safe List)
+# (Top 30 Forex Pairs + Gold + Silver)
 # ===========================
 INSTRUMENTS = [
 
-    # ===== Major Pairs (100% supported) =====
-    "EURUSD=X",
-    "GBPUSD=X",
-    "AUDUSD=X",
-    "NZDUSD=X",
-    "USDJPY=X",
-    "USDCHF=X",
-    "USDCAD=X",
+    # ===== Majors =====
+    "EUR/USD",
+    "GBP/USD",
+    "AUD/USD",
+    "NZD/USD",
+    "USD/JPY",
+    "USD/CHF",
+    "USD/CAD",
 
-    # ===== Crosses (safe & reliable) =====
-    "EURGBP=X",
-    "EURJPY=X",
-    "GBPJPY=X",
-    "AUDJPY=X",
-    "NZDJPY=X",
-    "CHFJPY=X",
-    "CADJPY=X",
+    # ===== Euro Crosses =====
+    "EUR/GBP",
+    "EUR/JPY",
+    "EUR/CHF",
+    "EUR/AUD",
+    "EUR/NZD",
+    "EUR/CAD",
+
+    # ===== GBP Crosses =====
+    "GBP/JPY",
+    "GBP/CHF",
+    "GBP/AUD",
+    "GBP/NZD",
+    "GBP/CAD",
+
+    # ===== AUD Crosses =====
+    "AUD/JPY",
+    "AUD/CHF",
+    "AUD/CAD",
+    "AUD/NZD",
+
+    # ===== NZD Crosses =====
+    "NZD/JPY",
+    "NZD/CHF",
+    "NZD/CAD",
+
+    # ===== CAD Crosses =====
+    "CAD/JPY",
+    "CAD/CHF",
+
+    # ===== Metals =====
+    "XAU/USD",    # Gold
+    "XAG/USD"     # Silver
 ]
 
 # ===========================
