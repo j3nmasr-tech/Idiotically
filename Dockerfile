@@ -1,10 +1,16 @@
-# Use official Python 3.12 image
+# Use official Python 3.12 slim image
 FROM python:3.12-slim
 
 # Set working directory
 WORKDIR /app
 
-# Copy requirements and install
+# Install system dependencies needed for MetaTrader5
+RUN apt-get update && apt-get install -y \
+    libatlas-base-dev \
+    gfortran \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements and install Python packages
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
@@ -19,4 +25,4 @@ ENV MT5_PASSWORD=""
 ENV MT5_SERVER=""
 
 # Run the bot
-CMD ["python", "./main.py"]
+CMD ["python", "main.py"]
