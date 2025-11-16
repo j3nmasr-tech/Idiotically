@@ -35,14 +35,14 @@ MIN_TF_SCORE  = 55
 CONF_MIN_TFS  = 2
 CONFIDENCE_MIN = 60.0
 
-TOP_SYMBOLS = [
+TOP_SYMBOLS = list(dict.fromkeys([
     "EURUSD","GBPUSD","USDJPY","USDCHF","AUDUSD","USDCAD","NZDUSD",
     "EURGBP","EURJPY","GBPJPY","AUDJPY","CADJPY","CHFJPY","EURCHF",
-    "EURAUD","EURAUD","XAUUSD","GBPCHF","AUDNZD","AUDCAD","NZDJPY",
-    "GBPUSD","EURCAD","USDNOK","USDSEK","USDTRY","USDSGD","EURSEK",
-    "EURNOK","GBPAUD","GBPCAD","NZDCHF","NZDJPY","XAGUSD","AUDCHF",
-    "AUDSGD","CHFSGD","EURSGD","GBPJPY","GBPNZD","EURNZD","CADCHF"
-]
+    "EURAUD","XAUUSD","GBPCHF","AUDNZD","AUDCAD","NZDJPY",
+    "EURCAD","USDNOK","USDSEK","USDTRY","USDSGD","EURSEK",
+    "EURNOK","GBPAUD","GBPCAD","NZDCHF","XAGUSD","AUDCHF",
+    "AUDSGD","CHFSGD","EURSGD","GBPNZD","EURNZD","CADCHF"
+]))
 
 LOG_CSV = "./sirts_forex_signals.csv"
 
@@ -68,7 +68,16 @@ def send_message(text):
         return False
 
 # ===== MT5 INITIALIZATION =====
-if not mt5.initialize(login=int(MT5_LOGIN), password=MT5_PASSWORD, server=MT5_SERVER):
+if not MT5_LOGIN or not MT5_PASSWORD or not MT5_SERVER:
+    print("❌ MT5 credentials missing, exiting")
+    exit(1)
+try:
+    login_int = int(MT5_LOGIN)
+except ValueError:
+    print("❌ MT5_LOGIN must be an integer")
+    exit(1)
+
+if not mt5.initialize(login=login_int, password=MT5_PASSWORD, server=MT5_SERVER):
     print("❌ MT5 initialization failed")
     exit(1)
 else:
@@ -162,12 +171,12 @@ def pos_size_units(entry, sl):
     if sl_dist == 0:
         return 0
     units = risk_usd / sl_dist
-    exposure = units * entry
     return round(units,2)
 
 # ===== LOGGING =====
 def init_csv():
     if not os.path.exists(LOG_CSV):
+        os.makedirs(os.path.dirname(LOG_CSV), exist_ok=True)
         with open(LOG_CSV,"w",newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["timestamp","symbol","side","entry","tp1","tp2","tp3","sl","tf","units"])
