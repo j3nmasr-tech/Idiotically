@@ -1,77 +1,42 @@
 # ===========================
-# FOREX BOT CONFIGURATION
+# TOP 30 FOREX + GOLD (TwelveData Format)
 # ===========================
 
-# Check every 5 minutes (safe for 800 requests/day limit)
-CHECK_INTERVAL = 300   # seconds
-
-# ===========================
-# TIMEFRAMES TO SCAN (TwelveData format)
-# ===========================
-TIMEFRAMES = [
-    "15min",
-    "30min",
-    "1h",
-    "4h"
-]
-
-# ===========================
-# FOREX INSTRUMENTS TO SCAN
-# (Top 30 Forex Pairs + Gold + Silver)
-# ===========================
 INSTRUMENTS = [
 
-    # ===== Majors =====
-    "EUR/USD",
-    "GBP/USD",
-    "AUD/USD",
-    "NZD/USD",
-    "USD/JPY",
-    "USD/CHF",
-    "USD/CAD",
+    # ------- Majors -------
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "USDCHF",
+    "USDCAD",
+    "AUDUSD",
+    "NZDUSD",
 
-    # ===== Euro Crosses =====
-    "EUR/GBP",
-    "EUR/JPY",
-    "EUR/CHF",
-    "EUR/AUD",
-    "EUR/NZD",
-    "EUR/CAD",
+    # ------- Major Crosses -------
+    "EURJPY",
+    "GBPJPY",
+    "CHFJPY",
+    "AUDJPY",
+    "NZDJPY",
+    "CADJPY",
 
-    # ===== GBP Crosses =====
-    "GBP/JPY",
-    "GBP/CHF",
-    "GBP/AUD",
-    "GBP/NZD",
-    "GBP/CAD",
+    "EURGBP",
+    "EURAUD",
+    "EURNZD",
+    "GBPAUD",
+    "GBPNZD",
 
-    # ===== AUD Crosses =====
-    "AUD/JPY",
-    "AUD/CHF",
-    "AUD/CAD",
-    "AUD/NZD",
+    # ------- Minors -------
+    "AUDNZD",
+    "AUDCAD",
+    "NZDCAD",
+    "EURCAD",
+    "GBPCAD",
+    "CADCHF",
+    "AUDCHF",
+    "NZDCHF",
 
-    # ===== NZD Crosses =====
-    "NZD/JPY",
-    "NZD/CHF",
-    "NZD/CAD",
-
-    # ===== CAD Crosses =====
-    "CAD/JPY",
-    "CAD/CHF",
-
-    # ===== Metals =====
-    "XAU/USD",    # Gold
-    "XAG/USD"     # Silver
+    # ------- Metals -------
+    "XAUUSD",   # Gold
 ]
-
-# ===========================
-# STRATEGY SETTINGS
-# ===========================
-MIN_CONFIDENCE = 60.0
-MIN_TF_SCORE = 55.0
-USE_STRICT_TF = True
-
-# Risk Settings
-BASE_RISK = 0.01
-MAX_RISK = 0.03
