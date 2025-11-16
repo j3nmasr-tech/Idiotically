@@ -17,68 +17,40 @@ TIMEFRAMES = [
 
 # ===========================
 # FOREX INSTRUMENTS TO SCAN
+# (Clean Yahoo-Safe List)
 # ===========================
 INSTRUMENTS = [
 
-    # Major Pairs
-    "EURUSD=X", "GBPUSD=X", "AUDUSD=X", "NZDUSD=X",
-    "USDJPY=X", "USDCHF=X", "USDCAD=X",
+    # ===== Major Pairs (100% supported) =====
+    "EURUSD=X",
+    "GBPUSD=X",
+    "AUDUSD=X",
+    "NZDUSD=X",
+    "USDJPY=X",
+    "USDCHF=X",
+    "USDCAD=X",
 
-    # Euro Crosses
-    "EURGBP=X", "EURJPY=X", "EURCHF=X",
-    "EURAUD=X", "EURNZD=X", "EURCAD=X",
-
-    # GBP Crosses
-    "GBPJPY=X", "GBPCHF=X",
-    "GBPAUD=X", "GBPNZD=X", "GBPCAD=X",
-
-    # AUD Crosses
-    "AUDJPY=X", "AUDCHF=X", "AUDCAD=X", "AUDNZD=X",
-
-    # NZD Crosses
-    "NZDJPY=X", "NZDCHF=X", "NZDCAD=X",
-
-    # CAD Crosses
-    "CADJPY=X", "CADCHF=X",
-
-    # CHF Crosses
+    # ===== Crosses (safe & reliable) =====
+    "EURGBP=X",
+    "EURJPY=X",
+    "GBPJPY=X",
+    "AUDJPY=X",
+    "NZDJPY=X",
     "CHFJPY=X",
+    "CADJPY=X",
 
-    # Metals
-    "XAUUSD=X",  # Gold
-    "XAGUSD=X",  # Silver
-
-    # USD Exotic Pairs
-    "USDSEK=X", "USDNOK=X", "USDZAR=X", "USDTRY=X",
-    "USDHKD=X", "USDSGD=X",
-
-    # Euro Exotic Crosses
-    "EURSEK=X", "EURNOK=X",
-    "EURHUF=X", "EURPLN=X",
-
-    # GBP Exotic Crosses
-    "GBPSEK=X", "GBPNOK=X",
-
-    # Others
-    "AUDSGD=X", "JPYSGD=X",
-
-    "ZARJPY=X", "TRYJPY=X",
+    # ===== Metals (use 1H+ data only) =====
+    "XAUUSD=X",
+    "XAGUSD=X",
 ]
 
 # ===========================
-# MORE SETTINGS (OPTIONAL)
-# I can fill these if needed
+# STRATEGY SETTINGS
 # ===========================
-
-# Minimum trend confidence %
 MIN_CONFIDENCE = 60.0
-
-# Minimum TF confirmation
 MIN_TF_SCORE = 55.0
+USE_STRICT_TF = True
 
-# Example risk settings (tell me if you want them ON)
+# Risk Settings
 BASE_RISK = 0.01
 MAX_RISK = 0.03
-
-# Add more filters if needed
-USE_STRICT_TF = True
