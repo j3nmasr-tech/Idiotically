@@ -1,4 +1,4 @@
-requests
-pandas
-python-telegram-bot==13.15
-PyYAML
+pandas==2.1.1
+numpy==1.26.2
+requests==2.31.0
+MetaTrader5==5.0.38
