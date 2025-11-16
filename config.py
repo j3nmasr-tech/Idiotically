@@ -2,8 +2,7 @@
 # FOREX BOT CONFIGURATION
 # ===========================
 
-# How often the bot checks new candles (seconds)
-CHECK_INTERVAL = 60     # 1 minute
+CHECK_INTERVAL = 60  # check every minute
 
 # ===========================
 # TIMEFRAMES TO SCAN
@@ -38,10 +37,6 @@ INSTRUMENTS = [
     "NZDJPY=X",
     "CHFJPY=X",
     "CADJPY=X",
-
-    # ===== Metals (use 1H+ data only) =====
-    "XAUUSD=X",
-    "XAGUSD=X",
 ]
 
 # ===========================
