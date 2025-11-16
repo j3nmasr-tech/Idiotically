@@ -17,4 +17,4 @@ COPY . .
 ENV PYTHONUNBUFFERED=1
 
 # Run the bot
-CMD ["python", "./your_bot_script.py"]
+CMD ["python", "./CMD ["python", "./main.py"]
