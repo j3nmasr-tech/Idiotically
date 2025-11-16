@@ -4,17 +4,19 @@ FROM python:3.12-slim
 # Set working directory
 WORKDIR /app
 
-# Copy requirements if you have one, otherwise install directly
+# Copy requirements and install
 COPY requirements.txt .
-
-# Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy bot code
-COPY . .
+# Copy the bot code
+COPY main.py .
 
-# Set environment variables to be read at runtime
-ENV PYTHONUNBUFFERED=1
+# Use environment variables for secrets
+ENV BOT_TOKEN=""
+ENV CHAT_ID=""
+ENV MT5_LOGIN=""
+ENV MT5_PASSWORD=""
+ENV MT5_SERVER=""
 
 # Run the bot
-CMD ["python", "./CMD ["python", "./main.py"]
+CMD ["python", "./main.py"]
