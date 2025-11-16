@@ -9,7 +9,7 @@ from indicators import (
     atr as compute_atr,   # keep name distinct if your indicator is named atr
 )
 # Use the TwelveData cache accessor (from data_fetch.py provided earlier)
-from data_fetch import get_cached_klines
+from data_fetch import get_cached_klines, normalize_symbol
 # Load config
 CONFIG = load_config()
 TIMEFRAMES = CONFIG.get("TIMEFRAMES", ["15m", "30m", "1h", "4h"])
