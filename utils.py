@@ -1,8 +1,7 @@
-import json
 import datetime
+from config import CONFIG
 
 def load_config():
-    from config import CONFIG
     return CONFIG
 
 def log(msg: str):
