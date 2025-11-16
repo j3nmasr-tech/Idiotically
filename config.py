@@ -2,7 +2,7 @@
 # FOREX BOT CONFIGURATION
 # ===========================
 
-CHECK_INTERVAL = 60  # check every minute
+CHECK_INTERVAL = 300  # check every minute
 
 # ===========================
 # TIMEFRAMES TO SCAN
