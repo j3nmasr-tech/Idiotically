@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-BingX Low-Volume Altcoin Scalp Bot - Sequential Version
-- Scans USDT pairs with 24h volume 100k–5M USD
-- Dynamic ATR + momentum TP/SL
+BingX Low-Volume Altcoin Scalp Bot - Rolling Scan Version
+- Low-volume USDT coins 100k–5M USD 24h volume
+- Instant-start scanning (rolling)
 - EMA trend + 5m entry
-- Telegram notifications
-- No threads, fully sequential
+- ATR + momentum dynamic TP/SL
+- RSI/MACD/volume/candle filter
+- Telegram alerts
+- Persistent signals & cooldown
 """
 
 import os, time, logging, json
@@ -179,7 +181,7 @@ def process_symbol(sym):
     send_telegram(msg)
     log_signal({"Timestamp":datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),"Symbol":sym,"Direction":direction,"EntryPrice":float(entry),"TP1":float(tp1),"TP2":float(tp2),"TP3":float(tp3),"SL":float(sl),"Status":"Open","ClosePrice":"","CloseTime":""})
     mark_signaled(sym)
-    time.sleep(0.2)  # rate-limit pause
+    time.sleep(0.2)
 
 # ---------- Main Loop ----------
 def run():
@@ -192,18 +194,20 @@ def run():
     if not available:
         logging.error("No low-volume USDT symbols found")
         return
-    logging.info(f"Found {len(available)} low-volume symbols. Starting scan...")
+    logging.info(f"Found {len(available)} low-volume symbols. Starting rolling scan...")
 
+    i = 0
     while True:
-        for sym in available:
-            process_symbol(sym)
-            # Update open signals
-            open_df = pd.read_csv(SIGNAL_LOG_FILE)
-            for idx,row in open_df[open_df['Status']=="Open"].iterrows():
-                tick = exchange.fetch_ticker(row['Symbol'])
-                last_price = tick.get('last')
-                if last_price: update_signal_status(row['Symbol'], row['Direction'], last_price)
-        time.sleep(POLL_INTERVAL)
+        sym = available[i % len(available)]
+        process_symbol(sym)
+        # Update open signals
+        open_df = pd.read_csv(SIGNAL_LOG_FILE)
+        for idx,row in open_df[open_df['Status']=="Open"].iterrows():
+            tick = exchange.fetch_ticker(row['Symbol'])
+            last_price = tick.get('last')
+            if last_price: update_signal_status(row['Symbol'], row['Direction'], last_price)
+        i += 1
+        time.sleep(0.5)  # small pause to avoid rate limit
 
 if __name__=="__main__":
     run()
