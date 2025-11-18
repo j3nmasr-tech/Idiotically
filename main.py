@@ -9,7 +9,7 @@ import ccxt
 # ---------- Config ----------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "120"))  # كل 2 دقيقة
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "120"))  # كل دقيقتين
 
 EMA_SHORT = int(os.getenv("EMA_SHORT", "50"))
 EMA_LONG  = int(os.getenv("EMA_LONG", "200"))
@@ -21,29 +21,25 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 
 # ---------- CCXT BingX ----------
 exchange = ccxt.bingx({'enableRateLimit': True})
+exchange.load_markets()
+EXCHANGE_SYMBOLS = set(exchange.symbols)  # جميع الرموز الموجودة على BingX
 
-# ---------- Get 100 low-vol/meme symbols dynamically ----------
-def get_low_vol_meme_symbols(limit=100, max_24h_volume=500000):
-    exchange.load_markets()
-    symbols_filtered = []
-    for symbol, market in exchange.markets.items():
-        if market['quote'] != 'USDT' or not market['spot']:
-            continue
-        try:
-            ticker = exchange.fetch_ticker(symbol)
-            volume_usd = ticker['quoteVolume'] or 0
-            if volume_usd <= max_24h_volume:
-                symbols_filtered.append(symbol)
-            if len(symbols_filtered) >= limit:
+# ---------- Load custom symbols ----------
+def load_custom_symbols(path="symbols.txt", top_n=500):
+    symbols = []
+    with open(path, "r") as f:
+        for line in f:
+            sym = line.strip().replace("/", "")  # remove slash if needed
+            if sym in EXCHANGE_SYMBOLS:
+                symbols.append(sym)
+            if len(symbols) >= top_n:
                 break
-        except Exception:
-            continue
-    return symbols_filtered
+    return symbols
 
-FIXED_SYMBOLS = get_low_vol_meme_symbols()
-logging.info("Scanning symbols: %s", FIXED_SYMBOLS)
+FIXED_SYMBOLS = load_custom_symbols()
+logging.info("Using %d symbols from custom list", len(FIXED_SYMBOLS))
 
-# ---------- Helpers ----------
+# ---------- Telegram helper ----------
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logging.warning("Telegram token/chat not provided — skipping send.")
@@ -57,6 +53,7 @@ def send_telegram(text: str):
     except Exception as e:
         logging.exception("Failed to send telegram message: %s", e)
 
+# ---------- Fetch OHLCV ----------
 def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 300):
     try:
         raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -179,7 +176,7 @@ def format_signal(symbol, direction, entry_price, tp1, tp2, tp3, sl):
 
 # ---------- Main Loop ----------
 def run():
-    send_telegram("🤖 Bot started. Scanning 100 low-vol/meme symbols on BingX.")
+    send_telegram("🤖 Bot started. Scanning custom symbols on BingX.")
     seen_signals = set()
     while True:
         try:
