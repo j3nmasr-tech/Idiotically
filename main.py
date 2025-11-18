@@ -22,25 +22,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 # ---------- CCXT BingX ----------
 exchange = ccxt.bingx({'enableRateLimit': True})
 exchange.load_markets()
-EXCHANGE_SYMBOLS = set(exchange.symbols)
 
-# ---------- Fixed symbols (example 100 symbols) ----------
-FIXED_SYMBOLS = [
-    "BTCUSDT","ETHUSDT","BNBUSDT","XRPUSDT","DOGEUSDT","ADAUSDT","SOLUSDT","LTCUSDT","DOTUSDT",
-    "SHIBUSDT","MATICUSDT","AVAXUSDT","LINKUSDT","ATOMUSDT","PEPEUSDT","MEMEUSDT","FLOKIUSDT",
-    "GALAUSDT","SANDUSDT","AXSUSDT","ALICEUSDT","RACAUSDT","LUNAUSDT","TAMAUSDT","CLOWNUSDT",
-    "BABYDOGEUSDT","ELONUSDT","KISHUUSDT","SAMOUSDT","WOOFUSDT","HOGEUSDT","MOONUSDT","TOADUSDT",
-    "FROGUSDT","COINUSDT","PUPPYUSDT","DOGUSDT","PIGGYUSDT","ROBOUSDT","KITTYUSDT","UNICORNUSDT",
-    "SNOOPUSDT","ALIENUSDT","NINJAUSDT","BULLUSDT","BEARUSDT","RABBITUSDT","SHARKUSDT","WHALEUSDT",
-    "PIXELUSDT","MEOWUSDT","LULUUSDT","BUNNYUSDT","FOXUSDT","OWLUSDT","LAMAUSDT","TIGERUSDT",
-    "CATTUSDT","NANAUSDT","MEMUSDT","PANDAUSDT","YODAUSDT","SHIBAELONUSDT","ELFUSDT","DRAGONUSDT",
-    "SLIMEUSDT","FISHUSDT","BOBAUSDT","LOKIUSDT","GOBUSDT","ALIUSDT","TOUSDT","FLOKIINUUSDT","AKITAUSDT",
-    "SAMOUSDT","HUSDT","SKYAIUSDT","FRIENDUSDT","ETSUSDT","SOBBUSDT","SKILLUSDT","MAGICUSDT","CRAZYUSDT",
-    "SPYUSDT","RUGUSDT","LADYSUSDT","CULTUSDT","GIGGLEUSDT","EGL1USDT","PEPECOINUSDT"
-]
-
-# Keep only symbols that exist on BingX
-FIXED_SYMBOLS = [s for s in FIXED_SYMBOLS if s in EXCHANGE_SYMBOLS]
+# ---------- Scan all USDT symbols ----------
+FIXED_SYMBOLS = [s for s in exchange.symbols if s.endswith("USDT")]
 logging.info("Using %d symbols", len(FIXED_SYMBOLS))
 
 # ---------- Telegram helper ----------
@@ -122,8 +106,7 @@ def check_entry_5m(df5: pd.DataFrame, direction: str):
     candle_range = last['high'] - last['low'] + 1e-12
     cond_body = (candle_body / candle_range) > 0.3
     ok = cond_rsi and cond_macd and cond_vol and cond_body
-    details = {"rsi": rsi_val, "macd_hist": macd_hist_last, "vol": last['volume'], "mean_vol20": mean_vol20}
-    return ok, details
+    return ok, {"rsi": rsi_val, "macd_hist": macd_hist_last, "vol": last['volume'], "mean_vol20": mean_vol20}
 
 # ---------- Signal Log ----------
 SIGNAL_LOG_FILE = "signals_log.csv"
@@ -198,7 +181,7 @@ def send_daily_summary():
 
 # ---------- Main Loop ----------
 def run():
-    send_telegram("🤖 Bot started. Scanning fixed symbols on BingX every 2 minutes.")
+    send_telegram("🤖 Bot started. Scanning all USDT symbols on BingX every 2 minutes.")
     seen_signals = set()
     last_summary_day = datetime.utcnow().day
     while True:
