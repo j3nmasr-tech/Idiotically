@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-BingX Low-Volume Altcoin Scalp Bot - Full Version
-- Sequential single-coin scan
-- Low-volume USDT coins (100k–5M USD)
+BingX Low-Volume Altcoin Scalp Bot - Optimized
+- Skips top 100 USDT coins
+- Scans coins with 24h volume 100k–5M USD
 - EMA trend + ATR TP/SL + RSI/MACD + candle/volume filter
-- Dynamic TP3 extension toward support/resistance
-- Tracks open signals and prevents duplicates
-- Sends Telegram notifications
+- Dynamic TP3 based on support/resistance
+- Sequential scan, minimal sleep (~0.2s)
 """
 
 import os, time, logging, json
@@ -18,7 +17,7 @@ import ccxt
 # ---------- Config ----------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
+POLL_INTERVAL = 0.2  # seconds between coins
 
 EMA_SHORT = int(os.getenv("EMA_SHORT", "50"))
 EMA_LONG  = int(os.getenv("EMA_LONG", "200"))
@@ -54,7 +53,7 @@ def send_telegram(text):
         logging.exception("Telegram send failed: %s", e)
 
 # ---------- OHLCV & Indicators ----------
-def fetch_ohlcv(symbol, tf, limit=300):
+def fetch_ohlcv(symbol, tf, limit=50):
     try:
         raw = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
         if not raw: return None
@@ -196,7 +195,7 @@ def process_symbol(sym):
                 "TP1":float(tp1),"TP2":float(tp2),"TP3":float(tp3),"SL":float(sl),
                 "Status":"Open","ClosePrice":"","CloseTime":""})
     mark_signaled(sym)
-    time.sleep(0.2)
+    time.sleep(POLL_INTERVAL)
 
 # ---------- Main Loop ----------
 def run():
@@ -206,8 +205,12 @@ def run():
     try: tickers = exchange.fetch_tickers()
     except Exception as e: logging.error("fetch_tickers failed: %s", e); return
 
-    available = [s for s,t in tickers.items() if s.endswith("/USDT")
-                 and MIN_24H_VOLUME_USD <= t.get('quoteVolume',0) <= MAX_24H_VOLUME_USD]
+    # Filter low-volume USDT coins and skip top 100
+    usdt_pairs = [(s, t.get('quoteVolume',0)) for s,t in tickers.items() if s.endswith("/USDT")]
+    usdt_pairs.sort(key=lambda x:x[1], reverse=True)
+    low_volume_pairs = usdt_pairs[100:]  # skip top 100
+    available = [s for s, vol in low_volume_pairs if MIN_24H_VOLUME_USD <= vol <= MAX_24H_VOLUME_USD]
+
     logging.info(f"Found {len(available)} low-volume symbols. Starting scan...")
 
     i = 0
@@ -226,7 +229,6 @@ def run():
             except: continue
 
         i += 1
-        time.sleep(POLL_INTERVAL)
 
 if __name__=="__main__":
     run()
