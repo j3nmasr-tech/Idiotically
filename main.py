@@ -23,9 +23,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 exchange = ccxt.bingx({'enableRateLimit': True})
 exchange.load_markets()
 
-# ---------- Scan all USDT symbols ----------
+# ---------- Scan all valid USDT symbols ----------
 FIXED_SYMBOLS = [s for s in exchange.symbols if s.endswith("USDT")]
-logging.info("Using %d symbols", len(FIXED_SYMBOLS))
+logging.info("Scanning %d USDT symbols on BingX", len(FIXED_SYMBOLS))
 
 # ---------- Telegram helper ----------
 def send_telegram(text: str):
@@ -41,14 +41,17 @@ def send_telegram(text: str):
     except Exception as e:
         logging.exception("Failed to send telegram message: %s", e)
 
-# ---------- Fetch OHLCV ----------
+# ---------- Fetch OHLCV with ignore for invalid symbols ----------
 def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 300):
     try:
         raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         df = pd.DataFrame(raw, columns=['ts','open','high','low','close','volume'])
         df['ts'] = pd.to_datetime(df['ts'], unit='ms')
         return df
-    except Exception as e:
+    except ccxt.BaseError as e:
+        if "100204" in str(e):
+            logging.warning("Symbol not found on BingX, skipping: %s", symbol)
+            return None
         logging.warning("fetch_ohlcv fail %s %s", symbol, e)
         return None
 
@@ -181,7 +184,7 @@ def send_daily_summary():
 
 # ---------- Main Loop ----------
 def run():
-    send_telegram("🤖 Bot started. Scanning all USDT symbols on BingX every 2 minutes.")
+    send_telegram("🤖 Bot started. Scanning all valid USDT symbols on BingX every 2 minutes.")
     seen_signals = set()
     last_summary_day = datetime.utcnow().day
     while True:
