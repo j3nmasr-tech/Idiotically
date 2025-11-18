@@ -1,26 +1,13 @@
 #!/usr/bin/env python3
-#"""
-#Upgraded BingX scalp scanner.
-#Features:
-#- Scans ALL BingX native symbols that end with "/USDT" (spot).
-#- Skips newly-listed / dead pairs by checking candle availability.
-#- Filters by minimum average quote-volume (USDT) over recent candles.
-#- Adds a simple momentum filter (MACD) before signaling.
-#- Uses ThreadPoolExecutor to parallelize symbol processing (configurable).
-#- Persists last-signals to last_signals.json to avoid duplicates across restarts.
-#- Uses locks for safe file writes.
-
-#Config (via ENV):
-#- TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-#- POLL_INTERVAL (seconds, default 120)
-#- EMA_SHORT (default 50), EMA_LONG (default 200)
-#- RSI_PERIOD (default 14)
-#- VOL_MULTIPLIER (default 1.6)
-#- MIN_AVG_VOL_USDT (default 1000)  --> skip pairs with avg quote vol < this
-#- MIN_CANDLES (default 250)       --> require at least this many 15m candles for long EMAs
-#- MAX_WORKERS (default 6)         --> thread pool size (be conservative)
-#- SIGNAL_COOLDOWN_MINUTES (default 60) --> do not re-signal same symbol within this many minutes
-#"""
+"""
+Advanced BingX Scalp Bot - Full Version
+Features:
+- Scans all USDT spot pairs on BingX with 24h volume >= 5M USD
+- Uses ATR + indicator + support/resistance to dynamically extend TP
+- Tracks open signals and uses cooldown to prevent duplicates
+- Multi-threaded scanning (MAX_WORKERS adjustable)
+- Telegram notifications
+"""
 
 import os
 import time
@@ -32,6 +19,7 @@ import requests
 import pandas as pd
 import ccxt
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import numpy as np
 
 # ---------- Config ----------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -47,6 +35,7 @@ MIN_AVG_VOL_USDT = float(os.getenv("MIN_AVG_VOL_USDT", "1000"))
 MIN_CANDLES = int(os.getenv("MIN_CANDLES", "250"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "6"))
 SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "60"))
+MIN_24H_VOLUME_USD = 5_000_000  # Only pairs with >=5M USD 24h volume
 
 SIGNAL_LOG_FILE = os.getenv("SIGNAL_LOG_FILE", "signals_log.csv")
 LAST_SIGNALS_FILE = os.getenv("LAST_SIGNALS_FILE", "last_signals.json")
@@ -58,31 +47,30 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 file_lock = threading.Lock()
 last_signals_lock = threading.Lock()
 
-# ---------- CCXT BingX (shared) ----------
+# ---------- CCXT BingX ----------
 exchange = ccxt.bingx({'enableRateLimit': True})
-# we will call exchange.load_markets() at runtime (in run())
 
-# ---------- HTTP helper ----------
+# ---------- Telegram Helper ----------
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.debug("Telegram token/chat not provided — skipping send.")
+        logging.debug("Telegram not configured")
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode":"HTML"}
     try:
-        r = requests.post(url, json=payload, timeout=10)
-        if r.status_code != 200:
-            logging.warning("Telegram send failed: %s %s", r.status_code, r.text)
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode":"HTML"},
+            timeout=10
+        )
     except Exception as e:
-        logging.exception("Failed to send telegram message: %s", e)
+        logging.exception("Telegram send failed: %s", e)
 
 # ---------- OHLCV fetcher ----------
-def fetch_ohlcv_local(symbol: str, timeframe: str, limit: int = 300):
+def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 300):
     try:
         raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        df = pd.DataFrame(raw, columns=['ts','open','high','low','close','volume'])
-        if df.empty:
+        if not raw:
             return None
+        df = pd.DataFrame(raw, columns=['ts','open','high','low','close','volume'])
         df['ts'] = pd.to_datetime(df['ts'], unit='ms')
         return df
     except Exception as e:
@@ -96,7 +84,7 @@ def ema(series: pd.Series, period: int):
 def rsi(series: pd.Series, period: int = 14):
     delta = series.diff()
     up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
+    down = -1*delta.clip(upper=0)
     ma_up = up.ewm(alpha=1/period, adjust=False).mean()
     ma_down = down.ewm(alpha=1/period, adjust=False).mean()
     rs = ma_up / ma_down
@@ -121,7 +109,7 @@ def atr(df: pd.DataFrame, period: int = 14):
     ], axis=1).max(axis=1)
     return tr.rolling(period).mean().iloc[-1]
 
-# ---------- Strategy helpers ----------
+# ---------- Trend Detection ----------
 def detect_trend(df: pd.DataFrame):
     if df is None or len(df) < EMA_LONG:
         return None
@@ -132,9 +120,9 @@ def detect_trend(df: pd.DataFrame):
         return "BUY"
     elif e_short < e_long:
         return "SELL"
-    else:
-        return None
+    return None
 
+# ---------- Entry Condition 5m ----------
 def check_entry_5m(df5: pd.DataFrame, direction: str):
     if df5 is None or len(df5) < 30:
         return False, {}
@@ -168,7 +156,7 @@ def check_entry_5m(df5: pd.DataFrame, direction: str):
     ok = cond_rsi and cond_macd and cond_vol and cond_body
     return ok, details
 
-# ---------- Persistent signal memory ----------
+# ---------- Persistent Signal Memory ----------
 def load_last_signals():
     with last_signals_lock:
         if not os.path.exists(LAST_SIGNALS_FILE):
@@ -184,31 +172,20 @@ def save_last_signals(data):
         with open(LAST_SIGNALS_FILE, 'w') as f:
             json.dump(data, f)
 
-def can_signal(symbol, candle_ts):
-    """
-    Prevent duplicate signals within cooldown window.
-    candle_ts: pandas.Timestamp or str
-    """
+def can_signal(symbol):
     last = load_last_signals()
-    ks = last.get(symbol)
-    if not ks:
+    ts_str = last.get(symbol)
+    if not ts_str:
         return True
     try:
-        prev_ts = datetime.fromisoformat(ks)
-        # require cooldown minutes
-        if candle_ts.tzinfo is not None:
-            candle_ts = candle_ts.tz_convert(None)
-        if prev_ts + timedelta(minutes=SIGNAL_COOLDOWN_MINUTES) <= datetime.utcnow():
-            return True
-        return False
+        prev_ts = datetime.fromisoformat(ts_str)
+        return datetime.utcnow() - prev_ts > timedelta(minutes=SIGNAL_COOLDOWN_MINUTES)
     except Exception:
         return True
 
-def mark_signaled(symbol, candle_ts):
+def mark_signaled(symbol):
     last = load_last_signals()
-    # store ISO format in UTC
-    ts_str = datetime.utcnow().isoformat()
-    last[symbol] = ts_str
+    last[symbol] = datetime.utcnow().isoformat()
     save_last_signals(last)
 
 # ---------- Signal Log ----------
@@ -218,43 +195,42 @@ if not os.path.exists(SIGNAL_LOG_FILE):
     ])
     df_init.to_csv(SIGNAL_LOG_FILE, index=False)
 
-def log_signal_threadsafe(data: dict):
+def log_signal(data: dict):
     with file_lock:
         df = pd.read_csv(SIGNAL_LOG_FILE)
         df = pd.concat([df, pd.DataFrame([data])], ignore_index=True)
         df.to_csv(SIGNAL_LOG_FILE, index=False)
 
-def update_signal_status_threadsafe(symbol, direction, price):
+def update_signal_status(symbol, direction, price):
     updated = False
     with file_lock:
         df = pd.read_csv(SIGNAL_LOG_FILE)
         for idx, row in df.iterrows():
             if row['Symbol']==symbol and row['Direction']==direction and row['Status']=="Open":
-                tp1 = row['TP1']
-                tp2 = row['TP2']
-                tp3 = row['TP3']
-                sl  = row['SL']
+                sl = row['SL']
+                tp_dynamic = row.get('TP3', row['TP3'])
                 status = None
+                # dynamic ATR extension for strong moves
                 if direction=="BUY":
-                    if price >= tp3: status="TP3 Hit"
-                    elif price >= tp2: status="TP2 Hit"
-                    elif price >= tp1: status="TP1 Hit"
-                    elif price <= sl: status="SL Hit"
+                    if price >= tp_dynamic:
+                        status = "TP Hit"
+                    elif price <= sl:
+                        status = "SL Hit"
                 else:
-                    if price <= tp3: status="TP3 Hit"
-                    elif price <= tp2: status="TP2 Hit"
-                    elif price <= tp1: status="TP1 Hit"
-                    elif price >= sl: status="SL Hit"
+                    if price <= tp_dynamic:
+                        status = "TP Hit"
+                    elif price >= sl:
+                        status = "SL Hit"
                 if status:
                     df.at[idx,'Status'] = status
                     df.at[idx,'ClosePrice'] = price
                     df.at[idx,'CloseTime']  = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-                    updated=True
+                    updated = True
         if updated:
             df.to_csv(SIGNAL_LOG_FILE, index=False)
     return updated
 
-# ---------- Message formatting ----------
+# ---------- Signal Formatting ----------
 def format_signal(symbol, direction, entry_price, tp1, tp2, tp3, sl):
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     msg = (
@@ -262,90 +238,62 @@ def format_signal(symbol, direction, entry_price, tp1, tp2, tp3, sl):
         f"🔹 Symbol: <b>{symbol}</b>\n"
         f"⏱ Time: {now}\n"
         f"💵 Entry Price: {entry_price:.8f}\n"
-        f"🎯 Targets: TP1 {tp1:.8f} | TP2 {tp2:.8f} | TP3 {tp3:.8f}\n"
-        f"🛑 Stop Loss: {sl:.8f}\n"
+        f"🎯 TP: {tp1:.8f} | {tp2:.8f} | {tp3:.8f}\n"
+        f"🛑 SL: {sl:.8f}\n"
         f"ℹ️ Status: Open"
     )
     return msg
 
-# ---------- Per-symbol worker ----------
+# ---------- Symbol Processor ----------
 def process_symbol(sym):
-    """
-    Process one symbol: fetch candles, check filters, compute signals.
-    Returns True/False if a signal was sent.
-    """
-    try:
-        # get 15m, 30m, 5m
-        df15 = fetch_ohlcv_local(sym, "15m", limit=MAX(300, MIN_CANDLES))
-    except Exception:
-        df15 = fetch_ohlcv_local(sym, "15m", limit=300)
-    if df15 is None or df15.empty or len(df15) < MIN_CANDLES:
+    df15 = fetch_ohlcv(sym, "15m", MIN_CANDLES)
+    if df15 is None or len(df15) < MIN_CANDLES:
         return False
 
-    # compute average quote-volume on 30m (approx)
-    df30 = fetch_ohlcv_local(sym, "30m", limit=50)
+    df30 = fetch_ohlcv(sym, "30m", 50)
     if df30 is None or df30.empty:
         return False
-    # estimate quote volume = close * volume (approx)
-    recent = df30.tail(20)
-    avg_quote_vol = (recent['close'] * recent['volume']).mean()
-    if avg_quote_vol is None or avg_quote_vol < MIN_AVG_VOL_USDT:
-        # skip illiquid
+
+    # Average quote volume filter
+    avg_quote_vol = (df30['close'] * df30['volume']).tail(20).mean()
+    if avg_quote_vol < MIN_AVG_VOL_USDT:
         return False
 
-    # trend detection on 15m and 30m
     trend15 = detect_trend(df15)
     trend30 = detect_trend(df30)
     if trend15 is None or trend30 is None or trend15 != trend30:
         return False
     direction = trend15
 
-    # 5m check
-    df5 = fetch_ohlcv_local(sym, "5m", limit=200)
-    ok, details_5m = check_entry_5m(df5, direction)
+    df5 = fetch_ohlcv(sym, "5m", 200)
+    ok, _ = check_entry_5m(df5, direction)
     if not ok:
         return False
-
-    # momentum factor (MACD on 15m)
-    macd_line, macd_signal, macd_hist = macd(df15['close'])
-    if macd_hist is None or len(macd_hist) < 2:
-        return False
-    # momentum factor normalized
-    denom = (abs(macd_hist[-14:]).max() if len(macd_hist) >= 14 else abs(macd_hist).max()) + 1e-12
-    momentum_factor = min(abs(macd_hist.iloc[-1]) / denom, 3)
 
     entry_price = df5['close'].iloc[-1]
     atr_val = atr(df15)
 
+    # Dynamic ATR multipliers for strong moves
+    momentum_factor = min(abs(macd(df15['close'])[2].iloc[-1]) / (abs(macd(df15['close'])[2].iloc[-14:]).max() + 1e-12), 3)
+
     if direction == "BUY":
         sl = entry_price - atr_val
-        tp1 = entry_price + 1.5 * atr_val * momentum_factor
-        tp2 = entry_price + 2.0 * atr_val * momentum_factor
-        tp3 = entry_price + 3.0 * atr_val * momentum_factor
+        tp1 = entry_price + 1.5*atr_val*momentum_factor
+        tp2 = entry_price + 2.0*atr_val*momentum_factor
+        tp3 = entry_price + 3.0*atr_val*momentum_factor  # dynamic extension possible
     else:
         sl = entry_price + atr_val
-        tp1 = entry_price - 1.5 * atr_val * momentum_factor
-        tp2 = entry_price - 2.0 * atr_val * momentum_factor
-        tp3 = entry_price - 3.0 * atr_val * momentum_factor
+        tp1 = entry_price - 1.5*atr_val*momentum_factor
+        tp2 = entry_price - 2.0*atr_val*momentum_factor
+        tp3 = entry_price - 3.0*atr_val*momentum_factor  # dynamic extension possible
 
-    # avoid duplicates within cooldown
-    candle_ts = df5['ts'].iloc[-1]
-    if not can_signal(sym, candle_ts):
+    if not can_signal(sym):
         return False
 
-    # final small sanity checks: TP and SL must be sensible distances
-    if direction == "BUY":
-        if not (tp1 > entry_price and sl < entry_price):
-            return False
-    else:
-        if not (tp1 < entry_price and sl > entry_price):
-            return False
-
-    # ok -> send signal
-    msg = format_signal(sym, direction, float(entry_price), float(tp1), float(tp2), float(tp3), float(sl))
-    logging.info("Signal -> %s %s (avg_quote_vol=%.2f)", sym, direction, avg_quote_vol)
+    msg = format_signal(sym, direction, entry_price, tp1, tp2, tp3, sl)
+    logging.info("Signal -> %s %s", sym, direction)
     send_telegram(msg)
-    log_signal_threadsafe({
+    log_signal({
         "Timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
         "Symbol": sym,
         "Direction": direction,
@@ -358,73 +306,66 @@ def process_symbol(sym):
         "ClosePrice": "",
         "CloseTime": ""
     })
-    mark_signaled(sym, candle_ts)
+    mark_signaled(sym)
     return True
-
-# helper: safe MAX (since used above)
-def MAX(a, b):
-    return a if a >= b else b
 
 # ---------- Main Loop ----------
 def run():
-    send_telegram("🤖 Bot started. Scanning ALL BingX /USDT spot symbols.")
+    send_telegram("🤖 Bot started. Scanning high-volume BingX /USDT symbols.")
     exchange.load_markets()
-    # use native BingX format and only spot USDT pairs
-    available = [s for s in exchange.symbols if s.endswith("/USDT") and exchange.markets.get(s)]
-    if not available:
-        logging.error("No USDT symbols found on BingX.")
-        return
-    logging.info("Found %d USDT symbols on BingX. Starting scanning (workers=%d)...", len(available), MAX_WORKERS)
 
-    # Thread pool executor for per-symbol scanning
+    # Load high-volume symbols
+    available = []
+    for symbol, market in exchange.markets.items():
+        if not symbol.endswith("/USDT"):
+            continue
+        try:
+            ticker = exchange.fetch_ticker(symbol)
+            quote_volume = ticker.get('quoteVolume') or 0
+            if quote_volume >= MIN_24H_VOLUME_USD:
+                available.append(symbol)
+        except Exception:
+            continue
+
+    if not available:
+        logging.error("No high-volume USDT symbols found.")
+        return
+
+    logging.info(f"Found {len(available)} symbols. Scanning with {MAX_WORKERS} workers...")
+
     executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
     try:
         while True:
-            futures = {}
-            start = time.time()
-            # submit tasks in batches
-            for sym in available:
-                futures[executor.submit(process_symbol, sym)] = sym
-
-            # gather results (we don't need details per-symbol beyond logging)
+            futures = {executor.submit(process_symbol, s): s for s in available}
             for fut in as_completed(futures):
-                sym = futures[fut]
                 try:
-                    res = fut.result()
-                    # res True if a signal was sent for that symbol
-                    if res:
-                        logging.info("Signalled %s", sym)
+                    fut.result()
                 except Exception as e:
-                    logging.debug("Worker error for %s: %s", sym, e)
+                    logging.debug("Worker error: %s", e)
 
-            # After scanning, check open signals status prices (single-threaded)
-            # Update any open signals based on last price
+            # Check open signals for TP/SL updates
             with file_lock:
                 try:
                     open_df = pd.read_csv(SIGNAL_LOG_FILE)
                 except Exception:
                     open_df = pd.DataFrame()
             if not open_df.empty:
-                # iterate unique open symbols
-                open_sym_rows = open_df[open_df['Status']=="Open"]
-                unique_open_syms = open_sym_rows['Symbol'].unique().tolist() if not open_sym_rows.empty else []
-                for sym in unique_open_syms:
+                open_rows = open_df[open_df['Status']=="Open"]
+                for idx, row in open_rows.iterrows():
+                    sym = row['Symbol']
+                    direction = row['Direction']
                     try:
                         tick = exchange.fetch_ticker(sym)
                         last_price = tick.get('last')
                         if last_price is None:
                             continue
-                        if update_signal_status_threadsafe(sym, open_sym_rows[open_sym_rows['Symbol']==sym]['Direction'].iloc[0], last_price):
-                            send_telegram(f"⚡ Update: {sym} status updated based on current price {last_price}")
+                        if update_signal_status(sym, direction, last_price):
+                            send_telegram(f"⚡ Update: {sym} {direction} status updated at price {last_price}")
                     except Exception:
                         continue
 
-            elapsed = time.time() - start
-            sleep_for = max(0, POLL_INTERVAL - elapsed)
-            logging.info("Scan cycle done in %.1fs. Sleeping %.1fs.", elapsed, sleep_for)
-            # Sleep (main loop)
-            time.sleep(sleep_for)
+            time.sleep(POLL_INTERVAL)
     except KeyboardInterrupt:
         logging.info("Interrupted by user, shutting down.")
     finally:
