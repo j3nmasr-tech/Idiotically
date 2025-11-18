@@ -122,14 +122,15 @@ def get_low_vol_meme_symbols():
         exchange.load_markets()
         all_symbols = exchange.symbols  # جميع الرموز الموجودة فعليًا
         markets = exchange.fetch_markets()
-        usdt_pairs = [m for m in markets if m['quote'] == 'USDT']
         filtered = []
-        for m in usdt_pairs:
-            base = m['base']
-            symbol = m['symbol']
-            quote_vol = float(m.get('info', {}).get('quoteVolume', 0) or 0)
-            if base not in majors and quote_vol < LOW_VOLUME_USDT and symbol in all_symbols:
-                filtered.append(symbol)
+        for m in markets:
+            # أزواج Spot USDT فقط
+            if m['spot'] and m['quote'] == 'USDT':
+                base = m['base']
+                symbol = m['symbol']
+                vol = float(m.get('info', {}).get('quoteVolume', 0) or 0)
+                if base not in majors and vol < LOW_VOLUME_USDT and symbol in all_symbols:
+                    filtered.append(symbol)
         return filtered
     except Exception as e:
         logging.exception("Failed to fetch low-vol meme symbols: %s", e)
