@@ -8,14 +8,13 @@ import ccxt
 
 # ---------- Config ----------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")  
+TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))  # seconds
 
 EMA_SHORT = int(os.getenv("EMA_SHORT", "50"))
 EMA_LONG  = int(os.getenv("EMA_LONG", "200"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-VOL_MULTIPLIER = float(os.getenv("VOL_MULTIPLIER", "1.6"))  
-LOW_VOLUME_USDT = float(os.getenv("LOW_VOLUME_USDT", "5000000"))
+VOL_MULTIPLIER = float(os.getenv("VOL_MULTIPLIER", "1.6"))
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -181,9 +180,9 @@ def format_signal(symbol, direction, entry_price, tp1, tp2, tp3, sl):
         f"🔹 Symbol: <b>{symbol}</b>\n"
         f"⏱ Time: {now}\n"
         f"💵 Entry Price: {entry_price:.6f}\n"
-        f"🎯 Targets: TP1 {tp1:.2%}, TP2 {tp2:.2%}, TP3 {tp3:.2%}\n"
-        f"🛑 Stop Loss: {sl:.2%}\n"
-        f"ℹ Status: Open"
+        f"🎯 Targets: TP1 {tp1:.6f} | TP2 {tp2:.6f} | TP3 {tp3:.6f}\n"
+        f"🛑 Stop Loss: {sl:.6f}\n"
+        f"ℹ️ Status: Open"
     )
     return msg
 
@@ -212,18 +211,22 @@ def run():
                 df5 = fetch_ohlcv(sym, "5m", 200)
                 ok, details_5m = check_entry_5m(df5, direction)
                 if ok:
-                    # Calculate entry price and TP/SL (example 1%/2%/3% and SL 0.5%)
                     entry_price = df5['close'].iloc[-1]
+                    # --- calculate absolute TP/SL numbers ---
+                    sl_percent = 0.3 / 100
+                    tp1_percent = 1 / 100
+                    tp2_percent = 2 / 100
+                    tp3_percent = 3 / 100
                     if direction=="BUY":
-                        tp1 = entry_price * 1.01
-                        tp2 = entry_price * 1.02
-                        tp3 = entry_price * 1.03
-                        sl  = entry_price * 0.995
+                        sl = entry_price * (1 - sl_percent)
+                        tp1 = entry_price * (1 + tp1_percent)
+                        tp2 = entry_price * (1 + tp2_percent)
+                        tp3 = entry_price * (1 + tp3_percent)
                     else:
-                        tp1 = entry_price * 0.99
-                        tp2 = entry_price * 0.98
-                        tp3 = entry_price * 0.97
-                        sl  = entry_price * 1.005
+                        sl = entry_price * (1 + sl_percent)
+                        tp1 = entry_price * (1 - tp1_percent)
+                        tp2 = entry_price * (1 - tp2_percent)
+                        tp3 = entry_price * (1 - tp3_percent)
                     key = f"{sym}|{direction}|{df5['ts'].iloc[-1]}"
                     if key in seen_signals:
                         continue
