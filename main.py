@@ -1,7 +1,7 @@
 import os
 import time
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import requests
 import pandas as pd
 import ccxt
@@ -9,12 +9,12 @@ import ccxt
 # ---------- Config ----------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "120"))  # كل دقيقتين
+POLL_INTERVAL = 120  # every 2 minutes
 
-EMA_SHORT = int(os.getenv("EMA_SHORT", "50"))
-EMA_LONG  = int(os.getenv("EMA_LONG", "200"))
-RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
-VOL_MULTIPLIER = float(os.getenv("VOL_MULTIPLIER", "1.6"))
+EMA_SHORT = 50
+EMA_LONG = 200
+RSI_PERIOD = 14
+VOL_MULTIPLIER = 1.6
 
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -22,14 +22,14 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 # ---------- CCXT BingX ----------
 exchange = ccxt.bingx({'enableRateLimit': True})
 exchange.load_markets()
-EXCHANGE_SYMBOLS = set(exchange.symbols)  # جميع الرموز الموجودة على BingX
+EXCHANGE_SYMBOLS = set(exchange.symbols)
 
 # ---------- Load custom symbols ----------
 def load_custom_symbols(path="symbols.txt", top_n=500):
     symbols = []
     with open(path, "r") as f:
         for line in f:
-            sym = line.strip().replace("/", "")  # remove slash if needed
+            sym = line.strip().replace("/", "")  # normalize
             if sym in EXCHANGE_SYMBOLS:
                 symbols.append(sym)
             if len(symbols) >= top_n:
@@ -95,8 +95,7 @@ def detect_trend(df: pd.DataFrame):
         return "BUY"
     elif e_short < e_long:
         return "SELL"
-    else:
-        return None
+    return None
 
 def check_entry_5m(df5: pd.DataFrame, direction: str):
     if df5 is None or len(df5) < 30:
@@ -174,10 +173,30 @@ def format_signal(symbol, direction, entry_price, tp1, tp2, tp3, sl):
         f"ℹ️ Status: Open"
     )
 
+# ---------- Daily Summary ----------
+def send_daily_summary():
+    if not os.path.exists(SIGNAL_LOG_FILE):
+        return
+    df = pd.read_csv(SIGNAL_LOG_FILE)
+    today = datetime.utcnow().date()
+    df_today = df[df['Timestamp'].str.startswith(str(today))]
+    if df_today.empty:
+        return
+    total = len(df_today)
+    tp1_hits = len(df_today[df_today['Status']=="TP1 Hit"])
+    tp2_hits = len(df_today[df_today['Status']=="TP2 Hit"])
+    tp3_hits = len(df_today[df_today['Status']=="TP3 Hit"])
+    sl_hits  = len(df_today[df_today['Status']=="SL Hit"])
+    msg = (f"📊 <b>Daily Summary ({today})</b>\n"
+           f"Total Signals: {total}\nTP1 Hits: {tp1_hits}\nTP2 Hits: {tp2_hits}\n"
+           f"TP3 Hits: {tp3_hits}\nSL Hits: {sl_hits}")
+    send_telegram(msg)
+
 # ---------- Main Loop ----------
 def run():
-    send_telegram("🤖 Bot started. Scanning custom symbols on BingX.")
+    send_telegram("🤖 Bot started. Scanning custom symbols on BingX every 2 minutes.")
     seen_signals = set()
+    last_summary_day = datetime.utcnow().day
     while True:
         try:
             for sym in FIXED_SYMBOLS:
@@ -194,24 +213,45 @@ def run():
                 if not ok:
                     continue
                 entry_price = df5['close'].iloc[-1]
-                sl, tp1, tp2, tp3 = (entry_price*0.997, entry_price*1.01, entry_price*1.02, entry_price*1.03) if direction=="BUY" else (entry_price*1.003, entry_price*0.99, entry_price*0.98, entry_price*0.97)
+                # --- exact TP/SL numbers ---
+                if direction=="BUY":
+                    sl = entry_price * 0.997
+                    tp1 = entry_price * 1.01
+                    tp2 = entry_price * 1.02
+                    tp3 = entry_price * 1.03
+                else:
+                    sl = entry_price * 1.003
+                    tp1 = entry_price * 0.99
+                    tp2 = entry_price * 0.98
+                    tp3 = entry_price * 0.97
                 key = f"{sym}|{direction}|{df5['ts'].iloc[-1]}"
-                if key in seen_signals:
-                    continue
-                msg = format_signal(sym, direction, entry_price, tp1, tp2, tp3, sl)
-                send_telegram(msg)
-                log_signal({
-                    "Timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                    "Symbol": sym, "Direction": direction, "EntryPrice": entry_price,
-                    "TP1": tp1, "TP2": tp2, "TP3": tp3, "SL": sl,
-                    "Status": "Open", "ClosePrice": "", "CloseTime": ""
-                })
-                seen_signals.add(key)
+                if key not in seen_signals:
+                    msg = format_signal(sym, direction, entry_price, tp1, tp2, tp3, sl)
+                    send_telegram(msg)
+                    log_signal({
+                        "Timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                        "Symbol": sym,
+                        "Direction": direction,
+                        "EntryPrice": entry_price,
+                        "TP1": tp1,
+                        "TP2": tp2,
+                        "TP3": tp3,
+                        "SL": sl,
+                        "Status": "Open",
+                        "ClosePrice": "",
+                        "CloseTime": ""
+                    })
+                    seen_signals.add(key)
+                # --- Update open signals ---
                 tick = exchange.fetch_ticker(sym)
                 last_price = tick['last']
                 if update_signal_status(sym, direction, last_price):
                     send_telegram(f"⚡ Update: {sym} {direction} status updated. Last Price: {last_price:.6f}")
-                time.sleep(0.2)
+            # --- Daily summary at UTC 23:59 ---
+            now = datetime.utcnow()
+            if now.day != last_summary_day and now.hour == 23 and now.minute >= 59:
+                send_daily_summary()
+                last_summary_day = now.day
         except Exception as e:
             logging.exception("Main loop error: %s", e)
         time.sleep(POLL_INTERVAL)
