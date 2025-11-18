@@ -281,19 +281,19 @@ def process_symbol(sym):
     if trend is None: return
 
     # 1h MTF confirmation
-    df1h = fetch_ohlcv(sym, "1h", 200)
-    if df1h is None or len(df1h) < 50:
-        logging.debug("No 1h data for %s", sym)
-    else:
-        trend_1h = detect_trend(df1h)
-        if trend_1h is not None and trend_1h != trend:
-            logging.info("[MTF] 1h trend mismatch for %s: 15m=%s 1h=%s - skipping", sym, trend, trend_1h)
-            return
+    #df1h = fetch_ohlcv(sym, "1h", 200)
+    #if df1h is None or len(df1h) < 50:
+        #logging.debug("No 1h data for %s", sym)
+    #else:
+        #trend_1h = detect_trend(df1h)
+        #if trend_1h is not None and trend_1h != trend:
+            #logging.info("[MTF] 1h trend mismatch for %s: 15m=%s 1h=%s - skipping", sym, trend, trend_1h)
+            #return
 
     # Market regime filter
-    if not is_good_market_regime(df15):
-        logging.debug("[REGIME] Market regime not suitable for %s", sym)
-        return
+    #if not is_good_market_regime(df15):
+        #logging.debug("[REGIME] Market regime not suitable for %s", sym)
+        #return
 
     # liquidity / spread check
     if not has_sufficient_liquidity(sym):
