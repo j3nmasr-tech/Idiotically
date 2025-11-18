@@ -1,7 +1,7 @@
 import os
 import time
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 import requests
 import pandas as pd
 import ccxt
@@ -24,20 +24,24 @@ exchange = ccxt.bingx({'enableRateLimit': True})
 exchange.load_markets()
 EXCHANGE_SYMBOLS = set(exchange.symbols)
 
-# ---------- Load custom symbols ----------
-def load_custom_symbols(path="symbols.txt", top_n=500):
-    symbols = []
-    with open(path, "r") as f:
-        for line in f:
-            sym = line.strip().replace("/", "")  # normalize
-            if sym in EXCHANGE_SYMBOLS:
-                symbols.append(sym)
-            if len(symbols) >= top_n:
-                break
-    return symbols
+# ---------- Fixed symbols (example 100 symbols) ----------
+FIXED_SYMBOLS = [
+    "BTCUSDT","ETHUSDT","BNBUSDT","XRPUSDT","DOGEUSDT","ADAUSDT","SOLUSDT","LTCUSDT","DOTUSDT",
+    "SHIBUSDT","MATICUSDT","AVAXUSDT","LINKUSDT","ATOMUSDT","PEPEUSDT","MEMEUSDT","FLOKIUSDT",
+    "GALAUSDT","SANDUSDT","AXSUSDT","ALICEUSDT","RACAUSDT","LUNAUSDT","TAMAUSDT","CLOWNUSDT",
+    "BABYDOGEUSDT","ELONUSDT","KISHUUSDT","SAMOUSDT","WOOFUSDT","HOGEUSDT","MOONUSDT","TOADUSDT",
+    "FROGUSDT","COINUSDT","PUPPYUSDT","DOGUSDT","PIGGYUSDT","ROBOUSDT","KITTYUSDT","UNICORNUSDT",
+    "SNOOPUSDT","ALIENUSDT","NINJAUSDT","BULLUSDT","BEARUSDT","RABBITUSDT","SHARKUSDT","WHALEUSDT",
+    "PIXELUSDT","MEOWUSDT","LULUUSDT","BUNNYUSDT","FOXUSDT","OWLUSDT","LAMAUSDT","TIGERUSDT",
+    "CATTUSDT","NANAUSDT","MEMUSDT","PANDAUSDT","YODAUSDT","SHIBAELONUSDT","ELFUSDT","DRAGONUSDT",
+    "SLIMEUSDT","FISHUSDT","BOBAUSDT","LOKIUSDT","GOBUSDT","ALIUSDT","TOUSDT","FLOKIINUUSDT","AKITAUSDT",
+    "SAMOUSDT","HUSDT","SKYAIUSDT","FRIENDUSDT","ETSUSDT","SOBBUSDT","SKILLUSDT","MAGICUSDT","CRAZYUSDT",
+    "SPYUSDT","RUGUSDT","LADYSUSDT","CULTUSDT","GIGGLEUSDT","EGL1USDT","PEPECOINUSDT"
+]
 
-FIXED_SYMBOLS = load_custom_symbols()
-logging.info("Using %d symbols from custom list", len(FIXED_SYMBOLS))
+# Keep only symbols that exist on BingX
+FIXED_SYMBOLS = [s for s in FIXED_SYMBOLS if s in EXCHANGE_SYMBOLS]
+logging.info("Using %d symbols", len(FIXED_SYMBOLS))
 
 # ---------- Telegram helper ----------
 def send_telegram(text: str):
@@ -194,7 +198,7 @@ def send_daily_summary():
 
 # ---------- Main Loop ----------
 def run():
-    send_telegram("🤖 Bot started. Scanning custom symbols on BingX every 2 minutes.")
+    send_telegram("🤖 Bot started. Scanning fixed symbols on BingX every 2 minutes.")
     seen_signals = set()
     last_summary_day = datetime.utcnow().day
     while True:
