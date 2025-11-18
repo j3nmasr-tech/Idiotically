@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
-BingX Low-Volume Altcoin Scalp Bot - Rolling Scan Version
+BingX Low-Volume Altcoin Scalp Bot - Fixed Instant-Start Version
 - Low-volume USDT coins 100k–5M USD 24h volume
-- Instant-start scanning (rolling)
-- EMA trend + 5m entry
-- ATR + momentum dynamic TP/SL
-- RSI/MACD/volume/candle filter
-- Telegram alerts
-- Persistent signals & cooldown
+- Instant startup: sends Telegram message immediately
+- Rolling scan without threads
+- EMA trend + ATR TP/SL + RSI/MACD/volume/candle filter
 """
 
 import os, time, logging, json
@@ -19,7 +16,7 @@ import ccxt
 # ---------- Config ----------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "120"))
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))  # seconds
 
 EMA_SHORT = int(os.getenv("EMA_SHORT", "50"))
 EMA_LONG  = int(os.getenv("EMA_LONG", "200"))
@@ -124,12 +121,10 @@ def mark_signaled(symbol):
 # ---------- Signal Logging ----------
 if not os.path.exists(SIGNAL_LOG_FILE):
     pd.DataFrame(columns=["Timestamp","Symbol","Direction","EntryPrice","TP1","TP2","TP3","SL","Status","ClosePrice","CloseTime"]).to_csv(SIGNAL_LOG_FILE,index=False)
-
 def log_signal(data):
     df = pd.read_csv(SIGNAL_LOG_FILE)
     df = pd.concat([df,pd.DataFrame([data])],ignore_index=True)
     df.to_csv(SIGNAL_LOG_FILE,index=False)
-
 def update_signal_status(symbol,direction,price):
     updated=False
     df=pd.read_csv(SIGNAL_LOG_FILE)
@@ -157,24 +152,30 @@ def format_signal(symbol,direction,entry,tp1,tp2,tp3,sl):
 
 # ---------- Symbol Processing ----------
 def process_symbol(sym):
-    df15 = fetch_ohlcv(sym,"15m",MIN_CANDLES)
     df30 = fetch_ohlcv(sym,"30m",50)
-    if df15 is None or df30 is None or len(df15)<MIN_CANDLES: return
+    if df30 is None or len(df30)<20: return
     avg_vol = (df30['close']*df30['volume']).tail(20).mean()
     if avg_vol<MIN_24H_VOLUME_USD or avg_vol>MAX_24H_VOLUME_USD: return
+
+    df15 = fetch_ohlcv(sym,"15m",MIN_CANDLES)
+    if df15 is None or len(df15)<MIN_CANDLES: return
     trend15, trend30 = detect_trend(df15), detect_trend(df30)
     if trend15!=trend30 or trend15 is None: return
     direction = trend15
+
     df5 = fetch_ohlcv(sym,"5m",200)
     ok,_ = check_entry_5m(df5,direction)
     if not ok: return
+
     entry = df5['close'].iloc[-1]
     atr_val = atr(df15)
-    momentum_factor = min(abs(macd(df15['close'])[2].iloc[-1])/ (abs(macd(df15['close'])[2].iloc[-14:]).max()+1e-12),3)
+    momentum_factor = min(abs(macd(df15['close'])[2].iloc[-1])/ (abs(macd(df15)['close'][2].iloc[-14:]).max()+1e-12),3)
+
     if direction=="BUY":
         sl = entry - atr_val; tp1 = entry+1.5*atr_val*momentum_factor; tp2=entry+2.0*atr_val*momentum_factor; tp3=entry+3.0*atr_val*momentum_factor
     else:
         sl = entry + atr_val; tp1 = entry-1.5*atr_val*momentum_factor; tp2=entry-2.0*atr_val*momentum_factor; tp3=entry-3.0*atr_val*momentum_factor
+
     if not can_signal(sym): return
     msg = format_signal(sym,direction,entry,tp1,tp2,tp3,sl)
     logging.info("Signal -> %s %s",sym,direction)
@@ -194,18 +195,24 @@ def run():
     if not available:
         logging.error("No low-volume USDT symbols found")
         return
+
+    # --- send startup message immediately ---
     logging.info(f"Found {len(available)} low-volume symbols. Starting rolling scan...")
+    send_telegram(f"🤖 Bot started. Found {len(available)} low-volume USDT symbols. Starting rolling scan...")
+    time.sleep(1)
 
     i = 0
     while True:
         sym = available[i % len(available)]
         process_symbol(sym)
+
         # Update open signals
         open_df = pd.read_csv(SIGNAL_LOG_FILE)
         for idx,row in open_df[open_df['Status']=="Open"].iterrows():
             tick = exchange.fetch_ticker(row['Symbol'])
             last_price = tick.get('last')
             if last_price: update_signal_status(row['Symbol'], row['Direction'], last_price)
+
         i += 1
         time.sleep(0.5)  # small pause to avoid rate limit
 
