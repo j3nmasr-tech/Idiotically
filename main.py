@@ -23,19 +23,15 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 exchange = ccxt.bingx({'enableRateLimit': True})
 exchange.load_markets()
 
-# ---------- Fixed symbol list (your current list) ----------
+# ---------- Fixed symbol list ----------
 FIXED_SYMBOLS = [
     "H/USDT","PEPECOIN/USDT","MEME/USDT","DOGE/USDT","SKYAI/USDT",
     "FLOKI/USDT","SHIB/USDT","AKITA/USDT","ELON/USDT","BABYDOGE/USDT",
     # add your other symbols here
 ]
 
-# ---------- Helper: convert any / symbols to BingX format ----------
+# ---------- Helper: convert / to BingX format ----------
 def match_bingx_symbol(symbol):
-    """
-    Convert any symbol with '/' to BingX exact format.
-    Example: H/USDT -> HUSDT
-    """
     candidates = [s for s in exchange.symbols if s.replace("/", "").upper() == symbol.replace("/", "").upper()]
     return candidates[0] if candidates else None
 
@@ -83,6 +79,17 @@ def macd(series: pd.Series, fast=12, slow=26, signal=9):
     signal_line = macd_line.ewm(span=signal, adjust=False).mean()
     hist = macd_line - signal_line
     return macd_line, signal_line, hist
+
+def atr(df: pd.DataFrame, period: int = 14):
+    high = df['high']
+    low = df['low']
+    close = df['close']
+    tr = pd.concat([
+        high - low,
+        (high - close.shift(1)).abs(),
+        (low - close.shift(1)).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(period).mean().iloc[-1]
 
 def detect_trend(df: pd.DataFrame):
     if df is None or len(df) < EMA_LONG:
@@ -221,21 +228,23 @@ def run():
                 ok, details_5m = check_entry_5m(df5, direction)
                 if ok:
                     entry_price = df5['close'].iloc[-1]
-                    # --- calculate absolute TP/SL numbers ---
-                    sl_percent = 0.3 / 100
-                    tp1_percent = 1 / 100
-                    tp2_percent = 2 / 100
-                    tp3_percent = 3 / 100
-                    if direction=="BUY":
-                        sl = entry_price * (1 - sl_percent)
-                        tp1 = entry_price * (1 + tp1_percent)
-                        tp2 = entry_price * (1 + tp2_percent)
-                        tp3 = entry_price * (1 + tp3_percent)
+
+                    # --- Dynamic TP/SL using ATR + Momentum ---
+                    atr_val = atr(df15)
+                    macd_line, macd_signal, macd_hist = macd(df15['close'])
+                    momentum_factor = min(abs(macd_hist.iloc[-1]) / (abs(macd_hist[-14:]).max() + 1e-12), 3)
+
+                    if direction == "BUY":
+                        sl = entry_price - atr_val
+                        tp1 = entry_price + 1.5 * atr_val * momentum_factor
+                        tp2 = entry_price + 2.0 * atr_val * momentum_factor
+                        tp3 = entry_price + 3.0 * atr_val * momentum_factor
                     else:
-                        sl = entry_price * (1 + sl_percent)
-                        tp1 = entry_price * (1 - tp1_percent)
-                        tp2 = entry_price * (1 - tp2_percent)
-                        tp3 = entry_price * (1 - tp3_percent)
+                        sl = entry_price + atr_val
+                        tp1 = entry_price - 1.5 * atr_val * momentum_factor
+                        tp2 = entry_price - 2.0 * atr_val * momentum_factor
+                        tp3 = entry_price - 3.0 * atr_val * momentum_factor
+
                     key = f"{sym}|{direction}|{df5['ts'].iloc[-1]}"
                     if key in seen_signals:
                         continue
@@ -256,11 +265,13 @@ def run():
                         "CloseTime": ""
                     })
                     seen_signals.add(key)
+
                 # --- Check open signals to update status ---
                 tick = exchange.fetch_ticker(sym)
                 last_price = tick['last']
                 if update_signal_status(sym, direction, last_price):
                     send_telegram(f"⚡ Update: {sym} {direction} status updated based on current price {last_price}")
+
                 time.sleep(0.2)
         except Exception as e:
             logging.exception("Main loop error: %s", e)
