@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-#"""
-#Advanced BingX Scalp Bot - Rate-Limited Full Version
-#Features:
-#- Scans all USDT spot pairs on BingX with 24h volume >= 5M USD
-#- Uses ATR + indicator + dynamic TP/SL based on momentum
-#- Safe, rate-limited worker queue (no freezes)
-#- Telegram notifications
-#- Logs signals and updates open trades
-#"""
+"""
+BingX Scalp Bot - Low-Volume Altcoins Version
+Features:
+- Scans USDT spot pairs with 24h volume 100k–5M USD
+- Uses ATR + indicators for dynamic TP/SL
+- 5m entry check, EMA trend confirmation
+- Persistent signal memory + cooldown
+- Telegram notifications
+- Multi-threaded, safe, rate-limited
+"""
 
 import os, time, logging, json, threading
 from datetime import datetime, timedelta
@@ -15,7 +16,6 @@ import requests
 import pandas as pd
 import ccxt
 from queue import Queue
-import numpy as np
 
 # ---------- Config ----------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -27,11 +27,11 @@ EMA_LONG  = int(os.getenv("EMA_LONG", "200"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 VOL_MULTIPLIER = float(os.getenv("VOL_MULTIPLIER", "1.6"))
 
-MIN_AVG_VOL_USDT = float(os.getenv("MIN_AVG_VOL_USDT", "1000"))
-MIN_CANDLES = int(os.getenv("MIN_CANDLES", "250"))
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))  # safe for 200+ symbols
-SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "60"))
-MIN_24H_VOLUME_USD = 5_000_000
+MIN_24H_VOLUME_USD = 100_000    # minimum 24h volume to avoid dust coins
+MAX_24H_VOLUME_USD = 5_000_000  # maximum 24h volume to keep low-volume alts
+MIN_CANDLES = 50
+MAX_WORKERS = 2
+SIGNAL_COOLDOWN_MINUTES = 60
 
 SIGNAL_LOG_FILE = os.getenv("SIGNAL_LOG_FILE", "signals_log.csv")
 LAST_SIGNALS_FILE = os.getenv("LAST_SIGNALS_FILE", "last_signals.json")
@@ -44,13 +44,11 @@ file_lock = threading.Lock()
 last_signals_lock = threading.Lock()
 
 # ---------- CCXT ----------
-exchange = ccxt.bingx({'enableRateLimit': True})
+exchange = ccxt.bingx({'enableRateLimit': True, 'timeout': 10000})
 
 # ---------- Telegram ----------
 def send_telegram(text: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.debug("Telegram not configured")
-        return
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
@@ -75,15 +73,12 @@ def fetch_ohlcv(symbol, tf, limit=300):
 def ema(series, period): return series.ewm(span=period, adjust=False).mean()
 def rsi(series, period=14):
     delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -1*delta.clip(upper=0)
-    ma_up = up.ewm(alpha=1/period, adjust=False).mean()
-    ma_down = down.ewm(alpha=1/period, adjust=False).mean()
+    up, down = delta.clip(lower=0), -1*delta.clip(upper=0)
+    ma_up, ma_down = up.ewm(alpha=1/period, adjust=False).mean(), down.ewm(alpha=1/period, adjust=False).mean()
     rs = ma_up / ma_down
     return 100 - (100 / (1 + rs))
 def macd(series, fast=12, slow=26, signal=9):
-    fast_ema = ema(series, fast)
-    slow_ema = ema(series, slow)
+    fast_ema, slow_ema = ema(series, fast), ema(series, slow)
     macd_line = fast_ema - slow_ema
     signal_line = macd_line.ewm(span=signal, adjust=False).mean()
     hist = macd_line - signal_line
@@ -92,14 +87,12 @@ def atr(df, period=14):
     high, low, close = df['high'], df['low'], df['close']
     tr = pd.concat([high-low, (high-close.shift(1)).abs(), (low-close.shift(1)).abs()], axis=1).max(axis=1)
     return tr.rolling(period).mean().iloc[-1]
-
 def detect_trend(df):
     if df is None or len(df)<EMA_LONG: return None
     e_short, e_long = ema(df['close'], EMA_SHORT).iloc[-1], ema(df['close'], EMA_LONG).iloc[-1]
     if e_short>e_long: return "BUY"
     elif e_short<e_long: return "SELL"
     return None
-
 def check_entry_5m(df5, direction):
     if df5 is None or len(df5)<30: return False, {}
     close, vol = df5['close'], df5['volume']
@@ -107,10 +100,8 @@ def check_entry_5m(df5, direction):
     mean_vol20 = vol[-21:-1].mean() if len(vol)>=21 else vol.mean()
     rsi_val = rsi(close, RSI_PERIOD).iloc[-1]
     macd_hist_last = macd(close)[2].iloc[-1]
-    if direction=="BUY":
-        cond_rsi, cond_macd = rsi_val>55, macd_hist_last>0
-    else:
-        cond_rsi, cond_macd = rsi_val<45, macd_hist_last<0
+    if direction=="BUY": cond_rsi, cond_macd = rsi_val>55, macd_hist_last>0
+    else: cond_rsi, cond_macd = rsi_val<45, macd_hist_last<0
     cond_vol = last['volume']>(mean_vol20*VOL_MULTIPLIER) if mean_vol20>0 else False
     body_ratio = abs(last['close']-last['open'])/(last['high']-last['low']+1e-12)
     cond_body = body_ratio>0.3
@@ -129,8 +120,7 @@ def can_signal(symbol):
     last = load_last_signals()
     ts_str = last.get(symbol)
     if not ts_str: return True
-    try:
-        return datetime.utcnow()-datetime.fromisoformat(ts_str)>timedelta(minutes=SIGNAL_COOLDOWN_MINUTES)
+    try: return datetime.utcnow()-datetime.fromisoformat(ts_str)>timedelta(minutes=SIGNAL_COOLDOWN_MINUTES)
     except: return True
 def mark_signaled(symbol):
     last = load_last_signals()
@@ -174,7 +164,7 @@ def process_symbol(sym):
         df30=fetch_ohlcv(sym,"30m",50)
         if df15 is None or df30 is None or len(df15)<MIN_CANDLES: return
         avg_vol=(df30['close']*df30['volume']).tail(20).mean()
-        if avg_vol<MIN_AVG_VOL_USDT: return
+        if avg_vol<MIN_24H_VOLUME_USD or avg_vol>MAX_24H_VOLUME_USD: return
         trend15,trend30=detect_trend(df15),detect_trend(df30)
         if trend15!=trend30 or trend15 is None: return
         direction=trend15
@@ -194,28 +184,22 @@ def process_symbol(sym):
         send_telegram(msg)
         log_signal({"Timestamp":datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),"Symbol":sym,"Direction":direction,"EntryPrice":float(entry),"TP1":float(tp1),"TP2":float(tp2),"TP3":float(tp3),"SL":float(sl),"Status":"Open","ClosePrice":"","CloseTime":""})
         mark_signaled(sym)
-        time.sleep(0.3)  # rate-limit
+        time.sleep(0.3)
     except Exception as e:
-        logging.debug("process_symbol error %s %s", sym, e)
+        logging.exception("Error processing %s: %s", sym, e)
 
 # ---------- Main Loop ----------
 def run():
     logging.info("🤖 Bot starting. Loading markets...")
     exchange.load_markets()
-    logging.info("Markets loaded. Fetching tickers...")
+    try: tickers = exchange.fetch_tickers()
+    except Exception as e: logging.error("fetch_tickers failed: %s", e); return
 
-    # Use bulk fetch_tickers() for startup
-    try:
-        tickers = exchange.fetch_tickers()
-    except Exception as e:
-        logging.error("fetch_tickers failed: %s", e)
-        return
-
-    available=[s for s,t in tickers.items() if s.endswith("/USDT") and t.get('quoteVolume',0)>=MIN_24H_VOLUME_USD]
+    available=[s for s,t in tickers.items() if s.endswith("/USDT") and MIN_24H_VOLUME_USD <= t.get('quoteVolume',0) <= MAX_24H_VOLUME_USD]
     if not available:
-        logging.error("No high-volume USDT symbols found")
+        logging.error("No low-volume USDT symbols found")
         return
-    logging.info(f"Found {len(available)} high-volume symbols. Starting scan...")
+    logging.info(f"Found {len(available)} low-volume symbols. Starting scan...")
 
     q=Queue()
     for s in available: q.put(s)
@@ -246,7 +230,7 @@ def run():
                         if last_price and update_signal_status(sym,direction,last_price):
                             send_telegram(f"⚡ Update: {sym} {direction} status updated at price {last_price}")
                     except: continue
-            # refill queue for next round
+            # refill queue
             for s in available: q.put(s)
 
     except KeyboardInterrupt:
