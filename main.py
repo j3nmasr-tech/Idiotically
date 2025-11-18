@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-BingX Low-Volume Altcoin Scalp Bot - One Coin at a Time
-- Scans 100k–5M USD low-volume USDT coins
-- EMA trend + ATR TP/SL + RSI/MACD + volume/candle filter
-- Updates open signals
-- Sends Telegram messages immediately
-- Sequential single-coin scan (no threads)
+BingX Low-Volume Altcoin Scalp Bot - Full Version
+- Sequential single-coin scan
+- Low-volume USDT coins (100k–5M USD)
+- EMA trend + ATR TP/SL + RSI/MACD + candle/volume filter
+- Dynamic TP3 extension toward support/resistance
+- Tracks open signals and prevents duplicates
+- Sends Telegram notifications
 """
 
 import os, time, logging, json
@@ -17,7 +18,7 @@ import ccxt
 # ---------- Config ----------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))  # seconds
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))
 
 EMA_SHORT = int(os.getenv("EMA_SHORT", "50"))
 EMA_LONG  = int(os.getenv("EMA_LONG", "200"))
@@ -106,8 +107,7 @@ def load_last_signals():
     if not os.path.exists(LAST_SIGNALS_FILE): return {}
     try: return json.load(open(LAST_SIGNALS_FILE))
     except: return {}
-def save_last_signals(data):
-    json.dump(data, open(LAST_SIGNALS_FILE,'w'))
+def save_last_signals(data): json.dump(data, open(LAST_SIGNALS_FILE,'w'))
 def can_signal(symbol):
     last = load_last_signals()
     ts_str = last.get(symbol)
@@ -151,39 +151,48 @@ def format_signal(symbol,direction,entry,tp1,tp2,tp3,sl):
     now=datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     return f"⚡ <b>SCALP SIGNAL: {direction}</b>\n🔹 Symbol: <b>{symbol}</b>\n⏱ Time: {now}\n💵 Entry Price: {entry:.8f}\n🎯 TP: {tp1:.8f} | {tp2:.8f} | {tp3:.8f}\n🛑 SL: {sl:.8f}\nℹ️ Status: Open"
 
+# ---------- Support/Resistance ----------
+def find_swing_levels(df, window=20):
+    highs, lows = df['high'], df['low']
+    resistances = [highs[i] for i in range(window,len(highs)-window) if highs[i]==max(highs[i-window:i+window+1])]
+    supports = [lows[i] for i in range(window,len(lows)-window) if lows[i]==min(lows[i-window:i+window+1])]
+    return sorted(supports), sorted(resistances)
+
 # ---------- Symbol Processing ----------
 def process_symbol(sym):
-    df30 = fetch_ohlcv(sym,"30m",50)
-    if df30 is None or len(df30)<20: return
-    avg_vol = (df30['close']*df30['volume']).tail(20).mean()
-    if avg_vol<MIN_24H_VOLUME_USD or avg_vol>MAX_24H_VOLUME_USD: return
-
     df15 = fetch_ohlcv(sym,"15m",MIN_CANDLES)
     if df15 is None or len(df15)<MIN_CANDLES: return
-    trend15, trend30 = detect_trend(df15), detect_trend(df30)
-    if trend15!=trend30 or trend15 is None: return
-    direction = trend15
+    trend = detect_trend(df15)
+    if trend is None: return
 
     df5 = fetch_ohlcv(sym,"5m",50)
     if df5 is None or len(df5)<20 or df5['volume'].iloc[-1]<50: return
-    ok,_ = check_entry_5m(df5,direction)
+
+    ok,_ = check_entry_5m(df5,trend)
     if not ok: return
 
     entry = df5['close'].iloc[-1]
     atr_val = atr(df15)
     momentum_factor = min(abs(macd(df15['close'])[2].iloc[-1])/(abs(macd(df15)['close'][2].iloc[-14:]).max()+1e-12),3)
 
-    if direction=="BUY":
-        sl = entry - atr_val; tp1 = entry+1.5*atr_val*momentum_factor; tp2=entry+2.0*atr_val*momentum_factor; tp3=entry+3.0*atr_val*momentum_factor
+    supports, resistances = find_swing_levels(df15, window=20)
+    if trend=="BUY":
+        sl = entry - atr_val
+        tp1, tp2 = entry+1.5*atr_val*momentum_factor, entry+2.0*atr_val*momentum_factor
+        tp_candidates = [r for r in resistances if r>entry]
+        tp3 = max(tp_candidates) if tp_candidates else entry+3.0*atr_val*momentum_factor
     else:
-        sl = entry + atr_val; tp1 = entry-1.5*atr_val*momentum_factor; tp2=entry-2.0*atr_val*momentum_factor; tp3=entry-3.0*atr_val*momentum_factor
+        sl = entry + atr_val
+        tp1, tp2 = entry-1.5*atr_val*momentum_factor, entry-2.0*atr_val*momentum_factor
+        tp_candidates = [s for s in supports if s<entry]
+        tp3 = min(tp_candidates) if tp_candidates else entry-3.0*atr_val*momentum_factor
 
     if not can_signal(sym): return
-    msg = format_signal(sym,direction,entry,tp1,tp2,tp3,sl)
-    logging.info("Signal -> %s %s",sym,direction)
+    msg = format_signal(sym,trend,entry,tp1,tp2,tp3,sl)
+    logging.info("Signal -> %s %s | TP3 extended to %.8f", sym, trend, tp3)
     send_telegram(msg)
     log_signal({"Timestamp":datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                "Symbol":sym,"Direction":direction,"EntryPrice":float(entry),
+                "Symbol":sym,"Direction":trend,"EntryPrice":float(entry),
                 "TP1":float(tp1),"TP2":float(tp2),"TP3":float(tp3),"SL":float(sl),
                 "Status":"Open","ClosePrice":"","CloseTime":""})
     mark_signaled(sym)
@@ -192,36 +201,29 @@ def process_symbol(sym):
 # ---------- Main Loop ----------
 def run():
     logging.info("🤖 Bot starting. Loading markets...")
+    send_telegram("🤖 Bot starting scanning low-volume USDT coins...")
     exchange.load_markets()
-    try:
-        tickers = exchange.fetch_tickers()
-    except Exception as e:
-        logging.error("fetch_tickers failed: %s", e)
-        return
+    try: tickers = exchange.fetch_tickers()
+    except Exception as e: logging.error("fetch_tickers failed: %s", e); return
 
-    available = [s for s,t in tickers.items() if s.endswith("/USDT") 
+    available = [s for s,t in tickers.items() if s.endswith("/USDT")
                  and MIN_24H_VOLUME_USD <= t.get('quoteVolume',0) <= MAX_24H_VOLUME_USD]
-
-    if not available:
-        logging.error("No low-volume USDT symbols found")
-        return
-
     logging.info(f"Found {len(available)} low-volume symbols. Starting scan...")
-    send_telegram(f"🤖 Bot started. Found {len(available)} low-volume USDT symbols. Starting scan...")
-    time.sleep(1)
 
     i = 0
     while True:
         sym = available[i % len(available)]
+        logging.info(f"Scanning coin {i+1}/{len(available)}: {sym}")
         process_symbol(sym)
 
-        # Update open signals for this coin
+        # Update open signals
         open_df = pd.read_csv(SIGNAL_LOG_FILE)
         for idx,row in open_df[(open_df['Status']=="Open") & (open_df['Symbol']==sym)].iterrows():
-            tick = exchange.fetch_ticker(row['Symbol'])
-            last_price = tick.get('last')
-            if last_price:
-                update_signal_status(row['Symbol'], row['Direction'], last_price)
+            try:
+                tick = exchange.fetch_ticker(row['Symbol'])
+                last_price = tick.get('last')
+                if last_price: update_signal_status(row['Symbol'], row['Direction'], last_price)
+            except: continue
 
         i += 1
         time.sleep(POLL_INTERVAL)
