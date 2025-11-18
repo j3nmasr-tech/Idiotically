@@ -41,7 +41,7 @@ def send_telegram(text: str):
     except Exception as e:
         logging.exception("Failed to send telegram message: %s", e)
 
-# ---------- Fetch OHLCV with ignore for invalid symbols ----------
+# ---------- Fetch OHLCV ----------
 def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 300):
     try:
         raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -110,6 +110,36 @@ def check_entry_5m(df5: pd.DataFrame, direction: str):
     cond_body = (candle_body / candle_range) > 0.3
     ok = cond_rsi and cond_macd and cond_vol and cond_body
     return ok, {"rsi": rsi_val, "macd_hist": macd_hist_last, "vol": last['volume'], "mean_vol20": mean_vol20}
+
+# ---------- ATR ----------
+def calculate_atr(df: pd.DataFrame, period: int = 14):
+    if df is None or len(df) < period+1:
+        return None
+    high = df['high']
+    low  = df['low']
+    close = df['close']
+    tr = pd.concat([
+        high - low,
+        (high - close.shift()).abs(),
+        (low - close.shift()).abs()
+    ], axis=1).max(axis=1)
+    atr = tr.rolling(period).mean()
+    return atr.iloc[-1]
+
+# ---------- Pivot Points ----------
+def pivot_points(df: pd.DataFrame):
+    if df is None or len(df) < 2:
+        return None
+    last = df.iloc[-2]  # previous candle
+    high, low, close = last['high'], last['low'], last['close']
+    pivot = (high + low + close) / 3
+    r1 = 2*pivot - low
+    r2 = pivot + (high - low)
+    r3 = r1 + (high - low)
+    s1 = 2*pivot - high
+    s2 = pivot - (high - low)
+    s3 = s1 - (high - low)
+    return {"PP": pivot, "R1": r1, "R2": r2, "R3": r3, "S1": s1, "S2": s2, "S3": s3}
 
 # ---------- Signal Log ----------
 SIGNAL_LOG_FILE = "signals_log.csv"
@@ -203,17 +233,43 @@ def run():
                 if not ok:
                     continue
                 entry_price = df5['close'].iloc[-1]
-                # --- exact TP/SL numbers ---
+
+                # ----------------- DYNAMIC TP/SL with ATR + Pivot Points -----------------
+                atr = calculate_atr(df15)
+                if atr is None:
+                    atr = entry_price * 0.01
+                tp_mult1,tp_mult2,tp_mult3,sl_mult = 2,3,4,1
+
+                macd_line, macd_signal, macd_hist = macd(df15['close'])
+                macd_slope = macd_hist.iloc[-1] - macd_hist.iloc[-2]
                 if direction=="BUY":
-                    sl = entry_price * 0.997
-                    tp1 = entry_price * 1.01
-                    tp2 = entry_price * 1.02
-                    tp3 = entry_price * 1.03
+                    if macd_slope>0: tp_mult1,tp_mult2,tp_mult3 = tp_mult1*1.2,tp_mult2*1.2,tp_mult3*1.2
+                    else: tp_mult1,tp_mult2,tp_mult3 = tp_mult1*0.8,tp_mult2*0.8,tp_mult3*0.8
                 else:
-                    sl = entry_price * 1.003
-                    tp1 = entry_price * 0.99
-                    tp2 = entry_price * 0.98
-                    tp3 = entry_price * 0.97
+                    if macd_slope<0: tp_mult1,tp_mult2,tp_mult3 = tp_mult1*1.2,tp_mult2*1.2,tp_mult3*1.2
+                    else: tp_mult1,tp_mult2,tp_mult3 = tp_mult1*0.8,tp_mult2*0.8,tp_mult3*0.8
+
+                pivots = pivot_points(df15)
+                if pivots:
+                    if direction=="BUY":
+                        tp1 = min(entry_price + tp_mult1*atr, pivots["R1"])
+                        tp2 = min(entry_price + tp_mult2*atr, pivots["R2"])
+                        tp3 = min(entry_price + tp_mult3*atr, pivots["R3"])
+                        sl  = max(entry_price - sl_mult*atr, pivots["S1"])
+                    else:
+                        tp1 = max(entry_price - tp_mult1*atr, pivots["S1"])
+                        tp2 = max(entry_price - tp_mult2*atr, pivots["S2"])
+                        tp3 = max(entry_price - tp_mult3*atr, pivots["S3"])
+                        sl  = min(entry_price + sl_mult*atr, pivots["R1"])
+                else:
+                    if direction=="BUY":
+                        tp1,tp2,tp3 = entry_price+tp_mult1*atr, entry_price+tp_mult2*atr, entry_price+tp_mult3*atr
+                        sl = entry_price - sl_mult*atr
+                    else:
+                        tp1,tp2,tp3 = entry_price-tp_mult1*atr, entry_price-tp_mult2*atr, entry_price-tp_mult3*atr
+                        sl = entry_price + sl_mult*atr
+                # -------------------------------------------------------------------------
+
                 key = f"{sym}|{direction}|{df5['ts'].iloc[-1]}"
                 if key not in seen_signals:
                     msg = format_signal(sym, direction, entry_price, tp1, tp2, tp3, sl)
@@ -232,12 +288,13 @@ def run():
                         "CloseTime": ""
                     })
                     seen_signals.add(key)
-                # --- Update open signals ---
+
                 tick = exchange.fetch_ticker(sym)
                 last_price = tick['last']
                 if update_signal_status(sym, direction, last_price):
                     send_telegram(f"⚡ Update: {sym} {direction} status updated. Last Price: {last_price:.6f}")
-            # --- Daily summary at UTC 23:59 ---
+
+            # Daily summary at UTC 23:59
             now = datetime.utcnow()
             if now.day != last_summary_day and now.hour == 23 and now.minute >= 59:
                 send_daily_summary()
