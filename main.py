@@ -1,26 +1,26 @@
 #!/usr/bin/env python3
-"""
-Upgraded BingX scalp scanner.
-Features:
-- Scans ALL BingX native symbols that end with "/USDT" (spot).
-- Skips newly-listed / dead pairs by checking candle availability.
-- Filters by minimum average quote-volume (USDT) over recent candles.
-- Adds a simple momentum filter (MACD) before signaling.
-- Uses ThreadPoolExecutor to parallelize symbol processing (configurable).
-- Persists last-signals to last_signals.json to avoid duplicates across restarts.
-- Uses locks for safe file writes.
+#"""
+#Upgraded BingX scalp scanner.
+#Features:
+#- Scans ALL BingX native symbols that end with "/USDT" (spot).
+#- Skips newly-listed / dead pairs by checking candle availability.
+#- Filters by minimum average quote-volume (USDT) over recent candles.
+#- Adds a simple momentum filter (MACD) before signaling.
+#- Uses ThreadPoolExecutor to parallelize symbol processing (configurable).
+#- Persists last-signals to last_signals.json to avoid duplicates across restarts.
+#- Uses locks for safe file writes.
 
-Config (via ENV):
-- TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-- POLL_INTERVAL (seconds, default 120)
-- EMA_SHORT (default 50), EMA_LONG (default 200)
-- RSI_PERIOD (default 14)
-- VOL_MULTIPLIER (default 1.6)
-- MIN_AVG_VOL_USDT (default 1000)  --> skip pairs with avg quote vol < this
-- MIN_CANDLES (default 250)       --> require at least this many 15m candles for long EMAs
-- MAX_WORKERS (default 6)         --> thread pool size (be conservative)
-- SIGNAL_COOLDOWN_MINUTES (default 60) --> do not re-signal same symbol within this many minutes
-"""
+#Config (via ENV):
+#- TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+#- POLL_INTERVAL (seconds, default 120)
+#- EMA_SHORT (default 50), EMA_LONG (default 200)
+#- RSI_PERIOD (default 14)
+#- VOL_MULTIPLIER (default 1.6)
+#- MIN_AVG_VOL_USDT (default 1000)  --> skip pairs with avg quote vol < this
+#- MIN_CANDLES (default 250)       --> require at least this many 15m candles for long EMAs
+#- MAX_WORKERS (default 6)         --> thread pool size (be conservative)
+#- SIGNAL_COOLDOWN_MINUTES (default 60) --> do not re-signal same symbol within this many minutes
+#"""
 
 import os
 import time
