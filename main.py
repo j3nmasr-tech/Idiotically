@@ -9,7 +9,7 @@ import ccxt
 # ---------- Config ----------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "60"))  # seconds
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "120"))  # كل 2 دقيقة
 
 EMA_SHORT = int(os.getenv("EMA_SHORT", "50"))
 EMA_LONG  = int(os.getenv("EMA_LONG", "200"))
@@ -22,22 +22,26 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 # ---------- CCXT BingX ----------
 exchange = ccxt.bingx({'enableRateLimit': True})
 
-# ---------- Fixed symbol list (~60 coins) ----------
-FIXED_SYMBOLS = [
-    "PEPECOIN/USDT","MEME/USDT","M/USDT","BONK/USDT","FLOKI/USDT",
-    "GIGGLE/USDT","EGL1/USDT","SHIB/USDT","DOGE/USDT","LADYS/USDT",
-    "CULT/USDT","AKITA/USDT","ELON/USDT","WOOF/USDT","SAMO/USDT",
-    "KISHU/USDT","BABYDOGE/USDT","HOGE/USDT","FLOKIINU/USDT","PEPE/USDT",
-    "MOON/USDT","CATT/USDT","TAMA/USDT","NANA/USDT","PUPPY/USDT",
-    "MEM/USDT","DOG/USDT","PIGGY/USDT","ROBO/USDT","KITTY/USDT",
-    "COIN/USDT","MINT/USDT","RUG/USDT","YODA/USDT","SHIBAELON/USDT",
-    "TOAD/USDT","CHAD/USDT","BULL/USDT","LULU/USDT","FROG/USDT",
-    "LOKI/USDT","BOBA/USDT","GOB/USDT","ZOO/USDT","PIXEL/USDT",
-    "MEOW/USDT","PANDA/USDT","UNICORN/USDT","SNOOP/USDT","ALIEN/USDT",
-    "NINJA/USDT","CLOWN/USDT","DRAGON/USDT","SLIME/USDT","FISH/USDT",
-    "LAMA/USDT","TIGER/USDT","BUNNY/USDT","FOX/USDT","OWL/USDT",
-    "BEAR/USDT","RABBIT/USDT","SHARK/USDT","WHALE/USDT","PIG/USDT"
-]
+# ---------- Get 100 low-vol/meme symbols dynamically ----------
+def get_low_vol_meme_symbols(limit=100, max_24h_volume=500000):
+    exchange.load_markets()
+    symbols_filtered = []
+    for symbol, market in exchange.markets.items():
+        if market['quote'] != 'USDT' or not market['spot']:
+            continue
+        try:
+            ticker = exchange.fetch_ticker(symbol)
+            volume_usd = ticker['quoteVolume'] or 0
+            if volume_usd <= max_24h_volume:
+                symbols_filtered.append(symbol)
+            if len(symbols_filtered) >= limit:
+                break
+        except Exception:
+            continue
+    return symbols_filtered
+
+FIXED_SYMBOLS = get_low_vol_meme_symbols()
+logging.info("Scanning symbols: %s", FIXED_SYMBOLS)
 
 # ---------- Helpers ----------
 def send_telegram(text: str):
@@ -113,21 +117,12 @@ def check_entry_5m(df5: pd.DataFrame, direction: str):
     else:
         cond_rsi = rsi_val < 45
         cond_macd = macd_hist_last < 0
-    cond_vol = False
-    if mean_vol20 > 0:
-        cond_vol = last['volume'] > (mean_vol20 * VOL_MULTIPLIER)
+    cond_vol = last['volume'] > (mean_vol20 * VOL_MULTIPLIER) if mean_vol20>0 else False
     candle_body = abs(last['close'] - last['open'])
     candle_range = last['high'] - last['low'] + 1e-12
-    body_ratio = candle_body / candle_range
-    cond_body = body_ratio > 0.3
-    details = {
-        "rsi": float(rsi_val),
-        "macd_hist": float(macd_hist_last),
-        "vol": float(last['volume']),
-        "mean_vol20": float(mean_vol20),
-        "body_ratio": float(body_ratio)
-    }
+    cond_body = (candle_body / candle_range) > 0.3
     ok = cond_rsi and cond_macd and cond_vol and cond_body
+    details = {"rsi": rsi_val, "macd_hist": macd_hist_last, "vol": last['volume'], "mean_vol20": mean_vol20}
     return ok, details
 
 # ---------- Signal Log ----------
@@ -148,10 +143,7 @@ def update_signal_status(symbol, direction, price):
     updated = False
     for idx, row in df.iterrows():
         if row['Symbol']==symbol and row['Direction']==direction and row['Status']=="Open":
-            tp1 = row['TP1']
-            tp2 = row['TP2']
-            tp3 = row['TP3']
-            sl  = row['SL']
+            tp1, tp2, tp3, sl = row['TP1'], row['TP2'], row['TP3'], row['SL']
             status = None
             if direction=="BUY":
                 if price >= tp3: status="TP3 Hit"
@@ -166,16 +158,16 @@ def update_signal_status(symbol, direction, price):
             if status:
                 df.at[idx,'Status'] = status
                 df.at[idx,'ClosePrice'] = price
-                df.at[idx,'CloseTime']  = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-                updated=True
+                df.at[idx,'CloseTime'] = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                updated = True
     if updated:
         df.to_csv(SIGNAL_LOG_FILE, index=False)
     return updated
 
-# ---------- Format Telegram Message ----------
+# ---------- Telegram Message ----------
 def format_signal(symbol, direction, entry_price, tp1, tp2, tp3, sl):
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    msg = (
+    return (
         f"⚡ <b>SCALP SIGNAL: {direction}</b>\n"
         f"🔹 Symbol: <b>{symbol}</b>\n"
         f"⏱ Time: {now}\n"
@@ -184,74 +176,44 @@ def format_signal(symbol, direction, entry_price, tp1, tp2, tp3, sl):
         f"🛑 Stop Loss: {sl:.6f}\n"
         f"ℹ️ Status: Open"
     )
-    return msg
 
 # ---------- Main Loop ----------
 def run():
-    send_telegram("🤖 Bot started. Scanning fixed meme/low-vol symbols on BingX.")
-    exchange.load_markets()
-    available = [s for s in FIXED_SYMBOLS if s in exchange.symbols]
-    if not available:
-        logging.error("None of the fixed symbols are available.")
-        return
-    logging.info("Scanning symbols: %s", available)
+    send_telegram("🤖 Bot started. Scanning 100 low-vol/meme symbols on BingX.")
     seen_signals = set()
     while True:
         try:
-            for sym in available:
+            for sym in FIXED_SYMBOLS:
                 df15 = fetch_ohlcv(sym, "15m", 300)
                 df30 = fetch_ohlcv(sym, "30m", 300)
                 if df15 is None or df30 is None:
                     continue
-                trend15 = detect_trend(df15)
-                trend30 = detect_trend(df30)
-                if trend15 is None or trend30 is None or trend15 != trend30:
+                trend15, trend30 = detect_trend(df15), detect_trend(df30)
+                if trend15 != trend30 or trend15 is None:
                     continue
                 direction = trend15
                 df5 = fetch_ohlcv(sym, "5m", 200)
-                ok, details_5m = check_entry_5m(df5, direction)
-                if ok:
-                    entry_price = df5['close'].iloc[-1]
-                    # --- calculate absolute TP/SL numbers ---
-                    sl_percent = 0.3 / 100
-                    tp1_percent = 1 / 100
-                    tp2_percent = 2 / 100
-                    tp3_percent = 3 / 100
-                    if direction=="BUY":
-                        sl = entry_price * (1 - sl_percent)
-                        tp1 = entry_price * (1 + tp1_percent)
-                        tp2 = entry_price * (1 + tp2_percent)
-                        tp3 = entry_price * (1 + tp3_percent)
-                    else:
-                        sl = entry_price * (1 + sl_percent)
-                        tp1 = entry_price * (1 - tp1_percent)
-                        tp2 = entry_price * (1 - tp2_percent)
-                        tp3 = entry_price * (1 - tp3_percent)
-                    key = f"{sym}|{direction}|{df5['ts'].iloc[-1]}"
-                    if key in seen_signals:
-                        continue
-                    msg = format_signal(sym, direction, entry_price, tp1, tp2, tp3, sl)
-                    logging.info("Signal -> %s %s", sym, direction)
-                    send_telegram(msg)
-                    log_signal({
-                        "Timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                        "Symbol": sym,
-                        "Direction": direction,
-                        "EntryPrice": entry_price,
-                        "TP1": tp1,
-                        "TP2": tp2,
-                        "TP3": tp3,
-                        "SL": sl,
-                        "Status": "Open",
-                        "ClosePrice": "",
-                        "CloseTime": ""
-                    })
-                    seen_signals.add(key)
-                # --- Check open signals to update status ---
+                ok, _ = check_entry_5m(df5, direction)
+                if not ok:
+                    continue
+                entry_price = df5['close'].iloc[-1]
+                sl, tp1, tp2, tp3 = (entry_price*0.997, entry_price*1.01, entry_price*1.02, entry_price*1.03) if direction=="BUY" else (entry_price*1.003, entry_price*0.99, entry_price*0.98, entry_price*0.97)
+                key = f"{sym}|{direction}|{df5['ts'].iloc[-1]}"
+                if key in seen_signals:
+                    continue
+                msg = format_signal(sym, direction, entry_price, tp1, tp2, tp3, sl)
+                send_telegram(msg)
+                log_signal({
+                    "Timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                    "Symbol": sym, "Direction": direction, "EntryPrice": entry_price,
+                    "TP1": tp1, "TP2": tp2, "TP3": tp3, "SL": sl,
+                    "Status": "Open", "ClosePrice": "", "CloseTime": ""
+                })
+                seen_signals.add(key)
                 tick = exchange.fetch_ticker(sym)
                 last_price = tick['last']
                 if update_signal_status(sym, direction, last_price):
-                    send_telegram(f"⚡ Update: {sym} {direction} status updated based on current price {last_price}")
+                    send_telegram(f"⚡ Update: {sym} {direction} status updated. Last Price: {last_price:.6f}")
                 time.sleep(0.2)
         except Exception as e:
             logging.exception("Main loop error: %s", e)
