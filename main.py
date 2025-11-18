@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""
-Advanced BingX Scalp Bot - Rate-Limited Full Version
-Features:
-- Scans all USDT spot pairs on BingX with 24h volume >= 5M USD
-- Uses ATR + indicator + dynamic TP/SL based on momentum
-- Safe, rate-limited worker queue (no freezes)
-- Telegram notifications
-- Logs signals and updates open trades
-"""
+#"""
+#Advanced BingX Scalp Bot - Rate-Limited Full Version
+#Features:
+#- Scans all USDT spot pairs on BingX with 24h volume >= 5M USD
+#- Uses ATR + indicator + dynamic TP/SL based on momentum
+#- Safe, rate-limited worker queue (no freezes)
+#- Telegram notifications
+#- Logs signals and updates open trades
+#"""
 
 import os, time, logging, json, threading
 from datetime import datetime, timedelta
