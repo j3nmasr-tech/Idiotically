@@ -17,7 +17,7 @@ import ccxt
 # ---------- Config ----------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
-POLL_INTERVAL = 0.2  # seconds between coins
+POLL_INTERVAL = 1.0  # 1 second between coins
 
 EMA_SHORT = int(os.getenv("EMA_SHORT", "50"))
 EMA_LONG  = int(os.getenv("EMA_LONG", "200"))
