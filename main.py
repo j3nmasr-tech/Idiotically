@@ -1,44 +1,71 @@
+#!/usr/bin/env python3
+"""
+Upgraded BingX scalp scanner.
+Features:
+- Scans ALL BingX native symbols that end with "/USDT" (spot).
+- Skips newly-listed / dead pairs by checking candle availability.
+- Filters by minimum average quote-volume (USDT) over recent candles.
+- Adds a simple momentum filter (MACD) before signaling.
+- Uses ThreadPoolExecutor to parallelize symbol processing (configurable).
+- Persists last-signals to last_signals.json to avoid duplicates across restarts.
+- Uses locks for safe file writes.
+
+Config (via ENV):
+- TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+- POLL_INTERVAL (seconds, default 120)
+- EMA_SHORT (default 50), EMA_LONG (default 200)
+- RSI_PERIOD (default 14)
+- VOL_MULTIPLIER (default 1.6)
+- MIN_AVG_VOL_USDT (default 1000)  --> skip pairs with avg quote vol < this
+- MIN_CANDLES (default 250)       --> require at least this many 15m candles for long EMAs
+- MAX_WORKERS (default 6)         --> thread pool size (be conservative)
+- SIGNAL_COOLDOWN_MINUTES (default 60) --> do not re-signal same symbol within this many minutes
+"""
+
 import os
 import time
 import logging
-from datetime import datetime
+import json
+import threading
+from datetime import datetime, timedelta
 import requests
 import pandas as pd
 import ccxt
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------- Config ----------
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID  = os.getenv("TELEGRAM_CHAT_ID")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "120"))  # scan every 2 minutes
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "120"))
 
 EMA_SHORT = int(os.getenv("EMA_SHORT", "50"))
 EMA_LONG  = int(os.getenv("EMA_LONG", "200"))
 RSI_PERIOD = int(os.getenv("RSI_PERIOD", "14"))
 VOL_MULTIPLIER = float(os.getenv("VOL_MULTIPLIER", "1.6"))
 
+MIN_AVG_VOL_USDT = float(os.getenv("MIN_AVG_VOL_USDT", "1000"))
+MIN_CANDLES = int(os.getenv("MIN_CANDLES", "250"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "6"))
+SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "60"))
+
+SIGNAL_LOG_FILE = os.getenv("SIGNAL_LOG_FILE", "signals_log.csv")
+LAST_SIGNALS_FILE = os.getenv("LAST_SIGNALS_FILE", "last_signals.json")
+
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-# ---------- CCXT BingX ----------
+# ---------- Globals & Locks ----------
+file_lock = threading.Lock()
+last_signals_lock = threading.Lock()
+
+# ---------- CCXT BingX (shared) ----------
 exchange = ccxt.bingx({'enableRateLimit': True})
-exchange.load_markets()
+# we will call exchange.load_markets() at runtime (in run())
 
-# ---------- Fixed symbol list ----------
-FIXED_SYMBOLS = [
-    "H/USDT","PEPECOIN/USDT","MEME/USDT","DOGE/USDT","SKYAI/USDT",
-    "FLOKI/USDT","SHIB/USDT","AKITA/USDT","ELON/USDT","BABYDOGE/USDT",
-    # add your other symbols here
-]
-
-# ---------- Helper: convert / to BingX format ----------
-def match_bingx_symbol(symbol):
-    candidates = [s for s in exchange.symbols if s.replace("/", "").upper() == symbol.replace("/", "").upper()]
-    return candidates[0] if candidates else None
-
-# ---------- Helpers ----------
+# ---------- HTTP helper ----------
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.warning("Telegram token/chat not provided — skipping send.")
+        logging.debug("Telegram token/chat not provided — skipping send.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode":"HTML"}
@@ -49,14 +76,17 @@ def send_telegram(text: str):
     except Exception as e:
         logging.exception("Failed to send telegram message: %s", e)
 
-def fetch_ohlcv(symbol: str, timeframe: str, limit: int = 300):
+# ---------- OHLCV fetcher ----------
+def fetch_ohlcv_local(symbol: str, timeframe: str, limit: int = 300):
     try:
         raw = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         df = pd.DataFrame(raw, columns=['ts','open','high','low','close','volume'])
+        if df.empty:
+            return None
         df['ts'] = pd.to_datetime(df['ts'], unit='ms')
         return df
     except Exception as e:
-        logging.warning("fetch_ohlcv fail %s %s", symbol, e)
+        logging.debug("fetch_ohlcv fail %s %s", symbol, e)
         return None
 
 # ---------- Indicators ----------
@@ -91,6 +121,7 @@ def atr(df: pd.DataFrame, period: int = 14):
     ], axis=1).max(axis=1)
     return tr.rolling(period).mean().iloc[-1]
 
+# ---------- Strategy helpers ----------
 def detect_trend(df: pd.DataFrame):
     if df is None or len(df) < EMA_LONG:
         return None
@@ -137,145 +168,268 @@ def check_entry_5m(df5: pd.DataFrame, direction: str):
     ok = cond_rsi and cond_macd and cond_vol and cond_body
     return ok, details
 
+# ---------- Persistent signal memory ----------
+def load_last_signals():
+    with last_signals_lock:
+        if not os.path.exists(LAST_SIGNALS_FILE):
+            return {}
+        try:
+            with open(LAST_SIGNALS_FILE, 'r') as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+def save_last_signals(data):
+    with last_signals_lock:
+        with open(LAST_SIGNALS_FILE, 'w') as f:
+            json.dump(data, f)
+
+def can_signal(symbol, candle_ts):
+    """
+    Prevent duplicate signals within cooldown window.
+    candle_ts: pandas.Timestamp or str
+    """
+    last = load_last_signals()
+    ks = last.get(symbol)
+    if not ks:
+        return True
+    try:
+        prev_ts = datetime.fromisoformat(ks)
+        # require cooldown minutes
+        if candle_ts.tzinfo is not None:
+            candle_ts = candle_ts.tz_convert(None)
+        if prev_ts + timedelta(minutes=SIGNAL_COOLDOWN_MINUTES) <= datetime.utcnow():
+            return True
+        return False
+    except Exception:
+        return True
+
+def mark_signaled(symbol, candle_ts):
+    last = load_last_signals()
+    # store ISO format in UTC
+    ts_str = datetime.utcnow().isoformat()
+    last[symbol] = ts_str
+    save_last_signals(last)
+
 # ---------- Signal Log ----------
-SIGNAL_LOG_FILE = "signals_log.csv"
 if not os.path.exists(SIGNAL_LOG_FILE):
     df_init = pd.DataFrame(columns=[
         "Timestamp","Symbol","Direction","EntryPrice","TP1","TP2","TP3","SL","Status","ClosePrice","CloseTime"
     ])
     df_init.to_csv(SIGNAL_LOG_FILE, index=False)
 
-def log_signal(data: dict):
-    df = pd.read_csv(SIGNAL_LOG_FILE)
-    df = pd.concat([df, pd.DataFrame([data])], ignore_index=True)
-    df.to_csv(SIGNAL_LOG_FILE, index=False)
-
-def update_signal_status(symbol, direction, price):
-    df = pd.read_csv(SIGNAL_LOG_FILE)
-    updated = False
-    for idx, row in df.iterrows():
-        if row['Symbol']==symbol and row['Direction']==direction and row['Status']=="Open":
-            tp1 = row['TP1']
-            tp2 = row['TP2']
-            tp3 = row['TP3']
-            sl  = row['SL']
-            status = None
-            if direction=="BUY":
-                if price >= tp3: status="TP3 Hit"
-                elif price >= tp2: status="TP2 Hit"
-                elif price >= tp1: status="TP1 Hit"
-                elif price <= sl: status="SL Hit"
-            else:
-                if price <= tp3: status="TP3 Hit"
-                elif price <= tp2: status="TP2 Hit"
-                elif price <= tp1: status="TP1 Hit"
-                elif price >= sl: status="SL Hit"
-            if status:
-                df.at[idx,'Status'] = status
-                df.at[idx,'ClosePrice'] = price
-                df.at[idx,'CloseTime']  = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-                updated=True
-    if updated:
+def log_signal_threadsafe(data: dict):
+    with file_lock:
+        df = pd.read_csv(SIGNAL_LOG_FILE)
+        df = pd.concat([df, pd.DataFrame([data])], ignore_index=True)
         df.to_csv(SIGNAL_LOG_FILE, index=False)
+
+def update_signal_status_threadsafe(symbol, direction, price):
+    updated = False
+    with file_lock:
+        df = pd.read_csv(SIGNAL_LOG_FILE)
+        for idx, row in df.iterrows():
+            if row['Symbol']==symbol and row['Direction']==direction and row['Status']=="Open":
+                tp1 = row['TP1']
+                tp2 = row['TP2']
+                tp3 = row['TP3']
+                sl  = row['SL']
+                status = None
+                if direction=="BUY":
+                    if price >= tp3: status="TP3 Hit"
+                    elif price >= tp2: status="TP2 Hit"
+                    elif price >= tp1: status="TP1 Hit"
+                    elif price <= sl: status="SL Hit"
+                else:
+                    if price <= tp3: status="TP3 Hit"
+                    elif price <= tp2: status="TP2 Hit"
+                    elif price <= tp1: status="TP1 Hit"
+                    elif price >= sl: status="SL Hit"
+                if status:
+                    df.at[idx,'Status'] = status
+                    df.at[idx,'ClosePrice'] = price
+                    df.at[idx,'CloseTime']  = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+                    updated=True
+        if updated:
+            df.to_csv(SIGNAL_LOG_FILE, index=False)
     return updated
 
-# ---------- Format Telegram Message ----------
+# ---------- Message formatting ----------
 def format_signal(symbol, direction, entry_price, tp1, tp2, tp3, sl):
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     msg = (
         f"⚡ <b>SCALP SIGNAL: {direction}</b>\n"
         f"🔹 Symbol: <b>{symbol}</b>\n"
         f"⏱ Time: {now}\n"
-        f"💵 Entry Price: {entry_price:.6f}\n"
-        f"🎯 Targets: TP1 {tp1:.6f} | TP2 {tp2:.6f} | TP3 {tp3:.6f}\n"
-        f"🛑 Stop Loss: {sl:.6f}\n"
+        f"💵 Entry Price: {entry_price:.8f}\n"
+        f"🎯 Targets: TP1 {tp1:.8f} | TP2 {tp2:.8f} | TP3 {tp3:.8f}\n"
+        f"🛑 Stop Loss: {sl:.8f}\n"
         f"ℹ️ Status: Open"
     )
     return msg
 
+# ---------- Per-symbol worker ----------
+def process_symbol(sym):
+    """
+    Process one symbol: fetch candles, check filters, compute signals.
+    Returns True/False if a signal was sent.
+    """
+    try:
+        # get 15m, 30m, 5m
+        df15 = fetch_ohlcv_local(sym, "15m", limit=MAX(300, MIN_CANDLES))
+    except Exception:
+        df15 = fetch_ohlcv_local(sym, "15m", limit=300)
+    if df15 is None or df15.empty or len(df15) < MIN_CANDLES:
+        return False
+
+    # compute average quote-volume on 30m (approx)
+    df30 = fetch_ohlcv_local(sym, "30m", limit=50)
+    if df30 is None or df30.empty:
+        return False
+    # estimate quote volume = close * volume (approx)
+    recent = df30.tail(20)
+    avg_quote_vol = (recent['close'] * recent['volume']).mean()
+    if avg_quote_vol is None or avg_quote_vol < MIN_AVG_VOL_USDT:
+        # skip illiquid
+        return False
+
+    # trend detection on 15m and 30m
+    trend15 = detect_trend(df15)
+    trend30 = detect_trend(df30)
+    if trend15 is None or trend30 is None or trend15 != trend30:
+        return False
+    direction = trend15
+
+    # 5m check
+    df5 = fetch_ohlcv_local(sym, "5m", limit=200)
+    ok, details_5m = check_entry_5m(df5, direction)
+    if not ok:
+        return False
+
+    # momentum factor (MACD on 15m)
+    macd_line, macd_signal, macd_hist = macd(df15['close'])
+    if macd_hist is None or len(macd_hist) < 2:
+        return False
+    # momentum factor normalized
+    denom = (abs(macd_hist[-14:]).max() if len(macd_hist) >= 14 else abs(macd_hist).max()) + 1e-12
+    momentum_factor = min(abs(macd_hist.iloc[-1]) / denom, 3)
+
+    entry_price = df5['close'].iloc[-1]
+    atr_val = atr(df15)
+
+    if direction == "BUY":
+        sl = entry_price - atr_val
+        tp1 = entry_price + 1.5 * atr_val * momentum_factor
+        tp2 = entry_price + 2.0 * atr_val * momentum_factor
+        tp3 = entry_price + 3.0 * atr_val * momentum_factor
+    else:
+        sl = entry_price + atr_val
+        tp1 = entry_price - 1.5 * atr_val * momentum_factor
+        tp2 = entry_price - 2.0 * atr_val * momentum_factor
+        tp3 = entry_price - 3.0 * atr_val * momentum_factor
+
+    # avoid duplicates within cooldown
+    candle_ts = df5['ts'].iloc[-1]
+    if not can_signal(sym, candle_ts):
+        return False
+
+    # final small sanity checks: TP and SL must be sensible distances
+    if direction == "BUY":
+        if not (tp1 > entry_price and sl < entry_price):
+            return False
+    else:
+        if not (tp1 < entry_price and sl > entry_price):
+            return False
+
+    # ok -> send signal
+    msg = format_signal(sym, direction, float(entry_price), float(tp1), float(tp2), float(tp3), float(sl))
+    logging.info("Signal -> %s %s (avg_quote_vol=%.2f)", sym, direction, avg_quote_vol)
+    send_telegram(msg)
+    log_signal_threadsafe({
+        "Timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "Symbol": sym,
+        "Direction": direction,
+        "EntryPrice": float(entry_price),
+        "TP1": float(tp1),
+        "TP2": float(tp2),
+        "TP3": float(tp3),
+        "SL": float(sl),
+        "Status": "Open",
+        "ClosePrice": "",
+        "CloseTime": ""
+    })
+    mark_signaled(sym, candle_ts)
+    return True
+
+# helper: safe MAX (since used above)
+def MAX(a, b):
+    return a if a >= b else b
+
 # ---------- Main Loop ----------
 def run():
-    send_telegram("🤖 Bot started. Scanning fixed meme/low-vol symbols on BingX.")
+    send_telegram("🤖 Bot started. Scanning ALL BingX /USDT spot symbols.")
     exchange.load_markets()
-    available = []
-    for raw_sym in FIXED_SYMBOLS:
-        sym = match_bingx_symbol(raw_sym)
-        if sym:
-            available.append(sym)
-        else:
-            logging.info("Skipped symbol (not on BingX): %s", raw_sym)
-
+    # use native BingX format and only spot USDT pairs
+    available = [s for s in exchange.symbols if s.endswith("/USDT") and exchange.markets.get(s)]
     if not available:
-        logging.error("No valid symbols available.")
+        logging.error("No USDT symbols found on BingX.")
         return
+    logging.info("Found %d USDT symbols on BingX. Starting scanning (workers=%d)...", len(available), MAX_WORKERS)
 
-    logging.info("Scanning symbols: %s", available)
-    seen_signals = set()
+    # Thread pool executor for per-symbol scanning
+    executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
-    while True:
-        try:
+    try:
+        while True:
+            futures = {}
+            start = time.time()
+            # submit tasks in batches
             for sym in available:
-                df15 = fetch_ohlcv(sym, "15m", 300)
-                df30 = fetch_ohlcv(sym, "30m", 300)
-                if df15 is None or df30 is None:
-                    continue
-                trend15 = detect_trend(df15)
-                trend30 = detect_trend(df30)
-                if trend15 is None or trend30 is None or trend15 != trend30:
-                    continue
-                direction = trend15
-                df5 = fetch_ohlcv(sym, "5m", 200)
-                ok, details_5m = check_entry_5m(df5, direction)
-                if ok:
-                    entry_price = df5['close'].iloc[-1]
+                futures[executor.submit(process_symbol, sym)] = sym
 
-                    # --- Dynamic TP/SL using ATR + Momentum ---
-                    atr_val = atr(df15)
-                    macd_line, macd_signal, macd_hist = macd(df15['close'])
-                    momentum_factor = min(abs(macd_hist.iloc[-1]) / (abs(macd_hist[-14:]).max() + 1e-12), 3)
+            # gather results (we don't need details per-symbol beyond logging)
+            for fut in as_completed(futures):
+                sym = futures[fut]
+                try:
+                    res = fut.result()
+                    # res True if a signal was sent for that symbol
+                    if res:
+                        logging.info("Signalled %s", sym)
+                except Exception as e:
+                    logging.debug("Worker error for %s: %s", sym, e)
 
-                    if direction == "BUY":
-                        sl = entry_price - atr_val
-                        tp1 = entry_price + 1.5 * atr_val * momentum_factor
-                        tp2 = entry_price + 2.0 * atr_val * momentum_factor
-                        tp3 = entry_price + 3.0 * atr_val * momentum_factor
-                    else:
-                        sl = entry_price + atr_val
-                        tp1 = entry_price - 1.5 * atr_val * momentum_factor
-                        tp2 = entry_price - 2.0 * atr_val * momentum_factor
-                        tp3 = entry_price - 3.0 * atr_val * momentum_factor
-
-                    key = f"{sym}|{direction}|{df5['ts'].iloc[-1]}"
-                    if key in seen_signals:
+            # After scanning, check open signals status prices (single-threaded)
+            # Update any open signals based on last price
+            with file_lock:
+                try:
+                    open_df = pd.read_csv(SIGNAL_LOG_FILE)
+                except Exception:
+                    open_df = pd.DataFrame()
+            if not open_df.empty:
+                # iterate unique open symbols
+                open_sym_rows = open_df[open_df['Status']=="Open"]
+                unique_open_syms = open_sym_rows['Symbol'].unique().tolist() if not open_sym_rows.empty else []
+                for sym in unique_open_syms:
+                    try:
+                        tick = exchange.fetch_ticker(sym)
+                        last_price = tick.get('last')
+                        if last_price is None:
+                            continue
+                        if update_signal_status_threadsafe(sym, open_sym_rows[open_sym_rows['Symbol']==sym]['Direction'].iloc[0], last_price):
+                            send_telegram(f"⚡ Update: {sym} status updated based on current price {last_price}")
+                    except Exception:
                         continue
-                    msg = format_signal(sym, direction, entry_price, tp1, tp2, tp3, sl)
-                    logging.info("Signal -> %s %s", sym, direction)
-                    send_telegram(msg)
-                    log_signal({
-                        "Timestamp": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-                        "Symbol": sym,
-                        "Direction": direction,
-                        "EntryPrice": entry_price,
-                        "TP1": tp1,
-                        "TP2": tp2,
-                        "TP3": tp3,
-                        "SL": sl,
-                        "Status": "Open",
-                        "ClosePrice": "",
-                        "CloseTime": ""
-                    })
-                    seen_signals.add(key)
 
-                # --- Check open signals to update status ---
-                tick = exchange.fetch_ticker(sym)
-                last_price = tick['last']
-                if update_signal_status(sym, direction, last_price):
-                    send_telegram(f"⚡ Update: {sym} {direction} status updated based on current price {last_price}")
-
-                time.sleep(0.2)
-        except Exception as e:
-            logging.exception("Main loop error: %s", e)
-        time.sleep(POLL_INTERVAL)
+            elapsed = time.time() - start
+            sleep_for = max(0, POLL_INTERVAL - elapsed)
+            logging.info("Scan cycle done in %.1fs. Sleeping %.1fs.", elapsed, sleep_for)
+            # Sleep (main loop)
+            time.sleep(sleep_for)
+    except KeyboardInterrupt:
+        logging.info("Interrupted by user, shutting down.")
+    finally:
+        executor.shutdown(wait=False)
+        logging.info("Exited.")
 
 if __name__ == "__main__":
     run()
