@@ -208,7 +208,7 @@ def run():
     # Filter low-volume USDT coins and skip top 100
     usdt_pairs = [(s, t.get('quoteVolume',0)) for s,t in tickers.items() if s.endswith("/USDT")]
     usdt_pairs.sort(key=lambda x:x[1], reverse=True)
-    low_volume_pairs = usdt_pairs[100:]  # skip top 100
+    low_volume_pairs = usdt_pairs[20:]  # skip top 20
     available = [s for s, vol in low_volume_pairs if MIN_24H_VOLUME_USD <= vol <= MAX_24H_VOLUME_USD]
 
     logging.info(f"Found {len(available)} low-volume symbols. Starting scan...")
