@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-BingX Low-Volume Altcoin Scalp Bot - Fixed Instant-Start Version
-- Low-volume USDT coins 100k–5M USD 24h volume
-- Instant startup: sends Telegram message immediately
-- Rolling scan without threads
-- EMA trend + ATR TP/SL + RSI/MACD/volume/candle filter
+BingX Low-Volume Altcoin Scalp Bot - One Coin at a Time
+- Scans 100k–5M USD low-volume USDT coins
+- EMA trend + ATR TP/SL + RSI/MACD + volume/candle filter
+- Updates open signals
+- Sends Telegram messages immediately
+- Sequential single-coin scan (no threads)
 """
 
 import os, time, logging, json
@@ -163,13 +164,14 @@ def process_symbol(sym):
     if trend15!=trend30 or trend15 is None: return
     direction = trend15
 
-    df5 = fetch_ohlcv(sym,"5m",200)
+    df5 = fetch_ohlcv(sym,"5m",50)
+    if df5 is None or len(df5)<20 or df5['volume'].iloc[-1]<50: return
     ok,_ = check_entry_5m(df5,direction)
     if not ok: return
 
     entry = df5['close'].iloc[-1]
     atr_val = atr(df15)
-    momentum_factor = min(abs(macd(df15['close'])[2].iloc[-1])/ (abs(macd(df15)['close'][2].iloc[-14:]).max()+1e-12),3)
+    momentum_factor = min(abs(macd(df15['close'])[2].iloc[-1])/(abs(macd(df15)['close'][2].iloc[-14:]).max()+1e-12),3)
 
     if direction=="BUY":
         sl = entry - atr_val; tp1 = entry+1.5*atr_val*momentum_factor; tp2=entry+2.0*atr_val*momentum_factor; tp3=entry+3.0*atr_val*momentum_factor
@@ -180,7 +182,10 @@ def process_symbol(sym):
     msg = format_signal(sym,direction,entry,tp1,tp2,tp3,sl)
     logging.info("Signal -> %s %s",sym,direction)
     send_telegram(msg)
-    log_signal({"Timestamp":datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),"Symbol":sym,"Direction":direction,"EntryPrice":float(entry),"TP1":float(tp1),"TP2":float(tp2),"TP3":float(tp3),"SL":float(sl),"Status":"Open","ClosePrice":"","CloseTime":""})
+    log_signal({"Timestamp":datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+                "Symbol":sym,"Direction":direction,"EntryPrice":float(entry),
+                "TP1":float(tp1),"TP2":float(tp2),"TP3":float(tp3),"SL":float(sl),
+                "Status":"Open","ClosePrice":"","CloseTime":""})
     mark_signaled(sym)
     time.sleep(0.2)
 
@@ -188,17 +193,21 @@ def process_symbol(sym):
 def run():
     logging.info("🤖 Bot starting. Loading markets...")
     exchange.load_markets()
-    try: tickers = exchange.fetch_tickers()
-    except Exception as e: logging.error("fetch_tickers failed: %s", e); return
+    try:
+        tickers = exchange.fetch_tickers()
+    except Exception as e:
+        logging.error("fetch_tickers failed: %s", e)
+        return
 
-    available = [s for s,t in tickers.items() if s.endswith("/USDT") and MIN_24H_VOLUME_USD<=t.get('quoteVolume',0)<=MAX_24H_VOLUME_USD]
+    available = [s for s,t in tickers.items() if s.endswith("/USDT") 
+                 and MIN_24H_VOLUME_USD <= t.get('quoteVolume',0) <= MAX_24H_VOLUME_USD]
+
     if not available:
         logging.error("No low-volume USDT symbols found")
         return
 
-    # --- send startup message immediately ---
-    logging.info(f"Found {len(available)} low-volume symbols. Starting rolling scan...")
-    send_telegram(f"🤖 Bot started. Found {len(available)} low-volume USDT symbols. Starting rolling scan...")
+    logging.info(f"Found {len(available)} low-volume symbols. Starting scan...")
+    send_telegram(f"🤖 Bot started. Found {len(available)} low-volume USDT symbols. Starting scan...")
     time.sleep(1)
 
     i = 0
@@ -206,15 +215,16 @@ def run():
         sym = available[i % len(available)]
         process_symbol(sym)
 
-        # Update open signals
+        # Update open signals for this coin
         open_df = pd.read_csv(SIGNAL_LOG_FILE)
-        for idx,row in open_df[open_df['Status']=="Open"].iterrows():
+        for idx,row in open_df[(open_df['Status']=="Open") & (open_df['Symbol']==sym)].iterrows():
             tick = exchange.fetch_ticker(row['Symbol'])
             last_price = tick.get('last')
-            if last_price: update_signal_status(row['Symbol'], row['Direction'], last_price)
+            if last_price:
+                update_signal_status(row['Symbol'], row['Direction'], last_price)
 
         i += 1
-        time.sleep(0.5)  # small pause to avoid rate limit
+        time.sleep(POLL_INTERVAL)
 
 if __name__=="__main__":
     run()
