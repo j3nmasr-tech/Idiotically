@@ -116,20 +116,23 @@ def check_entry_5m(df5: pd.DataFrame, direction: str):
     return ok, details
 
 def get_low_vol_meme_symbols():
-    """Fetch markets, filter meme / low volume / exclude majors"""
+    """Fetch markets, filter meme / low volume / exclude majors, keep only existing symbols"""
     majors = ["BTC","ETH","BNB","SOL","XRP","ADA","DOGE","LTC","TON","DOT","LINK"]
     try:
+        exchange.load_markets()
+        all_symbols = exchange.symbols  # جميع الرموز الموجودة فعليًا
         markets = exchange.fetch_markets()
         usdt_pairs = [m for m in markets if m['quote'] == 'USDT']
         filtered = []
         for m in usdt_pairs:
             base = m['base']
+            symbol = m['symbol']
             quote_vol = float(m.get('info', {}).get('quoteVolume', 0) or 0)
-            if base not in majors and quote_vol < LOW_VOLUME_USDT:
-                filtered.append(m['symbol'])
+            if base not in majors and quote_vol < LOW_VOLUME_USDT and symbol in all_symbols:
+                filtered.append(symbol)
         return filtered
     except Exception as e:
-        logging.exception("Failed to fetch low-vol symbols: %s", e)
+        logging.exception("Failed to fetch low-vol meme symbols: %s", e)
         return []
 
 def format_signal(symbol, direction, details_15_30, details_5m):
@@ -150,6 +153,7 @@ def format_signal(symbol, direction, details_15_30, details_5m):
 
 # ---------- main loop ----------
 def run():
+    send_telegram("🤖 Bot started successfully. Scanning low-vol meme coins on BingX...")
     symbols = get_low_vol_meme_symbols()
     if not symbols:
         logging.error("No low-vol meme symbols found. Exiting.")
