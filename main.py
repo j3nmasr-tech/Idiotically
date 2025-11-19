@@ -255,8 +255,11 @@ def run_bot():
     global signals_sent_total, skipped_signals, last_heartbeat
     symbols = get_top_symbols(TOP_SYMBOLS)
     
+    print(f"[{datetime.utcnow()}] Starting scan of {len(symbols)} symbols: {symbols}")  # debug
+    
     while True:
         for symbol in symbols:
+            print(f"[{datetime.utcnow()}] Checking {symbol}...")  # debug
             try:
                 signal = generate_signal(symbol)
                 if signal:
@@ -267,20 +270,20 @@ def run_bot():
                         f"Conf: {signal['confidence']}%"
                     )
                     signals_sent_total += 1
+                    print(f"[{datetime.utcnow()}] Signal sent: {signal['symbol']} {signal['side']}")  # debug
                 else:
                     skipped_signals += 1
+                    print(f"[{datetime.utcnow()}] No signal for {symbol}")  # debug
             except Exception as e:
-                print(f"Error processing {symbol}: {e}")
+                print(f"[{datetime.utcnow()}] Error processing {symbol}: {e}")
 
             time.sleep(SYMBOL_DELAY)  # per-symbol spacing
 
         # Heartbeat
         if time.time() - last_heartbeat > 600:
             send_message(f"FastScalp v2 heartbeat: {signals_sent_total} signals sent, {skipped_signals} skipped")
+            print(f"[{datetime.utcnow()}] Heartbeat sent")  # debug
             last_heartbeat = time.time()
 
+        print(f"[{datetime.utcnow()}] Sleeping {CHECK_INTERVAL} seconds until next scan...")  # debug
         time.sleep(CHECK_INTERVAL)
-
-if __name__=="__main__":
-    send_message("🚀 FastScalp v2 started!")
-    run_bot()
