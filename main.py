@@ -73,21 +73,31 @@ BINANCE_TICKERS = "https://api.binance.com/api/v3/ticker/24hr"
 BINANCE_KLINES  = "https://api.binance.com/api/v3/klines"
 
 def get_top_symbols(n=TOP_SYMBOLS):
-    j = requests.get(BINANCE_TICKERS, timeout=5).json()
+    try:
+        j = requests.get(BINANCE_TICKERS, timeout=5).json()
+    except Exception as e:
+        debug_print("Ticker request failed:", e)
+        return ["BTCUSDT","ETHUSDT"]
+
     pairs = []
     for d in j:
+        if not isinstance(d, dict):  # <-- FIX
+            continue
         sym = sanitize_symbol(d.get("symbol",""))
-        if not sym.endswith("USDT"): continue
+        if not sym.endswith("USDT"): 
+            continue
         try:
             vol = float(d.get("volume",0))
             last = float(d.get("lastPrice",0))
             pairs.append((sym, vol*last))
-        except: continue
+        except:
+            continue
+
     pairs.sort(key=lambda x:x[1], reverse=True)
     final = [s for s,_ in pairs[:n]]
     debug_print("Top symbols:", final)
     return final or ["BTCUSDT","ETHUSDT"]
-
+    
 def get_klines(symbol, interval="5m", limit=200):
     symbol = sanitize_symbol(symbol)
     params = {"symbol": symbol, "interval": interval, "limit": limit}
