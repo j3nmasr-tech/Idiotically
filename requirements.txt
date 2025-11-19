@@ -1,4 +1,7 @@
-ccxt>=3.0.0
-pandas>=1.5
+aiosqlite
+ccxt==4.2.100
+pandas
 numpy
-requests
+python-telegram-bot==20.7
+fastapi
+uvicorn[standard]
