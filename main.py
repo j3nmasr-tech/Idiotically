@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# FastScalp v2 – Dynamic ATR / TP / SL | Bybit | USDT Perps
+# FastScalp v2 – Dynamic ATR / TP / SL | Bitget | USDT Perps
 import os, time, csv, re, requests
 import pandas as pd
 import numpy as np
@@ -12,8 +12,7 @@ CHAT_ID   = os.getenv("CHAT_ID")
 CAPITAL = 80.0
 LEVERAGE = 30
 CHECK_INTERVAL = 300  # 5 minutes
-API_CALL_DELAY = 0.3  # 0.3 seconds between each API call
-SYMBOL_DELAY = 0.3  # seconds between API calls per symbol
+SYMBOL_DELAY = 0.3    # seconds between API calls per symbol
 TOP_SYMBOLS = 40
 
 TIMEFRAMES = ["5m","15m","30m","1h"]
@@ -26,6 +25,7 @@ MIN_SL_DISTANCE_PCT = 0.0015
 SYMBOL_BLACKLIST = set([])
 RECENT_SIGNAL_SIGNATURE_EXPIRE = 300
 
+
 WEIGHT_BIAS   = 0.2
 WEIGHT_TURTLE = 0.4
 WEIGHT_CRT    = 0.25
@@ -37,12 +37,8 @@ LOG_CSV = "./fastscalp_v2_signals.csv"
 open_trades = []
 recent_signals = {}
 signals_sent_total = 0
-signals_hit_total = 0
-signals_fail_total = 0
-total_checked_signals = 0
 skipped_signals = 0
 last_heartbeat = time.time()
-last_summary   = time.time()
 
 # ===== HELPERS =====
 def send_message(text):
@@ -70,53 +66,45 @@ def safe_get_json(url, params=None, timeout=5, retries=1):
             if attempt < retries: time.sleep(0.5*(attempt+1))
             else: return None
 
-# ===== BYBIT ACCESS =====
-BYBIT_BASE    = "https://api.bybit.com/v5/market"
-BYBIT_TICKERS = f"{BYBIT_BASE}/tickers"
-BYBIT_KLINES  = f"{BYBIT_BASE}/kline"
-_interval_map = {"1m":"1","3m":"3","5m":"5","15m":"15","30m":"30","1h":"60","4h":"240"}
+# ===== BITGET API =====
+BITGET_TICKERS = "https://api.bitget.com/api/spot/v1/market/tickers"
+BITGET_KLINES  = "https://api.bitget.com/api/spot/v1/market/candles"
+_interval_map = {"1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m","1h":"1h","4h":"4h"}
 
-def interval_to_bybit(interval):
+def interval_to_bitget(interval):
     return _interval_map.get(interval, interval)
 
 def get_top_symbols(n=TOP_SYMBOLS):
-    j = safe_get_json(BYBIT_TICKERS, {"category":"linear"})
-    if not j or "result" not in j or "list" not in j["result"]: return ["BTCUSDT","ETHUSDT"]
+    j = safe_get_json(BITGET_TICKERS)
+    if not j or "data" not in j: return ["BTCUSDT","ETHUSDT"]
     usdt_pairs = []
-    for d in j["result"]["list"]:
+    for d in j["data"]:
         sym = sanitize_symbol(d.get("symbol",""))
         if not sym.endswith("USDT"): continue
         try:
-            vol = float(d.get("volume24h",0))
-            last = float(d.get("lastPrice",0))
-            usdt_pairs.append((sym,vol*last))
+            vol = float(d.get("baseVolume",0))
+            last = float(d.get("last",0))
+            usdt_pairs.append((sym, vol*last))
         except: continue
     usdt_pairs.sort(key=lambda x:x[1], reverse=True)
     return [s[0] for s in usdt_pairs[:n]] or ["BTCUSDT","ETHUSDT"]
 
 def get_klines(symbol, interval="5m", limit=200):
     symbol = sanitize_symbol(symbol)
-    iv = interval_to_bybit(interval)
-    j = safe_get_json(BYBIT_KLINES, {"category":"linear","symbol":symbol,"interval":iv,"limit":limit})
-    if not j or "result" not in j or "list" not in j["result"]: return None
-    df = pd.DataFrame(j["result"]["list"])
+    iv = interval_to_bitget(interval)
+    j = safe_get_json(BITGET_KLINES, {"symbol":symbol,"granularity":iv,"limit":limit})
+    if not j or "data" not in j: return None
+    df = pd.DataFrame(j["data"], columns=["timestamp","open","high","low","close","volume"])
     if df.empty: return None
-    if set(["open","high","low","close","volume"]).issubset(df.columns):
-        return df[["open","high","low","close","volume"]].astype(float)
-    elif set(["o","h","l","c","v"]).issubset(df.columns):
-        df = df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume"})
-        return df[["open","high","low","close","volume"]].astype(float)
-    elif isinstance(df.iloc[0,0], list):
-        df = pd.DataFrame(df.iloc[:,1:6].values, columns=["open","high","low","close","volume"]).astype(float)
-        return df
-    return None
+    df[["open","high","low","close","volume"]] = df[["open","high","low","close","volume"]].astype(float)
+    return df
 
 def get_price(symbol):
-    j = safe_get_json(BYBIT_TICKERS, {"category":"linear","symbol":symbol})
-    if not j or "result" not in j or "list" not in j["result"]: return None
-    for d in j["result"]["list"]:
+    j = safe_get_json(BITGET_TICKERS)
+    if not j or "data" not in j: return None
+    for d in j["data"]:
         if sanitize_symbol(d.get("symbol",""))==symbol:
-            return float(d.get("lastPrice",0))
+            return float(d.get("last",0))
     return None
 
 # ===== INDICATORS =====
@@ -177,9 +165,9 @@ def generate_signal(symbol):
     global recent_signals
     dfs = {}
     directions = {}
-    scores = {}
-    conf_count = 0
     total_score = 0
+    conf_count = 0
+
     for tf in TIMEFRAMES:
         df = get_klines(symbol, tf, 100)
         if df is None or df.empty: continue
@@ -198,9 +186,8 @@ def generate_signal(symbol):
         else: bear_score += WEIGHT_BIAS*100
         if vol_ok_flag: bull_score += WEIGHT_VOLUME*50; bear_score += WEIGHT_VOLUME*50
         total_score += max(bull_score,bear_score)
-        scores[tf] = {"bull":bull_score, "bear":bear_score, "bias":bias, "vol_ok":vol_ok_flag}
-        if bull_score>=MIN_TF_SCORE: directions[tf]="BUY"
-        elif bear_score>=MIN_TF_SCORE: directions[tf]="SELL"
+        if bull_score>=ENTRY_FILTER_SCORE: directions[tf]="BUY"
+        elif bear_score>=ENTRY_FILTER_SCORE: directions[tf]="SELL"
         else: directions[tf]=None
         if directions[tf] is not None: conf_count+=1
 
@@ -211,7 +198,7 @@ def generate_signal(symbol):
     side = "BUY" if buy_count>sell_count else "SELL"
 
     confidence = total_score / max(1,len(dfs))
-    if confidence<CONFIDENCE_MIN: return None
+    if confidence<ENTRY_FILTER_CONF: return None
 
     sig_signature = f"{symbol}_{side}"
     if sig_signature in recent_signals and (time.time()-recent_signals[sig_signature])<RECENT_SIGNAL_SIGNATURE_EXPIRE:
@@ -239,7 +226,6 @@ def generate_signal(symbol):
 # ===== LOGGING =====
 def log_signal(signal):
     if signal is None: return
-    global LOG_CSV
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     row = [now, signal["symbol"], signal["side"], signal["entry"], signal["sl"], signal["tp1"], signal["tp2"], signal["tp3"], signal["confidence"]]
     if not os.path.exists(LOG_CSV):
@@ -253,13 +239,15 @@ def log_signal(signal):
 # ===== MAIN LOOP =====
 def run_bot():
     global signals_sent_total, skipped_signals, last_heartbeat
+    send_message("🚀 FastScalp v2 started on Bitget!")
+    print(f"[{datetime.utcnow()}] FastScalp v2 started on Bitget!")  # debug
+
     symbols = get_top_symbols(TOP_SYMBOLS)
-    
-    print(f"[{datetime.utcnow()}] Starting scan of {len(symbols)} symbols: {symbols}")  # debug
-    
+    print(f"[{datetime.utcnow()}] Scanning {len(symbols)} symbols: {symbols}")
+
     while True:
         for symbol in symbols:
-            print(f"[{datetime.utcnow()}] Checking {symbol}...")  # debug
+            print(f"[{datetime.utcnow()}] Checking {symbol}...")
             try:
                 signal = generate_signal(symbol)
                 if signal:
@@ -270,20 +258,21 @@ def run_bot():
                         f"Conf: {signal['confidence']}%"
                     )
                     signals_sent_total += 1
-                    print(f"[{datetime.utcnow()}] Signal sent: {signal['symbol']} {signal['side']}")  # debug
+                    print(f"[{datetime.utcnow()}] Signal sent: {signal['symbol']} {signal['side']}")
                 else:
                     skipped_signals += 1
-                    print(f"[{datetime.utcnow()}] No signal for {symbol}")  # debug
+                    print(f"[{datetime.utcnow()}] No signal for {symbol}")
             except Exception as e:
                 print(f"[{datetime.utcnow()}] Error processing {symbol}: {e}")
+            time.sleep(SYMBOL_DELAY)
 
-            time.sleep(SYMBOL_DELAY)  # per-symbol spacing
-
-        # Heartbeat
         if time.time() - last_heartbeat > 600:
             send_message(f"FastScalp v2 heartbeat: {signals_sent_total} signals sent, {skipped_signals} skipped")
-            print(f"[{datetime.utcnow()}] Heartbeat sent")  # debug
+            print(f"[{datetime.utcnow()}] Heartbeat sent")
             last_heartbeat = time.time()
 
-        print(f"[{datetime.utcnow()}] Sleeping {CHECK_INTERVAL} seconds until next scan...")  # debug
+        print(f"[{datetime.utcnow()}] Sleeping {CHECK_INTERVAL} seconds until next scan...")
         time.sleep(CHECK_INTERVAL)
+
+if __name__=="__main__":
+    run_bot()
