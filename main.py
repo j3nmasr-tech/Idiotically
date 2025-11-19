@@ -313,17 +313,35 @@ def log_signal(signal):
         writer = csv.writer(f)
         writer.writerow(row)
 
-# ===== MAIN LOOP =====
+# ===== STARTUP & MAIN LOOP =====
 def run_bot():
     global signals_sent_total, skipped_signals, last_heartbeat, _last_loop_start
 
-    print(f"[{datetime.utcnow()}] FastScalp v2 starting on OKX... (immediate scan)", flush=True)
-    send_message("🚀 FastScalp v2 started on OKX!")
-    _last_loop_start = time.time()
+    # Debug: confirm credentials are loaded
+    if not BOT_TOKEN or not CHAT_ID:
+        print(f"[{datetime.utcnow()}] ⚠️ Telegram not configured! BOT_TOKEN or CHAT_ID missing.", flush=True)
+    else:
+        print(f"[{datetime.utcnow()}] Telegram credentials loaded.", flush=True)
 
-    symbols = get_top_symbols(TOP_SYMBOLS)
+    # ===== STARTUP MESSAGE =====
+    _last_loop_start = time.time()
+    startup_text = "🚀 FastScalp v2 started on OKX! Scanning Top Symbols immediately."
+    sent = send_message(startup_text)
+    if sent:
+        print(f"[{datetime.utcnow()}] ✅ Startup message sent to Telegram.", flush=True)
+    else:
+        print(f"[{datetime.utcnow()}] ⚠️ Failed to send startup message.", flush=True)
+
+    # Fetch top symbols
+    try:
+        symbols = get_top_symbols(TOP_SYMBOLS)
+    except Exception as e:
+        print(f"[{datetime.utcnow()}] ⚠️ Error fetching top symbols: {e}", flush=True)
+        symbols = ["BTCUSDT","ETHUSDT"]
+
     print(f"[{datetime.utcnow()}] Scanning {len(symbols)} symbols: {symbols}", flush=True)
 
+    # ===== MAIN LOOP =====
     while True:
         loop_start = time.time()
         print(f"[{datetime.utcnow()}] >>> Loop start (scanning symbols now)...", flush=True)
@@ -347,8 +365,10 @@ def run_bot():
             except Exception as e:
                 traceback.print_exc()
                 print(f"Error on {symbol}: {e}", flush=True)
+
             time.sleep(SYMBOL_DELAY)
 
+        # Quick heartbeat every loop
         if time.time() - last_heartbeat > 10:
             send_message(f"Heartbeat: {signals_sent_total} signals sent, {skipped_signals} skipped")
             print(f"[{datetime.utcnow()}] Heartbeat: {signals_sent_total} signals sent, {skipped_signals} skipped", flush=True)
