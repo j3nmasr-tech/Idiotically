@@ -68,29 +68,6 @@ def send_message(text):
 def sanitize_symbol(symbol):
     return re.sub(r"[^A-Z0-9_.-]","",symbol.upper())[:20]
 
-# ===== BITGET API =====
-BITGET_TICKERS = "https://api.bitget.com/api/spot/v1/market/tickers"
-BITGET_KLINES  = "https://api.bitget.com/api/spot/v1/market/candles"
-
-# Bitget SPOT granularity mapping
-_interval_map = {
-    "1m":  "1min",
-    "3m":  "3min",
-    "5m":  "5min",
-    "15m": "15min",
-    "30m": "30min",
-    "1h":  "1hour",
-    "4h":  "4hour"
-}
-
-def interval_to_bitget(tf: str) -> str:
-    return _interval_map.get(tf, "5min")
-
-def to_bitget_symbol(symbol: str) -> str:
-    if symbol.endswith("_SPBL"):
-        return symbol
-    return f"{symbol}_SPBL"
-
 # ===== SAFE JSON =====
 def safe_get_json(url, params=None, timeout=5, retries=1):
     for attempt in range(retries+1):
@@ -109,7 +86,23 @@ def safe_get_json(url, params=None, timeout=5, retries=1):
                 debug_print("Returning None after retries.")
                 return None
 
-# ===== TOP SYMBOLS =====
+# ===== BITGET API =====
+BITGET_TICKERS = "https://api.bitget.com/api/spot/v1/market/tickers"
+BITGET_KLINES  = "https://api.bitget.com/api/spot/v1/market/candles"
+
+_interval_map = {
+    "1m": "1min",
+    "3m": "3min",
+    "5m": "5min",
+    "15m":"15min",
+    "30m":"30min",
+    "1h":"1hour",
+    "4h":"4hour"
+}
+
+def interval_to_bitget(tf):
+    return _interval_map.get(tf, "5min")
+
 def get_top_symbols(n=TOP_SYMBOLS):
     j = safe_get_json(BITGET_TICKERS)
     if not j or "data" not in j:
@@ -134,25 +127,22 @@ def get_top_symbols(n=TOP_SYMBOLS):
 
 # ===== KLINES =====
 def get_klines(symbol, interval="5m", limit=200):
-    symbol_bitget = to_bitget_symbol(sanitize_symbol(symbol))
+    symbol_clean = sanitize_symbol(symbol)  # no _SPBL
     gran = interval_to_bitget(interval)
 
-    j = safe_get_json(
-        BITGET_KLINES,
-        {"symbol": symbol_bitget, "granularity": gran, "limit": limit},
-        timeout=8,
-        retries=2
-    )
+    params = {"symbol": symbol_clean, "granularity": gran, "limit": limit}
 
+    j = safe_get_json(BITGET_KLINES, params, timeout=8, retries=2)
     if not j:
-        debug_print(f"Klines None for {symbol_bitget} {interval}")
+        debug_print(f"Klines None for {symbol_clean} {interval}")
         return None
 
     data = j.get("data")
     if not data:
-        debug_print(f"Klines empty for {symbol_bitget}")
+        debug_print(f"Klines empty for {symbol_clean}")
         return None
 
+    # parse as list-of-lists
     if isinstance(data, list) and len(data) > 0 and isinstance(data[0], (list, tuple)):
         try:
             df = pd.DataFrame(data, columns=["timestamp","open","high","low","close","volume"])
@@ -165,13 +155,13 @@ def get_klines(symbol, interval="5m", limit=200):
             mapping["time"] = "timestamp"
         if "close_price" in df.columns:
             mapping["close_price"] = "close"
-        if "quoteVolume" in df.columns:
-            mapping["quoteVolume"] = "volume"
+        if "quoteVol" in df.columns:
+            mapping["quoteVol"] = "volume"
         if mapping:
             df = df.rename(columns=mapping)
 
     if df.empty:
-        debug_print(f"Klines DataFrame empty for {symbol_bitget}")
+        debug_print(f"Klines DataFrame empty for {symbol_clean}")
         return None
 
     for col in ["open","high","low","close","volume"]:
@@ -180,14 +170,13 @@ def get_klines(symbol, interval="5m", limit=200):
 
     return df.reset_index(drop=True)
 
-# ===== PRICE =====
 def get_price(symbol):
-    symbol_bitget = to_bitget_symbol(sanitize_symbol(symbol))
+    symbol_clean = sanitize_symbol(symbol)
     j = safe_get_json(BITGET_TICKERS)
     if not j or "data" not in j:
         return None
     for d in j["data"]:
-        if sanitize_symbol(d.get("symbol","")) == symbol_bitget.replace("_SPBL",""):
+        if sanitize_symbol(d.get("symbol","")) == symbol_clean:
             try:
                 return float(d.get("last",0))
             except:
@@ -201,20 +190,26 @@ def detect_crt(df):
         return False,False
     last = df.iloc[-1]
     o,h,l,c,v = last["open"],last["high"],last["low"],last["close"],last["volume"]
+
     body_series = (df["close"] - df["open"]).abs()
     avg_body = body_series.rolling(10,min_periods=6).mean().iloc[-1]
     avg_vol  = df["volume"].rolling(10,min_periods=6).mean().iloc[-1]
+
     if np.isnan(avg_body) or np.isnan(avg_vol):
+        debug_print("CRT invalid avg body/volume")
         return False,False
+
     body = abs(c-o)
     wick_up = h - max(o,c)
     wick_down = min(o,c) - l
+
     bull = body < avg_body*0.7 and wick_down > avg_body*0.6 and v < avg_vol*1.2 and c > o
     bear = body < avg_body*0.7 and wick_up > avg_body*0.6 and v < avg_vol*1.2 and c < o
     return bull,bear
 
 def detect_turtle(df, look=20):
     if len(df)<look+2:
+        debug_print("Turtle skipped - insufficient data")
         return False,False
     ph = df["high"].iloc[-look-1:-1].max()
     pl = df["low"].iloc[-look-1:-1].min()
@@ -236,12 +231,16 @@ def volume_ok(df):
     mult = 1.2 if e20 > e50 else 1.1
     return df["volume"].iloc[-1] > ma * mult
 
-# ===== ATR & TRADE PARAMETERS =====
+# ===== ATR & TP/SL =====
 def get_atr(df, period=14):
-    if len(df) < period+1: return None
+    if len(df) < period+1:
+        debug_print("ATR insufficient candles")
+        return None
     h,l,c = df["high"].values, df["low"].values, df["close"].values
     trs = [max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])) for i in range(1,len(df))]
-    if not trs: return None
+    if not trs:
+        debug_print("ATR TR empty")
+        return None
     return float(np.mean(trs))
 
 def trade_params_dynamic(entry, side, atr, conf_pct):
@@ -277,29 +276,21 @@ def generate_signal(symbol):
 
         bull_score = 0
         bear_score = 0
-
         if bull_t: bull_score += WEIGHT_TURTLE*100
         if bear_t: bear_score += WEIGHT_TURTLE*100
         if bull_c: bull_score += WEIGHT_CRT*100
         if bear_c: bear_score += WEIGHT_CRT*100
         if bias=="bull": bull_score += WEIGHT_BIAS*100
         else: bear_score += WEIGHT_BIAS*100
-        if vol_ok_flag:
-            bull_score += WEIGHT_VOLUME*50
-            bear_score += WEIGHT_VOLUME*50
+        if vol_ok_flag: bull_score += WEIGHT_VOLUME*50; bear_score += WEIGHT_VOLUME*50
 
         total_score += max(bull_score,bear_score)
 
-        if bull_score >= ENTRY_FILTER_SCORE:
-            directions[tf] = "BUY"
-        elif bear_score >= ENTRY_FILTER_SCORE:
-            directions[tf] = "SELL"
-        else:
-            directions[tf] = None
+        if bull_score >= ENTRY_FILTER_SCORE: directions[tf]="BUY"
+        elif bear_score >= ENTRY_FILTER_SCORE: directions[tf]="SELL"
+        else: directions[tf]=None
 
-        if directions[tf] is not None:
-            conf_count += 1
-
+        if directions[tf] is not None: conf_count += 1
         debug_print(symbol, tf, "bull:", bull_score, "bear:", bear_score, "dir:", directions[tf])
 
     if conf_count < CONF_MIN_TFS:
@@ -319,7 +310,6 @@ def generate_signal(symbol):
     if sig_signature in recent_signals and (time.time() - recent_signals[sig_signature]) < RECENT_SIGNAL_SIGNATURE_EXPIRE:
         debug_print(f"{symbol} duplicate signal blocked.")
         return None
-
     recent_signals[sig_signature] = time.time()
 
     df_main = dfs.get("5m") or list(dfs.values())[0]
@@ -335,25 +325,13 @@ def generate_signal(symbol):
 
     sl,tp1,tp2,tp3 = trade_params_dynamic(price, side, atr, confidence)
 
-    return {
-        "symbol": symbol,
-        "side": side,
-        "entry": price,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "confidence": round(confidence,2)
-    }
+    return {"symbol": symbol,"side": side,"entry": price,"sl": sl,"tp1": tp1,"tp2": tp2,"tp3": tp3,"confidence": round(confidence,2)}
 
 # ===== LOGGING =====
 def log_signal(signal):
     if signal is None: return
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    row = [
-        now, signal["symbol"], signal["side"], signal["entry"], signal["sl"],
-        signal["tp1"], signal["tp2"], signal["tp3"], signal["confidence"]
-    ]
+    row = [now, signal["symbol"], signal["side"], signal["entry"], signal["sl"], signal["tp1"], signal["tp2"], signal["tp3"], signal["confidence"]]
     if not os.path.exists(LOG_CSV):
         with open(LOG_CSV,"w",newline="") as f:
             writer = csv.writer(f)
