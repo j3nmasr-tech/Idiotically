@@ -10,4 +10,4 @@ COPY main.py .
 ENV LC_ALL=C.UTF-8
 ENV LANG=C.UTF-8
 
-CMD ["python", "main.py"]
+CMD ["python3", "main.py"]
