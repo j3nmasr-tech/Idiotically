@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# FastScalp v2 – Dynamic ATR / TP / SL | Binance Spot | USDT Perps
+# FastScalp v2 – Dynamic ATR / TP / SL | OKX Spot | USDT Perps
 import os, time, csv, requests, re, traceback
 import pandas as pd
 import numpy as np
@@ -9,19 +9,18 @@ from datetime import datetime
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID   = os.getenv("CHAT_ID")
 
-DEBUG = True   # <<< TURN DEBUG ON/OFF HERE (kept True as you requested full debug)
+DEBUG = True   # full debug
 
 CAPITAL = 80.0
 LEVERAGE = 30
 
-# Changed so first full loop happens immediately and loop cycles are short
-CHECK_INTERVAL = 1        # seconds between full symbol cycles (was 300)
-SYMBOL_DELAY = 0.05       # short pause between symbols to be gentle on API
+# first loop starts immediately, short loop cycles
+CHECK_INTERVAL = 1    # seconds between full symbol cycles
+SYMBOL_DELAY = 0.05   # short pause between symbols
 
-# <<< YOU REQUESTED THIS → TOP 10 ONLY >>>
-TOP_SYMBOLS = 10
+TOP_SYMBOLS = 20      # your request: top 20 coins
 
-TIMEFRAMES = ["5m","15m","30m","1h"]
+TIMEFRAMES = ["1m","5m","15m","30m","1h"]
 MIN_TF_SCORE = 55
 CONF_MIN_TFS = 2
 CONFIDENCE_MIN = 60.0
@@ -57,7 +56,6 @@ def debug_print(*args):
 
 def send_message(text):
     if not BOT_TOKEN or not CHAT_ID:
-        # do not block — just log locally
         print("Telegram not configured:", text, flush=True)
         return False
     try:
@@ -74,28 +72,37 @@ def send_message(text):
 def sanitize_symbol(symbol):
     return re.sub(r"[^A-Z0-9]", "", symbol.upper())
 
-# ===== BINANCE API =====
-BINANCE_TICKERS = "https://api.binance.com/api/v3/ticker/24hr"
-BINANCE_KLINES  = "https://api.binance.com/api/v3/klines"
+# ===== OKX API =====
+OKX_TICKERS = "https://www.okx.com/api/v5/market/tickers?instType=SPOT"
+OKX_KLINES  = "https://www.okx.com/api/v5/market/candles"
+
+def okx_symbol(sym):
+    sym = sanitize_symbol(sym)
+    if sym.endswith("USDT"):
+        return sym.replace("USDT", "-USDT")
+    return sym
 
 def get_top_symbols(n=TOP_SYMBOLS):
     try:
-        j = requests.get(BINANCE_TICKERS, timeout=5).json()
+        j = requests.get(OKX_TICKERS, timeout=5).json()
     except Exception as e:
         debug_print("Ticker request failed:", e)
         return ["BTCUSDT","ETHUSDT"]
 
+    if "data" not in j:
+        debug_print("Ticker response invalid:", j)
+        return ["BTCUSDT","ETHUSDT"]
+
     pairs = []
-    for d in j:
-        if not isinstance(d, dict):
-            continue
-        sym = sanitize_symbol(d.get("symbol",""))
-        if not sym.endswith("USDT"):
+    for d in j["data"]:
+        instId = d.get("instId","")
+        if not instId.endswith("-USDT"):
             continue
         try:
-            vol = float(d.get("volume",0))
-            last = float(d.get("lastPrice",0))
-            pairs.append((sym, vol * last))
+            vol = float(d.get("vol24h",0))
+            last = float(d.get("last",0))
+            usdt = instId.replace("-","")
+            pairs.append((usdt, vol * last))
         except:
             continue
 
@@ -104,36 +111,49 @@ def get_top_symbols(n=TOP_SYMBOLS):
     debug_print("Top symbols:", final)
     return final or ["BTCUSDT","ETHUSDT"]
 
-def get_klines(symbol, interval="5m", limit=200):
-    symbol = sanitize_symbol(symbol)
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
+def get_klines(symbol, interval="1m", limit=200):
+    instId = okx_symbol(symbol)
+
+    tf_map = {
+        "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
+        "1h": "1H", "2h": "2H", "4h": "4H", "6h": "6H", "12h": "12H", "1d": "1D"
+    }
+    okx_tf = tf_map.get(interval, "1m")
+
+    url = f"{OKX_KLINES}?instId={instId}&bar={okx_tf}&limit={limit}"
+
     try:
-        r = requests.get(BINANCE_KLINES, params=params, timeout=8)
+        r = requests.get(url, timeout=8)
         r.raise_for_status()
-        data = r.json()
+        j = r.json()
     except Exception as e:
         debug_print(f"{symbol} klines failed: {e}")
         return None
-    if not data: return None
-    df = pd.DataFrame(data, columns=[
+
+    if "data" not in j or len(j["data"])==0:
+        return None
+
+    rows = j["data"][::-1]  # oldest → newest
+    df = pd.DataFrame(rows, columns=[
         "timestamp","open","high","low","close","volume",
-        "close_time","quote_asset_volume","trades","taker_buy_base",
-        "taker_buy_quote","ignore"
+        "volCcy","volCcyQuote","confirm"
     ])
     df = df[["timestamp","open","high","low","close","volume"]].astype(float)
     return df.reset_index(drop=True)
 
 def get_price(symbol):
-    symbol = sanitize_symbol(symbol)
     try:
-        j = requests.get(BINANCE_TICKERS, timeout=5).json()
+        j = requests.get(OKX_TICKERS, timeout=5).json()
     except Exception as e:
         debug_print(f"{symbol} get_price failed: {e}")
         return None
-    for d in j:
-        if sanitize_symbol(d.get("symbol","")) == symbol:
+    if "data" not in j:
+        return None
+    instId = okx_symbol(symbol)
+    for d in j["data"]:
+        if d.get("instId") == instId:
             try:
-                return float(d.get("lastPrice",0))
+                return float(d.get("last",0))
             except:
                 return None
     return None
@@ -259,7 +279,7 @@ def generate_signal(symbol):
 
     recent_signals[sig_signature] = time.time()
 
-    df_main = dfs.get("5m") or list(dfs.values())[0]
+    df_main = dfs.get("1m") or list(dfs.values())[0]
     atr = get_atr(df_main)
     if atr is None: return None
     price = get_price(symbol)
@@ -297,15 +317,13 @@ def log_signal(signal):
 def run_bot():
     global signals_sent_total, skipped_signals, last_heartbeat, _last_loop_start
 
-    # immediate start logging
-    print(f"[{datetime.utcnow()}] FastScalp v2 starting on Binance... (immediate scan)", flush=True)
-    send_message("🚀 FastScalp v2 started on Binance!")
+    print(f"[{datetime.utcnow()}] FastScalp v2 starting on OKX... (immediate scan)", flush=True)
+    send_message("🚀 FastScalp v2 started on OKX!")
     _last_loop_start = time.time()
 
     symbols = get_top_symbols(TOP_SYMBOLS)
     print(f"[{datetime.utcnow()}] Scanning {len(symbols)} symbols: {symbols}", flush=True)
 
-    # main loop: will run immediately upon start
     while True:
         loop_start = time.time()
         print(f"[{datetime.utcnow()}] >>> Loop start (scanning symbols now)...", flush=True)
@@ -329,19 +347,15 @@ def run_bot():
             except Exception as e:
                 traceback.print_exc()
                 print(f"Error on {symbol}: {e}", flush=True)
-            # short pause between symbols
             time.sleep(SYMBOL_DELAY)
 
-        # quick heartbeat every loop so logs show activity
-        if time.time() - last_heartbeat > 10:   # heartbeat every 10s to show alive
+        if time.time() - last_heartbeat > 10:
             send_message(f"Heartbeat: {signals_sent_total} signals sent, {skipped_signals} skipped")
             print(f"[{datetime.utcnow()}] Heartbeat: {signals_sent_total} signals sent, {skipped_signals} skipped", flush=True)
             last_heartbeat = time.time()
 
         loop_duration = time.time() - loop_start
         print(f"[{datetime.utcnow()}] Loop finished in {loop_duration:.2f}s. Sleeping {CHECK_INTERVAL}s before next loop...", flush=True)
-
-        # sleep small interval (set to 1s by default) then repeat immediately
         time.sleep(CHECK_INTERVAL)
 
 if __name__=="__main__":
