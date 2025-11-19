@@ -15,7 +15,9 @@ CAPITAL = 80.0
 LEVERAGE = 30
 CHECK_INTERVAL = 300
 SYMBOL_DELAY = 0.3
-TOP_SYMBOLS = 40
+
+# <<< YOU REQUESTED THIS → TOP 10 ONLY >>>
+TOP_SYMBOLS = 10
 
 TIMEFRAMES = ["5m","15m","30m","1h"]
 MIN_TF_SCORE = 55
@@ -81,23 +83,23 @@ def get_top_symbols(n=TOP_SYMBOLS):
 
     pairs = []
     for d in j:
-        if not isinstance(d, dict):  # <-- FIX
+        if not isinstance(d, dict):
             continue
         sym = sanitize_symbol(d.get("symbol",""))
-        if not sym.endswith("USDT"): 
+        if not sym.endswith("USDT"):
             continue
         try:
             vol = float(d.get("volume",0))
             last = float(d.get("lastPrice",0))
-            pairs.append((sym, vol*last))
+            pairs.append((sym, vol * last))
         except:
             continue
 
-    pairs.sort(key=lambda x:x[1], reverse=True)
+    pairs.sort(key=lambda x: x[1], reverse=True)
     final = [s for s,_ in pairs[:n]]
     debug_print("Top symbols:", final)
     return final or ["BTCUSDT","ETHUSDT"]
-    
+
 def get_klines(symbol, interval="5m", limit=200):
     symbol = sanitize_symbol(symbol)
     params = {"symbol": symbol, "interval": interval, "limit": limit}
@@ -111,7 +113,8 @@ def get_klines(symbol, interval="5m", limit=200):
     if not data: return None
     df = pd.DataFrame(data, columns=[
         "timestamp","open","high","low","close","volume",
-        "close_time","quote_asset_volume","trades","taker_buy_base","taker_buy_quote","ignore"
+        "close_time","quote_asset_volume","trades","taker_buy_base",
+        "taker_buy_quote","ignore"
     ])
     df = df[["timestamp","open","high","low","close","volume"]].astype(float)
     return df.reset_index(drop=True)
@@ -134,7 +137,7 @@ def get_price(symbol):
 def detect_crt(df):
     if len(df)<12: return False,False
     last = df.iloc[-1]
-    o,h,l,c,v = last["open"],last["high"],last["low"],last["close"],last["volume"]
+    o,h,l,c,v = last["open"], last["high"], last["low"], last["close"], last["volume"]
     body_series = (df["close"] - df["open"]).abs()
     avg_body = body_series.rolling(10,min_periods=6).mean().iloc[-1]
     avg_vol  = df["volume"].rolling(10,min_periods=6).mean().iloc[-1]
@@ -166,7 +169,7 @@ def volume_ok(df):
     e20 = df["close"].ewm(span=20).mean().iloc[-1]
     e50 = df["close"].ewm(span=50).mean().iloc[-1]
     mult = 1.2 if e20>e50 else 1.1
-    return df["volume"].iloc[-1]>ma*mult
+    return df["volume"].iloc[-1] > ma*mult
 
 # ===== ATR & TP/SL =====
 def get_atr(df, period=14):
@@ -198,24 +201,37 @@ def generate_signal(symbol):
             directions[tf] = None
             continue
         dfs[tf] = df
+
         bull_t, bear_t = detect_turtle(df)
         bull_c, bear_c = detect_crt(df)
         bias = smc_bias(df)
         vol_ok_flag = volume_ok(df)
+
         bull_score = 0
         bear_score = 0
+
         if bull_t: bull_score += WEIGHT_TURTLE*100
         if bear_t: bear_score += WEIGHT_TURTLE*100
         if bull_c: bull_score += WEIGHT_CRT*100
         if bear_c: bear_score += WEIGHT_CRT*100
         if bias=="bull": bull_score += WEIGHT_BIAS*100
         else: bear_score += WEIGHT_BIAS*100
-        if vol_ok_flag: bull_score += WEIGHT_VOLUME*50; bear_score += WEIGHT_VOLUME*50
+        if vol_ok_flag:
+            bull_score += WEIGHT_VOLUME*50
+            bear_score += WEIGHT_VOLUME*50
+
         total_score += max(bull_score,bear_score)
-        if bull_score >= ENTRY_FILTER_SCORE: directions[tf]="BUY"
-        elif bear_score >= ENTRY_FILTER_SCORE: directions[tf]="SELL"
-        else: directions[tf]=None
-        if directions[tf] is not None: conf_count += 1
+
+        if bull_score >= ENTRY_FILTER_SCORE:
+            directions[tf] = "BUY"
+        elif bear_score >= ENTRY_FILTER_SCORE:
+            directions[tf] = "SELL"
+        else:
+            directions[tf] = None
+
+        if directions[tf] is not None:
+            conf_count += 1
+
         debug_print(symbol, tf, "bull:", bull_score, "bear:", bear_score, "dir:", directions[tf])
 
     if conf_count < CONF_MIN_TFS:
@@ -225,15 +241,17 @@ def generate_signal(symbol):
     buy_count = sum(1 for d in directions.values() if d=="BUY")
     sell_count = sum(1 for d in directions.values() if d=="SELL")
     side = "BUY" if buy_count>sell_count else "SELL"
+
     confidence = total_score / max(1,len(dfs))
-    if confidence<ENTRY_FILTER_CONF:
+    if confidence < ENTRY_FILTER_CONF:
         debug_print(f"{symbol} rejected: low confidence {confidence:.2f}")
         return None
 
     sig_signature = f"{symbol}_{side}"
-    if sig_signature in recent_signals and (time.time()-recent_signals[sig_signature])<RECENT_SIGNAL_SIGNATURE_EXPIRE:
+    if sig_signature in recent_signals and (time.time()-recent_signals[sig_signature]) < RECENT_SIGNAL_SIGNATURE_EXPIRE:
         debug_print(f"{symbol} duplicate signal blocked.")
         return None
+
     recent_signals[sig_signature] = time.time()
 
     df_main = dfs.get("5m") or list(dfs.values())[0]
@@ -241,11 +259,17 @@ def generate_signal(symbol):
     if atr is None: return None
     price = get_price(symbol)
     if price is None: return None
+
     sl,tp1,tp2,tp3 = trade_params_dynamic(price, side, atr, confidence)
 
     return {
-        "symbol": symbol, "side": side, "entry": price,
-        "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+        "symbol": symbol,
+        "side": side,
+        "entry": price,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
         "confidence": round(confidence,2)
     }
 
@@ -253,7 +277,9 @@ def generate_signal(symbol):
 def log_signal(signal):
     if signal is None: return
     now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    row = [now, signal["symbol"], signal["side"], signal["entry"], signal["sl"], signal["tp1"], signal["tp2"], signal["tp3"], signal["confidence"]]
+    row = [now, signal["symbol"], signal["side"], signal["entry"],
+           signal["sl"], signal["tp1"], signal["tp2"], signal["tp3"],
+           signal["confidence"]]
     if not os.path.exists(LOG_CSV):
         with open(LOG_CSV,"w",newline="") as f:
             writer = csv.writer(f)
@@ -265,6 +291,7 @@ def log_signal(signal):
 # ===== MAIN LOOP =====
 def run_bot():
     global signals_sent_total, skipped_signals, last_heartbeat
+
     send_message("🚀 FastScalp v2 started on Binance!")
     print(f"[{datetime.utcnow()}] FastScalp v2 started on Binance!")
 
