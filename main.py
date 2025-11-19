@@ -296,67 +296,67 @@ def process_symbol(sym):
         #return
 
     # liquidity / spread check
-    if not has_sufficient_liquidity(sym):
-        logging.debug("[LIQ] insufficient liquidity %s", sym)
-        return
+    #if not has_sufficient_liquidity(sym):
+        #logging.debug("[LIQ] insufficient liquidity %s", sym)
+        #return
 
     # 5m entry check
     df5 = fetch_ohlcv(sym,"5m",60)
     if df5 is None or len(df5)<30 or df5['volume'].iloc[-1]<50: return
 
     # pump/spike protection (on 5m last candle)
-    last_candle = df5.iloc[-1]
-    atr_val = atr(df15)
-    candle_range = last_candle['high'] - last_candle['low']
-    mean_vol20 = df5['volume'][-21:-1].mean() if len(df5)>=21 else df5['volume'].mean()
-    if mean_vol20>0 and last_candle['volume'] > mean_vol20 * PUMP_VOL_MULT and candle_range > atr_val * PUMP_RANGE_ATR_MULT:
-        logging.info("[PUMP] skipping %s due pump/spike (vol x%.1f range x%.1f ATR)", sym, last_candle['volume']/max(mean_vol20,1), candle_range/max(atr_val,1e-12))
-        return
+    #last_candle = df5.iloc[-1]
+    #atr_val = atr(df15)
+    #candle_range = last_candle['high'] - last_candle['low']
+    #mean_vol20 = df5['volume'][-21:-1].mean() if len(df5)>=21 else df5['volume'].mean()
+    #if mean_vol20>0 and last_candle['volume'] > mean_vol20 * PUMP_VOL_MULT and candle_range > atr_val * PUMP_RANGE_ATR_MULT:
+        #logging.info("[PUMP] skipping %s due pump/spike (vol x%.1f range x%.1f ATR)", sym, last_candle['volume']/max(mean_vol20,1), candle_range/max(atr_val,1e-12))
+        #return
 
-    ok, meta = check_entry_5m(df5,trend)
-    if not ok:
-        logging.debug("[ENTRY] basic 5m checks failed %s %s", sym, meta)
-        return
+    #ok, meta = check_entry_5m(df5,trend)
+    #if not ok:
+        #logging.debug("[ENTRY] basic 5m checks failed %s %s", sym, meta)
+        #return
 
     # wick rejection on last candle
-    if is_wick_trap(last_candle, trend):
-        logging.info("[WICK] wick trap for %s, skipping", sym)
-        return
+    #if is_wick_trap(last_candle, trend):
+        #logging.info("[WICK] wick trap for %s, skipping", sym)
+        #return
 
     # hidden divergence confirmation (boost)
-    if not hidden_rsi_divergence(df5, trend, lookback=14):
+    #if not hidden_rsi_divergence(df5, trend, lookback=14):
         # allow trade to continue but log lower confidence
-        logging.debug("[DIVERGE] no hidden divergence for %s (lower confidence)", sym)
+        #logging.debug("[DIVERGE] no hidden divergence for %s (lower confidence)", sym)
         # optionally return to be more selective:
         # return
-        pass
+        #pass
 
     # Delay entry by 1 candle: wait for next 5m candle to close and confirm direction
-    try:
-        logging.info("[DELAY] waiting for next 5m candle to confirm %s", sym)
-        time.sleep(max(0.2, POLL_INTERVAL))  # short wait; real deploy may prefer sleep until candle boundary
-        df5_after = fetch_ohlcv(sym,"5m", 5)  # small fetch for recent candles
-        if df5_after is None or len(df5_after) < 2:
-            logging.debug("[DELAY] couldn't get next candle for %s", sym)
-            return
+    #try:
+        #logging.info("[DELAY] waiting for next 5m candle to confirm %s", sym)
+        #time.sleep(max(0.2, POLL_INTERVAL))  # short wait; real deploy may prefer sleep until candle boundary
+        #df5_after = fetch_ohlcv(sym,"5m", 5)  # small fetch for recent candles
+        #if df5_after is None or len(df5_after) < 2:
+            #logging.debug("[DELAY] couldn't get next candle for %s", sym)
+            #return
         # get the last closed candle after the trigger
-        confirm_candle = df5_after.iloc[-1]
+        #confirm_candle = df5_after.iloc[-1]
         # confirm direction: close above open for BUY, below open for SELL
-        if trend == "BUY" and confirm_candle['close'] <= confirm_candle['open']:
-            logging.info("[DELAY] confirmation candle not bullish for %s - skipping", sym)
-            return
-        if trend == "SELL" and confirm_candle['close'] >= confirm_candle['open']:
-            logging.info("[DELAY] confirmation candle not bearish for %s - skipping", sym)
-            return
+        #if trend == "BUY" and confirm_candle['close'] <= confirm_candle['open']:
+            #logging.info("[DELAY] confirmation candle not bullish for %s - skipping", sym)
+            #return
+        #if trend == "SELL" and confirm_candle['close'] >= confirm_candle['open']:
+            #logging.info("[DELAY] confirmation candle not bearish for %s - skipping", sym)
+            #return
         # wick rejection on confirm candle
-        if is_wick_trap(confirm_candle, trend):
-            logging.info("[DELAY] confirmation candle is wick trap for %s - skipping", sym)
-            return
+        #if is_wick_trap(confirm_candle, trend):
+            #logging.info("[DELAY] confirmation candle is wick trap for %s - skipping", sym)
+            #return
         # update entry to confirm candle close price
-        entry = float(confirm_candle['close'])
-    except Exception as e:
-        logging.debug("Delay/confirmation error %s %s", sym, e)
-        return
+        #entry = float(confirm_candle['close'])
+    #except Exception as e:
+        #logging.debug("Delay/confirmation error %s %s", sym, e)
+        #return
 
     # compute base TP/SL using atr (from 15m)
     atr_val = atr(df15)
