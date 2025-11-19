@@ -302,8 +302,15 @@ def process_symbol(sym):
 
     # 5m entry check
     df5 = fetch_ohlcv(sym,"5m",60)
-    if df5 is None or len(df5)<30 or df5['volume'].iloc[-1]<50: return
+    if df5 is None or len(df5)<30 or df5['volume'].iloc[-1]<50:
+        return
 
+    # NEW — required because entry is no longer set anywhere else
+    entry = float(df5.iloc[-1]['close'])
+    
+# pump/spike protection (on 5m last candle)
+#last_candle = df5.iloc[-1]
+#atr_val = atr(df15)
     # pump/spike protection (on 5m last candle)
     #last_candle = df5.iloc[-1]
     #atr_val = atr(df15)
