@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# FastScalp v2 – Dynamic ATR / TP / SL | Bitget | USDT Perps
-import os, time, csv, re, requests, traceback
+# FastScalp v2 – Dynamic ATR / TP / SL | Binance Spot | USDT Perps
+import os, time, csv, requests, re, traceback
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -66,151 +66,78 @@ def send_message(text):
         return False
 
 def sanitize_symbol(symbol):
-    return re.sub(r"[^A-Z0-9_.-]","",symbol.upper())[:20]
+    return re.sub(r"[^A-Z0-9]", "", symbol.upper())
 
-# ===== SAFE JSON =====
-def safe_get_json(url, params=None, timeout=5, retries=1):
-    for attempt in range(retries+1):
-        try:
-            debug_print(f"Requesting {url} params={params}")
-            r = requests.get(url, params=params, timeout=timeout)
-            r.raise_for_status()
-            j = r.json()
-            debug_print("Response OK")
-            return j
-        except Exception as e:
-            debug_print(f"Request failed (attempt {attempt}): {e}")
-            if attempt < retries:
-                time.sleep(0.4)
-            else:
-                debug_print("Returning None after retries.")
-                return None
-
-# ===== BITGET API =====
-BITGET_TICKERS = "https://api.bitget.com/api/spot/v1/market/tickers"
-BITGET_KLINES  = "https://api.bitget.com/api/spot/v1/market/candles"
-
-_interval_map = {
-    "1m": "1min",
-    "3m": "3min",
-    "5m": "5min",
-    "15m":"15min",
-    "30m":"30min",
-    "1h":"1hour",
-    "4h":"4hour"
-}
-
-def interval_to_bitget(tf):
-    return _interval_map.get(tf, "5min")
+# ===== BINANCE API =====
+BINANCE_TICKERS = "https://api.binance.com/api/v3/ticker/24hr"
+BINANCE_KLINES  = "https://api.binance.com/api/v3/klines"
 
 def get_top_symbols(n=TOP_SYMBOLS):
-    j = safe_get_json(BITGET_TICKERS)
-    if not j or "data" not in j:
-        debug_print("Ticker list failed, using BTC/ETH fallback")
-        return ["BTCUSDT","ETHUSDT"]
-
+    j = requests.get(BINANCE_TICKERS, timeout=5).json()
     pairs = []
-    for d in j["data"]:
+    for d in j:
         sym = sanitize_symbol(d.get("symbol",""))
         if not sym.endswith("USDT"): continue
         try:
-            vol = float(d.get("baseVolume",0))
-            last = float(d.get("last",0))
-            pairs.append((sym, vol * last))
-        except:
-            continue
-
-    pairs.sort(key=lambda x: x[1], reverse=True)
+            vol = float(d.get("volume",0))
+            last = float(d.get("lastPrice",0))
+            pairs.append((sym, vol*last))
+        except: continue
+    pairs.sort(key=lambda x:x[1], reverse=True)
     final = [s for s,_ in pairs[:n]]
     debug_print("Top symbols:", final)
     return final or ["BTCUSDT","ETHUSDT"]
 
-# ===== KLINES =====
 def get_klines(symbol, interval="5m", limit=200):
-    symbol_clean = sanitize_symbol(symbol)  # no _SPBL
-    gran = interval_to_bitget(interval)
-
-    params = {"symbol": symbol_clean, "granularity": gran, "limit": limit}
-
-    j = safe_get_json(BITGET_KLINES, params, timeout=8, retries=2)
-    if not j:
-        debug_print(f"Klines None for {symbol_clean} {interval}")
+    symbol = sanitize_symbol(symbol)
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    try:
+        r = requests.get(BINANCE_KLINES, params=params, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        debug_print(f"{symbol} klines failed: {e}")
         return None
-
-    data = j.get("data")
-    if not data:
-        debug_print(f"Klines empty for {symbol_clean}")
-        return None
-
-    # parse as list-of-lists
-    if isinstance(data, list) and len(data) > 0 and isinstance(data[0], (list, tuple)):
-        try:
-            df = pd.DataFrame(data, columns=["timestamp","open","high","low","close","volume"])
-        except:
-            df = pd.DataFrame(data)
-    else:
-        df = pd.DataFrame(data)
-        mapping = {}
-        if "time" in df.columns and "timestamp" not in df.columns:
-            mapping["time"] = "timestamp"
-        if "close_price" in df.columns:
-            mapping["close_price"] = "close"
-        if "quoteVol" in df.columns:
-            mapping["quoteVol"] = "volume"
-        if mapping:
-            df = df.rename(columns=mapping)
-
-    if df.empty:
-        debug_print(f"Klines DataFrame empty for {symbol_clean}")
-        return None
-
-    for col in ["open","high","low","close","volume"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
+    if not data: return None
+    df = pd.DataFrame(data, columns=[
+        "timestamp","open","high","low","close","volume",
+        "close_time","quote_asset_volume","trades","taker_buy_base","taker_buy_quote","ignore"
+    ])
+    df = df[["timestamp","open","high","low","close","volume"]].astype(float)
     return df.reset_index(drop=True)
 
 def get_price(symbol):
-    symbol_clean = sanitize_symbol(symbol)
-    j = safe_get_json(BITGET_TICKERS)
-    if not j or "data" not in j:
+    symbol = sanitize_symbol(symbol)
+    try:
+        j = requests.get(BINANCE_TICKERS, timeout=5).json()
+    except:
         return None
-    for d in j["data"]:
-        if sanitize_symbol(d.get("symbol","")) == symbol_clean:
+    for d in j:
+        if sanitize_symbol(d.get("symbol","")) == symbol:
             try:
-                return float(d.get("last",0))
+                return float(d.get("lastPrice",0))
             except:
                 return None
     return None
 
 # ===== INDICATORS =====
 def detect_crt(df):
-    if len(df)<12:
-        debug_print("CRT skipped - insufficient candles")
-        return False,False
+    if len(df)<12: return False,False
     last = df.iloc[-1]
     o,h,l,c,v = last["open"],last["high"],last["low"],last["close"],last["volume"]
-
     body_series = (df["close"] - df["open"]).abs()
     avg_body = body_series.rolling(10,min_periods=6).mean().iloc[-1]
     avg_vol  = df["volume"].rolling(10,min_periods=6).mean().iloc[-1]
-
-    if np.isnan(avg_body) or np.isnan(avg_vol):
-        debug_print("CRT invalid avg body/volume")
-        return False,False
-
+    if np.isnan(avg_body) or np.isnan(avg_vol): return False,False
     body = abs(c-o)
     wick_up = h - max(o,c)
     wick_down = min(o,c) - l
-
-    bull = body < avg_body*0.7 and wick_down > avg_body*0.6 and v < avg_vol*1.2 and c > o
-    bear = body < avg_body*0.7 and wick_up > avg_body*0.6 and v < avg_vol*1.2 and c < o
+    bull = body<avg_body*0.7 and wick_down>avg_body*0.6 and v<avg_vol*1.2 and c>o
+    bear = body<avg_body*0.7 and wick_up>avg_body*0.6 and v<avg_vol*1.2 and c<o
     return bull,bear
 
 def detect_turtle(df, look=20):
-    if len(df)<look+2:
-        debug_print("Turtle skipped - insufficient data")
-        return False,False
+    if len(df)<look+2: return False,False
     ph = df["high"].iloc[-look-1:-1].max()
     pl = df["low"].iloc[-look-1:-1].min()
     last = df.iloc[-1]
@@ -221,41 +148,35 @@ def detect_turtle(df, look=20):
 def smc_bias(df):
     e20 = df["close"].ewm(span=20).mean().iloc[-1]
     e50 = df["close"].ewm(span=50).mean().iloc[-1]
-    return "bull" if (e20 - e50)/e50 > 0.002 else "bear"
+    return "bull" if (e20-e50)/e50>0.002 else "bear"
 
 def volume_ok(df):
     ma = df["volume"].rolling(20,min_periods=8).mean().iloc[-1]
     if np.isnan(ma): return True
     e20 = df["close"].ewm(span=20).mean().iloc[-1]
     e50 = df["close"].ewm(span=50).mean().iloc[-1]
-    mult = 1.2 if e20 > e50 else 1.1
-    return df["volume"].iloc[-1] > ma * mult
+    mult = 1.2 if e20>e50 else 1.1
+    return df["volume"].iloc[-1]>ma*mult
 
 # ===== ATR & TP/SL =====
 def get_atr(df, period=14):
-    if len(df) < period+1:
-        debug_print("ATR insufficient candles")
-        return None
+    if len(df)<period+1: return None
     h,l,c = df["high"].values, df["low"].values, df["close"].values
     trs = [max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])) for i in range(1,len(df))]
-    if not trs:
-        debug_print("ATR TR empty")
-        return None
-    return float(np.mean(trs))
+    return float(np.mean(trs)) if trs else None
 
 def trade_params_dynamic(entry, side, atr, conf_pct):
     adj = 1 + (conf_pct/100)*0.5
     tp1 = entry + atr*1.5*adj if side=="BUY" else entry - atr*1.5*adj
     tp2 = entry + atr*2.5*adj if side=="BUY" else entry - atr*2.5*adj
     tp3 = entry + atr*3.5*adj if side=="BUY" else entry - atr*3.5*adj
-    sl  = entry - atr*1.2       if side=="BUY" else entry + atr*1.2
+    sl  = entry - atr*1.2 if side=="BUY" else entry + atr*1.2
     return round(sl,6), round(tp1,6), round(tp2,6), round(tp3,6)
 
 # ===== SIGNAL ENGINE =====
 def generate_signal(symbol):
     debug_print(f"Generating signal for {symbol}")
     global recent_signals
-
     dfs = {}
     directions = {}
     total_score = 0
@@ -264,16 +185,13 @@ def generate_signal(symbol):
     for tf in TIMEFRAMES:
         df = get_klines(symbol, tf, 100)
         if df is None:
-            debug_print(f"{symbol} {tf}: no data")
             directions[tf] = None
             continue
-
         dfs[tf] = df
         bull_t, bear_t = detect_turtle(df)
         bull_c, bear_c = detect_crt(df)
         bias = smc_bias(df)
         vol_ok_flag = volume_ok(df)
-
         bull_score = 0
         bear_score = 0
         if bull_t: bull_score += WEIGHT_TURTLE*100
@@ -283,13 +201,10 @@ def generate_signal(symbol):
         if bias=="bull": bull_score += WEIGHT_BIAS*100
         else: bear_score += WEIGHT_BIAS*100
         if vol_ok_flag: bull_score += WEIGHT_VOLUME*50; bear_score += WEIGHT_VOLUME*50
-
         total_score += max(bull_score,bear_score)
-
         if bull_score >= ENTRY_FILTER_SCORE: directions[tf]="BUY"
         elif bear_score >= ENTRY_FILTER_SCORE: directions[tf]="SELL"
         else: directions[tf]=None
-
         if directions[tf] is not None: conf_count += 1
         debug_print(symbol, tf, "bull:", bull_score, "bear:", bear_score, "dir:", directions[tf])
 
@@ -299,33 +214,30 @@ def generate_signal(symbol):
 
     buy_count = sum(1 for d in directions.values() if d=="BUY")
     sell_count = sum(1 for d in directions.values() if d=="SELL")
-    side = "BUY" if buy_count > sell_count else "SELL"
-    confidence = total_score / max(1, len(dfs))
-
-    if confidence < ENTRY_FILTER_CONF:
+    side = "BUY" if buy_count>sell_count else "SELL"
+    confidence = total_score / max(1,len(dfs))
+    if confidence<ENTRY_FILTER_CONF:
         debug_print(f"{symbol} rejected: low confidence {confidence:.2f}")
         return None
 
     sig_signature = f"{symbol}_{side}"
-    if sig_signature in recent_signals and (time.time() - recent_signals[sig_signature]) < RECENT_SIGNAL_SIGNATURE_EXPIRE:
+    if sig_signature in recent_signals and (time.time()-recent_signals[sig_signature])<RECENT_SIGNAL_SIGNATURE_EXPIRE:
         debug_print(f"{symbol} duplicate signal blocked.")
         return None
     recent_signals[sig_signature] = time.time()
 
     df_main = dfs.get("5m") or list(dfs.values())[0]
     atr = get_atr(df_main)
-    if atr is None:
-        debug_print(f"{symbol} ATR failed")
-        return None
-
+    if atr is None: return None
     price = get_price(symbol)
-    if price is None:
-        debug_print(f"{symbol} price unavailable")
-        return None
-
+    if price is None: return None
     sl,tp1,tp2,tp3 = trade_params_dynamic(price, side, atr, confidence)
 
-    return {"symbol": symbol,"side": side,"entry": price,"sl": sl,"tp1": tp1,"tp2": tp2,"tp3": tp3,"confidence": round(confidence,2)}
+    return {
+        "symbol": symbol, "side": side, "entry": price,
+        "sl": sl, "tp1": tp1, "tp2": tp2, "tp3": tp3,
+        "confidence": round(confidence,2)
+    }
 
 # ===== LOGGING =====
 def log_signal(signal):
@@ -343,9 +255,8 @@ def log_signal(signal):
 # ===== MAIN LOOP =====
 def run_bot():
     global signals_sent_total, skipped_signals, last_heartbeat
-
-    send_message("🚀 FastScalp v2 started on Bitget!")
-    print(f"[{datetime.utcnow()}] FastScalp v2 started on Bitget!")
+    send_message("🚀 FastScalp v2 started on Binance!")
+    print(f"[{datetime.utcnow()}] FastScalp v2 started on Binance!")
 
     symbols = get_top_symbols(TOP_SYMBOLS)
     print(f"[{datetime.utcnow()}] Scanning {len(symbols)} symbols: {symbols}")
@@ -355,7 +266,6 @@ def run_bot():
             try:
                 print(f"[{datetime.utcnow()}] Checking {symbol}...")
                 signal = generate_signal(symbol)
-
                 if signal:
                     log_signal(signal)
                     send_message(
@@ -378,5 +288,5 @@ def run_bot():
         print(f"Sleeping {CHECK_INTERVAL}s...")
         time.sleep(CHECK_INTERVAL)
 
-if __name__ == "__main__":
+if __name__=="__main__":
     run_bot()
