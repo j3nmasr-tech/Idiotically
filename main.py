@@ -14,19 +14,18 @@ DEBUG = True   # full debug
 CAPITAL = 80.0
 LEVERAGE = 30
 
-# first loop starts immediately, short loop cycles
 CHECK_INTERVAL = 60    # seconds between full symbol cycles
-SYMBOL_DELAY = 0.1   # short pause between symbols
+SYMBOL_DELAY = 0.1     # short pause between symbols
 
-TOP_SYMBOLS = 20      # your request: top 20 coins
+TOP_SYMBOLS = 20      # top 20 coins
 
 # ===== TIMEFRAMES =====
 TIMEFRAMES = ["5m", "15m", "30m", "1h"]
 
 # ===== SIGNAL FILTERS =====
-MIN_TF_SCORE   = 60   # increase from 55 to filter weaker signals
-CONF_MIN_TFS   = 2    # keep at 2: require at least 2 TFs in agreement
-CONFIDENCE_MIN = 65.0 # slightly higher to avoid low-confidence signals
+MIN_TF_SCORE   = 60
+CONF_MIN_TFS   = 2
+CONFIDENCE_MIN = 65.0
 
 ENTRY_FILTER_SCORE = MIN_TF_SCORE
 ENTRY_FILTER_CONF  = CONFIDENCE_MIN
@@ -36,14 +35,13 @@ MAX_OPEN_TRADES       = 50
 MAX_EXPOSURE_PCT      = 0.25
 MIN_SL_DISTANCE_PCT   = 0.0015
 SYMBOL_BLACKLIST      = set([])
-RECENT_SIGNAL_SIGNATURE_EXPIRE = 300  # seconds
+RECENT_SIGNAL_SIGNATURE_EXPIRE = 300
 
 # ===== WEIGHTS =====
-# Emphasize breakout and trend over CRT and volume for intraday signals
-WEIGHT_TURTLE = 0.5   # breakout patterns matter most
-WEIGHT_BIAS   = 0.3   # trend direction matters
-WEIGHT_CRT    = 0.15  # CRT patterns less important
-WEIGHT_VOLUME = 0.05  # volume confirmation minimal
+WEIGHT_TURTLE = 0.5
+WEIGHT_BIAS   = 0.3
+WEIGHT_CRT    = 0.15
+WEIGHT_VOLUME = 0.05
 
 LOG_CSV = "./fastscalp_v2_signals.csv"
 
@@ -52,7 +50,6 @@ open_trades = []
 recent_signals = {}
 signals_sent_total = 0
 skipped_signals = 0
-last_heartbeat = time.time()
 _last_loop_start = 0.0
 
 # ===== HELPERS =====
@@ -119,15 +116,12 @@ def get_top_symbols(n=TOP_SYMBOLS):
 
 def get_klines(symbol, interval="1m", limit=200):
     instId = okx_symbol(symbol)
-
     tf_map = {
         "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
         "1h": "1H", "2h": "2H", "4h": "4H", "6h": "6H", "12h": "12H", "1d": "1D"
     }
     okx_tf = tf_map.get(interval, "1m")
-
     url = f"{OKX_KLINES}?instId={instId}&bar={okx_tf}&limit={limit}"
-
     try:
         r = requests.get(url, timeout=8)
         r.raise_for_status()
@@ -139,7 +133,7 @@ def get_klines(symbol, interval="1m", limit=200):
     if "data" not in j or len(j["data"])==0:
         return None
 
-    rows = j["data"][::-1]  # oldest → newest
+    rows = j["data"][::-1]
     df = pd.DataFrame(rows, columns=[
         "timestamp","open","high","low","close","volume",
         "volCcy","volCcyQuote","confirm"
@@ -217,7 +211,45 @@ def trade_params_dynamic(entry, side, atr, conf_pct):
     sl  = entry - atr*1.2 if side=="BUY" else entry + atr*1.2
     return round(sl,6), round(tp1,6), round(tp2,6), round(tp3,6)
 
-# ===== SIGNAL ENGINE =====
+# ===== BTC TREND & VOLATILITY HELPERS =====
+VOLATILITY_THRESHOLD_PCT = 0.4
+
+def btc_volatility_spike():
+    df = get_klines("BTCUSDT", "5m", 3)
+    if df is None or len(df) < 3:
+        return False
+    pct = (df["close"].iloc[-1] - df["close"].iloc[0]) / df["close"].iloc[0] * 100.0
+    return abs(pct) >= VOLATILITY_THRESHOLD_PCT
+
+def btc_trend_agree():
+    df1 = get_klines("BTCUSDT", "15m", 50)
+    df2 = get_klines("BTCUSDT", "1h", 50)
+    if df1 is None or df2 is None:
+        return None, None
+    b1 = smc_bias(df1)
+    b2 = smc_bias(df2)
+    return (b1 == b2), b1 if b1==b2 else None
+
+def entry_allowed(symbol, df):
+    atr = get_atr(df)
+    last_candle = df.iloc[-1]
+    if atr is not None and abs(last_candle['close'] - last_candle['open']) > 1.8 * atr:
+        return False
+
+    recent_high = df['high'].iloc[-5:].max()
+    recent_low  = df['low'].iloc[-5:].min()
+    if (recent_high - recent_low)/recent_low < 0.003:
+        return False
+
+    btc_agree, btc_dir = btc_trend_agree()
+    if btc_agree is None or not btc_agree:
+        return False
+    if btc_volatility_spike():
+        return False
+
+    return True
+
+# ===== SIGNAL ENGINE (with BTC filter) =====
 def generate_signal(symbol):
     debug_print(f"Generating signal for {symbol}")
     global recent_signals
@@ -226,6 +258,13 @@ def generate_signal(symbol):
     total_score = 0
     conf_count = 0
 
+    # BTC & candle filter first
+    df_check = get_klines(symbol, "5m", 50)
+    if df_check is None or not entry_allowed(symbol, df_check):
+        debug_print(f"{symbol} skipped due to BTC trend/volatility or candle filter")
+        return None
+
+    # ===== SCORING =====
     for tf in TIMEFRAMES:
         df = get_klines(symbol, tf, 100)
         if df is None:
@@ -285,7 +324,7 @@ def generate_signal(symbol):
 
     recent_signals[sig_signature] = time.time()
 
-    df_main = dfs.get("1m") or list(dfs.values())[0]
+    df_main = dfs[TIMEFRAMES[0]]  # 5m TF for ATR
     atr = get_atr(df_main)
     if atr is None: return None
     price = get_price(symbol)
@@ -319,17 +358,15 @@ def log_signal(signal):
         writer = csv.writer(f)
         writer.writerow(row)
 
-# ===== STARTUP & MAIN LOOP =====
+# ===== MAIN LOOP =====
 def run_bot():
-    global signals_sent_total, skipped_signals, last_heartbeat, _last_loop_start
+    global signals_sent_total, skipped_signals, _last_loop_start
 
-    # Debug: confirm credentials are loaded
     if not BOT_TOKEN or not CHAT_ID:
-        print(f"[{datetime.utcnow()}] ⚠️ Telegram not configured! BOT_TOKEN or CHAT_ID missing.", flush=True)
+        print(f"[{datetime.utcnow()}] ⚠️ Telegram not configured!", flush=True)
     else:
         print(f"[{datetime.utcnow()}] Telegram credentials loaded.", flush=True)
 
-    # ===== STARTUP MESSAGE =====
     _last_loop_start = time.time()
     startup_text = "🚀 FastScalp v2 started on OKX! Scanning Top Symbols immediately."
     sent = send_message(startup_text)
@@ -338,7 +375,6 @@ def run_bot():
     else:
         print(f"[{datetime.utcnow()}] ⚠️ Failed to send startup message.", flush=True)
 
-    # Fetch top symbols
     try:
         symbols = get_top_symbols(TOP_SYMBOLS)
     except Exception as e:
@@ -347,10 +383,9 @@ def run_bot():
 
     print(f"[{datetime.utcnow()}] Scanning {len(symbols)} symbols: {symbols}", flush=True)
 
-    # ===== MAIN LOOP =====
     while True:
         loop_start = time.time()
-        print(f"[{datetime.utcnow()}] >>> Loop start (scanning symbols now)...", flush=True)
+        print(f"[{datetime.utcnow()}] >>> Loop start...", flush=True)
 
         for idx, symbol in enumerate(symbols, start=1):
             try:
@@ -374,14 +409,8 @@ def run_bot():
 
             time.sleep(SYMBOL_DELAY)
 
-        # Quick heartbeat every loop
-        #if time.time() - last_heartbeat > 10:
-            #send_message(f"Heartbeat: {signals_sent_total} signals sent, {skipped_signals} skipped")
-            #print(f"[{datetime.utcnow()}] Heartbeat: {signals_sent_total} signals sent, {skipped_signals} skipped", flush=True)
-            #last_heartbeat = time.time()
-
         loop_duration = time.time() - loop_start
-        print(f"[{datetime.utcnow()}] Loop finished in {loop_duration:.2f}s. Sleeping {CHECK_INTERVAL}s before next loop...", flush=True)
+        print(f"[{datetime.utcnow()}] Loop finished in {loop_duration:.2f}s. Sleeping {CHECK_INTERVAL}s...", flush=True)
         time.sleep(CHECK_INTERVAL)
 
 if __name__=="__main__":
