@@ -1,419 +1,402 @@
 #!/usr/bin/env python3
-# FastScalp v2 – Dynamic ATR / TP / SL | OKX Spot | USDT Perps
-import os, time, csv, requests, re, traceback
+# -*- coding: utf-8 -*-
+
+"""
+Premium SMC Scanner (Signals Only) – OKX Top 100
+----------------------------------------------------
+✓ NO trading
+✓ NO OKX API keys needed
+✓ Public-market data only
+✓ Telegram-only signal notifications
+✓ Northflank-ready (environment variables only)
+
+Required ENV variables:
+- TELEGRAM_BOT_TOKEN
+- TELEGRAM_CHAT_ID
+"""
+
+import os
+import time
+import asyncio
+import logging
+import datetime
+from typing import Dict, Any, Optional
+
+import aiosqlite
+import httpx
+import ccxt.async_support as ccxt
 import pandas as pd
 import numpy as np
-from datetime import datetime
 
-# ===== CONFIG =====
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID   = os.getenv("CHAT_ID")
+from fastapi import FastAPI, Request, HTTPException
+import uvicorn
 
-DEBUG = True   # full debug
 
-CAPITAL = 80.0
-LEVERAGE = 30
+###########################################################
+# ---------------------- ENV CONFIG -----------------------
+###########################################################
 
-CHECK_INTERVAL = 60    # seconds between full symbol cycles
-SYMBOL_DELAY = 0.1     # short pause between symbols
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-TOP_SYMBOLS = 60  # top 60 coins
-# ===== TIMEFRAMES =====
-TIMEFRAMES = ["5m", "15m", "30m", "1h"]
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")  # optional
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 
-# ===== SIGNAL FILTERS =====
-MIN_TF_SCORE   = 45
-CONF_MIN_TFS   = 1
-CONFIDENCE_MIN = 60.0
+DB_PATH = "signals.db"
 
-ENTRY_FILTER_SCORE = MIN_TF_SCORE
-ENTRY_FILTER_CONF  = CONFIDENCE_MIN
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
+TOP_N = int(os.getenv("TOP_N", 100))
 
-# ===== TRADE RISK MANAGEMENT =====
-MAX_OPEN_TRADES       = 50
-MAX_EXPOSURE_PCT      = 0.25
-MIN_SL_DISTANCE_PCT   = 0.0015
-SYMBOL_BLACKLIST      = set([])
-RECENT_SIGNAL_SIGNATURE_EXPIRE = 300
+MAX_SPREAD = float(os.getenv("MAX_SPREAD", "0.0015"))
+MIN_VOLUME = float(os.getenv("MIN_VOLUME", "1000000"))
 
-# ===== WEIGHTS =====
-WEIGHT_TURTLE = 0.5
-WEIGHT_BIAS   = 0.3
-WEIGHT_CRT    = 0.15
-WEIGHT_VOLUME = 0.05
+BTC_PAIR = os.getenv("BTC_PAIR", "BTC-USDT-SWAP")
 
-LOG_CSV = "./fastscalp_v2_signals.csv"
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", 3600))
+DAILY_SUMMARY_HOUR = int(os.getenv("DAILY_SUMMARY_HOUR", 23))
 
-# ===== STATE =====
-open_trades = []
-recent_signals = {}
-signals_sent_total = 0
-skipped_signals = 0
-_last_loop_start = 0.0
 
-# ===== HELPERS =====
-def debug_print(*args):
-    if DEBUG:
-        print("[DEBUG]", *args, flush=True)
+###########################################################
+# ---------------------- LOGGING --------------------------
+###########################################################
 
-def send_message(text):
-    if not BOT_TOKEN or not CHAT_ID:
-        print("Telegram not configured:", text, flush=True)
-        return False
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
+log = logging.getLogger("smc_bot")
+
+
+###########################################################
+# ------------------- TELEGRAM UTILS ----------------------
+###########################################################
+
+async def tg(msg: str):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram creds missing — cannot send message.")
+        return
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    async with httpx.AsyncClient() as client:
+        await client.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": msg,
+            "parse_mode": "HTML"
+        })
+
+
+###########################################################
+# --------------------- SQLITE INIT -----------------------
+###########################################################
+
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT,
+            side TEXT,
+            entry REAL,
+            sl REAL,
+            tp1 REAL,
+            tp2 REAL,
+            tp3 REAL,
+            timestamp TEXT,
+            status TEXT,
+            reason TEXT
+        );
+        """)
+        await db.commit()
+
+
+###########################################################
+# -------------------- FETCH OHLCV ------------------------
+###########################################################
+
+async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data={"chat_id": CHAT_ID, "text": text},
-            timeout=10
-        )
-        return True
-    except Exception as e:
-        print("Telegram error:", e, flush=True)
-        return False
-
-def sanitize_symbol(symbol):
-    return re.sub(r"[^A-Z0-9]", "", symbol.upper())
-
-# ===== OKX API =====
-OKX_TICKERS = "https://www.okx.com/api/v5/market/tickers?instType=SPOT"
-OKX_KLINES  = "https://www.okx.com/api/v5/market/candles"
-
-def okx_symbol(sym):
-    sym = sanitize_symbol(sym)
-    if sym.endswith("USDT"):
-        return sym.replace("USDT", "-USDT")
-    return sym
-
-def get_top_symbols(n=TOP_SYMBOLS):
-    try:
-        j = requests.get(OKX_TICKERS, timeout=5).json()
-    except Exception as e:
-        debug_print("Ticker request failed:", e)
-        return ["BTCUSDT","ETHUSDT"]
-
-    if "data" not in j:
-        debug_print("Ticker response invalid:", j)
-        return ["BTCUSDT","ETHUSDT"]
-
-    pairs = []
-    for d in j["data"]:
-        instId = d.get("instId","")
-        if not instId.endswith("-USDT"):
-            continue
-        try:
-            vol = float(d.get("vol24h",0))
-            last = float(d.get("last",0))
-            usdt = instId.replace("-","")
-            pairs.append((usdt, vol * last))
-        except:
-            continue
-
-    pairs.sort(key=lambda x: x[1], reverse=True)
-    final = [s for s,_ in pairs[:n]]
-    debug_print("Top symbols:", final)
-    return final or ["BTCUSDT","ETHUSDT"]
-
-def get_klines(symbol, interval="1m", limit=200):
-    instId = okx_symbol(symbol)
-    tf_map = {
-        "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
-        "1h": "1H", "2h": "2H", "4h": "4H", "6h": "6H", "12h": "12H", "1d": "1D"
-    }
-    okx_tf = tf_map.get(interval, "1m")
-    url = f"{OKX_KLINES}?instId={instId}&bar={okx_tf}&limit={limit}"
-    try:
-        r = requests.get(url, timeout=8)
-        r.raise_for_status()
-        j = r.json()
-    except Exception as e:
-        debug_print(f"{symbol} klines failed: {e}")
+        return await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    except:
         return None
 
-    if "data" not in j or len(j["data"])==0:
-        return None
 
-    rows = j["data"][::-1]
-    df = pd.DataFrame(rows, columns=[
-        "timestamp","open","high","low","close","volume",
-        "volCcy","volCcyQuote","confirm"
+###########################################################
+# ----------------------- INDICATORS ----------------------
+###########################################################
+
+def compute_atr(df: pd.DataFrame, length=14):
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+
+    tr = np.maximum(high[1:], close[:-1]) - np.minimum(low[1:], close[:-1])
+    atr = pd.Series(tr).rolling(length).mean()
+    return np.concatenate([[np.nan], atr])
+
+
+def compute_adx(df: pd.DataFrame, length=14):
+    high = df["high"].values
+    low = df["low"].values
+    close = df["close"].values
+
+    plus_dm = np.maximum(high[1:] - high[:-1], 0)
+    minus_dm = np.maximum(low[:-1] - low[1:], 0)
+
+    tr = np.maximum.reduce([
+        high[1:] - low[1:],
+        np.abs(high[1:] - close[:-1]),
+        np.abs(low[1:] - close[:-1])
     ])
-    df = df[["timestamp","open","high","low","close","volume"]].astype(float)
-    return df.reset_index(drop=True)
 
-def get_price(symbol):
-    try:
-        j = requests.get(OKX_TICKERS, timeout=5).json()
-    except Exception as e:
-        debug_print(f"{symbol} get_price failed: {e}")
-        return None
-    if "data" not in j:
-        return None
-    instId = okx_symbol(symbol)
-    for d in j["data"]:
-        if d.get("instId") == instId:
+    atr = pd.Series(tr).rolling(length).mean()
+
+    plus_di = 100 * pd.Series(plus_dm).rolling(length).sum() / atr
+    minus_di = 100 * pd.Series(minus_dm).rolling(length).sum() / atr
+    dx = (100 * np.abs(plus_di - minus_di) / (plus_di + minus_di)).rolling(length).mean()
+
+    return np.concatenate([[np.nan] * 2, dx])
+
+
+###########################################################
+# ---------------------- SMC CORE --------------------------
+###########################################################
+
+def detect_order_block(df: pd.DataFrame):
+    candle = df.iloc[-3]
+    if candle["close"] > candle["open"]:
+        return "bullish", candle["open"], candle["low"]
+    else:
+        return "bearish", candle["high"], candle["open"]
+
+
+def detect_fvg(df: pd.DataFrame):
+    c1 = df.iloc[-3]
+    c2 = df.iloc[-2]
+    c3 = df.iloc[-1]
+
+    bull = c2["low"] > c1["high"] and c3["low"] > c2["high"]
+    bear = c2["high"] < c1["low"] and c3["high"] < c2["low"]
+    return bull, bear
+
+
+def detect_liquidity_sweep(df):
+    last = df.iloc[-1]
+    prev = df.iloc[-5:-1]
+    return last["high"] > prev["high"].max(), last["low"] < prev["low"].min()
+
+
+def detect_bos(df):
+    last = df.iloc[-1]
+    prev = df.iloc[-5:-1]
+    hh = last["high"] > prev["high"].max()
+    ll = last["low"] < prev["low"].min()
+    return hh, ll
+
+
+###########################################################
+# ------------------- BTC CLEAN FILTER --------------------
+###########################################################
+
+async def btc_is_clean(exchange) -> bool:
+    ohlcv1h = await fetch_ohlcv(exchange, BTC_PAIR, "1h", 200)
+    ohlcv15 = await fetch_ohlcv(exchange, BTC_PAIR, "15m", 200)
+
+    if not ohlcv1h or not ohlcv15:
+        return False
+
+    df1h = pd.DataFrame(ohlcv1h, columns=["ts","open","high","low","close","vol"])
+    df15 = pd.DataFrame(ohlcv15, columns=["ts","open","high","low","close","vol"])
+
+    df1h["atr"] = compute_atr(df1h)
+    df1h["adx"] = compute_adx(df1h)
+
+    adx_ok = df1h["adx"].iloc[-1] > 20
+    vol_rising = df1h["atr"].iloc[-1] > df1h["atr"].iloc[-5]
+
+    hh1, ll1 = detect_bos(df1h)
+    d1h = "up" if hh1 else "down" if ll1 else "neutral"
+
+    hh15, ll15 = detect_bos(df15)
+    d15 = "up" if hh15 else "down" if ll15 else "neutral"
+
+    structure_ok = d1h == d15 and d1h != "neutral"
+
+    # News feed optional
+    if NEWS_API_KEY:
+        async with httpx.AsyncClient() as client:
             try:
-                return float(d.get("last",0))
+                r = await client.get(f"https://cryptopanic.com/api/v1/posts/?auth_token={NEWS_API_KEY}")
+                items = r.json().get("results", [])
+                for item in items:
+                    if item.get("votes", {}).get("important", 0) > 2:
+                        return False
             except:
-                return None
+                pass
+
+    return adx_ok and vol_rising and structure_ok
+
+
+###########################################################
+# ------------------- SIGNAL CREATION ---------------------
+###########################################################
+
+def generate_signal(df: pd.DataFrame, symbol: str):
+    ob_type, ob_hi, ob_lo = detect_order_block(df)
+    bull_fvg, bear_fvg = detect_fvg(df)
+    sweep_high, sweep_low = detect_liquidity_sweep(df)
+    bos_hh, bos_ll = detect_bos(df)
+
+    last = df["close"].iloc[-1]
+
+    long = (
+        ob_type == "bullish" and bull_fvg and sweep_low and bos_hh and last > ob_hi
+    )
+
+    short = (
+        ob_type == "bearish" and bear_fvg and sweep_high and bos_ll and last < ob_lo
+    )
+
+    if long:
+        return {
+            "symbol": symbol,
+            "side": "BUY",
+            "entry": float(last),
+            "sl": float(ob_lo),
+            "tp1": float(last * 1.004),
+            "tp2": float(last * 1.008),
+            "tp3": float(last * 1.012),
+            "reason": "Premium SMC long"
+        }
+
+    if short:
+        return {
+            "symbol": symbol,
+            "side": "SELL",
+            "entry": float(last),
+            "sl": float(ob_hi),
+            "tp1": float(last * 0.996),
+            "tp2": float(last * 0.992),
+            "tp3": float(last * 0.988),
+            "reason": "Premium SMC short"
+        }
+
     return None
 
-# ===== INDICATORS =====
-def detect_crt(df):
-    if len(df)<12: return False,False
-    last = df.iloc[-1]
-    o,h,l,c,v = last["open"], last["high"], last["low"], last["close"], last["volume"]
-    body_series = (df["close"] - df["open"]).abs()
-    avg_body = body_series.rolling(10,min_periods=6).mean().iloc[-1]
-    avg_vol  = df["volume"].rolling(10,min_periods=6).mean().iloc[-1]
-    if np.isnan(avg_body) or np.isnan(avg_vol): return False,False
-    body = abs(c-o)
-    wick_up = h - max(o,c)
-    wick_down = min(o,c) - l
-    bull = body<avg_body*0.7 and wick_down>avg_body*0.6 and v<avg_vol*1.2 and c>o
-    bear = body<avg_body*0.7 and wick_up>avg_body*0.6 and v<avg_vol*1.2 and c<o
-    return bull,bear
 
-def detect_turtle(df, look=20):
-    if len(df)<look+2: return False,False
-    ph = df["high"].iloc[-look-1:-1].max()
-    pl = df["low"].iloc[-look-1:-1].min()
-    last = df.iloc[-1]
-    bull = last["low"] < pl and last["close"] > pl*1.005
-    bear = last["high"] > ph and last["close"] < ph*0.995
-    return bull,bear
+###########################################################
+# ---------------------- LOG SIGNAL -----------------------
+###########################################################
 
-def smc_bias(df):
-    e20 = df["close"].ewm(span=20).mean().iloc[-1]
-    e50 = df["close"].ewm(span=50).mean().iloc[-1]
-    return "bull" if (e20-e50)/e50>0.002 else "bear"
+async def log_signal(sig):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+        """, (
+            sig["symbol"], sig["side"], sig["entry"], sig["sl"],
+            sig["tp1"], sig["tp2"], sig["tp3"],
+            datetime.datetime.utcnow().isoformat(),
+            "OPEN", sig["reason"]
+        ))
+        await db.commit()
 
-def volume_ok(df):
-    ma = df["volume"].rolling(20,min_periods=8).mean().iloc[-1]
-    if np.isnan(ma): return True
-    e20 = df["close"].ewm(span=20).mean().iloc[-1]
-    e50 = df["close"].ewm(span=50).mean().iloc[-1]
-    mult = 1.2 if e20>e50 else 1.1
-    return df["volume"].iloc[-1] > ma*mult
 
-# ===== ATR & TP/SL =====
-def get_atr(df, period=14):
-    if len(df)<period+1: return None
-    h,l,c = df["high"].values, df["low"].values, df["close"].values
-    trs = [max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])) for i in range(1,len(df))]
-    return float(np.mean(trs)) if trs else None
+###########################################################
+# ------------------------ MAIN LOOP ----------------------
+###########################################################
 
-def trade_params_dynamic(entry, side, atr, conf_pct):
-    adj = 1 + (conf_pct/100)*0.5
-    tp1 = entry + atr*1.5*adj if side=="BUY" else entry - atr*1.5*adj
-    tp2 = entry + atr*2.5*adj if side=="BUY" else entry - atr*2.5*adj
-    tp3 = entry + atr*3.5*adj if side=="BUY" else entry - atr*3.5*adj
-    sl  = entry - atr*1.2 if side=="BUY" else entry + atr*1.2
-    return round(sl,6), round(tp1,6), round(tp2,6), round(tp3,6)
+async def scan_loop():
+    exchange = ccxt.okx({"enableRateLimit": True})
+    await init_db()
 
-# ===== BTC TREND & VOLATILITY HELPERS =====
-VOLATILITY_THRESHOLD_PCT = 0.8
-
-def btc_volatility_spike():
-    df = get_klines("BTCUSDT", "5m", 3)
-    if df is None or len(df) < 3:
-        return False
-    pct = (df["close"].iloc[-1] - df["close"].iloc[0]) / df["close"].iloc[0] * 100.0
-    return abs(pct) >= VOLATILITY_THRESHOLD_PCT
-
-def btc_trend_agree():
-    df1 = get_klines("BTCUSDT", "15m", 50)
-    df2 = get_klines("BTCUSDT", "1h", 50)
-    if df1 is None or df2 is None:
-        return None, None
-    b1 = smc_bias(df1)
-    b2 = smc_bias(df2)
-    return (b1 == b2), b1 if b1==b2 else None
-
-def entry_allowed(symbol, df):
-    atr = get_atr(df)
-    last_candle = df.iloc[-1]
-    if atr is not None and abs(last_candle['close'] - last_candle['open']) > 2.5 * atr:
-        return False
-
-    recent_high = df['high'].iloc[-5:].max()
-    recent_low  = df['low'].iloc[-5:].min()
-    if (recent_high - recent_low)/recent_low < 0.0015:
-        return False
-
-    btc_agree, btc_dir = btc_trend_agree()
-    # Relaxed: only check if we can detect BTC direction
-    if btc_dir is None:
-        return False  # only skip if trend is undetectable
-    # otherwise allow trades even if BTC 15m disagrees
-
-    if btc_volatility_spike():
-        return False
-
-    return True
-
-# ===== SIGNAL ENGINE (with BTC filter) =====
-def generate_signal(symbol):
-    debug_print(f"Generating signal for {symbol}")
-    global recent_signals
-    dfs = {}
-    directions = {}
-    total_score = 0
-    conf_count = 0
-
-    # BTC & candle filter first
-    df_check = get_klines(symbol, "5m", 50)
-    if df_check is None or not entry_allowed(symbol, df_check):
-        debug_print(f"{symbol} skipped due to BTC trend/volatility or candle filter")
-        return None
-
-    # ===== SCORING =====
-    for tf in TIMEFRAMES:
-        df = get_klines(symbol, tf, 100)
-        if df is None:
-            directions[tf] = None
-            continue
-        dfs[tf] = df
-
-        bull_t, bear_t = detect_turtle(df)
-        bull_c, bear_c = detect_crt(df)
-        bias = smc_bias(df)
-        vol_ok_flag = volume_ok(df)
-
-        bull_score = 0
-        bear_score = 0
-
-        if bull_t: bull_score += WEIGHT_TURTLE*100
-        if bear_t: bear_score += WEIGHT_TURTLE*100
-        if bull_c: bull_score += WEIGHT_CRT*100
-        if bear_c: bear_score += WEIGHT_CRT*100
-        if bias=="bull": bull_score += WEIGHT_BIAS*100
-        else: bear_score += WEIGHT_BIAS*100
-        if vol_ok_flag:
-            bull_score += WEIGHT_VOLUME*50
-            bear_score += WEIGHT_VOLUME*50
-
-        total_score += max(bull_score,bear_score)
-
-        if bull_score >= ENTRY_FILTER_SCORE:
-            directions[tf] = "BUY"
-        elif bear_score >= ENTRY_FILTER_SCORE:
-            directions[tf] = "SELL"
-        else:
-            directions[tf] = None
-
-        if directions[tf] is not None:
-            conf_count += 1
-
-        debug_print(symbol, tf, "bull:", bull_score, "bear:", bear_score, "dir:", directions[tf])
-
-    if conf_count < CONF_MIN_TFS:
-        debug_print(f"{symbol} rejected: insufficient TF confirmations")
-        return None
-
-    buy_count = sum(1 for d in directions.values() if d=="BUY")
-    sell_count = sum(1 for d in directions.values() if d=="SELL")
-    side = "BUY" if buy_count>sell_count else "SELL"
-
-    confidence = total_score / max(1,len(dfs))
-    if confidence < ENTRY_FILTER_CONF:
-        debug_print(f"{symbol} rejected: low confidence {confidence:.2f}")
-        return None
-
-    sig_signature = f"{symbol}_{side}"
-    if sig_signature in recent_signals and (time.time()-recent_signals[sig_signature]) < RECENT_SIGNAL_SIGNATURE_EXPIRE:
-        debug_print(f"{symbol} duplicate signal blocked.")
-        return None
-
-    recent_signals[sig_signature] = time.time()
-
-    df_main = dfs[TIMEFRAMES[0]]  # 5m TF for ATR
-    atr = get_atr(df_main)
-    if atr is None: return None
-    price = get_price(symbol)
-    if price is None: return None
-
-    sl,tp1,tp2,tp3 = trade_params_dynamic(price, side, atr, confidence)
-
-    return {
-        "symbol": symbol,
-        "side": side,
-        "entry": price,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "confidence": round(confidence,2)
-    }
-
-# ===== LOGGING =====
-def log_signal(signal):
-    if signal is None: return
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    row = [now, signal["symbol"], signal["side"], signal["entry"],
-           signal["sl"], signal["tp1"], signal["tp2"], signal["tp3"],
-           signal["confidence"]]
-    if not os.path.exists(LOG_CSV):
-        with open(LOG_CSV,"w",newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["time","symbol","side","entry","sl","tp1","tp2","tp3","confidence"])
-    with open(LOG_CSV,"a",newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(row)
-
-# ===== MAIN LOOP =====
-def run_bot():
-    global signals_sent_total, skipped_signals, _last_loop_start
-
-    if not BOT_TOKEN or not CHAT_ID:
-        print(f"[{datetime.utcnow()}] ⚠️ Telegram not configured!", flush=True)
-    else:
-        print(f"[{datetime.utcnow()}] Telegram credentials loaded.", flush=True)
-
-    _last_loop_start = time.time()
-    startup_text = "🚀 FastScalp v2 started on OKX! Scanning Top Symbols immediately."
-    sent = send_message(startup_text)
-    if sent:
-        print(f"[{datetime.utcnow()}] ✅ Startup message sent to Telegram.", flush=True)
-    else:
-        print(f"[{datetime.utcnow()}] ⚠️ Failed to send startup message.", flush=True)
-
-    try:
-        symbols = get_top_symbols(TOP_SYMBOLS)
-    except Exception as e:
-        print(f"[{datetime.utcnow()}] ⚠️ Error fetching top symbols: {e}", flush=True)
-        symbols = ["BTCUSDT","ETHUSDT"]
-
-    print(f"[{datetime.utcnow()}] Scanning {len(symbols)} symbols: {symbols}", flush=True)
+    last_heartbeat = 0
 
     while True:
-        loop_start = time.time()
-        print(f"[{datetime.utcnow()}] >>> Loop start...", flush=True)
+        t0 = time.time()
 
-        for idx, symbol in enumerate(symbols, start=1):
-            try:
-                print(f"[{datetime.utcnow()}] [{idx}/{len(symbols)}] Checking {symbol}...", flush=True)
-                signal = generate_signal(symbol)
-                if signal:
-                    log_signal(signal)
-                    send_message(
-                        f"🔥 {signal['symbol']} | {signal['side']} | Entry: {signal['entry']}\n"
-                        f"SL: {signal['sl']} | TP1: {signal['tp1']} | TP2: {signal['tp2']} | TP3: {signal['tp3']}\n"
-                        f"Conf: {signal['confidence']}%"
+        try:
+            # BTC cleanliness filter
+            if not await btc_is_clean(exchange):
+                await tg("⚠️ PAUSED — BTC not clean for SMC conditions")
+                await asyncio.sleep(SCAN_INTERVAL)
+                continue
+
+            markets = await exchange.load_markets()
+            tickers = await exchange.fetch_tickers()
+
+            # top 100 by quote volume
+            top = sorted(
+                [(s, v.get("quoteVolume", 0)) for s, v in tickers.items() if s.endswith("USDT")],
+                key=lambda x: x[1],
+                reverse=True
+            )[:TOP_N]
+
+            for symbol, vol in top:
+                if vol < MIN_VOLUME:
+                    continue
+
+                ohlcv = await fetch_ohlcv(exchange, symbol, "1m", 200)
+                if not ohlcv:
+                    continue
+
+                df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+                sig = generate_signal(df, symbol)
+
+                if sig:
+                    await tg(
+                        f"🚀 <b>SMC Signal</b>\n"
+                        f"{sig['symbol']} | {sig['side']}\n"
+                        f"Entry: {sig['entry']}\n"
+                        f"SL: {sig['sl']}\n"
+                        f"TP1: {sig['tp1']}  TP2: {sig['tp2']}  TP3: {sig['tp3']}\n"
+                        f"{sig['reason']}"
                     )
-                    signals_sent_total += 1
-                    print(f"[{datetime.utcnow()}] >>> SIGNAL for {symbol}: {signal['side']} (conf {signal['confidence']})", flush=True)
-                else:
-                    skipped_signals += 1
-                    print(f"[{datetime.utcnow()}] >>> No signal for {symbol}", flush=True)
-            except Exception as e:
-                traceback.print_exc()
-                print(f"Error on {symbol}: {e}", flush=True)
+                    await log_signal(sig)
 
-            time.sleep(SYMBOL_DELAY)
+            # Heartbeat
+            now = time.time()
+            if now - last_heartbeat > HEARTBEAT_INTERVAL:
+                last_heartbeat = now
+                await tg("❤️ SMC Scanner running smoothly.")
 
-        loop_duration = time.time() - loop_start
-        print(f"[{datetime.utcnow()}] Loop finished in {loop_duration:.2f}s. Sleeping {CHECK_INTERVAL}s...", flush=True)
-        time.sleep(CHECK_INTERVAL)
+            # Daily summary placeholder
+            utc = datetime.datetime.utcnow()
+            if utc.hour == DAILY_SUMMARY_HOUR and utc.minute < 2:
+                await tg("📊 Daily summary: Placeholder (expand if needed).")
 
-if __name__=="__main__":
-    run_bot()
+        except Exception as e:
+            log.exception("Error: %s", e)
+            await tg(f"❌ Error: {e}")
+
+        elapsed = time.time() - t0
+        await asyncio.sleep(max(1, SCAN_INTERVAL - elapsed))
+
+
+###########################################################
+# ---------------------- FASTAPI API ----------------------
+###########################################################
+
+app = FastAPI()
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    token = request.headers.get("X-Auth", "")
+    if token != WEBHOOK_SECRET:
+        raise HTTPException(403, "Invalid secret")
+
+    data = await request.json()
+    log.info("Webhook received: %s", data)
+    return {"ok": True}
+
+
+###########################################################
+# --------------------------- RUN -------------------------
+###########################################################
+
+if __name__ == "__main__":
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--http", action="store_true")
+    args = p.parse_args()
+
+    if args.http:
+        uvicorn.run(app, host="0.0.0.0", port=9000)
+    else:
+        asyncio.run(scan_loop())
