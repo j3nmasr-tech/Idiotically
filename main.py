@@ -52,7 +52,8 @@ def send_message(text):
         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                       data={"chat_id": CHAT_ID, "text": text}, timeout=10)
         return True
-    except:
+    except Exception as e:
+        print("Telegram error:", e)
         return False
 
 def sanitize_symbol(symbol):
@@ -169,6 +170,7 @@ def trade_params_dynamic(entry, side, atr, conf_pct):
     tp3 = entry + atr*3.5*adj if side=="BUY" else entry - atr*3.5*adj
     sl  = entry - atr*1.2 if side=="BUY" else entry + atr*1.2
     return round(sl,6), round(tp1,6), round(tp2,6), round(tp3,6)
+
 # ===== SIGNAL ENGINE =====
 def generate_signal(symbol):
     global recent_signals
@@ -184,7 +186,7 @@ def generate_signal(symbol):
         bull_t, bear_t = detect_turtle(df)
         bull_c, bear_c = detect_crt(df)
         bias = smc_bias(df)
-        vol_ok = volume_ok(df)
+        vol_ok_flag = volume_ok(df)
         bull_score = 0
         bear_score = 0
         if bull_t: bull_score += WEIGHT_TURTLE*100
@@ -193,39 +195,35 @@ def generate_signal(symbol):
         if bear_c: bear_score += WEIGHT_CRT*100
         if bias=="bull": bull_score += WEIGHT_BIAS*100
         else: bear_score += WEIGHT_BIAS*100
-        if vol_ok: bull_score += WEIGHT_VOLUME*50; bear_score += WEIGHT_VOLUME*50
+        if vol_ok_flag: bull_score += WEIGHT_VOLUME*50; bear_score += WEIGHT_VOLUME*50
         total_score += max(bull_score,bear_score)
-        scores[tf] = {"bull":bull_score, "bear":bear_score, "bias":bias, "vol_ok":vol_ok}
+        scores[tf] = {"bull":bull_score, "bear":bear_score, "bias":bias, "vol_ok":vol_ok_flag}
         if bull_score>=MIN_TF_SCORE: directions[tf]="BUY"
         elif bear_score>=MIN_TF_SCORE: directions[tf]="SELL"
         else: directions[tf]=None
         if directions[tf] is not None: conf_count+=1
 
-    # Check minimum TF confirmations
     if conf_count<CONF_MIN_TFS: return None
 
-    # Determine dominant side
     buy_count = sum(1 for d in directions.values() if d=="BUY")
     sell_count = sum(1 for d in directions.values() if d=="SELL")
     side = "BUY" if buy_count>sell_count else "SELL"
 
-    # Average confidence
-    confidence = total_score / len(TIMEFRAMES)
+    confidence = total_score / max(1,len(dfs))
     if confidence<CONFIDENCE_MIN: return None
 
-    # Deduplicate recent signals
     sig_signature = f"{symbol}_{side}"
     if sig_signature in recent_signals and (time.time()-recent_signals[sig_signature])<RECENT_SIGNAL_SIGNATURE_EXPIRE:
         return None
     recent_signals[sig_signature] = time.time()
 
-    # Calculate dynamic TP/SL
-    df_main = dfs["5m"] if "5m" in dfs else list(dfs.values())[0]
+    df_main = dfs.get("5m") or list(dfs.values())[0]
     atr = get_atr(df_main)
     if atr is None: return None
     price = get_price(symbol)
     if price is None: return None
     sl,tp1,tp2,tp3 = trade_params_dynamic(price, side, atr, confidence)
+
     return {
         "symbol": symbol,
         "side": side,
@@ -269,7 +267,6 @@ def run_bot():
             except Exception as e:
                 print(f"Error processing {symbol}: {e}")
                 continue
-        # Heartbeat every 10 min
         if time.time()-last_heartbeat>600:
             send_message(f"FastScalp v2 heartbeat: {signals_sent_total} signals sent, {skipped_signals} skipped")
             last_heartbeat = time.time()
