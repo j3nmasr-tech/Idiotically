@@ -375,10 +375,10 @@ def run_bot():
             time.sleep(SYMBOL_DELAY)
 
         # Quick heartbeat every loop
-        if time.time() - last_heartbeat > 10:
-            send_message(f"Heartbeat: {signals_sent_total} signals sent, {skipped_signals} skipped")
-            print(f"[{datetime.utcnow()}] Heartbeat: {signals_sent_total} signals sent, {skipped_signals} skipped", flush=True)
-            last_heartbeat = time.time()
+        #if time.time() - last_heartbeat > 10:
+            #send_message(f"Heartbeat: {signals_sent_total} signals sent, {skipped_signals} skipped")
+            #print(f"[{datetime.utcnow()}] Heartbeat: {signals_sent_total} signals sent, {skipped_signals} skipped", flush=True)
+            #last_heartbeat = time.time()
 
         loop_duration = time.time() - loop_start
         print(f"[{datetime.utcnow()}] Loop finished in {loop_duration:.2f}s. Sleeping {CHECK_INTERVAL}s before next loop...", flush=True)
