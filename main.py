@@ -22,8 +22,8 @@ MIN_TF_SCORE = 55
 CONF_MIN_TFS = 2
 CONFIDENCE_MIN = 60.0
 
-ENTRY_FILTER_SCORE = MIN_TF_SCORE          # FIXED missing variable
-ENTRY_FILTER_CONF  = CONFIDENCE_MIN        # FIXED missing variable
+ENTRY_FILTER_SCORE = MIN_TF_SCORE
+ENTRY_FILTER_CONF  = CONFIDENCE_MIN
 
 MAX_OPEN_TRADES = 50
 MAX_EXPOSURE_PCT = 0.25
@@ -68,7 +68,30 @@ def send_message(text):
 def sanitize_symbol(symbol):
     return re.sub(r"[^A-Z0-9_.-]","",symbol.upper())[:20]
 
-# ===== SAFE JSON (DEBUG AWARE) =====
+# ===== BITGET API =====
+BITGET_TICKERS = "https://api.bitget.com/api/spot/v1/market/tickers"
+BITGET_KLINES  = "https://api.bitget.com/api/spot/v1/market/candles"
+
+# Bitget SPOT granularity mapping
+_interval_map = {
+    "1m":  "1min",
+    "3m":  "3min",
+    "5m":  "5min",
+    "15m": "15min",
+    "30m": "30min",
+    "1h":  "1hour",
+    "4h":  "4hour"
+}
+
+def interval_to_bitget(tf: str) -> str:
+    return _interval_map.get(tf, "5min")
+
+def to_bitget_symbol(symbol: str) -> str:
+    if symbol.endswith("_SPBL"):
+        return symbol
+    return f"{symbol}_SPBL"
+
+# ===== SAFE JSON =====
 def safe_get_json(url, params=None, timeout=5, retries=1):
     for attempt in range(retries+1):
         try:
@@ -86,25 +109,7 @@ def safe_get_json(url, params=None, timeout=5, retries=1):
                 debug_print("Returning None after retries.")
                 return None
 
-# ===== BITGET API =====
-BITGET_TICKERS = "https://api.bitget.com/api/spot/v1/market/tickers"
-BITGET_KLINES  = "https://api.bitget.com/api/spot/v1/market/candles"
-
-# Bitget SPOT uses string tokens for granularity (e.g. "5min", "1hour")
-_interval_map = {
-    "1m": "1min",
-    "3m": "3min",
-    "5m": "5min",
-    "15m":"15min",
-    "30m":"30min",
-    "1h":"1hour",
-    "4h":"4hour"
-}
-
-def interval_to_bitget(tf):
-    # return correct spot granularity token (fallback to "5min")
-    return _interval_map.get(tf, "5min")
-
+# ===== TOP SYMBOLS =====
 def get_top_symbols(n=TOP_SYMBOLS):
     j = safe_get_json(BITGET_TICKERS)
     if not j or "data" not in j:
@@ -122,32 +127,32 @@ def get_top_symbols(n=TOP_SYMBOLS):
         except:
             continue
 
-    pairs.sort(key=lambda x:x[1], reverse=True)
+    pairs.sort(key=lambda x: x[1], reverse=True)
     final = [s for s,_ in pairs[:n]]
     debug_print("Top symbols:", final)
     return final or ["BTCUSDT","ETHUSDT"]
 
-# ===== KLINES WITH FULL DEBUG =====
+# ===== KLINES =====
 def get_klines(symbol, interval="5m", limit=200):
-    symbol = sanitize_symbol(symbol)
+    symbol_bitget = to_bitget_symbol(sanitize_symbol(symbol))
     gran = interval_to_bitget(interval)
 
     j = safe_get_json(
         BITGET_KLINES,
-        {"symbol": symbol, "granularity": gran, "limit": limit},
-        timeout=8
+        {"symbol": symbol_bitget, "granularity": gran, "limit": limit},
+        timeout=8,
+        retries=2
     )
 
     if not j:
-        debug_print(f"Klines None for {symbol} {interval}")
+        debug_print(f"Klines None for {symbol_bitget} {interval}")
         return None
 
     data = j.get("data")
     if not data:
-        debug_print(f"Klines empty for {symbol}")
+        debug_print(f"Klines empty for {symbol_bitget}")
         return None
 
-    # list-of-lists (most common)
     if isinstance(data, list) and len(data) > 0 and isinstance(data[0], (list, tuple)):
         try:
             df = pd.DataFrame(data, columns=["timestamp","open","high","low","close","volume"])
@@ -155,7 +160,6 @@ def get_klines(symbol, interval="5m", limit=200):
             df = pd.DataFrame(data)
     else:
         df = pd.DataFrame(data)
-        # rename common alt fields
         mapping = {}
         if "time" in df.columns and "timestamp" not in df.columns:
             mapping["time"] = "timestamp"
@@ -167,23 +171,23 @@ def get_klines(symbol, interval="5m", limit=200):
             df = df.rename(columns=mapping)
 
     if df.empty:
-        debug_print(f"Klines DataFrame empty for {symbol}")
+        debug_print(f"Klines DataFrame empty for {symbol_bitget}")
         return None
 
-    # ensure numeric
     for col in ["open","high","low","close","volume"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     return df.reset_index(drop=True)
 
+# ===== PRICE =====
 def get_price(symbol):
-    symbol = sanitize_symbol(symbol)
+    symbol_bitget = to_bitget_symbol(sanitize_symbol(symbol))
     j = safe_get_json(BITGET_TICKERS)
     if not j or "data" not in j:
         return None
     for d in j["data"]:
-        if sanitize_symbol(d.get("symbol","")) == symbol:
+        if sanitize_symbol(d.get("symbol","")) == symbol_bitget.replace("_SPBL",""):
             try:
                 return float(d.get("last",0))
             except:
@@ -197,32 +201,24 @@ def detect_crt(df):
         return False,False
     last = df.iloc[-1]
     o,h,l,c,v = last["open"],last["high"],last["low"],last["close"],last["volume"]
-
     body_series = (df["close"] - df["open"]).abs()
     avg_body = body_series.rolling(10,min_periods=6).mean().iloc[-1]
     avg_vol  = df["volume"].rolling(10,min_periods=6).mean().iloc[-1]
-
     if np.isnan(avg_body) or np.isnan(avg_vol):
-        debug_print("CRT invalid avg body/volume")
         return False,False
-
     body = abs(c-o)
     wick_up = h - max(o,c)
     wick_down = min(o,c) - l
-
     bull = body < avg_body*0.7 and wick_down > avg_body*0.6 and v < avg_vol*1.2 and c > o
     bear = body < avg_body*0.7 and wick_up > avg_body*0.6 and v < avg_vol*1.2 and c < o
     return bull,bear
 
 def detect_turtle(df, look=20):
     if len(df)<look+2:
-        debug_print("Turtle skipped - insufficient data")
         return False,False
-
     ph = df["high"].iloc[-look-1:-1].max()
     pl = df["low"].iloc[-look-1:-1].min()
     last = df.iloc[-1]
-
     bull = last["low"] < pl and last["close"] > pl*1.005
     bear = last["high"] > ph and last["close"] < ph*0.995
     return bull,bear
@@ -230,8 +226,7 @@ def detect_turtle(df, look=20):
 def smc_bias(df):
     e20 = df["close"].ewm(span=20).mean().iloc[-1]
     e50 = df["close"].ewm(span=50).mean().iloc[-1]
-    bias = "bull" if (e20 - e50)/e50 > 0.002 else "bear"
-    return bias
+    return "bull" if (e20 - e50)/e50 > 0.002 else "bear"
 
 def volume_ok(df):
     ma = df["volume"].rolling(20,min_periods=8).mean().iloc[-1]
@@ -241,19 +236,12 @@ def volume_ok(df):
     mult = 1.2 if e20 > e50 else 1.1
     return df["volume"].iloc[-1] > ma * mult
 
-# ===== ATR =====
+# ===== ATR & TRADE PARAMETERS =====
 def get_atr(df, period=14):
-    if len(df) < period+1:
-        debug_print("ATR insufficient candles")
-        return None
+    if len(df) < period+1: return None
     h,l,c = df["high"].values, df["low"].values, df["close"].values
-    trs = [
-        max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1]))
-        for i in range(1,len(df))
-    ]
-    if not trs:
-        debug_print("ATR TR empty")
-        return None
+    trs = [max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])) for i in range(1,len(df))]
+    if not trs: return None
     return float(np.mean(trs))
 
 def trade_params_dynamic(entry, side, atr, conf_pct):
@@ -320,7 +308,6 @@ def generate_signal(symbol):
 
     buy_count = sum(1 for d in directions.values() if d=="BUY")
     sell_count = sum(1 for d in directions.values() if d=="SELL")
-
     side = "BUY" if buy_count > sell_count else "SELL"
     confidence = total_score / max(1, len(dfs))
 
