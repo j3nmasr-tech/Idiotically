@@ -11,8 +11,8 @@ CHAT_ID   = os.getenv("CHAT_ID")
 
 CAPITAL = 80.0
 LEVERAGE = 30
-CHECK_INTERVAL = 60  # 1 min
-API_CALL_DELAY = 0.05
+CHECK_INTERVAL = 300  # 5 minutes
+API_CALL_DELAY = 0.3  # 0.3 seconds between each API call
 TOP_SYMBOLS = 40
 
 TIMEFRAMES = ["5m","15m","30m","1h"]
