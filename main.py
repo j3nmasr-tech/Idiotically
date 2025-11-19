@@ -20,24 +20,30 @@ SYMBOL_DELAY = 0.1   # short pause between symbols
 
 TOP_SYMBOLS = 20      # your request: top 20 coins
 
+# ===== TIMEFRAMES =====
 TIMEFRAMES = ["5m", "15m", "30m", "1h"]
-MIN_TF_SCORE = 55
-CONF_MIN_TFS = 2
-CONFIDENCE_MIN = 60.0
+
+# ===== SIGNAL FILTERS =====
+MIN_TF_SCORE   = 60   # increase from 55 to filter weaker signals
+CONF_MIN_TFS   = 2    # keep at 2: require at least 2 TFs in agreement
+CONFIDENCE_MIN = 65.0 # slightly higher to avoid low-confidence signals
 
 ENTRY_FILTER_SCORE = MIN_TF_SCORE
 ENTRY_FILTER_CONF  = CONFIDENCE_MIN
 
-MAX_OPEN_TRADES = 50
-MAX_EXPOSURE_PCT = 0.25
-MIN_SL_DISTANCE_PCT = 0.0015
-SYMBOL_BLACKLIST = set([])
-RECENT_SIGNAL_SIGNATURE_EXPIRE = 300
+# ===== TRADE RISK MANAGEMENT =====
+MAX_OPEN_TRADES       = 50
+MAX_EXPOSURE_PCT      = 0.25
+MIN_SL_DISTANCE_PCT   = 0.0015
+SYMBOL_BLACKLIST      = set([])
+RECENT_SIGNAL_SIGNATURE_EXPIRE = 300  # seconds
 
-WEIGHT_BIAS   = 0.2
-WEIGHT_TURTLE = 0.4
-WEIGHT_CRT    = 0.25
-WEIGHT_VOLUME = 0.15
+# ===== WEIGHTS =====
+# Emphasize breakout and trend over CRT and volume for intraday signals
+WEIGHT_TURTLE = 0.5   # breakout patterns matter most
+WEIGHT_BIAS   = 0.3   # trend direction matters
+WEIGHT_CRT    = 0.15  # CRT patterns less important
+WEIGHT_VOLUME = 0.05  # volume confirmation minimal
 
 LOG_CSV = "./fastscalp_v2_signals.csv"
 
