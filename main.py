@@ -17,8 +17,7 @@ LEVERAGE = 30
 CHECK_INTERVAL = 60    # seconds between full symbol cycles
 SYMBOL_DELAY = 0.1     # short pause between symbols
 
-TOP_SYMBOLS = 20      # top 20 coins
-
+TOP_SYMBOLS = 60  # top 60 coins
 # ===== TIMEFRAMES =====
 TIMEFRAMES = ["5m", "15m", "30m", "1h"]
 
