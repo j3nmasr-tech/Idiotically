@@ -90,14 +90,20 @@ def safe_get_json(url, params=None, timeout=5, retries=1):
 BITGET_TICKERS = "https://api.bitget.com/api/spot/v1/market/tickers"
 BITGET_KLINES  = "https://api.bitget.com/api/spot/v1/market/candles"
 
-# Bitget usually uses SECONDS for granularity
+# Bitget SPOT uses string tokens for granularity (e.g. "5min", "1hour")
 _interval_map = {
-    "1m":"60","3m":"180","5m":"300","15m":"900",
-    "30m":"1800","1h":"3600","4h":"14400"
+    "1m": "1min",
+    "3m": "3min",
+    "5m": "5min",
+    "15m":"15min",
+    "30m":"30min",
+    "1h":"1hour",
+    "4h":"4hour"
 }
 
 def interval_to_bitget(tf):
-    return _interval_map.get(tf, "300")
+    # return correct spot granularity token (fallback to "5min")
+    return _interval_map.get(tf, "5min")
 
 def get_top_symbols(n=TOP_SYMBOLS):
     j = safe_get_json(BITGET_TICKERS)
@@ -116,7 +122,7 @@ def get_top_symbols(n=TOP_SYMBOLS):
         except:
             continue
 
-    pairs.sort(key=lambda x: x[1], reverse=True)
+    pairs.sort(key=lambda x:x[1], reverse=True)
     final = [s for s,_ in pairs[:n]]
     debug_print("Top symbols:", final)
     return final or ["BTCUSDT","ETHUSDT"]
