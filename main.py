@@ -9,12 +9,14 @@ from datetime import datetime
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID   = os.getenv("CHAT_ID")
 
-DEBUG = True   # <<< TURN DEBUG ON/OFF HERE
+DEBUG = True   # <<< TURN DEBUG ON/OFF HERE (kept True as you requested full debug)
 
 CAPITAL = 80.0
 LEVERAGE = 30
-CHECK_INTERVAL = 300
-SYMBOL_DELAY = 0.3
+
+# Changed so first full loop happens immediately and loop cycles are short
+CHECK_INTERVAL = 1        # seconds between full symbol cycles (was 300)
+SYMBOL_DELAY = 0.05       # short pause between symbols to be gentle on API
 
 # <<< YOU REQUESTED THIS → TOP 10 ONLY >>>
 TOP_SYMBOLS = 10
@@ -46,15 +48,17 @@ recent_signals = {}
 signals_sent_total = 0
 skipped_signals = 0
 last_heartbeat = time.time()
+_last_loop_start = 0.0
 
 # ===== HELPERS =====
 def debug_print(*args):
     if DEBUG:
-        print("[DEBUG]", *args)
+        print("[DEBUG]", *args, flush=True)
 
 def send_message(text):
     if not BOT_TOKEN or not CHAT_ID:
-        print("Telegram not configured:", text)
+        # do not block — just log locally
+        print("Telegram not configured:", text, flush=True)
         return False
     try:
         requests.post(
@@ -64,7 +68,7 @@ def send_message(text):
         )
         return True
     except Exception as e:
-        print("Telegram error:", e)
+        print("Telegram error:", e, flush=True)
         return False
 
 def sanitize_symbol(symbol):
@@ -123,7 +127,8 @@ def get_price(symbol):
     symbol = sanitize_symbol(symbol)
     try:
         j = requests.get(BINANCE_TICKERS, timeout=5).json()
-    except:
+    except Exception as e:
+        debug_print(f"{symbol} get_price failed: {e}")
         return None
     for d in j:
         if sanitize_symbol(d.get("symbol","")) == symbol:
@@ -290,18 +295,24 @@ def log_signal(signal):
 
 # ===== MAIN LOOP =====
 def run_bot():
-    global signals_sent_total, skipped_signals, last_heartbeat
+    global signals_sent_total, skipped_signals, last_heartbeat, _last_loop_start
 
+    # immediate start logging
+    print(f"[{datetime.utcnow()}] FastScalp v2 starting on Binance... (immediate scan)", flush=True)
     send_message("🚀 FastScalp v2 started on Binance!")
-    print(f"[{datetime.utcnow()}] FastScalp v2 started on Binance!")
+    _last_loop_start = time.time()
 
     symbols = get_top_symbols(TOP_SYMBOLS)
-    print(f"[{datetime.utcnow()}] Scanning {len(symbols)} symbols: {symbols}")
+    print(f"[{datetime.utcnow()}] Scanning {len(symbols)} symbols: {symbols}", flush=True)
 
+    # main loop: will run immediately upon start
     while True:
-        for symbol in symbols:
+        loop_start = time.time()
+        print(f"[{datetime.utcnow()}] >>> Loop start (scanning symbols now)...", flush=True)
+
+        for idx, symbol in enumerate(symbols, start=1):
             try:
-                print(f"[{datetime.utcnow()}] Checking {symbol}...")
+                print(f"[{datetime.utcnow()}] [{idx}/{len(symbols)}] Checking {symbol}...", flush=True)
                 signal = generate_signal(symbol)
                 if signal:
                     log_signal(signal)
@@ -311,18 +322,26 @@ def run_bot():
                         f"Conf: {signal['confidence']}%"
                     )
                     signals_sent_total += 1
+                    print(f"[{datetime.utcnow()}] >>> SIGNAL for {symbol}: {signal['side']} (conf {signal['confidence']})", flush=True)
                 else:
                     skipped_signals += 1
+                    print(f"[{datetime.utcnow()}] >>> No signal for {symbol}", flush=True)
             except Exception as e:
                 traceback.print_exc()
-                print(f"Error on {symbol}: {e}")
+                print(f"Error on {symbol}: {e}", flush=True)
+            # short pause between symbols
             time.sleep(SYMBOL_DELAY)
 
-        if time.time() - last_heartbeat > 600:
+        # quick heartbeat every loop so logs show activity
+        if time.time() - last_heartbeat > 10:   # heartbeat every 10s to show alive
             send_message(f"Heartbeat: {signals_sent_total} signals sent, {skipped_signals} skipped")
+            print(f"[{datetime.utcnow()}] Heartbeat: {signals_sent_total} signals sent, {skipped_signals} skipped", flush=True)
             last_heartbeat = time.time()
 
-        print(f"Sleeping {CHECK_INTERVAL}s...")
+        loop_duration = time.time() - loop_start
+        print(f"[{datetime.utcnow()}] Loop finished in {loop_duration:.2f}s. Sleeping {CHECK_INTERVAL}s before next loop...", flush=True)
+
+        # sleep small interval (set to 1s by default) then repeat immediately
         time.sleep(CHECK_INTERVAL)
 
 if __name__=="__main__":
