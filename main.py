@@ -15,12 +15,12 @@ CAPITAL = 80.0
 LEVERAGE = 30
 
 # first loop starts immediately, short loop cycles
-CHECK_INTERVAL = 1    # seconds between full symbol cycles
-SYMBOL_DELAY = 0.05   # short pause between symbols
+CHECK_INTERVAL = 60    # seconds between full symbol cycles
+SYMBOL_DELAY = 0.1   # short pause between symbols
 
 TOP_SYMBOLS = 20      # your request: top 20 coins
 
-TIMEFRAMES = ["1m","5m","15m","30m","1h"]
+TIMEFRAMES = ["5m", "15m", "30m", "1h"]
 MIN_TF_SCORE = 55
 CONF_MIN_TFS = 2
 CONFIDENCE_MIN = 60.0
