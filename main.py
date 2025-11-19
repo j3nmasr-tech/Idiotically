@@ -22,9 +22,9 @@ TOP_SYMBOLS = 60  # top 60 coins
 TIMEFRAMES = ["5m", "15m", "30m", "1h"]
 
 # ===== SIGNAL FILTERS =====
-MIN_TF_SCORE   = 60
-CONF_MIN_TFS   = 2
-CONFIDENCE_MIN = 65.0
+MIN_TF_SCORE   = 45
+CONF_MIN_TFS   = 1
+CONFIDENCE_MIN = 60.0
 
 ENTRY_FILTER_SCORE = MIN_TF_SCORE
 ENTRY_FILTER_CONF  = CONFIDENCE_MIN
@@ -211,7 +211,7 @@ def trade_params_dynamic(entry, side, atr, conf_pct):
     return round(sl,6), round(tp1,6), round(tp2,6), round(tp3,6)
 
 # ===== BTC TREND & VOLATILITY HELPERS =====
-VOLATILITY_THRESHOLD_PCT = 0.4
+VOLATILITY_THRESHOLD_PCT = 0.8
 
 def btc_volatility_spike():
     df = get_klines("BTCUSDT", "5m", 3)
@@ -232,17 +232,20 @@ def btc_trend_agree():
 def entry_allowed(symbol, df):
     atr = get_atr(df)
     last_candle = df.iloc[-1]
-    if atr is not None and abs(last_candle['close'] - last_candle['open']) > 1.8 * atr:
+    if atr is not None and abs(last_candle['close'] - last_candle['open']) > 2.5 * atr:
         return False
 
     recent_high = df['high'].iloc[-5:].max()
     recent_low  = df['low'].iloc[-5:].min()
-    if (recent_high - recent_low)/recent_low < 0.003:
+    if (recent_high - recent_low)/recent_low < 0.0015:
         return False
 
     btc_agree, btc_dir = btc_trend_agree()
-    if btc_agree is None or not btc_agree:
-        return False
+    # Relaxed: only check if we can detect BTC direction
+    if btc_dir is None:
+        return False  # only skip if trend is undetectable
+    # otherwise allow trades even if BTC 15m disagrees
+
     if btc_volatility_spike():
         return False
 
