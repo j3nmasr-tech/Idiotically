@@ -13,6 +13,7 @@ CAPITAL = 80.0
 LEVERAGE = 30
 CHECK_INTERVAL = 300  # 5 minutes
 API_CALL_DELAY = 0.3  # 0.3 seconds between each API call
+SYMBOL_DELAY = 0.3  # seconds between API calls per symbol
 TOP_SYMBOLS = 40
 
 TIMEFRAMES = ["5m","15m","30m","1h"]
@@ -251,25 +252,33 @@ def log_signal(signal):
 
 # ===== MAIN LOOP =====
 def run_bot():
-    global open_trades, signals_sent_total, skipped_signals, last_heartbeat
+    global signals_sent_total, skipped_signals, last_heartbeat
     symbols = get_top_symbols(TOP_SYMBOLS)
+    
     while True:
         for symbol in symbols:
             try:
                 signal = generate_signal(symbol)
                 if signal:
                     log_signal(signal)
-                    send_message(f"🔥 {signal['symbol']} | {signal['side']} | Entry: {signal['entry']}\nSL: {signal['sl']} | TP1: {signal['tp1']} | TP2: {signal['tp2']} | TP3: {signal['tp3']}\nConf: {signal['confidence']}%")
+                    send_message(
+                        f"🔥 {signal['symbol']} | {signal['side']} | Entry: {signal['entry']}\n"
+                        f"SL: {signal['sl']} | TP1: {signal['tp1']} | TP2: {signal['tp2']} | TP3: {signal['tp3']}\n"
+                        f"Conf: {signal['confidence']}%"
+                    )
                     signals_sent_total += 1
                 else:
                     skipped_signals += 1
-                time.sleep(API_CALL_DELAY)
             except Exception as e:
                 print(f"Error processing {symbol}: {e}")
-                continue
-        if time.time()-last_heartbeat>600:
+
+            time.sleep(SYMBOL_DELAY)  # per-symbol spacing
+
+        # Heartbeat
+        if time.time() - last_heartbeat > 600:
             send_message(f"FastScalp v2 heartbeat: {signals_sent_total} signals sent, {skipped_signals} skipped")
             last_heartbeat = time.time()
+
         time.sleep(CHECK_INTERVAL)
 
 if __name__=="__main__":
