@@ -325,7 +325,7 @@ async def monitor_signals(exchange):
 
 # ---------------- SCAN LOOP ----------------
 last_signal_time = {}  # will hold keys like "BTC-USDT-SWAP:1m"
-btc_paused = False     # properly declared global
+btc_paused = False  # properly declared global
 
 async def scan_loop(exchange):
     global btc_paused
@@ -346,28 +346,29 @@ async def scan_loop(exchange):
                         )
                         await db.commit()
                     btc_paused = True
+                await asyncio.sleep(SCAN_INTERVAL)
+                # continue scanning top coins even if BTC not clean
             else:
                 btc_paused = False
 
             tickers = await exchange.fetch_tickers()
             top = sorted(
-                [(s, v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")],
-                key=lambda x: x[1], reverse=True
+                [(s, v.get("quoteVolume", 0)) for s, v in tickers.items() if s.endswith("USDT")],
+                key=lambda x: x[1],
+                reverse=True
             )[:TOP_N]
 
-            # Ensure BTC is always included even if not top N
-            if "BTC-USDT-SWAP" not in [s for s,_ in top]:
+            # Always include BTC-USDT-SWAP if it exists
+            if "BTC-USDT-SWAP" in tickers and "BTC-USDT-SWAP" not in [s for s, _ in top]:
                 top.insert(0, ("BTC-USDT-SWAP", tickers["BTC-USDT-SWAP"].get("quoteVolume", 0)))
 
             for symbol, vol in top:
-                # Skip low-volume coins except BTC
-                if vol < MIN_VOLUME and symbol != "BTC-USDT-SWAP":
+                if vol < MIN_VOLUME:
                     continue
 
+                # iterate timeframes
                 for tf in TIMEFRAMES:
                     key = f"{symbol}:{tf}"
-
-                    # cooldown per symbol+timeframe
                     if key in last_signal_time and time.time() - last_signal_time[key] < 1800:
                         continue
 
@@ -375,20 +376,17 @@ async def scan_loop(exchange):
                     if not ohlcv:
                         continue
 
-                    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-
-                    # Only apply clean logic to non-BTC coins
-                    if symbol == "BTC-USDT-SWAP" or btc_clean:
-                        sig = generate_signal(df, symbol)
-                        if sig:
-                            await tg(
-                                f"🚀 <b>SMC Signal</b>\n{sig['symbol']} ({tf}) | {sig['side']}\n"
-                                f"Entry: {sig['entry']}\nSL: {sig['sl']}\n"
-                                f"TP1: {sig['tp1']}  TP2: {sig['tp2']}  TP3: {sig['tp3']}\n"
-                                f"Reason: {sig['reason']}\nScore: {sig['score']}"
-                            )
-                            await log_signal(sig)
-                            last_signal_time[key] = time.time()
+                    df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
+                    sig = generate_signal(df, symbol)
+                    if sig:
+                        await tg(
+                            f"🚀 <b>SMC Signal</b>\n{sig['symbol']} ({tf}) | {sig['side']}\n"
+                            f"Entry: {sig['entry']}\nSL: {sig['sl']}\n"
+                            f"TP1: {sig['tp1']}  TP2: {sig['tp2']}  TP3: {sig['tp3']}\n"
+                            f"Reason: {sig['reason']}\nScore: {sig['score']}"
+                        )
+                        await log_signal(sig)
+                        last_signal_time[key] = time.time()
 
             now = time.time()
             if now - last_heartbeat > HEARTBEAT_INTERVAL:
@@ -405,7 +403,6 @@ async def scan_loop(exchange):
 
         elapsed = time.time() - t0
         await asyncio.sleep(max(1, SCAN_INTERVAL - elapsed))
-
 # ---------------- FASTAPI ----------------
 app = FastAPI()
 @app.post("/webhook")
