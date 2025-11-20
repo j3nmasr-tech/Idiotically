@@ -324,8 +324,8 @@ async def monitor_signals(exchange):
         await asyncio.sleep(SCAN_INTERVAL)
 
 # ---------------- SCAN LOOP ----------------
-last_signal_time = {}  # will hold keys like "BTC-USDT-SWAP:1m"
-btc_paused = False  # properly declared global
+last_signal_time = {}  # holds keys like "BTC-USDT-SWAP:1m"
+btc_paused = False      # global flag
 
 async def scan_loop(exchange):
     global btc_paused
@@ -334,10 +334,11 @@ async def scan_loop(exchange):
     while True:
         t0 = time.time()
         try:
+            # BTC clean check (logging only, still scans BTC)
             btc_clean, reason = await btc_is_clean(exchange)
-
             if not btc_clean:
                 if not btc_paused:
+                    log.info(f"⚠️ BTC not clean: {reason}")
                     await tg(f"⚠️ PAUSED — BTC not clean: {reason}")
                     async with aiosqlite.connect(DB_PATH) as db:
                         await db.execute(
@@ -346,11 +347,10 @@ async def scan_loop(exchange):
                         )
                         await db.commit()
                     btc_paused = True
-                await asyncio.sleep(SCAN_INTERVAL)
-                # continue scanning top coins even if BTC not clean
             else:
                 btc_paused = False
 
+            # Fetch all tickers
             tickers = await exchange.fetch_tickers()
             top = sorted(
                 [(s, v.get("quoteVolume", 0)) for s, v in tickers.items() if s.endswith("USDT")],
@@ -358,27 +358,34 @@ async def scan_loop(exchange):
                 reverse=True
             )[:TOP_N]
 
-            # Always include BTC-USDT-SWAP if it exists
+            # Always include BTC-USDT-SWAP
             if "BTC-USDT-SWAP" in tickers and "BTC-USDT-SWAP" not in [s for s, _ in top]:
                 top.insert(0, ("BTC-USDT-SWAP", tickers["BTC-USDT-SWAP"].get("quoteVolume", 0)))
 
+            # Loop through top coins
             for symbol, vol in top:
                 if vol < MIN_VOLUME:
+                    log.info(f"Skipped {symbol} — volume {vol} below MIN_VOLUME")
                     continue
 
-                # iterate timeframes
+                log.info(f"Scanning {symbol}...")
+
+                # Iterate through timeframes
                 for tf in TIMEFRAMES:
                     key = f"{symbol}:{tf}"
                     if key in last_signal_time and time.time() - last_signal_time[key] < 1800:
+                        log.info(f"Skipped {symbol} ({tf}) — cooldown active")
                         continue
 
                     ohlcv = await fetch_ohlcv(exchange, symbol, tf, 200)
                     if not ohlcv:
+                        log.warning(f"OHLCV fetch failed for {symbol} ({tf})")
                         continue
 
                     df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
                     sig = generate_signal(df, symbol)
                     if sig:
+                        log.info(f"Signal generated for {symbol} ({tf})")
                         await tg(
                             f"🚀 <b>SMC Signal</b>\n{sig['symbol']} ({tf}) | {sig['side']}\n"
                             f"Entry: {sig['entry']}\nSL: {sig['sl']}\n"
@@ -387,15 +394,21 @@ async def scan_loop(exchange):
                         )
                         await log_signal(sig)
                         last_signal_time[key] = time.time()
+                    else:
+                        log.info(f"No signal for {symbol} ({tf})")
 
+            # Heartbeat
             now = time.time()
             if now - last_heartbeat > HEARTBEAT_INTERVAL:
                 last_heartbeat = now
                 await tg("❤️ SMC Scanner running.")
+                log.info("Heartbeat sent.")
 
+            # Daily summary
             utc = datetime.datetime.utcnow()
             if utc.hour == DAILY_SUMMARY_HOUR and utc.minute < 2:
                 await tg("📊 Daily summary placeholder.")
+                log.info("Daily summary sent.")
 
         except Exception as e:
             log.exception("Error in scan_loop: %s", e)
