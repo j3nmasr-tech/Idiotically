@@ -49,6 +49,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger("smc_bot")
 
 # ---------------- TELEGRAM ----------------
+def escape_html(msg: str) -> str:
+    if not msg:
+        return "-"
+    return str(msg).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 async def tg(msg: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram creds missing.")
@@ -57,8 +62,7 @@ async def tg(msg: str):
         log.error("Attempted to send empty Telegram message")
         return
 
-    # Convert None to safe string
-    safe_msg = str(msg).replace("None", "-")
+    safe_msg = escape_html(msg)
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     async with httpx.AsyncClient() as client:
         try:
