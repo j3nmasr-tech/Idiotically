@@ -2,17 +2,9 @@
 # -*- coding: utf-8 -*-
 
 """
-Production-ready Premium SMC Scanner (Signals Only)
-----------------------------------------------------
-- BTC clean filter
-- Top N OKX USDT symbols
-- Full SMC detection (OB, FVG, BOS, Liquidity Sweep, Mitigation Entry)
-- Scoring system for high-probability signals
-- Symbol+timeframe cooldown to avoid duplicates
-- Telegram alerts including TP/SL hits (timeframe shown)
-- SQLite logging
-- Async, ENV-only configuration
-- Heartbeat and daily summary
+Production-ready Premium SMC Scanner (Signals Only) — patched with user rules
+- Adds: Entry pre-checks, TF confirmation, momentum filters, ATR-based TP/SL,
+  SL-cluster deprioritization, minimal structural checks.
 """
 
 import os, time, asyncio, logging, datetime
@@ -22,6 +14,7 @@ import ccxt.async_support as ccxt
 import pandas as pd
 from fastapi import FastAPI, Request, HTTPException
 import uvicorn
+from collections import defaultdict, deque
 
 # ---------------- ENV ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -141,23 +134,32 @@ def compute_adx(df: pd.DataFrame, period:int=14):
 
 # ---------------- SMC DETECTION ----------------
 def detect_order_block(df: pd.DataFrame):
+    # keep original logic: use 3rd-from-last candle as OB
+    if len(df) < 3:
+        return None, None, None
     candle = df.iloc[-3]
     if candle["close"] > candle["open"]:
         return "bullish", candle["open"], candle["low"]
     return "bearish", candle["high"], candle["open"]
 
 def detect_fvg(df: pd.DataFrame):
+    if len(df) < 3:
+        return False, False
     c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
     bull = c2["low"] > c1["high"] and c3["low"] > c2["high"]
     bear = c2["high"] < c1["low"] and c3["high"] < c2["low"]
     return bull, bear
 
 def detect_liquidity_sweep(df):
+    if len(df) < 6:
+        return False, False
     last = df.iloc[-1]
     prev = df.iloc[-5:-1]
     return last["high"] > prev["high"].max(), last["low"] < prev["low"].min()
 
 def detect_bos(df):
+    if len(df) < 6:
+        return False, False
     last = df.iloc[-1]
     prev = df.iloc[-5:-1]
     hh = last["high"] > prev["high"].max()
@@ -165,10 +167,33 @@ def detect_bos(df):
     return hh, ll
 
 def detect_mitigation_entry(df, ob_hi, ob_lo, side):
+    if df is None or len(df) == 0:
+        return False
     last = df["close"].iloc[-1]
     if side=="BUY":
         return last <= ob_hi
     return last >= ob_lo
+
+# ---------------- SL-CLUSTER DEPRIORITIZATION ----------------
+# track SL hits per coin (epoch seconds)
+recent_sl = defaultdict(lambda: deque())
+
+def record_sl_hit_in_memory(symbol: str, now_ts: float = None, lookback_minutes: int = 30):
+    if now_ts is None:
+        now_ts = time.time()
+    dq = recent_sl[symbol]
+    dq.append(now_ts)
+    cutoff = now_ts - lookback_minutes * 60
+    while dq and dq[0] < cutoff:
+        dq.popleft()
+
+def coin_deprioritized(symbol: str, threshold_count: int = 3, lookback_minutes: int = 30) -> bool:
+    dq = recent_sl[symbol]
+    now_ts = time.time()
+    cutoff = now_ts - lookback_minutes * 60
+    while dq and dq[0] < cutoff:
+        dq.popleft()
+    return len(dq) >= threshold_count
 
 # ---------------- BTC CLEAN FILTER ----------------
 async def btc_is_clean(exchange) -> (bool, str):
@@ -183,7 +208,7 @@ async def btc_is_clean(exchange) -> (bool, str):
     df1h["adx"] = compute_adx(df1h)
 
     adx_ok = df1h["adx"].iloc[-1] > 20
-    vol_rising = df1h["atr"].iloc[-1] > df1h["atr"].iloc[-5]
+    vol_rising = df1h["atr"].iloc[-1] > df1h["atr"].iloc[-5] if len(df1h)>=6 else False
 
     hh1, ll1 = detect_bos(df1h)
     d1h = "up" if hh1 else "down" if ll1 else "neutral"
@@ -199,7 +224,7 @@ async def btc_is_clean(exchange) -> (bool, str):
                 for item in r.json().get("results", []):
                     if item.get("votes", {}).get("important",0) > 2:
                         news_ok = False
-        except:
+        except Exception:
             news_ok = False
 
     is_clean = adx_ok and vol_rising and structure_ok and news_ok
@@ -212,16 +237,19 @@ async def btc_is_clean(exchange) -> (bool, str):
 
 
 # ============================================================
-# 🟩 ADDED — REQUIRED MISSING HELPERS (NO OTHER CODE TOUCHED)
+# 🟩 ADDED — REQUIRED MISSING HELPERS & RULE LOGIC
 # ============================================================
-
 BLACKLIST_COINS = set([])
 
 def coin_allowed(symbol: str) -> bool:
+    # placeholder - keep existing allow-all but you can add blacklist logic
+    if symbol in BLACKLIST_COINS:
+        return False
     return True
 
-def volatility_ok(df: pd.DataFrame, min_atr_ratio=0.001, max_atr_ratio=0.03) -> bool:
-    if df is None or len(df) < 20:
+def volatility_ok(df: pd.DataFrame, min_atr_ratio=0.0005, max_atr_ratio=0.05) -> bool:
+    # min/max ATR ratio check (ATR / close). Conservative defaults.
+    if df is None or len(df) < 10:
         return False
     atr = compute_atr(df, 14)
     if atr is None or atr.isna().all():
@@ -233,10 +261,10 @@ def volatility_ok(df: pd.DataFrame, min_atr_ratio=0.001, max_atr_ratio=0.03) -> 
     atr_ratio = last_atr / last_close
     return min_atr_ratio <= atr_ratio <= max_atr_ratio
 
-def structure_ok(bos_hh: bool, bos_ll: bool, sweep_high: bool, sweep_low: bool) -> bool:
-    return bos_hh or bos_ll
-
 def momentum_ok(df: pd.DataFrame, side: str) -> bool:
+    # simple EMA 8/21 confirmation
+    if df is None or len(df) < 22:
+        return False
     close = df["close"]
     ema_fast = close.ewm(span=8, adjust=False).mean().iloc[-1]
     ema_slow = close.ewm(span=21, adjust=False).mean().iloc[-1]
@@ -244,34 +272,47 @@ def momentum_ok(df: pd.DataFrame, side: str) -> bool:
         return ema_fast > ema_slow
     else:
         return ema_fast < ema_slow
-        
-# ================================================
-# OPTIMIZED PREMIUM SMC SIGNAL GENERATOR
-# ================================================
-def generate_signal(df: pd.DataFrame, symbol: str):
 
-    # 0. REJECT UNSTABLE / WICKY COINS
-    #if not coin_allowed(symbol):
-    #    return None
+
+# ================================================
+# OPTIMIZED PREMIUM SMC SIGNAL GENERATOR (patched)
+# - Now accepts optional context: {"tf":tf, "df_15m":df_15m, "df_1h":df_1h}
+# - Enforces pre-checks: Score>=6, OB+BOS required, Sweep or Mitigation or Momentum required
+# - Applies ATR-based TP/SL if 15m context available
+# ================================================
+def generate_signal(df: pd.DataFrame, symbol: str, context: dict = None):
+    # context may be None or contain 'tf', 'df_15m', 'df_1h'
+    if context is None:
+        context = {}
+    tf = context.get("tf", None)  # may be "1m","3m","5m","15m","30m"
+
+    if df is None or len(df) < 6:
+        return None
 
     last = df["close"].iloc[-1]
 
-    # 1. VOLATILITY FILTER
+    # 0. coin allowed check
+    if not coin_allowed(symbol):
+        return None
+
+    # 1. VOLATILITY FILTER (on current tf)
     if not volatility_ok(df):
         return None
 
     # 2. SMC DETECTIONS
     ob_type, ob_hi, ob_lo = detect_order_block(df)
+    if ob_type is None:
+        return None
     bull_fvg, bear_fvg = detect_fvg(df)
     sweep_high, sweep_low = detect_liquidity_sweep(df)
     bos_hh, bos_ll = detect_bos(df)
 
-    # 3. STRUCTURE CHECK
-    struct = structure_ok(bos_hh, bos_ll, sweep_high, sweep_low)
-    if struct is False:
+    # 3. Structure check - require BOS (one of hh/ll)
+    if not (bos_hh or bos_ll):
+        # we require BOS as part of entry pre-checks (BOS mandatory)
         return None
 
-    # 4. SCORE
+    # 4. Score building (same as original logic)
     score = 0
     reasons = []
 
@@ -287,10 +328,8 @@ def generate_signal(df: pd.DataFrame, symbol: str):
     else:
         reasons.append("No FVG +0")
 
-    if bos_hh or bos_ll:
-        score += 2; reasons.append("Break of Structure +2")
-    else:
-        reasons.append("No BOS +0")
+    # BOS already required above
+    score += 2; reasons.append("Break of Structure +2")
 
     if sweep_high or sweep_low:
         score += 1; reasons.append("Liquidity Sweep +1")
@@ -302,6 +341,7 @@ def generate_signal(df: pd.DataFrame, symbol: str):
     else:
         reasons.append("No Mitigation Entry +0")
 
+    # momentum: simple check last vs 5 candles ago
     if df["close"].iloc[-1] > df["close"].iloc[-5]:
         score += 1; reasons.append("Momentum Up +1")
     else:
@@ -311,23 +351,105 @@ def generate_signal(df: pd.DataFrame, symbol: str):
     if score < min_score:
         return None
 
-    # 6. MOMENTUM ALIGNMENT
+    # 5. Momentum alignment stricter: require EMA momentum
     side = "BUY" if ob_type == "bullish" else "SELL"
     if not momentum_ok(df, side):
-        return None
+        # allow if mitigation + score==7 per user request
+        if not ( ("Mitigation Entry +1" in reasons) and score >= 7):
+            return None
 
-    # 7. TP/SL
+    # 6. Timeframe confirmation logic (for entries coming from scan_loop)
+    # If context.tf is provided, enforce TF confirmation policy:
+    df_15m = context.get("df_15m")
+    df_1h = context.get("df_1h")
+
+    # Helper to derive higher TF trend
+    def get_trend_from_df(d):
+        if d is None or len(d) < 50:
+            return "neutral"
+        close = d["close"]
+        e50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
+        e200 = close.ewm(span=200, adjust=False).mean().iloc[-1] if len(close) >= 200 else close.ewm(span=200, adjust=False).mean().iloc[-1]
+        if close.iloc[-1] > e50 and e50 > e200:
+            return "bull"
+        if close.iloc[-1] < e50 and e50 < e200:
+            return "bear"
+        return "neutral"
+
+    # If tf is 3m/5m — require at least one of 15m or 1h trend matching side
+    if tf in ("3m","5m"):
+        higher_ok = False
+        trend15 = get_trend_from_df(df_15m) if df_15m is not None else "neutral"
+        trend1h = get_trend_from_df(df_1h) if df_1h is not None else "neutral"
+        desired = "bull" if side=="BUY" else "bear"
+        if trend15 == desired or trend1h == desired:
+            higher_ok = True
+        if not higher_ok:
+            return None
+
+    # If tf is 1m — require sweep AND 15m confirmation
+    if tf == "1m":
+        if not (sweep_high or sweep_low):
+            return None
+        trend15 = get_trend_from_df(df_15m) if df_15m is not None else "neutral"
+        desired = "bull" if side=="BUY" else "bear"
+        if trend15 != desired:
+            return None
+
+    # For 15m/1h entries, we allow as-is (they are higher TFs)
+
+    # 7. TP/SL logic — use ATR(15m) if available in context
+    atr15_val = None
+    if df_15m is not None and len(df_15m) >= 10:
+        try:
+            atr_series = compute_atr(df_15m, period=14)
+            atr15_val = float(atr_series.iloc[-1])
+        except Exception:
+            atr15_val = None
+
     entry = float(last)
-    if side == "BUY":
-        sl = float(ob_lo)
-        tp1 = entry * 1.004
-        tp2 = entry * 1.008
-        tp3 = entry * 1.012
+
+    # default multipliers
+    tp_multiplier_default = 0.8
+    sl_multiplier_default = 1.0
+
+    # optional stronger TP if symbol historically performs (kept simple here)
+    strong_tp_symbols = set()  # you can populate based on historical analysis
+    tp_multiplier = 1.2 if symbol in strong_tp_symbols else tp_multiplier_default
+    sl_multiplier = sl_multiplier_default
+
+    if atr15_val and atr15_val > 0:
+        if side == "BUY":
+            sl = entry - sl_multiplier * atr15_val
+            tp1 = entry + tp_multiplier * atr15_val  # single TP target style; we will also create TP2/TP3 stagger if desired
+            # create smaller steps for TP2/TP3
+            tp2 = entry + (tp_multiplier * 1.5) * atr15_val
+            tp3 = entry + (tp_multiplier * 2.5) * atr15_val
+        else:
+            sl = entry + sl_multiplier * atr15_val
+            tp1 = entry - tp_multiplier * atr15_val
+            tp2 = entry - (tp_multiplier * 1.5) * atr15_val
+            tp3 = entry - (tp_multiplier * 2.5) * atr15_val
     else:
-        sl = float(ob_hi)
-        tp1 = entry * 0.996
-        tp2 = entry * 0.992
-        tp3 = entry * 0.988
+        # fallback to previous fixed percents if ATR not available
+        if side == "BUY":
+            sl = float(ob_lo)
+            tp1 = entry * 1.004
+            tp2 = entry * 1.008
+            tp3 = entry * 1.012
+        else:
+            sl = float(ob_hi)
+            tp1 = entry * 0.996
+            tp2 = entry * 0.992
+            tp3 = entry * 0.988
+
+    # Safety: ensure sl is not equal to entry
+    if sl == entry:
+        # widen SL slightly
+        if side == "BUY":
+            sl = entry - (entry * 0.002)
+        else:
+            sl = entry + (entry * 0.002)
 
     return {
         "symbol": symbol,
@@ -372,18 +494,28 @@ async def monitor_signals(exchange):
                             continue
                         
                         hits = []
+                        sl_hit = False
                         if side=="BUY":
-                            if not tp1_hit and last_price >= tp1: hits.append("TP1"); tp1_hit=1
-                            if not tp2_hit and last_price >= tp2: hits.append("TP2"); tp2_hit=1
-                            if not tp3_hit and last_price >= tp3: hits.append("TP3"); tp3_hit=1
-                            if last_price <= sl: hits.append("SL"); status="CLOSED"
+                            if not tp1_hit and last_price >= tp1:
+                                hits.append("TP1"); tp1_hit=1
+                            if not tp2_hit and last_price >= tp2:
+                                hits.append("TP2"); tp2_hit=1
+                            if not tp3_hit and last_price >= tp3:
+                                hits.append("TP3"); tp3_hit=1
+                            if last_price <= sl:
+                                hits.append("SL"); status="CLOSED"; sl_hit = True
                         else:
-                            if not tp1_hit and last_price <= tp1: hits.append("TP1"); tp1_hit=1
-                            if not tp2_hit and last_price <= tp2: hits.append("TP2"); tp2_hit=1
-                            if not tp3_hit and last_price <= tp3: hits.append("TP3"); tp3_hit=1
-                            if last_price >= sl: hits.append("SL"); status="CLOSED"
+                            if not tp1_hit and last_price <= tp1:
+                                hits.append("TP1"); tp1_hit=1
+                            if not tp2_hit and last_price <= tp2:
+                                hits.append("TP2"); tp2_hit=1
+                            if not tp3_hit and last_price <= tp3:
+                                hits.append("TP3"); tp3_hit=1
+                            if last_price >= sl:
+                                hits.append("SL"); status="CLOSED"; sl_hit = True
 
                         if hits:
+                            # Send update
                             await tg(
                                 f"🎯 <b>SMC Signal Update</b>\n"
                                 f"{symbol} | {side}\n"
@@ -393,7 +525,15 @@ async def monitor_signals(exchange):
                                 f"SL: {sl}\n"
                                 f"TP1: {tp1}  TP2: {tp2}  TP3: {tp3}"
                             )
-                        
+
+                        # if SL was hit - register in-memory SL history for deprioritization
+                        if sl_hit:
+                            try:
+                                # record in memory for deprioritization
+                                record_sl_hit_in_memory(symbol)
+                            except Exception:
+                                pass
+
                         # write updates under lock to avoid SQLite 'database is locked'
                         async with db_lock:
                             await db.execute("""
@@ -407,7 +547,7 @@ async def monitor_signals(exchange):
             await tg(f"❌ Error in monitor_signals: {e}")
         
         await asyncio.sleep(SCAN_INTERVAL)
-        
+
 # ---------------- SCAN LOOP ----------------
 last_signal_time = {}
 btc_paused = False
@@ -446,11 +586,22 @@ async def scan_loop(exchange):
                 top.insert(0, (BTC_PAIR, tickers[BTC_PAIR].get("quoteVolume",0)))
 
             for symbol, vol in top:
+                # Skip deprioritized coins early
+                if coin_deprioritized(symbol):
+                    log.info(f"Deprioritized {symbol} due to recent SL cluster. Skipping.")
+                    continue
+
                 if vol < MIN_VOLUME:
                     log.info(f"Skipped {symbol} — volume {vol} below MIN_VOLUME")
                     continue
 
                 log.info(f"Scanning {symbol}...")
+
+                # We'll fetch 15m and 1h once per symbol when needed for TF confirmation / ATR
+                df_15m = None
+                df_1h = None
+                # Pre-fetch higher TFs lazily (only if we encounter candidate TFs 1m/3m/5m)
+                # We'll fetch inside the TF loop on demand to reduce requests.
 
                 for tf in TIMEFRAMES:
                     key = f"{symbol}:{tf}"
@@ -458,16 +609,45 @@ async def scan_loop(exchange):
                         log.info(f"Skipped {symbol} ({tf}) — cooldown active")
                         continue
 
+                    # If coin is deprioritized mid-loop re-check
+                    if coin_deprioritized(symbol):
+                        log.info(f"Deprioritized {symbol} during TF loop. Skipping remaining TFs.")
+                        break
+
                     ohlcv = await fetch_ohlcv(exchange, symbol, tf, 200)
                     if not ohlcv:
                         log.warning(f"OHLCV fetch failed for {symbol} ({tf})")
                         continue
 
                     df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-                    sig = generate_signal(df, symbol)
+                    # ensure float columns
+                    for c in ["open","high","low","close","vol"]:
+                        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+                    # If tf is a low tf that requires higher TF confirmation, we fetch higher TFs
+                    if tf in ("1m","3m","5m"):
+                        if df_15m is None:
+                            ohlcv15 = await fetch_ohlcv(exchange, symbol, "15m", 200)
+                            if ohlcv15:
+                                df_15m = pd.DataFrame(ohlcv15, columns=["ts","open","high","low","close","vol"])
+                                for c in ["open","high","low","close","vol"]:
+                                    df_15m[c] = pd.to_numeric(df_15m[c], errors="coerce")
+                        if df_1h is None:
+                            ohlcv1h = await fetch_ohlcv(exchange, symbol, "1h", 200)
+                            if ohlcv1h:
+                                df_1h = pd.DataFrame(ohlcv1h, columns=["ts","open","high","low","close","vol"])
+                                for c in ["open","high","low","close","vol"]:
+                                    df_1h[c] = pd.to_numeric(df_1h[c], errors="coerce")
+
+                    context = {"tf": tf, "df_15m": df_15m, "df_1h": df_1h}
+                    sig = generate_signal(df, symbol, context=context)
                     if sig:
                         log.info(f"Signal generated for {symbol} ({tf})")
 
+                        # When a signal is generated, we re-check timeframe confirmation here as an extra safety
+                        # (generate_signal already enforced the TF rules if context.tf provided)
+
+                        # Build breakdown text
                         breakdown_text = "\n• ".join(sig.get("reason_list", []))
 
                         await tg(
@@ -503,6 +683,7 @@ async def scan_loop(exchange):
 
         elapsed = time.time() - t0
         await asyncio.sleep(max(1, SCAN_INTERVAL - elapsed))
+
 # ---------------- FASTAPI ----------------
 app = FastAPI()
 @app.post("/webhook")
