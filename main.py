@@ -4,6 +4,15 @@
 """
 Production-ready Premium SMC Scanner (Signals Only)
 ----------------------------------------------------
+- BTC clean filter
+- Top 100 OKX USDT symbols
+- Full SMC detection (OB, FVG, BOS, Liquidity Sweep, Mitigation Entry)
+- Scoring system for high-probability signals
+- Symbol cooldown to avoid duplicates
+- Telegram alerts including TP/SL hits
+- SQLite logging
+- Async, ENV-only configuration
+- Heartbeat and daily summary
 """
 
 import os, time, asyncio, logging, datetime
@@ -21,7 +30,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")  # optional
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 
-DB_PATH = "signals.db"
+DB_PATH = os.path.join(os.getcwd(), "signals.db")
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
 TOP_N = int(os.getenv("TOP_N", 100))
@@ -75,10 +84,6 @@ async def init_db():
         );
         """)
         await db.commit()
-
-# ---------------- GLOBALS ----------------
-last_signal_time = {}
-btc_paused = False  # Track if BTC pause alert has been sent
 
 # ---------------- OHLCV ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
@@ -186,7 +191,7 @@ async def btc_is_clean(exchange) -> (bool, str):
     if not news_ok: reason += "News upcoming; "
     return is_clean, reason.strip()
 
-# ---------------- SIGNAL GENERATION ----------------
+# ---------------- SIGNAL GENERATION WITH SCORING ----------------
 def generate_signal(df: pd.DataFrame, symbol: str):
     score = 0
     ob_type, ob_hi, ob_lo = detect_order_block(df)
@@ -195,6 +200,7 @@ def generate_signal(df: pd.DataFrame, symbol: str):
     bos_hh, bos_ll = detect_bos(df)
     last = df["close"].iloc[-1]
 
+    # Scoring
     if ob_type=="bullish": score +=2
     if ob_type=="bearish": score +=2
     if bull_fvg: score+=2
@@ -202,6 +208,7 @@ def generate_signal(df: pd.DataFrame, symbol: str):
     if bos_hh or bos_ll: score+=2
     if sweep_high or sweep_low: score+=1
     if detect_mitigation_entry(df, ob_hi, ob_lo, "BUY" if ob_type=="bullish" else "SELL"): score+=1
+    # ATR slope rising check
     if df["close"].iloc[-1] > df["close"].iloc[-5]: score+=1
 
     threshold = 8
@@ -246,48 +253,79 @@ async def monitor_signals(exchange):
                             continue
                         
                         hits = []
-                        if side=="BUY":
-                            if not tp1_hit and last_price >= tp1: hits.append("TP1"); tp1_hit=1
-                            if not tp2_hit and last_price >= tp2: hits.append("TP2"); tp2_hit=1
-                            if not tp3_hit and last_price >= tp3: hits.append("TP3"); tp3_hit=1
-                            if last_price <= sl: hits.append("SL"); status="CLOSED"
+                        # BUY signals
+                        if side == "BUY":
+                            if not tp1_hit and last_price >= tp1:
+                                hits.append("TP1")
+                                tp1_hit = 1
+                            if not tp2_hit and last_price >= tp2:
+                                hits.append("TP2")
+                                tp2_hit = 1
+                            if not tp3_hit and last_price >= tp3:
+                                hits.append("TP3")
+                                tp3_hit = 1
+                            if last_price <= sl:
+                                hits.append("SL")
+                                status = "CLOSED"
+                        # SELL signals
                         else:
-                            if not tp1_hit and last_price <= tp1: hits.append("TP1"); tp1_hit=1
-                            if not tp2_hit and last_price <= tp2: hits.append("TP2"); tp2_hit=1
-                            if not tp3_hit and last_price <= tp3: hits.append("TP3"); tp3_hit=1
-                            if last_price >= sl: hits.append("SL"); status="CLOSED"
+                            if not tp1_hit and last_price <= tp1:
+                                hits.append("TP1")
+                                tp1_hit = 1
+                            if not tp2_hit and last_price <= tp2:
+                                hits.append("TP2")
+                                tp2_hit = 1
+                            if not tp3_hit and last_price <= tp3:
+                                hits.append("TP3")
+                                tp3_hit = 1
+                            if last_price >= sl:
+                                hits.append("SL")
+                                status = "CLOSED"
                         
                         if hits:
-                            await tg(f"🎯 <b>SMC Signal Update</b>\n{symbol} | {side}\nEntry: {entry}\nLast: {last_price}\nHIT: {', '.join(hits)}\nSL: {sl}\nTP1: {tp1}  TP2: {tp2}  TP3: {tp3}")
-
+                            await tg(
+                                f"🎯 <b>SMC Signal Update</b>\n"
+                                f"{symbol} | {side}\n"
+                                f"Entry: {entry}\n"
+                                f"Last: {last_price}\n"
+                                f"HIT: {', '.join(hits)}\n"
+                                f"SL: {sl}\n"
+                                f"TP1: {tp1}  TP2: {tp2}  TP3: {tp3}"
+                            )
+                        
                         await db.execute("""
                             UPDATE signals
                             SET tp1_hit=?, tp2_hit=?, tp3_hit=?, status=?
                             WHERE id=?
-                        """, (tp1_hit,tp2_hit,tp3_hit,status,sig_id))
+                        """, (tp1_hit, tp2_hit, tp3_hit, status, sig_id))
                 await db.commit()
         except Exception as e:
             log.exception("Error in monitor_signals: %s", e)
             await tg(f"❌ Error in monitor_signals: {e}")
+        
         await asyncio.sleep(SCAN_INTERVAL)
 
 # ---------------- SCAN LOOP ----------------
-async def scan_loop():
+last_signal_time = {}
+btc_paused = False  # properly declared global
+
+async def scan_loop(exchange):
     global btc_paused
-    exchange = ccxt.okx({"enableRateLimit": True})
-    await init_db()
     last_heartbeat = 0
 
     while True:
         t0 = time.time()
         try:
             btc_clean, reason = await btc_is_clean(exchange)
+            
             if not btc_clean:
                 if not btc_paused:
                     await tg(f"⚠️ PAUSED — BTC not clean: {reason}")
                     async with aiosqlite.connect(DB_PATH) as db:
-                        await db.execute("INSERT INTO pauses (reason,timestamp) VALUES (?,?)", 
-                                         (reason,datetime.datetime.utcnow().isoformat()))
+                        await db.execute(
+                            "INSERT INTO pauses (reason,timestamp) VALUES (?,?)",
+                            (reason, datetime.datetime.utcnow().isoformat())
+                        )
                         await db.commit()
                     btc_paused = True
                 await asyncio.sleep(SCAN_INTERVAL)
@@ -295,14 +333,16 @@ async def scan_loop():
             else:
                 btc_paused = False
 
-            markets = await exchange.load_markets()
             tickers = await exchange.fetch_tickers()
-            top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")],
-                         key=lambda x:x[1], reverse=True)[:TOP_N]
+            top = sorted(
+                [(s, v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")],
+                key=lambda x:x[1], reverse=True
+            )[:TOP_N]
 
             for symbol, vol in top:
                 if vol<MIN_VOLUME: continue
-                if symbol in last_signal_time and time.time()-last_signal_time[symbol]<1800: continue
+                if symbol in last_signal_time and time.time()-last_signal_time[symbol]<1800:  # cooldown
+                    continue
                 ohlcv = await fetch_ohlcv(exchange,symbol,"1m",200)
                 if not ohlcv: continue
                 df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
@@ -310,7 +350,7 @@ async def scan_loop():
                 if sig:
                     await tg(f"🚀 <b>SMC Signal</b>\n{sig['symbol']} | {sig['side']}\nEntry: {sig['entry']}\nSL: {sig['sl']}\nTP1: {sig['tp1']}  TP2: {sig['tp2']}  TP3: {sig['tp3']}\nReason: {sig['reason']}\nScore: {sig['score']}")
                     await log_signal(sig)
-                    last_signal_time[symbol]=time.time()
+                    last_signal_time[symbol] = time.time()
 
             now = time.time()
             if now - last_heartbeat > HEARTBEAT_INTERVAL:
@@ -322,8 +362,8 @@ async def scan_loop():
                 await tg("📊 Daily summary placeholder.")
 
         except Exception as e:
-            log.exception("Error: %s", e)
-            await tg(f"❌ Error: {e}")
+            log.exception("Error in scan_loop: %s", e)
+            await tg(f"❌ Error in scan_loop: {e}")
 
         elapsed = time.time()-t0
         await asyncio.sleep(max(1, SCAN_INTERVAL-elapsed))
@@ -340,17 +380,21 @@ async def webhook(request: Request):
     return {"ok":True}
 
 # ---------------- MAIN ----------------
+async def main():
+    await init_db()
+    exchange = ccxt.okx({"enableRateLimit": True})
+    await asyncio.gather(
+        scan_loop(exchange),
+        monitor_signals(exchange)
+    )
+
 if __name__=="__main__":
     import argparse
     p = argparse.ArgumentParser()
     p.add_argument("--http", action="store_true")
     args = p.parse_args()
 
-    exchange = ccxt.okx({"enableRateLimit": True})
-
     if args.http:
         uvicorn.run(app, host="0.0.0.0", port=9000)
     else:
-        async def main():
-            await asyncio.gather(scan_loop(), monitor_signals(exchange))
         asyncio.run(main())
