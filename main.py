@@ -5,12 +5,12 @@
 Production-ready Premium SMC Scanner (Signals Only)
 ----------------------------------------------------
 - BTC clean filter
-- Top 100 OKX USDT symbols
+- Top N OKX USDT symbols
 - Full SMC detection (OB, FVG, BOS, Liquidity Sweep, Mitigation Entry)
 - Scoring system for high-probability signals
 - Symbol+timeframe cooldown to avoid duplicates
 - Telegram alerts including TP/SL hits (timeframe shown)
-- SQLite logging (schema unchanged)
+- SQLite logging
 - Async, ENV-only configuration
 - Heartbeat and daily summary
 """
@@ -20,7 +20,6 @@ import aiosqlite
 import httpx
 import ccxt.async_support as ccxt
 import pandas as pd
-import numpy as np
 from fastapi import FastAPI, Request, HTTPException
 import uvicorn
 
@@ -212,7 +211,7 @@ async def btc_is_clean(exchange) -> (bool, str):
 # ---------------- SIGNAL GENERATION WITH SCORING ----------------
 def generate_signal(df: pd.DataFrame, symbol: str):
     score = 0
-    reasons = []  # NEW — breakdown list
+    reasons = []
 
     ob_type, ob_hi, ob_lo = detect_order_block(df)
     bull_fvg, bear_fvg = detect_fvg(df)
@@ -220,71 +219,62 @@ def generate_signal(df: pd.DataFrame, symbol: str):
     bos_hh, bos_ll = detect_bos(df)
     last = df["close"].iloc[-1]
 
-    # ----- ORDER BLOCK -----
-    if ob_type == "bullish":
-        score += 2
-        reasons.append("Order Block (Bullish) +2")
+    # Order Block
+    if ob_type=="bullish":
+        score +=2; reasons.append("Order Block (Bullish) +2")
     else:
-        score += 2
-        reasons.append("Order Block (Bearish) +2")
+        score +=2; reasons.append("Order Block (Bearish) +2")
 
-    # ----- FAIR VALUE GAP (FVG) -----
+    # FVG
     if bull_fvg:
-        score += 2
-        reasons.append("FVG Bullish +2")
+        score +=2; reasons.append("FVG Bullish +2")
     elif bear_fvg:
-        score += 2
-        reasons.append("FVG Bearish +2")
+        score +=2; reasons.append("FVG Bearish +2")
     else:
         reasons.append("No FVG +0")
 
-    # ----- BOS -----
+    # BOS
     if bos_hh or bos_ll:
-        score += 2
-        reasons.append("Break of Structure +2")
+        score +=2; reasons.append("Break of Structure +2")
     else:
         reasons.append("No BOS +0")
 
-    # ----- SWEEP -----
+    # Sweep
     if sweep_high or sweep_low:
-        score += 1
-        reasons.append("Liquidity Sweep +1")
+        score +=1; reasons.append("Liquidity Sweep +1")
     else:
         reasons.append("No Sweep +0")
 
-    # ----- MITIGATION ENTRY -----
+    # Mitigation Entry
     if detect_mitigation_entry(df, ob_hi, ob_lo, "BUY" if ob_type=="bullish" else "SELL"):
-        score += 1
-        reasons.append("Mitigation Entry +1")
+        score +=1; reasons.append("Mitigation Entry +1")
     else:
         reasons.append("No Mitigation Entry +0")
 
-    # ----- MOMENTUM / CLOSE SLOPE -----
+    # Momentum / slope
     if df["close"].iloc[-1] > df["close"].iloc[-5]:
-        score += 1
-        reasons.append("Momentum Up +1")
+        score +=1; reasons.append("Momentum Up +1")
     else:
         reasons.append("Momentum Weak +0")
 
-    # ----- SCORE THRESHOLD -----
     threshold = 5
-    if score < threshold:
-        return None
+    if score < threshold: return None
 
-    side = "BUY" if ob_type == "bullish" else "SELL"
+    side = "BUY" if ob_type=="bullish" else "SELL"
 
     return {
         "symbol": symbol,
         "side": side,
         "entry": float(last),
-        "sl": float(ob_lo if side == "BUY" else ob_hi),
-        "tp1": float(last * (1.004 if side == "BUY" else 0.996)),
-        "tp2": float(last * (1.008 if side == "BUY" else 0.992)),
-        "tp3": float(last * (1.012 if side == "BUY" else 0.988)),
+        "sl": float(ob_lo if side=="BUY" else ob_hi),
+        "tp1": float(last*(1.004 if side=="BUY" else 0.996)),
+        "tp2": float(last*(1.008 if side=="BUY" else 0.992)),
+        "tp3": float(last*(1.012 if side=="BUY" else 0.988)),
         "reason": "Premium SMC high-score",
         "score": score,
-        "reason_list": reasons  # NEW
+        "reason_list": reasons
     }
+
 # ---------------- LOG SIGNAL ----------------
 async def log_signal(sig):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -314,35 +304,17 @@ async def monitor_signals(exchange):
                             continue
                         
                         hits = []
-                        # BUY signals
-                        if side == "BUY":
-                            if not tp1_hit and last_price >= tp1:
-                                hits.append("TP1")
-                                tp1_hit = 1
-                            if not tp2_hit and last_price >= tp2:
-                                hits.append("TP2")
-                                tp2_hit = 1
-                            if not tp3_hit and last_price >= tp3:
-                                hits.append("TP3")
-                                tp3_hit = 1
-                            if last_price <= sl:
-                                hits.append("SL")
-                                status = "CLOSED"
-                        # SELL signals
+                        if side=="BUY":
+                            if not tp1_hit and last_price >= tp1: hits.append("TP1"); tp1_hit=1
+                            if not tp2_hit and last_price >= tp2: hits.append("TP2"); tp2_hit=1
+                            if not tp3_hit and last_price >= tp3: hits.append("TP3"); tp3_hit=1
+                            if last_price <= sl: hits.append("SL"); status="CLOSED"
                         else:
-                            if not tp1_hit and last_price <= tp1:
-                                hits.append("TP1")
-                                tp1_hit = 1
-                            if not tp2_hit and last_price <= tp2:
-                                hits.append("TP2")
-                                tp2_hit = 1
-                            if not tp3_hit and last_price <= tp3:
-                                hits.append("TP3")
-                                tp3_hit = 1
-                            if last_price >= sl:
-                                hits.append("SL")
-                                status = "CLOSED"
-                        
+                            if not tp1_hit and last_price <= tp1: hits.append("TP1"); tp1_hit=1
+                            if not tp2_hit and last_price <= tp2: hits.append("TP2"); tp2_hit=1
+                            if not tp3_hit and last_price <= tp3: hits.append("TP3"); tp3_hit=1
+                            if last_price >= sl: hits.append("SL"); status="CLOSED"
+
                         if hits:
                             await tg(
                                 f"🎯 <b>SMC Signal Update</b>\n"
@@ -367,8 +339,8 @@ async def monitor_signals(exchange):
         await asyncio.sleep(SCAN_INTERVAL)
 
 # ---------------- SCAN LOOP ----------------
-last_signal_time = {}  # holds keys like "BTC-USDT-SWAP:1m"
-btc_paused = False      # global flag
+last_signal_time = {}
+btc_paused = False
 
 async def scan_loop(exchange):
     global btc_paused
@@ -377,76 +349,69 @@ async def scan_loop(exchange):
     while True:
         t0 = time.time()
         try:
-            # BTC clean check (logging only, still scans BTC)
+            # BTC clean check (logging only)
             btc_clean, reason = await btc_is_clean(exchange)
-            if not btc_clean:
-                if not btc_paused:
-                    log.info(f"⚠️ BTC not clean: {reason}")
-                    await tg(f"⚠️ PAUSED — BTC not clean: {reason}")
-                    async with aiosqlite.connect(DB_PATH) as db:
-                        await db.execute(
-                            "INSERT INTO pauses (reason,timestamp) VALUES (?,?)",
-                            (reason, datetime.datetime.utcnow().isoformat())
-                        )
-                        await db.commit()
-                    btc_paused = True
+            if not btc_clean and not btc_paused:
+                log.info(f"⚠️ BTC not clean: {reason}")
+                await tg(f"⚠️ PAUSED — BTC not clean: {reason}")
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute(
+                        "INSERT INTO pauses (reason,timestamp) VALUES (?,?)",
+                        (reason, datetime.datetime.utcnow().isoformat())
+                    )
+                    await db.commit()
+                btc_paused = True
             else:
                 btc_paused = False
 
-            # Fetch all tickers
             tickers = await exchange.fetch_tickers()
             top = sorted(
-                [(s, v.get("quoteVolume", 0)) for s, v in tickers.items() if s.endswith("USDT")],
-                key=lambda x: x[1],
-                reverse=True
+                [(s, v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")],
+                key=lambda x:x[1], reverse=True
             )[:TOP_N]
 
-            # Always include BTC-USDT-SWAP
-            if "BTC-USDT-SWAP" in tickers and "BTC-USDT-SWAP" not in [s for s, _ in top]:
-                top.insert(0, ("BTC-USDT-SWAP", tickers["BTC-USDT-SWAP"].get("quoteVolume", 0)))
+            # Always include BTC
+            if BTC_PAIR in tickers and BTC_PAIR not in [s for s,_ in top]:
+                top.insert(0, (BTC_PAIR, tickers[BTC_PAIR].get("quoteVolume",0)))
 
-    # Loop through top coins
-for symbol, vol in top:
-    if vol < MIN_VOLUME:
-        log.info(f"Skipped {symbol} — volume {vol} below MIN_VOLUME")
-        continue
+            for symbol, vol in top:
+                if vol < MIN_VOLUME:
+                    log.info(f"Skipped {symbol} — volume {vol} below MIN_VOLUME")
+                    continue
 
-    log.info(f"Scanning {symbol}...")
+                log.info(f"Scanning {symbol}...")
 
-    # Iterate through timeframes
-    for tf in TIMEFRAMES:
-        key = f"{symbol}:{tf}"
-        if key in last_signal_time and time.time() - last_signal_time[key] < 1800:
-            log.info(f"Skipped {symbol} ({tf}) — cooldown active")
-            continue
+                for tf in TIMEFRAMES:
+                    key = f"{symbol}:{tf}"
+                    if key in last_signal_time and time.time() - last_signal_time[key] < 1800:
+                        log.info(f"Skipped {symbol} ({tf}) — cooldown active")
+                        continue
 
-        ohlcv = await fetch_ohlcv(exchange, symbol, tf, 200)
-        if not ohlcv:
-            log.warning(f"OHLCV fetch failed for {symbol} ({tf})")
-            continue
+                    ohlcv = await fetch_ohlcv(exchange, symbol, tf, 200)
+                    if not ohlcv:
+                        log.warning(f"OHLCV fetch failed for {symbol} ({tf})")
+                        continue
 
-        df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
-        sig = generate_signal(df, symbol)
-        if sig:
-            log.info(f"Signal generated for {symbol} ({tf})")
+                    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+                    sig = generate_signal(df, symbol)
+                    if sig:
+                        log.info(f"Signal generated for {symbol} ({tf})")
 
-            # Format breakdown
-            breakdown_text = "\n• ".join(sig.get("reason_list", []))
+                        breakdown_text = "\n• ".join(sig.get("reason_list", []))
 
-            await tg(
-                f"🚀 <b>SMC Signal</b>\n"
-                f"{sig['symbol']} ({tf}) | {sig['side']}\n"
-                f"Entry: {sig['entry']}\nSL: {sig['sl']}\n"
-                f"TP1: {sig['tp1']}  TP2: {sig['tp2']}  TP3: {sig['tp3']}\n"
-                f"Reason: {sig['reason']}\n"
-                f"Score: {sig['score']}\n\n"
-                f"<b>Breakdown:</b>\n• {breakdown_text}"
-            )
-
-            await log_signal(sig)
-            last_signal_time[key] = time.time()
-        else:
-            log.info(f"No signal for {symbol} ({tf})")
+                        await tg(
+                            f"🚀 <b>SMC Signal</b>\n"
+                            f"{sig['symbol']} ({tf}) | {sig['side']}\n"
+                            f"Entry: {sig['entry']}\nSL: {sig['sl']}\n"
+                            f"TP1: {sig['tp1']}  TP2: {sig['tp2']}  TP3: {sig['tp3']}\n"
+                            f"Reason: {sig['reason']}\n"
+                            f"Score: {sig['score']}\n\n"
+                            f"<b>Breakdown:</b>\n• {breakdown_text}"
+                        )
+                        await log_signal(sig)
+                        last_signal_time[key] = time.time()
+                    else:
+                        log.info(f"No signal for {symbol} ({tf})")
 
             # Heartbeat
             now = time.time()
