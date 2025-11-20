@@ -208,69 +208,128 @@ async def btc_is_clean(exchange) -> (bool, str):
     if not news_ok: reason += "News upcoming; "
     return is_clean, reason.strip()
 
-# ---------------- SIGNAL GENERATION WITH SCORING ----------------
-def generate_signal(df: pd.DataFrame, symbol: str):
-    score = 0
-    reasons = []
+# ================================================
+# OPTIMIZED PREMIUM SMC SIGNAL GENERATOR
+# ================================================
 
+def generate_signal(df: pd.DataFrame, symbol: str):
+
+    # -------------------------------
+    # 0. REJECT UNSTABLE / WICKY COINS
+    # -------------------------------
+    if not coin_allowed(symbol):
+        return None
+
+    last = df["close"].iloc[-1]
+
+    # -------------------------------
+    # 1. VOLATILITY FILTER (ATR trend)
+    # -------------------------------
+    if not volatility_ok(df):
+        return None
+
+    # -------------------------------
+    # 2. SMC DETECTIONS
+    # -------------------------------
     ob_type, ob_hi, ob_lo = detect_order_block(df)
     bull_fvg, bear_fvg = detect_fvg(df)
     sweep_high, sweep_low = detect_liquidity_sweep(df)
     bos_hh, bos_ll = detect_bos(df)
-    last = df["close"].iloc[-1]
 
-    # Order Block
-    if ob_type=="bullish":
-        score +=2; reasons.append("Order Block (Bullish) +2")
+    # -------------------------------
+    # 3. STRUCTURE SANITY CHECK
+    # -------------------------------
+    struct = structure_ok(bos_hh, bos_ll, sweep_high, sweep_low)
+    if struct is False:
+        # Missing BOS = SL magnet (based on dataset)
+        return None
+
+    # -------------------------------
+    # 4. RAW SCORE SYSTEM
+    # -------------------------------
+    score = 0
+    reasons = []
+
+    # --- Order Block ---
+    if ob_type == "bullish":
+        score += 2; reasons.append("Order Block (Bullish) +2")
     else:
-        score +=2; reasons.append("Order Block (Bearish) +2")
+        score += 2; reasons.append("Order Block (Bearish) +2")
 
-    # FVG
+    # --- FVG ---
     if bull_fvg:
-        score +=2; reasons.append("FVG Bullish +2")
+        score += 2; reasons.append("FVG Bullish +2")
     elif bear_fvg:
-        score +=2; reasons.append("FVG Bearish +2")
+        score += 2; reasons.append("FVG Bearish +2")
     else:
         reasons.append("No FVG +0")
 
-    # BOS
+    # --- BOS ---
     if bos_hh or bos_ll:
-        score +=2; reasons.append("Break of Structure +2")
+        score += 2; reasons.append("Break of Structure +2")
     else:
         reasons.append("No BOS +0")
 
-    # Sweep
+    # --- Sweep ---
     if sweep_high or sweep_low:
-        score +=1; reasons.append("Liquidity Sweep +1")
+        score += 1; reasons.append("Liquidity Sweep +1")
     else:
         reasons.append("No Sweep +0")
 
-    # Mitigation Entry
+    # --- Mitigation ---
     if detect_mitigation_entry(df, ob_hi, ob_lo, "BUY" if ob_type=="bullish" else "SELL"):
-        score +=1; reasons.append("Mitigation Entry +1")
+        score += 1; reasons.append("Mitigation Entry +1")
     else:
         reasons.append("No Mitigation Entry +0")
 
-    # Momentum / slope
+    # --- Momentum ---
+    # Momentum: last > past X bars
     if df["close"].iloc[-1] > df["close"].iloc[-5]:
-        score +=1; reasons.append("Momentum Up +1")
+        score += 1; reasons.append("Momentum Up +1")
     else:
         reasons.append("Momentum Weak +0")
 
-    threshold = 5
-    if score < threshold: return None
+    # -------------------------------
+    # 5. FINAL SCORE THRESHOLD
+    # -------------------------------
+    min_score = 6 if symbol not in BLACKLIST_COINS else 7
+    if score < min_score:
+        return None
 
-    side = "BUY" if ob_type=="bullish" else "SELL"
+    # -------------------------------
+    # 6. MOMENTUM ALIGNMENT FILTER
+    # -------------------------------
+    side = "BUY" if ob_type == "bullish" else "SELL"
+    if not momentum_ok(df, side):
+        return None
 
+    # -------------------------------
+    # 7. GENERATE TP/SL LEVELS
+    # -------------------------------
+    entry = float(last)
+    if side == "BUY":
+        sl = float(ob_lo)
+        tp1 = entry * 1.004
+        tp2 = entry * 1.008
+        tp3 = entry * 1.012
+    else:
+        sl = float(ob_hi)
+        tp1 = entry * 0.996
+        tp2 = entry * 0.992
+        tp3 = entry * 0.988
+
+    # -------------------------------
+    # 8. FINAL SIGNAL OBJECT
+    # -------------------------------
     return {
         "symbol": symbol,
         "side": side,
-        "entry": float(last),
-        "sl": float(ob_lo if side=="BUY" else ob_hi),
-        "tp1": float(last*(1.004 if side=="BUY" else 0.996)),
-        "tp2": float(last*(1.008 if side=="BUY" else 0.992)),
-        "tp3": float(last*(1.012 if side=="BUY" else 0.988)),
-        "reason": "Premium SMC high-score",
+        "entry": entry,
+        "sl": float(sl),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "tp3": float(tp3),
+        "reason": "Optimized SMC high-probability signal",
         "score": score,
         "reason_list": reasons
     }
