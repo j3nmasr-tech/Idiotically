@@ -334,22 +334,22 @@ async def scan_loop(exchange):
     while True:
         t0 = time.time()
         try:
-            btc_clean, reason = await btc_is_clean(exchange)
+            #btc_clean, reason = await btc_is_clean(exchange)
             
-            if not btc_clean:
-                if not btc_paused:
-                    await tg(f"⚠️ PAUSED — BTC not clean: {reason}")
-                    async with aiosqlite.connect(DB_PATH) as db:
-                        await db.execute(
-                            "INSERT INTO pauses (reason,timestamp) VALUES (?,?)",
-                            (reason, datetime.datetime.utcnow().isoformat())
-                        )
-                        await db.commit()
-                    btc_paused = True
-                await asyncio.sleep(SCAN_INTERVAL)
-                continue
-            else:
-                btc_paused = False
+            #if not btc_clean:
+                #if not btc_paused:
+                    #await tg(f"⚠️ PAUSED — BTC not clean: {reason}")
+                    #async with aiosqlite.connect(DB_PATH) as db:
+                        #await db.execute(
+                            #"INSERT INTO pauses (reason,timestamp) VALUES (?,?)",
+                            #(reason, datetime.datetime.utcnow().isoformat())
+                        #)
+                        #await db.commit()
+                    #btc_paused = True
+                #await asyncio.sleep(SCAN_INTERVAL)
+                #continue
+            #else:
+                #btc_paused = False
 
             tickers = await exchange.fetch_tickers()
             top = sorted(
