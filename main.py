@@ -42,7 +42,7 @@ HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", 3600))
 DAILY_SUMMARY_HOUR = int(os.getenv("DAILY_SUMMARY_HOUR", 23))
 
 # ---------------- TIMEFRAMES ----------------
-TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h"]
+TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -324,8 +324,8 @@ async def monitor_signals(exchange):
         await asyncio.sleep(SCAN_INTERVAL)
 
 # ---------------- SCAN LOOP ----------------
-last_signal_time = {}            # will hold keys like "BTC-USDT-SWAP:1m"
-btc_paused = False  # properly declared global
+last_signal_time = {}  # will hold keys like "BTC-USDT-SWAP:1m"
+btc_paused = False     # properly declared global
 
 async def scan_loop(exchange):
     global btc_paused
@@ -335,7 +335,7 @@ async def scan_loop(exchange):
         t0 = time.time()
         try:
             btc_clean, reason = await btc_is_clean(exchange)
-            
+
             if not btc_clean:
                 if not btc_paused:
                     await tg(f"⚠️ PAUSED — BTC not clean: {reason}")
@@ -346,36 +346,49 @@ async def scan_loop(exchange):
                         )
                         await db.commit()
                     btc_paused = True
-                await asyncio.sleep(SCAN_INTERVAL)
-                continue
             else:
                 btc_paused = False
 
             tickers = await exchange.fetch_tickers()
             top = sorted(
                 [(s, v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")],
-                key=lambda x:x[1], reverse=True
+                key=lambda x: x[1], reverse=True
             )[:TOP_N]
 
-            for symbol, vol in top:
-                if vol<MIN_VOLUME: continue
+            # Ensure BTC is always included even if not top N
+            if "BTC-USDT-SWAP" not in [s for s,_ in top]:
+                top.insert(0, ("BTC-USDT-SWAP", tickers["BTC-USDT-SWAP"].get("quoteVolume", 0)))
 
-                # iterate timeframes (added) - each timeframe evaluated independently
+            for symbol, vol in top:
+                # Skip low-volume coins except BTC
+                if vol < MIN_VOLUME and symbol != "BTC-USDT-SWAP":
+                    continue
+
                 for tf in TIMEFRAMES:
                     key = f"{symbol}:{tf}"
-                    # per-symbol+timeframe cooldown (keeps original cooldown behavior but per-TF)
-                    if key in last_signal_time and time.time()-last_signal_time[key]<1800:
+
+                    # cooldown per symbol+timeframe
+                    if key in last_signal_time and time.time() - last_signal_time[key] < 1800:
                         continue
 
-                    ohlcv = await fetch_ohlcv(exchange,symbol,tf,200)
-                    if not ohlcv: continue
+                    ohlcv = await fetch_ohlcv(exchange, symbol, tf, 200)
+                    if not ohlcv:
+                        continue
+
                     df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-                    sig = generate_signal(df,symbol)  # keep symbol unchanged in DB
-                    if sig:
-                        # Telegram shows timeframe beside symbol (user requested Option A)
-                        await tg(f"🚀 <b>SMC Signal</b>\n{sig['symbol']} ({tf}) | {sig['side']}\nEntry: {sig['entry']}\nSL: {sig['sl']}\nTP1: {sig['tp1']}  TP2: {sig['tp2']}  TP3: {sig['tp3']}\nReason: {sig['reason']}\nScore: {sig['score']}")
-                        await log_signal(sig)  # DB schema unchanged (symbol stored without TF)
-                        last_signal_time[key] = time.time()
+
+                    # Only apply clean logic to non-BTC coins
+                    if symbol == "BTC-USDT-SWAP" or btc_clean:
+                        sig = generate_signal(df, symbol)
+                        if sig:
+                            await tg(
+                                f"🚀 <b>SMC Signal</b>\n{sig['symbol']} ({tf}) | {sig['side']}\n"
+                                f"Entry: {sig['entry']}\nSL: {sig['sl']}\n"
+                                f"TP1: {sig['tp1']}  TP2: {sig['tp2']}  TP3: {sig['tp3']}\n"
+                                f"Reason: {sig['reason']}\nScore: {sig['score']}"
+                            )
+                            await log_signal(sig)
+                            last_signal_time[key] = time.time()
 
             now = time.time()
             if now - last_heartbeat > HEARTBEAT_INTERVAL:
@@ -383,15 +396,15 @@ async def scan_loop(exchange):
                 await tg("❤️ SMC Scanner running.")
 
             utc = datetime.datetime.utcnow()
-            if utc.hour==DAILY_SUMMARY_HOUR and utc.minute<2:
+            if utc.hour == DAILY_SUMMARY_HOUR and utc.minute < 2:
                 await tg("📊 Daily summary placeholder.")
 
         except Exception as e:
             log.exception("Error in scan_loop: %s", e)
             await tg(f"❌ Error in scan_loop: {e}")
 
-        elapsed = time.time()-t0
-        await asyncio.sleep(max(1, SCAN_INTERVAL-elapsed))
+        elapsed = time.time() - t0
+        await asyncio.sleep(max(1, SCAN_INTERVAL - elapsed))
 
 # ---------------- FASTAPI ----------------
 app = FastAPI()
