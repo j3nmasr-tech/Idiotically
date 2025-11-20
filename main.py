@@ -53,9 +53,20 @@ async def tg(msg: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram creds missing.")
         return
+    if not msg:
+        log.error("Attempted to send empty Telegram message")
+        return
+
+    # Convert None to safe string
+    safe_msg = str(msg).replace("None", "-")
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     async with httpx.AsyncClient() as client:
-        await client.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode":"HTML"})
+        try:
+            r = await client.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": safe_msg, "parse_mode":"HTML"})
+            if r.status_code != 200:
+                log.error(f"Telegram send failed: {r.status_code} | {r.text}")
+        except Exception as e:
+            log.error(f"Telegram send exception: {e}")
 
 # ---------------- SQLITE ----------------
 async def init_db():
