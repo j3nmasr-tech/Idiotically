@@ -212,36 +212,79 @@ async def btc_is_clean(exchange) -> (bool, str):
 # ---------------- SIGNAL GENERATION WITH SCORING ----------------
 def generate_signal(df: pd.DataFrame, symbol: str):
     score = 0
+    reasons = []  # NEW — breakdown list
+
     ob_type, ob_hi, ob_lo = detect_order_block(df)
     bull_fvg, bear_fvg = detect_fvg(df)
     sweep_high, sweep_low = detect_liquidity_sweep(df)
     bos_hh, bos_ll = detect_bos(df)
     last = df["close"].iloc[-1]
 
-    # Scoring
-    if ob_type=="bullish": score +=2
-    if ob_type=="bearish": score +=2
-    if bull_fvg: score+=2
-    if bear_fvg: score+=2
-    if bos_hh or bos_ll: score+=2
-    if sweep_high or sweep_low: score+=1
-    if detect_mitigation_entry(df, ob_hi, ob_lo, "BUY" if ob_type=="bullish" else "SELL"): score+=1
-    # ATR slope rising check
-    if df["close"].iloc[-1] > df["close"].iloc[-5]: score+=1
+    # ----- ORDER BLOCK -----
+    if ob_type == "bullish":
+        score += 2
+        reasons.append("Order Block (Bullish) +2")
+    else:
+        score += 2
+        reasons.append("Order Block (Bearish) +2")
 
-    threshold = 8
-    if score<threshold: return None
+    # ----- FAIR VALUE GAP (FVG) -----
+    if bull_fvg:
+        score += 2
+        reasons.append("FVG Bullish +2")
+    elif bear_fvg:
+        score += 2
+        reasons.append("FVG Bearish +2")
+    else:
+        reasons.append("No FVG +0")
 
-    side = "BUY" if ob_type=="bullish" else "SELL"
+    # ----- BOS -----
+    if bos_hh or bos_ll:
+        score += 2
+        reasons.append("Break of Structure +2")
+    else:
+        reasons.append("No BOS +0")
+
+    # ----- SWEEP -----
+    if sweep_high or sweep_low:
+        score += 1
+        reasons.append("Liquidity Sweep +1")
+    else:
+        reasons.append("No Sweep +0")
+
+    # ----- MITIGATION ENTRY -----
+    if detect_mitigation_entry(df, ob_hi, ob_lo, "BUY" if ob_type=="bullish" else "SELL"):
+        score += 1
+        reasons.append("Mitigation Entry +1")
+    else:
+        reasons.append("No Mitigation Entry +0")
+
+    # ----- MOMENTUM / CLOSE SLOPE -----
+    if df["close"].iloc[-1] > df["close"].iloc[-5]:
+        score += 1
+        reasons.append("Momentum Up +1")
+    else:
+        reasons.append("Momentum Weak +0")
+
+    # ----- SCORE THRESHOLD -----
+    threshold = 5
+    if score < threshold:
+        return None
+
+    side = "BUY" if ob_type == "bullish" else "SELL"
+
     return {
-        "symbol":symbol,"side":side,"entry":float(last),
-        "sl":float(ob_lo if side=="BUY" else ob_hi),
-        "tp1":float(last*1.004 if side=="BUY" else last*0.996),
-        "tp2":float(last*1.008 if side=="BUY" else last*0.992),
-        "tp3":float(last*1.012 if side=="BUY" else last*0.988),
-        "reason":"Premium SMC high-score","score":score
+        "symbol": symbol,
+        "side": side,
+        "entry": float(last),
+        "sl": float(ob_lo if side == "BUY" else ob_hi),
+        "tp1": float(last * (1.004 if side == "BUY" else 0.996)),
+        "tp2": float(last * (1.008 if side == "BUY" else 0.992)),
+        "tp3": float(last * (1.012 if side == "BUY" else 0.988)),
+        "reason": "Premium SMC high-score",
+        "score": score,
+        "reason_list": reasons  # NEW
     }
-
 # ---------------- LOG SIGNAL ----------------
 async def log_signal(sig):
     async with aiosqlite.connect(DB_PATH) as db:
@@ -387,10 +430,13 @@ async def scan_loop(exchange):
                     if sig:
                         log.info(f"Signal generated for {symbol} ({tf})")
                         await tg(
-                            f"🚀 <b>SMC Signal</b>\n{sig['symbol']} ({tf}) | {sig['side']}\n"
+                            f"🚀 <b>SMC Signal</b>\n"
+                            f"{sig['symbol']} ({tf}) | {sig['side']}\n"
                             f"Entry: {sig['entry']}\nSL: {sig['sl']}\n"
                             f"TP1: {sig['tp1']}  TP2: {sig['tp2']}  TP3: {sig['tp3']}\n"
-                            f"Reason: {sig['reason']}\nScore: {sig['score']}"
+                            f"Reason: {sig['reason']}\n"
+                            f"Score: {sig['score']}\n\n"
+                            f"<b>Breakdown:</b>\n{sig['breakdown']}"
                         )
                         await log_signal(sig)
                         last_signal_time[key] = time.time()
