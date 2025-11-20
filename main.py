@@ -405,43 +405,48 @@ async def scan_loop(exchange):
             if "BTC-USDT-SWAP" in tickers and "BTC-USDT-SWAP" not in [s for s, _ in top]:
                 top.insert(0, ("BTC-USDT-SWAP", tickers["BTC-USDT-SWAP"].get("quoteVolume", 0)))
 
-            # Loop through top coins
-            for symbol, vol in top:
-                if vol < MIN_VOLUME:
-                    log.info(f"Skipped {symbol} — volume {vol} below MIN_VOLUME")
-                    continue
+    # Loop through top coins
+for symbol, vol in top:
+    if vol < MIN_VOLUME:
+        log.info(f"Skipped {symbol} — volume {vol} below MIN_VOLUME")
+        continue
 
-                log.info(f"Scanning {symbol}...")
+    log.info(f"Scanning {symbol}...")
 
-                # Iterate through timeframes
-                for tf in TIMEFRAMES:
-                    key = f"{symbol}:{tf}"
-                    if key in last_signal_time and time.time() - last_signal_time[key] < 1800:
-                        log.info(f"Skipped {symbol} ({tf}) — cooldown active")
-                        continue
+    # Iterate through timeframes
+    for tf in TIMEFRAMES:
+        key = f"{symbol}:{tf}"
+        if key in last_signal_time and time.time() - last_signal_time[key] < 1800:
+            log.info(f"Skipped {symbol} ({tf}) — cooldown active")
+            continue
 
-                    ohlcv = await fetch_ohlcv(exchange, symbol, tf, 200)
-                    if not ohlcv:
-                        log.warning(f"OHLCV fetch failed for {symbol} ({tf})")
-                        continue
+        ohlcv = await fetch_ohlcv(exchange, symbol, tf, 200)
+        if not ohlcv:
+            log.warning(f"OHLCV fetch failed for {symbol} ({tf})")
+            continue
 
-                    df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
-                    sig = generate_signal(df, symbol)
-                    if sig:
-                        log.info(f"Signal generated for {symbol} ({tf})")
-                        await tg(
-                            f"🚀 <b>SMC Signal</b>\n"
-                            f"{sig['symbol']} ({tf}) | {sig['side']}\n"
-                            f"Entry: {sig['entry']}\nSL: {sig['sl']}\n"
-                            f"TP1: {sig['tp1']}  TP2: {sig['tp2']}  TP3: {sig['tp3']}\n"
-                            f"Reason: {sig['reason']}\n"
-                            f"Score: {sig['score']}\n\n"
-                            f"<b>Breakdown:</b>\n{sig['breakdown']}"
-                        )
-                        await log_signal(sig)
-                        last_signal_time[key] = time.time()
-                    else:
-                        log.info(f"No signal for {symbol} ({tf})")
+        df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
+        sig = generate_signal(df, symbol)
+        if sig:
+            log.info(f"Signal generated for {symbol} ({tf})")
+
+            # Format breakdown
+            breakdown_text = "\n• ".join(sig.get("reason_list", []))
+
+            await tg(
+                f"🚀 <b>SMC Signal</b>\n"
+                f"{sig['symbol']} ({tf}) | {sig['side']}\n"
+                f"Entry: {sig['entry']}\nSL: {sig['sl']}\n"
+                f"TP1: {sig['tp1']}  TP2: {sig['tp2']}  TP3: {sig['tp3']}\n"
+                f"Reason: {sig['reason']}\n"
+                f"Score: {sig['score']}\n\n"
+                f"<b>Breakdown:</b>\n• {breakdown_text}"
+            )
+
+            await log_signal(sig)
+            last_signal_time[key] = time.time()
+        else:
+            log.info(f"No signal for {symbol} ({tf})")
 
             # Heartbeat
             now = time.time()
