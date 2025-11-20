@@ -47,6 +47,9 @@ TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger("smc_bot")
 
+# ---------------- GLOBAL DB LOCK ----------------
+db_lock = asyncio.Lock()
+
 # ---------------- TELEGRAM ----------------
 def escape_html(msg: str) -> str:
     if not msg:
@@ -221,6 +224,8 @@ def volatility_ok(df: pd.DataFrame, min_atr_ratio=0.001, max_atr_ratio=0.03) -> 
     if df is None or len(df) < 20:
         return False
     atr = compute_atr(df, 14)
+    if atr is None or atr.isna().all():
+        return False
     last_atr = float(atr.iloc[-1])
     last_close = float(df["close"].iloc[-1])
     if last_close == 0:
@@ -239,8 +244,7 @@ def momentum_ok(df: pd.DataFrame, side: str) -> bool:
         return ema_fast > ema_slow
     else:
         return ema_fast < ema_slow
-
-
+        
 # ================================================
 # OPTIMIZED PREMIUM SMC SIGNAL GENERATOR
 # ================================================
@@ -340,13 +344,14 @@ def generate_signal(df: pd.DataFrame, symbol: str):
 
 # ---------------- LOG SIGNAL ----------------
 async def log_signal(sig):
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-        INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?)
-        """, (sig["symbol"],sig["side"],sig["entry"],sig["sl"],sig["tp1"],sig["tp2"],sig["tp3"],
-              datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"]))
-        await db.commit()
+    async with db_lock:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+            INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            """, (sig["symbol"],sig["side"],sig["entry"],sig["sl"],sig["tp1"],sig["tp2"],sig["tp3"],
+                  datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"]))
+            await db.commit()
 
 # ---------------- MONITOR SIGNALS ----------------
 async def monitor_signals(exchange):
@@ -389,18 +394,20 @@ async def monitor_signals(exchange):
                                 f"TP1: {tp1}  TP2: {tp2}  TP3: {tp3}"
                             )
                         
-                        await db.execute("""
-                            UPDATE signals
-                            SET tp1_hit=?, tp2_hit=?, tp3_hit=?, status=?
-                            WHERE id=?
-                        """, (tp1_hit, tp2_hit, tp3_hit, status, sig_id))
+                        # write updates under lock to avoid SQLite 'database is locked'
+                        async with db_lock:
+                            await db.execute("""
+                                UPDATE signals
+                                SET tp1_hit=?, tp2_hit=?, tp3_hit=?, status=?
+                                WHERE id=?
+                            """, (tp1_hit, tp2_hit, tp3_hit, status, sig_id))
                 await db.commit()
         except Exception as e:
             log.exception("Error in monitor_signals: %s", e)
             await tg(f"❌ Error in monitor_signals: {e}")
         
         await asyncio.sleep(SCAN_INTERVAL)
-
+        
 # ---------------- SCAN LOOP ----------------
 last_signal_time = {}
 btc_paused = False
@@ -412,16 +419,18 @@ async def scan_loop(exchange):
     while True:
         t0 = time.time()
         try:
+            # BTC clean check (logging only)
             btc_clean, reason = await btc_is_clean(exchange)
             if not btc_clean and not btc_paused:
                 log.info(f"⚠️ BTC not clean: {reason}")
                 await tg(f"⚠️ PAUSED — BTC not clean: {reason}")
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute(
-                        "INSERT INTO pauses (reason,timestamp) VALUES (?,?)",
-                        (reason, datetime.datetime.utcnow().isoformat())
-                    )
-                    await db.commit()
+                async with db_lock:
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        await db.execute(
+                            "INSERT INTO pauses (reason,timestamp) VALUES (?,?)",
+                            (reason, datetime.datetime.utcnow().isoformat())
+                        )
+                        await db.commit()
                 btc_paused = True
             else:
                 btc_paused = False
@@ -432,6 +441,7 @@ async def scan_loop(exchange):
                 key=lambda x:x[1], reverse=True
             )[:TOP_N]
 
+            # Always include BTC
             if BTC_PAIR in tickers and BTC_PAIR not in [s for s,_ in top]:
                 top.insert(0, (BTC_PAIR, tickers[BTC_PAIR].get("quoteVolume",0)))
 
@@ -474,12 +484,14 @@ async def scan_loop(exchange):
                     else:
                         log.info(f"No signal for {symbol} ({tf})")
 
+            # Heartbeat
             now = time.time()
             if now - last_heartbeat > HEARTBEAT_INTERVAL:
                 last_heartbeat = now
                 await tg("❤️ SMC Scanner running.")
                 log.info("Heartbeat sent.")
 
+            # Daily summary
             utc = datetime.datetime.utcnow()
             if utc.hour == DAILY_SUMMARY_HOUR and utc.minute < 2:
                 await tg("📊 Daily summary placeholder.")
@@ -491,7 +503,6 @@ async def scan_loop(exchange):
 
         elapsed = time.time() - t0
         await asyncio.sleep(max(1, SCAN_INTERVAL - elapsed))
-
 # ---------------- FASTAPI ----------------
 app = FastAPI()
 @app.post("/webhook")
