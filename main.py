@@ -231,6 +231,77 @@ async def log_signal(sig):
               datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"]))
         await db.commit()
 
+# ---------------- MONITOR SIGNALS ----------------
+async def monitor_signals(exchange):
+    """Check active signals for TP/SL hits and send Telegram alerts (once per target)"""
+    while True:
+        try:
+            async with aiosqlite.connect(DB_PATH) as db:
+                async with db.execute("""
+                    SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,tp1_hit,tp2_hit,tp3_hit,status 
+                    FROM signals 
+                    WHERE status='OPEN'
+                """) as cursor:
+                    async for row in cursor:
+                        sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status = row
+                        
+                        ticker = await exchange.fetch_ticker(symbol)
+                        last_price = ticker.get("last", None)
+                        if last_price is None:
+                            continue
+                        
+                        hits = []
+                        # BUY signals
+                        if side == "BUY":
+                            if not tp1_hit and last_price >= tp1:
+                                hits.append("TP1")
+                                tp1_hit = 1
+                            if not tp2_hit and last_price >= tp2:
+                                hits.append("TP2")
+                                tp2_hit = 1
+                            if not tp3_hit and last_price >= tp3:
+                                hits.append("TP3")
+                                tp3_hit = 1
+                            if last_price <= sl:
+                                hits.append("SL")
+                                status = "CLOSED"
+                        # SELL signals
+                        else:
+                            if not tp1_hit and last_price <= tp1:
+                                hits.append("TP1")
+                                tp1_hit = 1
+                            if not tp2_hit and last_price <= tp2:
+                                hits.append("TP2")
+                                tp2_hit = 1
+                            if not tp3_hit and last_price <= tp3:
+                                hits.append("TP3")
+                                tp3_hit = 1
+                            if last_price >= sl:
+                                hits.append("SL")
+                                status = "CLOSED"
+                        
+                        if hits:
+                            await tg(
+                                f"🎯 <b>SMC Signal Update</b>\n"
+                                f"{symbol} | {side}\n"
+                                f"Entry: {entry}\n"
+                                f"Last: {last_price}\n"
+                                f"HIT: {', '.join(hits)}\n"
+                                f"SL: {sl}\n"
+                                f"TP1: {tp1}  TP2: {tp2}  TP3: {tp3}"
+                            )
+                        
+                        await db.execute("""
+                            UPDATE signals
+                            SET tp1_hit=?, tp2_hit=?, tp3_hit=?, status=?
+                            WHERE id=?
+                        """, (tp1_hit, tp2_hit, tp3_hit, status, sig_id))
+                await db.commit()
+        except Exception as e:
+            log.exception("Error in monitor_signals: %s", e)
+            await tg(f"❌ Error in monitor_signals: {e}")
+        
+        await asyncio.sleep(SCAN_INTERVAL)
 # ---------------- SCAN LOOP ----------------
 last_signal_time = {}
 btc_paused = False  # Track if BTC pause alert has been sent
@@ -314,10 +385,21 @@ async def webhook(request: Request):
 # ---------------- MAIN ----------------
 if __name__=="__main__":
     import argparse
-    p=argparse.ArgumentParser()
-    p.add_argument("--http",action="store_true")
-    args=p.parse_args()
+    import ccxt.async_support as ccxt
+    import asyncio
+    import uvicorn
+
+    p = argparse.ArgumentParser()
+    p.add_argument("--http", action="store_true")
+    args = p.parse_args()
+
     if args.http:
-        uvicorn.run(app,host="0.0.0.0",port=9000)
+        uvicorn.run(app, host="0.0.0.0", port=9000)
     else:
-        asyncio.run(scan_loop())
+        exchange = ccxt.okx({"enableRateLimit": True})
+        asyncio.run(
+            asyncio.gather(
+                scan_loop(),
+                monitor_signals(exchange)
+            )
+        )
