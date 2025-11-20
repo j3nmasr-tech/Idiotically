@@ -33,7 +33,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = os.path.join(os.getcwd(), "signals.db")
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
-TOP_N = int(os.getenv("TOP_N", 50))
+TOP_N = int(os.getenv("TOP_N", 20))
 MAX_SPREAD = float(os.getenv("MAX_SPREAD", 0.0015))
 MIN_VOLUME = float(os.getenv("MIN_VOLUME", 1000000))
 
@@ -334,22 +334,22 @@ async def scan_loop(exchange):
     while True:
         t0 = time.time()
         try:
-            #btc_clean, reason = await btc_is_clean(exchange)
+            btc_clean, reason = await btc_is_clean(exchange)
             
-            #if not btc_clean:
-                #if not btc_paused:
-                    #await tg(f"⚠️ PAUSED — BTC not clean: {reason}")
-                    #async with aiosqlite.connect(DB_PATH) as db:
-                        #await db.execute(
-                            #"INSERT INTO pauses (reason,timestamp) VALUES (?,?)",
-                            #(reason, datetime.datetime.utcnow().isoformat())
-                        #)
-                        #await db.commit()
-                    #btc_paused = True
-                #await asyncio.sleep(SCAN_INTERVAL)
-                #continue
-            #else:
-                #btc_paused = False
+            if not btc_clean:
+                if not btc_paused:
+                    await tg(f"⚠️ PAUSED — BTC not clean: {reason}")
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        await db.execute(
+                            "INSERT INTO pauses (reason,timestamp) VALUES (?,?)",
+                            (reason, datetime.datetime.utcnow().isoformat())
+                        )
+                        await db.commit()
+                    btc_paused = True
+                await asyncio.sleep(SCAN_INTERVAL)
+                continue
+            else:
+                btc_paused = False
 
             tickers = await exchange.fetch_tickers()
             top = sorted(
