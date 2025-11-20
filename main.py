@@ -29,7 +29,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY")  # optional
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 
-DB_PATH = os.path.join(os.getcwd(), "signals.db")
+DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
 TOP_N = int(os.getenv("TOP_N", 100))
