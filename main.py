@@ -397,9 +397,17 @@ if __name__=="__main__":
         uvicorn.run(app, host="0.0.0.0", port=9000)
     else:
         exchange = ccxt.okx({"enableRateLimit": True})
-        asyncio.run(
-            asyncio.gather(
-                scan_loop(),
-                monitor_signals(exchange)
-            )
-        )
+
+        async def main():
+            try:
+                # Run both loops concurrently
+                await asyncio.gather(
+                    scan_loop(),
+                    monitor_signals(exchange)
+                )
+            except Exception as e:
+                log.exception("Fatal error in main: %s", e)
+            finally:
+                await exchange.close()
+
+        asyncio.run(main())
