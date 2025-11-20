@@ -217,8 +217,8 @@ def generate_signal(df: pd.DataFrame, symbol: str):
     # -------------------------------
     # 0. REJECT UNSTABLE / WICKY COINS
     # -------------------------------
-    if not coin_allowed(symbol):
-        return None
+    #if not coin_allowed(symbol):
+        #return None
 
     last = df["close"].iloc[-1]
 
