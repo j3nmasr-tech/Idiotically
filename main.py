@@ -332,78 +332,144 @@ async def monitor_signals(exchange):
         await asyncio.sleep(SCAN_INTERVAL)
 
 # ---------------- SCAN LOOP ----------------
-last_signal_time = {}
+# ---------------- SAFE FETCH HELPERS & SCAN LOOP (freeze-proof) ----------------
+# concurrency semaphore to avoid blasting the exchange
+OHLCV_SEMAPHORE = asyncio.Semaphore(8)  # tune between 4-16 depending on environment
 
-async def safe_fetch_tickers(exchange, timeout=7):
+async def safe_fetch_tickers(exchange, timeout=8):
+    """Fetch tickers with timeout and return dict (or {})"""
     try:
         return await asyncio.wait_for(exchange.fetch_tickers(), timeout=timeout)
     except Exception as e:
-        log.error(f"fetch_tickers timeout or error: {e}")
+        log.error(f"safe_fetch_tickers error/timeout: {e}")
         return {}
 
+async def fetch_ohlcv_with_sem(exchange, symbol, tf, limit=200):
+    """Internal wrapper that runs fetch_ohlcv under a semaphore to limit concurrency."""
+    async with OHLCV_SEMAPHORE:
+        return await fetch_ohlcv(exchange, symbol, tf, limit)
+
+async def safe_fetch_ohlcv(exchange, symbol, tf, limit=200, timeout=7, retry=True):
+    """
+    Protect fetch_ohlcv with timeout and an optional retry.
+    Returns None on failure.
+    """
+    try:
+        return await asyncio.wait_for(fetch_ohlcv_with_sem(exchange, symbol, tf, limit), timeout=timeout)
+    except Exception as e:
+        log.error(f"{symbol} {tf} OHLCV timeout/error: {e}")
+        if retry:
+            # quick short retry with smaller limit
+            try:
+                return await asyncio.wait_for(fetch_ohlcv_with_sem(exchange, symbol, tf, max(50, limit//4)), timeout=5)
+            except Exception as e2:
+                log.error(f"{symbol} {tf} OHLCV retry failed: {e2}")
+        return None
+
+# Cached ticker fetch control
+_last_ticker_fetch = 0.0
+_cached_tickers = {}
+
+async def get_top_tickers(exchange, cooldown=30):
+    """
+    Returns a dict of tickers (cached for `cooldown` seconds).
+    Only returns USDT pairs. Never blocks forever thanks to safe_fetch_tickers.
+    """
+    global _last_ticker_fetch, _cached_tickers
+    now = time.time()
+    if _cached_tickers and (now - _last_ticker_fetch) < cooldown:
+        return _cached_tickers
+    tickers = await safe_fetch_tickers(exchange)
+    if not tickers:
+        # keep previous cached if empty to avoid chopping to nothing
+        return _cached_tickers or {}
+    # keep only USDT pairs early to reduce memory
+    tickers = {s: v for s, v in tickers.items() if s.endswith("USDT")}
+    _cached_tickers = tickers
+    _last_ticker_fetch = now
+    return _cached_tickers
+
+# Main scan loop (drop-in replacement)
+last_signal_time = {}
 async def scan_loop(exchange):
+    """
+    Freeze-proof scan loop:
+    - fetches top tickers (cached)
+    - for each symbol fetches ALL TIMEFRAMES in parallel (once)
+    - uses safe_fetch_ohlcv (timeout + retry)
+    - reuses parent TFs for all small TF checks
+    """
+    global last_signal_time
     while True:
-        t0 = time.time()
+        loop_start = time.time()
         try:
-            # SAFE version (never freezes)
-            tickers = await safe_fetch_tickers(exchange)
+            tickers = await get_top_tickers(exchange, cooldown=30)
+            if not tickers:
+                log.warning("No tickers available this cycle.")
+                await asyncio.sleep(max(1, SCAN_INTERVAL))
+                continue
 
-            # Filter only USDT pairs early
-            tickers = {s:v for s,v in tickers.items() if s.endswith("USDT")}
-
-            # Sort top liquidity
+            # build top by liquidity
             top = sorted(
-                [(s, v.get("quoteVolume", 0)) for s, v in tickers.items()],
+                [(s, v.get("quoteVolume", 0) or 0) for s, v in tickers.items()],
                 key=lambda x: x[1],
                 reverse=True
             )[:TOP_N]
 
-            for symbol, _ in top:
-
+            for symbol, _vol in top:
+                # deprioritization (recent SL cluster) check
                 if deprioritized(symbol):
                     continue
 
-                ohlcvs = {}
+                # Prepare tasks: fetch all TFs for this symbol in parallel, but safely
+                tasks = {tf: asyncio.create_task(safe_fetch_ohlcv(exchange, symbol, tf, 200)) for tf in TIMEFRAMES}
 
+                # Await all tasks and build ohlcv DataFrames cache
+                ohlcvs = {}
+                for tf, task in tasks.items():
+                    data = await task
+                    if not data:
+                        continue
+                    df = pd.DataFrame(data, columns=["ts", "open", "high", "low", "close", "vol"])
+                    for c in ["open", "high", "low", "close", "vol"]:
+                        df[c] = pd.to_numeric(df[c], errors="coerce")
+                    ohlcvs[tf] = df
+
+                # Ensure we have at least parent TFs that filters rely on
+                # if you prefer strictness, require 15m and 1h/4h
+                if "15m" not in ohlcvs:
+                    # skip symbol - parent TF missing
+                    continue
+
+                # Iterate TFs and generate signals using cached parent data
                 for tf in TIMEFRAMES:
                     key = f"{symbol}:{tf}"
 
-                    # Cooldown
+                    # cooldown per (symbol,tf)
                     if key in last_signal_time and time.time() - last_signal_time[key] < 1800:
                         continue
 
-                    ohlcv = await fetch_ohlcv(exchange, symbol, tf, 200)
-                    if not ohlcv:
+                    df = ohlcvs.get(tf)
+                    if df is None or len(df) < 6:
                         continue
 
-                    df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
-                    for c in ["open", "high", "low", "close", "vol"]:
-                        df[c] = pd.to_numeric(df[c], errors="coerce")
-
+                    # Build context using cached parents
                     context = {
                         "tf": tf,
                         "df_15m": ohlcvs.get("15m"),
                         "df_1h": ohlcvs.get("1h"),
+                        "df_4h": ohlcvs.get("4h"),
                     }
 
-                    if tf in ("1m", "3m", "5m"):
-                        if "15m" not in ohlcvs:
-                            ohlcv15 = await fetch_ohlcv(exchange, symbol, "15m", 200)
-                            if ohlcv15:
-                                ohlcvs["15m"] = pd.DataFrame(ohlcv15, columns=["ts", "open", "high", "low", "close", "vol"])
-
-                        if "1h" not in ohlcvs:
-                            ohlcv1h = await fetch_ohlcv(exchange, symbol, "1h", 200)
-                            if ohlcv1h:
-                                ohlcvs["1h"] = pd.DataFrame(ohlcv1h, columns=["ts", "open", "high", "low", "close", "vol"])
-
-                        context["df_15m"] = ohlcvs.get("15m")
-                        context["df_1h"] = ohlcvs.get("1h")
-
-                    # --- Generate signal ---
-                    sig = generate_signal(df, symbol, context)
+                    # Generate signal (unchanged)
+                    try:
+                        sig = generate_signal(df, symbol, context)
+                    except Exception as e:
+                        log.exception("generate_signal EXCEPTION for %s %s: %s", symbol, tf, e)
+                        sig = None
 
                     if sig:
+                        # send + log
                         await tg(
                             f"🚀 {sig['symbol']} ({tf}) {sig['side']}\n"
                             f"Entry:{sig['entry']}\nSL:{sig['sl']}\n"
@@ -415,10 +481,15 @@ async def scan_loop(exchange):
                         last_signal_time[key] = time.time()
 
         except Exception as e:
-            log.exception("scan error: %s", e)
-            await tg(f"❌ Scan error: {e}")
+            log.exception("scan loop fatal error: %s", e)
+            # notify but keep loop running
+            try:
+                await tg(f"❌ Scan loop error: {e}")
+            except Exception:
+                pass
 
-        elapsed = time.time() - t0
+        # maintain a steady SCAN_INTERVAL cadence
+        elapsed = time.time() - loop_start
         await asyncio.sleep(max(1, SCAN_INTERVAL - elapsed))
         
 # ---------------- FASTAPI ----------------
