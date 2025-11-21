@@ -204,6 +204,7 @@ async def log_signal(sig):
 
 # ---------------- MONITOR ----------------
 async def monitor_signals(exchange):
+    log.info("Monitor loop started")
     while True:
         try:
             async with aiosqlite.connect(DB_PATH) as db:
@@ -217,6 +218,7 @@ async def monitor_signals(exchange):
                         if not ticker: continue
                         last_price = ticker.get("last")
                         if last_price is None: continue
+
                         hits=[]; sl_hit=False
                         if side=="BUY":
                             if not tp1_hit and last_price>=tp1: hits.append("TP1"); tp1_hit=1
@@ -228,12 +230,19 @@ async def monitor_signals(exchange):
                             if not tp2_hit and last_price<=tp2: hits.append("TP2"); tp2_hit=1
                             if not tp3_hit and last_price<=tp3: hits.append("TP3"); tp3_hit=1
                             if last_price>=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
-                        if hits: await tg(f"{symbol} update {hits}")
-                        if sl_hit: record_sl_hit(symbol)
+
+                        if hits:
+                            await tg(f"{symbol} update {hits}")
+                            log.info(f"{symbol} update {hits}")
+
+                        if sl_hit:
+                            record_sl_hit(symbol)
+
                         async with db_lock:
                             await db.execute("""
                             UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?
                             """,(tp1_hit,tp2_hit,tp3_hit,status,sig_id))
+            log.info("Monitor cycle completed")
             await asyncio.sleep(SCAN_INTERVAL)
         except Exception as e:
             log.exception("Monitor error: %s", e)
@@ -242,9 +251,12 @@ async def monitor_signals(exchange):
 # ---------------- SCAN LOOP ----------------
 last_signal_time = {}
 async def scan_loop(exchange):
+    log.info("Scan loop started")
     while True:
         t0 = time.time()
         try:
+            log.info("Starting new scan cycle")
+            # --- prefetch BTC 15m for HTF alignment and choppiness once per scan ---
             btc_trend = "NEUTRAL"
             btc_choppy = None
             df_btc15 = None
@@ -254,43 +266,79 @@ async def scan_loop(exchange):
                     df_btc15 = pd.DataFrame(btc_15_ohlcv, columns=["ts","open","high","low","close","vol"])
                     for c in ["open","high","low","close","vol"]:
                         df_btc15[c] = pd.to_numeric(df_btc15[c], errors="coerce")
-                    btc_trend = "BUY" if df_btc15["close"].iloc[-1]>df_btc15["close"].iloc[-2] else "SELL"
-                    btc_choppy = choppiness_index(df_btc15)
+                    btc_trend = compute_htf_trend(df_btc15, fast=5, slow=20)
+                    btc_choppy = choppiness_index(df_btc15, period=14)
+                log.info(f"BTC 15m trend: {btc_trend}, choppiness: {btc_choppy:.2f}")
             except Exception as e:
-                log.debug("BTC prefetch failed: %s", e)
+                log.debug("BTC prefetch/trend failed: %s", e)
 
+            # --- fetch tickers ---
             tickers = await safe_call(exchange.fetch_tickers)
-            if not tickers: 
+            if not tickers:
+                log.warning("fetch_tickers failed/timeout; sleeping briefly")
                 await asyncio.sleep(1)
                 continue
 
-            tv = [(s, float(v.get("quoteVolume") or 0)) for s,v in tickers.items() if str(s).endswith("USDT")]
-            top = sorted(tv, key=lambda x:x[1], reverse=True)[:TOP_N]
+            # --- choose top N by volume ---
+            tv = []
+            for s, v in tickers.items():
+                try:
+                    qv = v.get("quoteVolume") or v.get("quoteVolume24h") or v.get("baseVolume") or 0
+                    tv.append((s, float(qv)))
+                except:
+                    continue
+            top = sorted([x for x in tv if str(x[0]).endswith("USDT")], key=lambda x:x[1], reverse=True)[:TOP_N]
+            log.info(f"Top {TOP_N} symbols by volume: {[x[0] for x in top]}")
 
-            for symbol,_ in top:
-                if deprioritized(symbol): continue
+            # --- scan each symbol ---
+            for symbol, vol in top:
+                if deprioritized(symbol):
+                    log.debug(f"Symbol {symbol} deprioritized due to SL cluster")
+                    continue
 
+                ohlcvs = {}
                 for tf in TIMEFRAMES:
                     key = f"{symbol}:{tf}"
                     if key in last_signal_time and time.time() - last_signal_time[key] < 1800:
                         continue
+
                     ohlcv = await fetch_ohlcv(exchange, symbol, tf, 200)
-                    if not ohlcv: continue
+                    if not ohlcv:
+                        continue
+
                     df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
                     for c in ["open","high","low","close","vol"]:
                         df[c] = pd.to_numeric(df[c], errors="coerce")
+                    ohlcvs[tf] = df
 
-                    context = {"tf":tf,"df_15m":df_btc15,"btc_trend":btc_trend,"btc_choppy":btc_choppy}
+                    # --- build context for signal generator ---
+                    context = {
+                        "tf": tf,
+                        "df_15m": ohlcvs.get("15m") or df_btc15,
+                        "df_1h": ohlcvs.get("1h"),
+                        "btc_trend": btc_trend,
+                        "btc_choppy": btc_choppy
+                    }
+
+                    # --- generate signal ---
                     sig = generate_signal(df, symbol, context)
                     if sig:
                         last_signal_time[key] = time.time()
                         await log_signal(sig)
-                        await tg(f"🚀 {sig['symbol']} ({tf}) {sig['side']} Entry:{sig['entry']} SL:{sig['sl']} TP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}")
+                        await tg(
+                            f"🚀 {sig['symbol']} ({tf}) {sig['side']}\n"
+                            f"Entry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\n"
+                            f"Score:{sig['score']}\nBreakdown:{', '.join(sig['reason_list'])}"
+                        )
+                        log.info(f"Signal generated for {symbol} ({tf}) {sig['side']}")
 
         except Exception as e:
-            log.exception("scan_loop error: %s", e)
-        elapsed = time.time()-t0
-        await asyncio.sleep(max(1, SCAN_INTERVAL-elapsed))
+            log.exception("scan_loop exception: %s", e)
+            await tg(f"❌ Scan loop error: {e}")
+
+        elapsed = time.time() - t0
+        log.info(f"Scan cycle completed in {elapsed:.2f} seconds")
+        await asyncio.sleep(max(1, SCAN_INTERVAL - elapsed))
 
 # ---------------- MAIN ----------------
 async def main():
