@@ -1021,37 +1021,34 @@ for sym in symbols:
 
         all_signals.extend(signals)
 
+        # Send Telegram notifications if requested and credentials present
+        if args.send_telegram and token and chat_id:
+            for s in signals:
+                if s.signal in ("BUY", "SELL") and s.confidence > 0:
+                    text = f"*{s.symbol}* {s.signal}\nConfidence: {s.confidence}\nEntry: {s.entry_price}\nSL: {s.stop_loss}\nTP1: {s.tp1}\nTP2: {s.tp2}\nTP3: {s.tp3}\nReasons: {', '.join(s.reason)}"
+                    ok = send_telegram_message(token, chat_id, text)
+                    print(f"[TELEGRAM] Sent for {s.symbol}: {ok}")
+                    log_event("signals.log", f"{s.symbol} {s.signal} entry={s.entry_price} sl={s.stop_loss} tp1={s.tp1} tp2={s.tp2} tp3={s.tp3} conf={s.confidence}")
+                    t = threading.Thread(target=monitor_trade, args=(s.symbol, s.signal, s.entry_price, s.stop_loss, s.tp1, s.tp2, s.tp3, token, chat_id), daemon=True)
+                    t.start()
+
     except Exception as e:
         print(f"[ERROR] Failed scanning {sym}: {e}")
-            # Send Telegram notifications if requested and credentials present
-            if args.send_telegram and token and chat_id:
-                for s in signals:
-                    # send only actionable signals
-                    if s.signal in ("BUY", "SELL") and s.confidence > 0:
-                        text = f"*{s.symbol}* {s.signal}\nConfidence: {s.confidence}\nEntry: {s.entry_price}\nSL: {s.stop_loss}\nTP1: {s.tp1}\nTP2: {s.tp2}\nTP3: {s.tp3}\nReasons: {', '.join(s.reason)}"
-                        ok = send_telegram_message(token, chat_id, text)
-                        print(f"[TELEGRAM] Sent for {s.symbol}: {ok}")
-                        # log the signal
-                        log_event("signals.log", f"{s.symbol} {s.signal} entry={s.entry_price} sl={s.stop_loss} tp1={s.tp1} tp2={s.tp2} tp3={s.tp3} conf={s.confidence}")
-                        # start a monitoring thread for this signal (non-blocking)
-                        t = threading.Thread(target=monitor_trade, args=(s.symbol, s.signal, s.entry_price, s.stop_loss, s.tp1, s.tp2, s.tp3, token, chat_id), daemon=True)
-                        t.start()
-        except Exception as e:
-            print(f"[SCAN] Error processing {sym}: {e}")
 
-    # Exports for full scan if desired
-    if args.export:
-        out_csv = args.export
-        rows = [s.to_json() for s in all_signals]
-        pd.DataFrame(rows).to_csv(out_csv, index=False)
-        print(f"[EXPORT] Signals exported to {out_csv}")
-    if args.json:
-        out_json = args.json
-        rows = [s.to_json() for s in all_signals]
-        json.dump(rows, open(out_json, "w"), indent=2, default=str)
-        print(f"[EXPORT] Signals JSON exported to {out_json}")
+# Exports for full scan if desired
+if args.export:
+    out_csv = args.export
+    rows = [s.to_json() for s in all_signals]
+    pd.DataFrame(rows).to_csv(out_csv, index=False)
+    print(f"[EXPORT] Signals exported to {out_csv}")
 
-    print("[DONE] Scan finished.")
+if args.json:
+    out_json = args.json
+    rows = [s.to_json() for s in all_signals]
+    json.dump(rows, open(out_json, "w"), indent=2, default=str)
+    print(f"[EXPORT] Signals JSON exported to {out_json}")
+
+print("[DONE] Scan finished.")
 
 if __name__ == "__main__":
     main()
