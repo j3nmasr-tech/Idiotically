@@ -382,7 +382,7 @@ def detect_fvg(df: pd.DataFrame, min_gap: float = 0.0) -> List[Dict[str,Any]]:
 # ---------------------------
 # Order block detection (heuristic)
 # ---------------------------
-def detect_order_blocks(df: pd.DataFrame, lookback:int=20) -> List[Dict[str,Any]]:
+def detect_order_blocks(df: pd.DataFrame, lookback: int = 20) -> List[Dict[str, Any]]:
     """
     Heuristic: an order block is the last bullish (or bearish) candle before a strong impulsive move opposite.
     We detect impulses by consecutive closes in same direction exceeding ATR.
@@ -394,24 +394,34 @@ def detect_order_blocks(df: pd.DataFrame, lookback:int=20) -> List[Dict[str,Any]
     l = df["low"].values
     n = len(df)
     eps = 1e-9
+
     # detect impulses (3+ consecutive directional bars with size > ATR)
     for i in range(2, n):
         # bullish impulse
-        sizes = np.abs(np.diff(c[max(0,i-4):i+1]))
+        sizes = np.abs(np.diff(c[max(0, i-4):i+1]))
         if len(sizes) >= 3 and np.all(sizes > (at[i] + eps)):
             # order block is the last bearish corrective candle before impulse
             # search backward for last opposite candle
-            j = i-1
+            j = i - 1
             while j >= 0:
-                if c[j] < o := df["open"].iat[j]:
-                    ob_list.append({"type":"bullish","start":df.index[j],"end":df.index[i],"high":float(h[j]),"low":float(l[j])})
+                o = df["open"].iat[j]  # assign first
+                if c[j] < o:  # then compare
+                    ob_list.append({
+                        "type": "bullish",
+                        "start": df.index[j],
+                        "end": df.index[i],
+                        "high": float(h[j]),
+                        "low": float(l[j])
+                    })
                     break
                 j -= 1
-        # bearish impulse
-        # (symmetric)
+
+        # bearish impulse (symmetric)
         if len(sizes) >= 3 and np.all(sizes > (at[i] + eps)):
-            # last bullish before downward impulse
+            # last bullish corrective candle before downward impulse
+            # TODO: implement symmetric bearish logic
             pass
+
     # Note: this is a conservative heuristic and may be expanded for production
     return ob_list
 
