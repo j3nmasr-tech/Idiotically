@@ -28,9 +28,9 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = os.getenv("DB_PATH", "./data/signals.db")
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
-TOP_N = int(os.getenv("TOP_N", 20))
+TOP_N = int(os.getenv("TOP_N", 1))
 BTC_PAIR = os.getenv("BTC_PAIR", "BTC-USDT-SWAP")
-TIMEFRAMES = ["1m","3m","5m","15m","30m","1h","4h"]
+TIMEFRAMES = ["1m","3m","5m","15m","30m"]
 
 # Filters
 MIN_SCORE_TO_SIGNAL = int(os.getenv("MIN_SCORE_TO_SIGNAL", 5))
