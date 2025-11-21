@@ -33,7 +33,7 @@ MAX_SPREAD = float(os.getenv("MAX_SPREAD", 0.002))
 BTC_PAIR = os.getenv("BTC_PAIR", "BTC-USDT-SWAP")
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", 3600))
 DAILY_SUMMARY_HOUR = int(os.getenv("DAILY_SUMMARY_HOUR", 23))
-TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
+TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "4h"]
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
