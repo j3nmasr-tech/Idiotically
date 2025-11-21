@@ -27,13 +27,13 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
-TOP_N = int(os.getenv("TOP_N", 1))
+TOP_N = int(os.getenv("TOP_N", 5))
 MIN_VOLUME = float(os.getenv("MIN_VOLUME", 1000000))
 MAX_SPREAD = float(os.getenv("MAX_SPREAD", 0.002))
 BTC_PAIR = os.getenv("BTC_PAIR", "BTC-USDT-SWAP")
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", 3600))
 DAILY_SUMMARY_HOUR = int(os.getenv("DAILY_SUMMARY_HOUR", 23))
-TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "4h"]
+TIMEFRAMES = ["3m", "5m", "15m", "30m", "1h"]
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
