@@ -170,28 +170,40 @@ def sma(series: pd.Series, period: int):
 def choppiness_index(df: pd.DataFrame, period=14):
     """
     Returns the Choppiness Index (0-100). Higher values indicate chop.
-    Approximation used for screening.
+    Safe version: no deprecated pandas options, no warnings, no freeze.
     """
     if df is None or len(df) < period + 1:
         return None
+
     high, low, close = df["high"], df["low"], df["close"]
+
+    # True Range approximation
     tr = (high - low).abs()
-    tr = tr.combine((high - close.shift(1)).abs(), max).combine((low - close.shift(1)).abs(), max)
+    tr = tr.combine((high - close.shift(1)).abs(), max)
+    tr = tr.combine((low - close.shift(1)).abs(), max)
+
     atr_sum = tr.rolling(period).sum()
     hh = high.rolling(period).max()
     ll = low.rolling(period).min()
+
     denom = (hh - ll).replace(0, 1e-12)
-    # safe log-like mapping to produce relative values
-    with pd.option_context('mode.use_inf_as_na', True):
-        frac = atr_sum / denom
-        frac = frac.replace([float('inf'), -float('inf')], pd.NA).fillna(0)
-        # use a transform and scale to 0-100
-        scaled = frac.apply(lambda x: math.log(x + 1e-12) if x > 0 else -10)
-    # normalize into 0-100 window
+
+    # ---------------- SAFE VERSION ----------------
+    frac = atr_sum / denom
+    # Remove inf/nan safely
+    frac = frac.replace([float('inf'), -float('inf')], pd.NA)
+    frac = frac.fillna(0)
+    frac = frac.infer_objects(copy=False)
+
+    # log transform
+    scaled = frac.apply(lambda x: math.log(x + 1e-12) if x > 0 else -10)
+
     scaled = scaled.fillna(-10)
     minv, maxv = float(scaled.min()), float(scaled.max())
+
     if maxv - minv < 1e-9:
-        return float(50.0)
+        return 50.0
+
     ci = 100.0 * (scaled.iloc[-1] - minv) / (maxv - minv)
     return float(ci)
 
