@@ -333,42 +333,94 @@ async def monitor_signals(exchange):
 
 # ---------------- SCAN LOOP ----------------
 last_signal_time = {}
+
+async def safe_fetch_tickers(exchange, timeout=7):
+    try:
+        return await asyncio.wait_for(exchange.fetch_tickers(), timeout=timeout)
+    except Exception as e:
+        log.error(f"fetch_tickers timeout or error: {e}")
+        return {}
+
 async def scan_loop(exchange):
     while True:
-        t0=time.time()
+        t0 = time.time()
         try:
-            tickers = await exchange.fetch_tickers()
-            top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")], key=lambda x:x[1], reverse=True)[:TOP_N]
-            for symbol,_ in top:
-                if deprioritized(symbol): continue
-                ohlcvs={}
+            # SAFE version (never freezes)
+            tickers = await safe_fetch_tickers(exchange)
+
+            # Filter only USDT pairs early
+            tickers = {s:v for s,v in tickers.items() if s.endswith("USDT")}
+
+            # Sort top liquidity
+            top = sorted(
+                [(s, v.get("quoteVolume", 0)) for s, v in tickers.items()],
+                key=lambda x: x[1],
+                reverse=True
+            )[:TOP_N]
+
+            for symbol, _ in top:
+
+                if deprioritized(symbol):
+                    continue
+
+                ohlcvs = {}
+
                 for tf in TIMEFRAMES:
-                    key=f"{symbol}:{tf}"
-                    if key in last_signal_time and time.time()-last_signal_time[key]<1800: continue
-                    ohlcv = await fetch_ohlcv(exchange,symbol,tf,200)
-                    if not ohlcv: continue
-                    df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
-                    for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
-                    context={"tf":tf,"df_15m":ohlcvs.get("15m"),"df_1h":ohlcvs.get("1h")}
-                    if tf in ("1m","3m","5m"):
-                        if "15m" not in ohlcvs: 
-                            ohlcv15 = await fetch_ohlcv(exchange,symbol,"15m",200)
-                            if ohlcv15: ohlcvs["15m"]=pd.DataFrame(ohlcv15,columns=["ts","open","high","low","close","vol"])
+                    key = f"{symbol}:{tf}"
+
+                    # Cooldown
+                    if key in last_signal_time and time.time() - last_signal_time[key] < 1800:
+                        continue
+
+                    ohlcv = await fetch_ohlcv(exchange, symbol, tf, 200)
+                    if not ohlcv:
+                        continue
+
+                    df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
+                    for c in ["open", "high", "low", "close", "vol"]:
+                        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+                    context = {
+                        "tf": tf,
+                        "df_15m": ohlcvs.get("15m"),
+                        "df_1h": ohlcvs.get("1h"),
+                    }
+
+                    if tf in ("1m", "3m", "5m"):
+                        if "15m" not in ohlcvs:
+                            ohlcv15 = await fetch_ohlcv(exchange, symbol, "15m", 200)
+                            if ohlcv15:
+                                ohlcvs["15m"] = pd.DataFrame(ohlcv15, columns=["ts", "open", "high", "low", "close", "vol"])
+
                         if "1h" not in ohlcvs:
-                            ohlcv1h = await fetch_ohlcv(exchange,symbol,"1h",200)
-                            if ohlcv1h: ohlcvs["1h"]=pd.DataFrame(ohlcv1h,columns=["ts","open","high","low","close","vol"])
-                        context["df_15m"]=ohlcvs.get("15m"); context["df_1h"]=ohlcvs.get("1h")
-                    sig = generate_signal(df,symbol,context)
+                            ohlcv1h = await fetch_ohlcv(exchange, symbol, "1h", 200)
+                            if ohlcv1h:
+                                ohlcvs["1h"] = pd.DataFrame(ohlcv1h, columns=["ts", "open", "high", "low", "close", "vol"])
+
+                        context["df_15m"] = ohlcvs.get("15m")
+                        context["df_1h"] = ohlcvs.get("1h")
+
+                    # --- Generate signal ---
+                    sig = generate_signal(df, symbol, context)
+
                     if sig:
-                        await tg(f"🚀 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{sig['score']}\nBreakdown:{', '.join(sig['reason_list'])}")
+                        await tg(
+                            f"🚀 {sig['symbol']} ({tf}) {sig['side']}\n"
+                            f"Entry:{sig['entry']}\nSL:{sig['sl']}\n"
+                            f"TP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\n"
+                            f"Score:{sig['score']}\n"
+                            f"Breakdown:{', '.join(sig['reason_list'])}"
+                        )
                         await log_signal(sig)
-                        last_signal_time[key]=time.time()
+                        last_signal_time[key] = time.time()
+
         except Exception as e:
             log.exception("scan error: %s", e)
             await tg(f"❌ Scan error: {e}")
-        elapsed=time.time()-t0
-        await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
 
+        elapsed = time.time() - t0
+        await asyncio.sleep(max(1, SCAN_INTERVAL - elapsed))
+        
 # ---------------- FASTAPI ----------------
 app = FastAPI()
 @app.post("/webhook")
