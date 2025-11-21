@@ -2,15 +2,21 @@
 # -*- coding: utf-8 -*-
 
 """
-Production-ready Premium SMC Scanner (Set B architecture)
+Production-ready Premium SMC Scanner (Set B architecture) - UPGRADED
 - Full SMC core: OB/FVG/Liquidity/BOS/MSS detection
 - ATR-based TP/SL
 - SL-cluster deprioritization
 - Momentum & volatility filters
 - Top N USDT coins, multi-timeframe scan
+- Added filters:
+    * 15m BTC trend alignment (for 1m/3m/5m entries)
+    * Choppiness index rejection
+    * Wick-dominance rejection
+    * Strong BOS/Sweep validation
+    * Volatility-aware SL sanity
 """
 
-import os, time, asyncio, logging, datetime
+import os, time, asyncio, logging, datetime, math
 import aiosqlite
 import httpx
 import ccxt.async_support as ccxt
@@ -34,6 +40,15 @@ BTC_PAIR = os.getenv("BTC_PAIR", "BTC-USDT-SWAP")
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", 3600))
 DAILY_SUMMARY_HOUR = int(os.getenv("DAILY_SUMMARY_HOUR", 23))
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h", "4h"]
+
+# ---------------- TUNABLE FILTERS ----------------
+MIN_SCORE_TO_SIGNAL = int(os.getenv("MIN_SCORE_TO_SIGNAL", 5))
+CHOPPINESS_REJECT = float(os.getenv("CHOPPINESS_REJECT", 61.0))  # classic CI threshold (higher == more choppy)
+WICK_DOMINANCE_REJECT = float(os.getenv("WICK_DOMINANCE_REJECT", 1.2))  # avg wick / body ratio
+MIN_SL_ATR_MULT = float(os.getenv("MIN_SL_ATR_MULT", 0.6))  # min acceptable SL distance in ATR multiples
+MIN_ATR_FOR_SCAN = float(os.getenv("MIN_ATR_FOR_SCAN", 0.0001))  # avoid division by zero
+HTF_ALIGNMENT_ENFORCE = os.getenv("HTF_ALIGNMENT_ENFORCE", "1m,3m,5m")  # TFs where alignment required
+HTF_ALIGNMENT_SET = set([x.strip() for x in HTF_ALIGNMENT_ENFORCE.split(",") if x.strip()])
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -104,9 +119,11 @@ async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
 
 # ---------------- INDICATORS ----------------
 def atr(df: pd.DataFrame, period=14):
+    if df is None or len(df) < 2:
+        return pd.Series([])
     high, low, close = df["high"], df["low"], df["close"]
     tr = pd.DataFrame({
-        "h-l": high - low,
+        "h-l": (high - low).abs(),
         "h-pc": (high - close.shift(1)).abs(),
         "l-pc": (low - close.shift(1)).abs()
     }).max(axis=1)
@@ -115,10 +132,30 @@ def atr(df: pd.DataFrame, period=14):
 def sma(series: pd.Series, period: int):
     return series.rolling(period, min_periods=1).mean()
 
+def choppiness_index(df: pd.DataFrame, period=14):
+    """
+    Returns the Choppiness Index (0-100). Higher values indicate chop.
+    Classic formula.
+    """
+    if df is None or len(df) < period + 1:
+        return None
+    high, low, close = df["high"], df["low"], df["close"]
+    tr = (high - low).abs()
+    tr = tr.combine((high - close.shift(1)).abs(), max).combine((low - close.shift(1)).abs(), max)
+    atr_sum = tr.rolling(period).sum()
+    hh = high.rolling(period).max()
+    ll = low.rolling(period).min()
+    denom = (hh - ll).replace(0, 1e-12)
+    ci = 100 * (atr_sum / denom).apply(lambda x: math.log(x) if x>0 else 0)
+    # normalize: map to 0-100 using simple scaling (approximation)
+    # Note: classic CI uses log10 and constants; this gives comparable relative values for screening.
+    ci = (ci - ci.min()) / (ci.max() - ci.min() + 1e-12) * 100
+    return float(ci.iloc[-1])
+
 # ---------------- SMC CORE ----------------
 def detect_swing_points(df: pd.DataFrame):
-    if len(df) < 5:
-        return None
+    if df is None or len(df) < 5:
+        return None, None
     last = df.iloc[-1]
     prev = df.iloc[-3:-1]
     swing_high = last["high"] > prev["high"].max()
@@ -126,6 +163,8 @@ def detect_swing_points(df: pd.DataFrame):
     return swing_high, swing_low
 
 def detect_active_range(df: pd.DataFrame, lookback=10):
+    if df is None or len(df) < lookback:
+        return None, None
     last = df.iloc[-lookback:]
     return last["high"].max(), last["low"].min()
 
@@ -134,7 +173,7 @@ def detect_liquidity_pools(df: pd.DataFrame):
     return hh, ll
 
 def detect_sweep(df: pd.DataFrame):
-    if len(df) < 6:
+    if df is None or len(df) < 6:
         return False, False
     last = df.iloc[-1]
     prev = df.iloc[-5:-1]
@@ -145,20 +184,80 @@ def detect_bos_mss(df: pd.DataFrame):
     return hh, ll
 
 def detect_fvg(df: pd.DataFrame):
-    if len(df) < 3:
+    if df is None or len(df) < 3:
         return False, False
     c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
-    bull = c2["low"] > c1["high"] and c3["low"] > c2["high"]
-    bear = c2["high"] < c1["low"] and c3["high"] < c2["low"]
+    bull = (c2["low"] > c1["high"]) and (c3["low"] > c2["high"])
+    bear = (c2["high"] < c1["low"]) and (c3["high"] < c2["low"])
     return bull, bear
 
 def detect_order_blocks(df: pd.DataFrame):
-    if len(df) < 3:
+    if df is None or len(df) < 3:
         return None, None, None
+    # Use the third-from-last candle as in original code
     candle = df.iloc[-3]
-    if candle["close"] > candle["open"]:
-        return "bullish", candle["open"], candle["low"]
-    return "bearish", candle["high"], candle["open"]
+    try:
+        if candle["close"] > candle["open"]:
+            return "bullish", float(candle["open"]), float(candle["low"])
+        return "bearish", float(candle["high"]), float(candle["open"])
+    except Exception:
+        return None, None, None
+
+# ---------------- SMC STRENGTH VALIDATORS ----------------
+def wick_dominance(df: pd.DataFrame, lookback=12):
+    """
+    Compute average wick/body ratio over last `lookback` candles.
+    Higher ratio -> more wick-dominated (choppy).
+    """
+    if df is None or len(df) < lookback:
+        return 0.0
+    sample = df.iloc[-lookback:]
+    bodies = (sample["close"] - sample["open"]).abs().replace(0, 1e-12)
+    upper_wick = (sample["high"] - sample[["open","close"]].max(axis=1)).abs()
+    lower_wick = (sample[["open","close"]].min(axis=1) - sample["low"]).abs()
+    wick = (upper_wick + lower_wick) / 2.0
+    ratio = (wick / bodies).replace([float('inf'), -float('inf')], 0).fillna(0)
+    return float(ratio.mean())
+
+def strong_sweep_or_bos(df: pd.DataFrame, lookback=6):
+    """
+    Check amplitude of most recent sweep/BOS vs ATR to ensure it wasn't a tiny wick.
+    Returns True if there is a meaningful sweep/BOS.
+    """
+    if df is None or len(df) < lookback:
+        return False
+    sweep_h, sweep_l = detect_sweep(df)
+    atr_val = atr(df, 14).iloc[-1] if len(df) >= 14 else None
+    if atr_val is None or atr_val < MIN_ATR_FOR_SCAN:
+        # If ATR tiny, still allow if sweep is relatively large vs recent range
+        atr_val = max(MIN_ATR_FOR_SCAN, float(df["high"].iloc[-lookback:].max() - df["low"].iloc[-lookback:].min()) / lookback)
+    if sweep_h:
+        amplitude = float(df["high"].iloc[-1] - df["high"].iloc[-2])
+        return amplitude >= 0.5 * atr_val
+    if sweep_l:
+        amplitude = float(df["low"].iloc[-2] - df["low"].iloc[-1])
+        return amplitude >= 0.5 * atr_val
+    # fallback: check last BOS candlestick body size
+    last_body = abs(df["close"].iloc[-1] - df["open"].iloc[-1])
+    return last_body >= 0.4 * atr_val
+
+# ---------------- HTF TREND ----------------
+def compute_htf_trend(df: pd.DataFrame, fast=5, slow=20):
+    """
+    Simple HTF trend: slope of sma(fast) vs sma(slow) on the provided df.
+    Returns "BUY", "SELL", or "NEUTRAL".
+    """
+    if df is None or len(df) < slow + 2:
+        return "NEUTRAL"
+    close = df["close"].astype(float)
+    sfast = sma(close, fast).iloc[-1]
+    sslow = sma(close, slow).iloc[-1]
+    # Use small delta threshold relative to price
+    if sfast > sslow * 1.0006:
+        return "BUY"
+    if sfast < sslow * 0.9994:
+        return "SELL"
+    return "NEUTRAL"
 
 # ---------------- SL-CLUSTER ----------------
 recent_sl = defaultdict(lambda: deque())
@@ -179,6 +278,14 @@ def deprioritized(symbol: str, threshold=3, lookback=30):
 
 # ---------------- SIGNAL GENERATOR ----------------
 def generate_signal(df: pd.DataFrame, symbol: str, context=None):
+    """
+    context expected keys:
+      - tf : timeframe for this df (e.g., "5m")
+      - df_15m : 15m DataFrame for this symbol (optional)
+      - df_1h : 1h DataFrame for this symbol (optional)
+      - btc_trend : "BUY"/"SELL"/"NEUTRAL" (from BTC 15m)
+      - btc_choppy : numeric choppiness value for BTC 15m
+    """
     if context is None:
         context = {}
     tf = context.get("tf","15m")
@@ -186,7 +293,7 @@ def generate_signal(df: pd.DataFrame, symbol: str, context=None):
     if df is None or len(df) < 6:
         return None
 
-    last = df["close"].iloc[-1]
+    last = float(df["close"].iloc[-1])
 
     ob_type, ob_hi, ob_lo = detect_order_blocks(df)
     if ob_type is None:
@@ -196,9 +303,11 @@ def generate_signal(df: pd.DataFrame, symbol: str, context=None):
     sweep_h, sweep_l = detect_sweep(df)
     bos_hh, bos_ll = detect_bos_mss(df)
 
-    if not (bos_hh or bos_ll):
+    # Require at least one BOS or sweep (strong version)
+    if not strong_sweep_or_bos(df):
         return None
 
+    # Basic score + reasons
     score = 0
     reasons = []
 
@@ -212,16 +321,49 @@ def generate_signal(df: pd.DataFrame, symbol: str, context=None):
     if sweep_h or sweep_l: score+=1; reasons.append("Sweep +1")
     else: reasons.append("No Sweep +0")
 
+    # Wick dominance check
+    wick_ratio = wick_dominance(df, lookback=12)
+    if wick_ratio >= WICK_DOMINANCE_REJECT:
+        reasons.append(f"WickDominant:{wick_ratio:.2f}")
+        # too choppy on candles - reject
+        return None
+    else:
+        reasons.append(f"WickRatio:{wick_ratio:.2f}")
+
     side = "BUY" if ob_type=="bullish" else "SELL"
+
+    # Enforce HTF BTC alignment for very short TFs if available
+    btc_trend = context.get("btc_trend", "NEUTRAL")
+    btc_choppy = context.get("btc_choppy", None)
+    if tf in HTF_ALIGNMENT_SET and btc_trend in ("BUY","SELL"):
+        if side != btc_trend:
+            reasons.append(f"HTF_MISALIGN:{side}!={btc_trend}")
+            return None
+        else:
+            reasons.append(f"HTF_ALIGN:{side}=={btc_trend}")
+
+    # Reject if BTC is choppy beyond threshold (optional)
+    if btc_choppy is not None:
+        if btc_choppy >= CHOPPINESS_REJECT:
+            reasons.append(f"BTC_Choppy:{btc_choppy:.1f}")
+            return None
+        else:
+            reasons.append(f"BTC_Choppy:{btc_choppy:.1f}")
 
     # ATR-based TP/SL
     atr_val = None
     df15 = context.get("df_15m")
     if df15 is not None and len(df15)>=10:
-        atr_val = float(atr(df15,14).iloc[-1])
+        try:
+            atr_series = atr(df15,14)
+            if len(atr_series)>0:
+                atr_val = float(atr_series.iloc[-1])
+        except Exception:
+            atr_val = None
+
     entry = float(last)
     tp_mult, sl_mult = 0.8, 1.0
-    if atr_val:
+    if atr_val and atr_val > 0:
         if side=="BUY":
             sl = entry - sl_mult*atr_val
             tp1 = entry + tp_mult*atr_val
@@ -233,6 +375,7 @@ def generate_signal(df: pd.DataFrame, symbol: str, context=None):
             tp2 = entry - tp_mult*1.5*atr_val
             tp3 = entry - tp_mult*2.5*atr_val
     else:
+        # fallback: use OB edges
         if side=="BUY":
             sl = float(ob_lo)
             tp1 = entry*1.004; tp2 = entry*1.008; tp3 = entry*1.012
@@ -240,19 +383,47 @@ def generate_signal(df: pd.DataFrame, symbol: str, context=None):
             sl = float(ob_hi)
             tp1 = entry*0.996; tp2 = entry*0.992; tp3 = entry*0.988
 
-    if sl==entry:
-        sl = entry - entry*0.002 if side=="BUY" else entry + entry*0.002
+    # Ensure SL distance is not too tight relative to ATR; if tight, try to widen; else reject
+    if atr_val and atr_val > 0:
+        sl_distance = abs(entry - sl)
+        min_allowed = max(MIN_SL_ATR_MULT * atr_val, atr_val * 0.25)  # ensure reasonable
+        if sl_distance < min_allowed:
+            # attempt to widen SL to min_allowed
+            if side == "BUY":
+                new_sl = entry - min_allowed
+            else:
+                new_sl = entry + min_allowed
+            # If widening places SL inside OB or too far, prefer rejecting conservatively
+            # We'll allow widening but keep original if it's still sensical
+            sl = float(new_sl)
+            reasons.append(f"SL_widened_to_at_least_{min_allowed:.6f}")
+    else:
+        # If no ATR, ensure SL is at least small percentage
+        min_pct = 0.0015
+        sl_distance = abs(entry - sl)
+        if sl_distance < entry * min_pct:
+            # widen a bit
+            if side == "BUY":
+                sl = entry - entry * min_pct
+            else:
+                sl = entry + entry * min_pct
+            reasons.append(f"SL_widened_pct_{min_pct}")
+
+    # Score gating
+    if score < MIN_SCORE_TO_SIGNAL:
+        reasons.append(f"ScoreTooLow:{score}")
+        return None
 
     return {
         "symbol": symbol,
         "side": side,
         "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
+        "sl": float(sl),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "tp3": float(tp3),
         "score": score,
-        "reason": "Set B SMC Signal",
+        "reason": "Set B SMC Signal (upgraded filters)",
         "reason_list": reasons
     }
 
@@ -278,7 +449,10 @@ async def monitor_signals(exchange):
                 """) as cursor:
                     async for row in cursor:
                         sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status = row
-                        ticker = await exchange.fetch_ticker(symbol)
+                        try:
+                            ticker = await exchange.fetch_ticker(symbol)
+                        except Exception:
+                            continue
                         last_price = ticker.get("last")
                         if last_price is None: continue
 
@@ -316,6 +490,19 @@ async def scan_loop(exchange):
     while True:
         t0=time.time()
         try:
+            # --- prefetch BTC 15m for HTF alignment and choppiness once per scan ---
+            btc_trend = "NEUTRAL"
+            btc_choppy = None
+            try:
+                btc_15_ohlcv = await fetch_ohlcv(exchange, BTC_PAIR, "15m", 200)
+                if btc_15_ohlcv:
+                    df_btc15 = pd.DataFrame(btc_15_ohlcv, columns=["ts","open","high","low","close","vol"])
+                    for c in ["open","high","low","close","vol"]: df_btc15[c]=pd.to_numeric(df_btc15[c],errors="coerce")
+                    btc_trend = compute_htf_trend(df_btc15, fast=5, slow=20)
+                    btc_choppy = choppiness_index(df_btc15, period=14)
+            except Exception as e:
+                log.debug("BTC prefetch/trend failed: %s", e)
+
             tickers = await exchange.fetch_tickers()
             top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")], key=lambda x:x[1], reverse=True)[:TOP_N]
             for symbol,_ in top:
@@ -328,9 +515,12 @@ async def scan_loop(exchange):
                     if not ohlcv: continue
                     df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
                     for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
-                    context={"tf":tf,"df_15m":ohlcvs.get("15m"),"df_1h":ohlcvs.get("1h")}
+                    ohlcvs[tf]=df  # store by timeframe
+                    context={"tf":tf,"df_15m":ohlcvs.get("15m"),"df_1h":ohlcvs.get("1h"),
+                             "btc_trend": btc_trend, "btc_choppy": btc_choppy}
+                    # For ultra-short TFs ensure we pass 15m/1h context
                     if tf in ("1m","3m","5m"):
-                        if "15m" not in ohlcvs: 
+                        if "15m" not in ohlcvs:
                             ohlcv15 = await fetch_ohlcv(exchange,symbol,"15m",200)
                             if ohlcv15: ohlcvs["15m"]=pd.DataFrame(ohlcv15,columns=["ts","open","high","low","close","vol"])
                         if "1h" not in ohlcvs:
