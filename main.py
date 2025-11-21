@@ -25,7 +25,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
-TOP_N = int(os.getenv("TOP_N", 40))
+TOP_N = int(os.getenv("TOP_N", 30))
 MAX_SPREAD = float(os.getenv("MAX_SPREAD", 0.0015))
 MIN_VOLUME = float(os.getenv("MIN_VOLUME", 1000000))
 
