@@ -687,49 +687,63 @@ def run_tests():
 # ---------------------------
 # ADDED: Binance fetcher + helpers
 # ---------------------------
-def tf_to_binance_interval(tf: str) -> str:
+def tf_to_bybit_interval(tf: str) -> str:
     """
-    Convert pandas offset alias like '1T','3T','30T' to Binance interval '1m','3m','30m' etc.
-    If unknown, default to '1m'.
+    Convert pandas offset alias ('1T','3T','30T','1H') to Bybit kline intervals.
+    Bybit uses minute numbers as strings: "1","3","5","15","30","60","240".
     """
     if tf.endswith("T"):
-        n = tf[:-1]
-        return f"{n}m"
-    # fallback mappings
-    mapping = {"1min":"1m","3min":"3m","5min":"5m","15min":"15m","30min":"30m","1H":"1h"}
-    return mapping.get(tf, "1m")
+        return tf[:-1]  # "30T" -> "30"
+    mapping = {
+        "1min": "1",
+        "3min": "3",
+        "5min": "5",
+        "15min": "15",
+        "30min": "30",
+        "1H": "60",
+        "4H": "240"
+    }
+    return mapping.get(tf, "1")  # default 1-minute
 
-def fetch_klines_binance(symbol: str, interval: str = "30m", limit: int = 1000, api_base: str = "https://api.binance.com") -> pd.DataFrame:
+def fetch_klines_bybit(symbol: str, interval: str = "30", limit: int = 1000) -> pd.DataFrame:
     """
-    Fetch klines from Binance public API and return a DataFrame with index datetime and columns open,high,low,close,volume.
-    Note: rate-limited; use responsibly (Northflank container concurrency must be considered).
+    Fetch klines from Bybit v5 public API.
+    interval must be a string representing minutes ("1","3","5","15","30","60","240"...)
     """
-    url = f"{api_base}/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    url = "https://api.bybit.com/v5/market/kline"
+    params = {
+        "category": "linear",   # USDT-perpetual market (same as Binance futures)
+        "symbol": symbol,
+        "interval": interval,
+        "limit": limit
+    }
+
     try:
         r = requests.get(url, params=params, timeout=20)
         r.raise_for_status()
-        data = r.json()
-        # kline format: [open_time, open, high, low, close, volume, close_time, ...]
-        if not data:
-            raise ValueError("Empty klines")
+        raw = r.json()
+
+        if raw.get("retCode") != 0 or "list" not in raw.get("result", {}):
+            raise RuntimeError(f"Bybit error response: {raw}")
+
         rows = []
-        for k in data:
+        for k in raw["result"]["list"]:
+            # Bybit format: [start, open, high, low, close, volume, turnover]
             rows.append({
-                "open_time": int(k[0]),
+                "timestamp": pd.to_datetime(int(k[0]), unit="ms"),
                 "open": float(k[1]),
                 "high": float(k[2]),
                 "low": float(k[3]),
                 "close": float(k[4]),
-                "volume": float(k[5])
+                "volume": float(k[5]),
             })
+
         df = pd.DataFrame(rows)
-        df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms")
         df = df.set_index("timestamp").sort_index()
-        df = df[["open","high","low","close","volume"]]
         return df
+
     except Exception as e:
-        raise RuntimeError(f"Failed to fetch klines for {symbol}: {e}")
+        raise RuntimeError(f"Failed to fetch Bybit klines for {symbol}: {e}")
 
 # ---------------------------
 # ADDED: Telegram sender helper
@@ -768,31 +782,53 @@ def log_event(filename: str, text: str):
     except Exception as e:
         print(f"[LOG] Failed to write log {filename}: {e}")
 
-def monitor_trade(symbol: str, side: str, entry: float, sl: Optional[float], tp1: Optional[float], tp2: Optional[float], tp3: Optional[float], token: Optional[str], chat_id: Optional[str], poll_interval: float = 5.0):
+
+def monitor_trade(
+    symbol: str,
+    side: str,
+    entry: float,
+    sl: Optional[float],
+    tp1: Optional[float],
+    tp2: Optional[float],
+    tp3: Optional[float],
+    token: Optional[str],
+    chat_id: Optional[str],
+    poll_interval: float = 5.0
+):
     """
-    Monitor live price and notify when TP or SL hit.
+    Monitor live price using Bybit API and notify when TP or SL hit.
     Works for both BUY and SELL.
-    Runs until a TP (tp1/tp2/tp3) or SL is hit for that signal.
+    Runs until a TP or SL is hit.
     """
     print(f"[MONITOR] Started monitor for {symbol} {side} entry={entry} sl={sl} tp1={tp1} tp2={tp2} tp3={tp3}")
+
     hit_tp1 = False
     hit_tp2 = False
     hit_tp3 = False
 
     while True:
         try:
-            r = requests.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": symbol}, timeout=10)
+            # -------------------------
+            #   BYBIT PRICE FETCH
+            # -------------------------
+            r = requests.get(
+                "https://api.bybit.com/v5/market/tickers",
+                params={"category": "linear", "symbol": symbol},
+                timeout=10
+            )
             r.raise_for_status()
-            price = float(r.json().get("price", 0.0))
+            resp = r.json()
+            price = float(resp["result"]["list"][0]["lastPrice"])
         except Exception as e:
             print(f"[MONITOR] Price fetch error for {symbol}: {e}")
             time.sleep(poll_interval)
             continue
 
-        # For BUY signals: TP when price >= target, SL when price <= sl
-        # For SELL signals: TP when price <= target, SL when price >= sl
+        # -------------------------
+        #     BUY LOGIC
+        # -------------------------
         if side == "BUY":
-            # Stop Loss
+            # SL
             if sl is not None and not np.isnan(sl) and price <= sl:
                 msg = f"❌ {symbol} STOP LOSS hit at {price} (SL: {sl})"
                 print("[MONITOR]", msg)
@@ -800,6 +836,7 @@ def monitor_trade(symbol: str, side: str, entry: float, sl: Optional[float], tp1
                 if token and chat_id:
                     send_telegram_message(token, chat_id, msg)
                 return
+
             # TP1
             if tp1 is not None and not hit_tp1 and price >= tp1:
                 hit_tp1 = True
@@ -808,6 +845,7 @@ def monitor_trade(symbol: str, side: str, entry: float, sl: Optional[float], tp1
                 log_event("executions.log", msg)
                 if token and chat_id:
                     send_telegram_message(token, chat_id, msg)
+
             # TP2
             if tp2 is not None and hit_tp1 and not hit_tp2 and price >= tp2:
                 hit_tp2 = True
@@ -816,6 +854,7 @@ def monitor_trade(symbol: str, side: str, entry: float, sl: Optional[float], tp1
                 log_event("executions.log", msg)
                 if token and chat_id:
                     send_telegram_message(token, chat_id, msg)
+
             # TP3
             if tp3 is not None and hit_tp2 and not hit_tp3 and price >= tp3:
                 hit_tp3 = True
@@ -825,8 +864,12 @@ def monitor_trade(symbol: str, side: str, entry: float, sl: Optional[float], tp1
                 if token and chat_id:
                     send_telegram_message(token, chat_id, msg)
                 return
-        else:  # SELL
-            # Stop Loss for SELL is price >= sl
+
+        # -------------------------
+        #     SELL LOGIC
+        # -------------------------
+        else:
+            # SL
             if sl is not None and not np.isnan(sl) and price >= sl:
                 msg = f"❌ {symbol} STOP LOSS hit at {price} (SL: {sl})"
                 print("[MONITOR]", msg)
@@ -834,7 +877,8 @@ def monitor_trade(symbol: str, side: str, entry: float, sl: Optional[float], tp1
                 if token and chat_id:
                     send_telegram_message(token, chat_id, msg)
                 return
-            # TP1 for SELL: price <= tp1
+
+            # TP1
             if tp1 is not None and not hit_tp1 and price <= tp1:
                 hit_tp1 = True
                 msg = f"🎯 {symbol} TP1 hit at {price} (TP1: {tp1})"
@@ -842,6 +886,8 @@ def monitor_trade(symbol: str, side: str, entry: float, sl: Optional[float], tp1
                 log_event("executions.log", msg)
                 if token and chat_id:
                     send_telegram_message(token, chat_id, msg)
+
+            # TP2
             if tp2 is not None and hit_tp1 and not hit_tp2 and price <= tp2:
                 hit_tp2 = True
                 msg = f"🎯 {symbol} TP2 hit at {price} (TP2: {tp2})"
@@ -849,6 +895,8 @@ def monitor_trade(symbol: str, side: str, entry: float, sl: Optional[float], tp1
                 log_event("executions.log", msg)
                 if token and chat_id:
                     send_telegram_message(token, chat_id, msg)
+
+            # TP3
             if tp3 is not None and hit_tp2 and not hit_tp3 and price <= tp3:
                 hit_tp3 = True
                 msg = f"🏆 {symbol} TP3 hit at {price} (TP3: {tp3})"
@@ -936,33 +984,45 @@ def main():
         print("[DONE] main.py finished.")
         return
 
-    # Otherwise: scan top40 (default) using Binance API
-    symbols = symbols_to_scan if symbols_to_scan else TOP_40_SYMBOLS
-    print(f"[SCAN] Scanning {len(symbols)} symbols")
-    interval = tf_to_binance_interval(cfg.get("range_tf", "30T"))
-    all_signals: List[Signal] = []
-    # Attempt to compute BTC bias once if enabled
-    btc_bias = 0
-    if cfg.get("btc_filter_enabled", True):
-        try:
-            btc_symbol = cfg.get("btc_symbol", "BTCUSDT")
-            btc_df = fetch_klines_binance(btc_symbol, interval=interval, limit=500)
-            btc_bias = compute_btc_bias(btc_df, cfg.get("btc_tf","30T"))
-        except Exception as e:
-            print(f"[BTC] Could not compute BTC bias from Binance: {e}")
-            btc_bias = 0
+# Otherwise: scan top40 (default) using Bybit API
+symbols = symbols_to_scan if symbols_to_scan else TOP_40_SYMBOLS
+print(f"[SCAN] Scanning {len(symbols)} symbols")
 
-    for sym in symbols:
-        try:
-            df_sym = fetch_klines_binance(sym, interval=interval, limit=600)
-            # short-circuit if empty
-            if df_sym is None or df_sym.empty:
-                print(f"[DATA] No data for {sym}, skipping.")
-                continue
-            signals = score_and_generate(df_sym, symbol=sym, cfg=cfg, btc_bias=btc_bias)
-            for s in signals:
-                print(json.dumps(s.to_json(), indent=2))
-            all_signals.extend(signals)
+# Convert timeframe to Bybit interval string ("30T" -> "30")
+interval = tf_to_bybit_interval(cfg.get("range_tf", "30T"))
+
+all_signals: List[Signal] = []
+
+# Compute BTC bias if enabled
+btc_bias = 0
+if cfg.get("btc_filter_enabled", True):
+    try:
+        btc_symbol = cfg.get("btc_symbol", "BTCUSDT")
+        btc_interval = tf_to_bybit_interval(cfg.get("btc_tf", "30T"))
+        btc_df = fetch_klines_bybit(btc_symbol, interval=btc_interval, limit=500)
+        btc_bias = compute_btc_bias(btc_df, cfg.get("btc_tf", "30T"))
+    except Exception as e:
+        print(f"[BTC] Could not compute BTC bias from Bybit: {e}")
+        btc_bias = 0
+
+# === MAIN SYMBOL LOOP (Bybit) ===
+for sym in symbols:
+    try:
+        df_sym = fetch_klines_bybit(sym, interval=interval, limit=600)
+        
+        if df_sym is None or df_sym.empty:
+            print(f"[DATA] No data for {sym}, skipping.")
+            continue
+
+        signals = score_and_generate(df_sym, symbol=sym, cfg=cfg, btc_bias=btc_bias)
+
+        for s in signals:
+            print(json.dumps(s.to_json(), indent=2))
+
+        all_signals.extend(signals)
+
+    except Exception as e:
+        print(f"[ERROR] Failed scanning {sym}: {e}")
             # Send Telegram notifications if requested and credentials present
             if args.send_telegram and token and chat_id:
                 for s in signals:
