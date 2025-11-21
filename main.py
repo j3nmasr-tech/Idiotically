@@ -23,7 +23,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_PATH = os.getenv("DB_PATH", "./data/signals.db")
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
-TOP_N = int(os.getenv("TOP_N", 10))
+TOP_N = int(os.getenv("TOP_N", 4))
 BTC_PAIR = os.getenv("BTC_PAIR", "BTC-USDT-SWAP")
 TIMEFRAMES = ["1m","3m","5m","15m","30m"]
 
