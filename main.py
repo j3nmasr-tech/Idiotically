@@ -914,6 +914,7 @@ def monitor_trade(
 def main():
     args = parse_args()
     cfg = load_config(args.config if args.config else None)
+
     if args.test:
         run_tests()
         return
@@ -926,17 +927,18 @@ def main():
             print("[TELEGRAM] TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set in the environment to send messages.")
             # continue without sending
 
-    # load override top40 list if provided
+    # Load override top40 list if provided
     symbols_to_scan = None
     if args.top40_list and os.path.isfile(args.top40_list):
         with open(args.top40_list, "r") as f:
             symbols_to_scan = [s.strip().upper() for s in f.readlines() if s.strip()]
-    # If data arg is 'top40' or None, scan top 40; if data is provided as CSV, process single symbol/file
-    if args.data and args.data.lower() not in ("demo","sample","top40"):
-        # regular CSV or filename
+
+    # SINGLE-SYMBOL / CSV MODE
+    if args.data and args.data.lower() not in ("demo", "sample", "top40"):
         df = load_csv_or_demo(args.data)
         symbol = args.symbol
         btc_bias = 0
+
         if cfg.get("btc_filter_enabled", True):
             btc_path = cfg.get("btc_symbol", None)
             if btc_path and os.path.isfile(f"{btc_path}.csv"):
@@ -948,41 +950,116 @@ def main():
                     btc_bias = 0
             else:
                 btc_bias = 0
+
         signals = score_and_generate(df, symbol=symbol, cfg=cfg, btc_bias=btc_bias)
-        # export / json / print as before
+
+        # EXPORTS
         if args.export:
             out_csv = args.export
             rows = [s.to_json() for s in signals]
             pd.DataFrame(rows).to_csv(out_csv, index=False)
             print(f"[EXPORT] Signals exported to {out_csv}")
+
         if args.json:
             out_json = args.json
             rows = [s.to_json() for s in signals]
             json.dump(rows, open(out_json, "w"), indent=2, default=str)
             print(f"[EXPORT] Signals JSON exported to {out_json}")
+
+        # PRINT SIGNALS
         for s in signals:
             print(json.dumps(s.to_json(), indent=2))
-        # Optionally send telegram and start monitors (single-symbol mode)
+
+        # TELEGRAM
         if args.send_telegram and token and chat_id:
             for s in signals:
-                # Send only BUY/SELL or optionally NO-TRADE (change if desired)
-                if s.signal in ("BUY","SELL"):
+                if s.signal in ("BUY", "SELL"):
                     text = f"*{s.symbol}* {s.signal}\nConfidence: {s.confidence}\nEntry: {s.entry_price}\nSL: {s.stop_loss}\nTP1: {s.tp1}\nTP2: {s.tp2}\nTP3: {s.tp3}\nReasons: {', '.join(s.reason)}"
                     ok = send_telegram_message(token, chat_id, text)
                     print(f"[TELEGRAM] Sent for {s.symbol}: {ok}")
-                    # log signal
                     log_event("signals.log", f"{s.symbol} {s.signal} entry={s.entry_price} sl={s.stop_loss} tp1={s.tp1} tp2={s.tp2} tp3={s.tp3} conf={s.confidence}")
-                    # start monitor thread for this signal
+                    # Start monitoring thread
                     t = threading.Thread(target=monitor_trade, args=(s.symbol, s.signal, s.entry_price, s.stop_loss, s.tp1, s.tp2, s.tp3, token, chat_id), daemon=True)
                     t.start()
+
+        # PLOTTING
         if args.plot:
             df_higher = resample_to(df, cfg["range_tf"])
             rng = detect_active_range(df_higher, cfg["left_bars"], cfg["right_bars"], cfg["atr_period"], cfg["min_range_atr_multiplier"])
             pools = detect_liquidity_pools(df)
             fvg_list = detect_fvg(df)
             plot_annotations(df, signals, rng=rng, fvg_list=fvg_list, pools=pools)
+
         print("[DONE] main.py finished.")
         return
+
+    # ===== TOP40 / DEFAULT SCAN MODE =====
+    symbols = symbols_to_scan if symbols_to_scan else TOP_40_SYMBOLS
+    print(f"[SCAN] Scanning {len(symbols)} symbols")
+
+    interval = tf_to_bybit_interval(cfg.get("range_tf", "30T"))
+    all_signals: List[Signal] = []
+
+    # BTC bias
+    btc_bias = 0
+    if cfg.get("btc_filter_enabled", True):
+        try:
+            btc_symbol = cfg.get("btc_symbol", "BTCUSDT")
+            btc_interval = tf_to_bybit_interval(cfg.get("btc_tf", "30T"))
+            btc_df = fetch_klines_bybit(btc_symbol, interval=btc_interval, limit=500)
+            btc_bias = compute_btc_bias(btc_df, cfg.get("btc_tf", "30T"))
+        except Exception as e:
+            print(f"[BTC] Could not compute BTC bias from Bybit: {e}")
+            btc_bias = 0
+
+    # MAIN SYMBOL LOOP
+    for sym in symbols:
+        try:
+            df_sym = fetch_klines_bybit(sym, interval=interval, limit=600)
+
+            if df_sym is None or df_sym.empty:
+                print(f"[DATA] No data for {sym}, skipping.")
+                continue
+
+            signals = score_and_generate(df_sym, symbol=sym, cfg=cfg, btc_bias=btc_bias)
+
+            for s in signals:
+                print(json.dumps(s.to_json(), indent=2))
+
+            all_signals.extend(signals)
+
+            # TELEGRAM NOTIFICATIONS
+            if args.send_telegram and token and chat_id:
+                for s in signals:
+                    if s.signal in ("BUY", "SELL") and s.confidence > 0:
+                        text = f"*{s.symbol}* {s.signal}\nConfidence: {s.confidence}\nEntry: {s.entry_price}\nSL: {s.stop_loss}\nTP1: {s.tp1}\nTP2: {s.tp2}\nTP3: {s.tp3}\nReasons: {', '.join(s.reason)}"
+                        ok = send_telegram_message(token, chat_id, text)
+                        print(f"[TELEGRAM] Sent for {s.symbol}: {ok}")
+                        log_event("signals.log", f"{s.symbol} {s.signal} entry={s.entry_price} sl={s.stop_loss} tp1={s.tp1} tp2={s.tp2} tp3={s.tp3} conf={s.confidence}")
+                        t = threading.Thread(target=monitor_trade, args=(s.symbol, s.signal, s.entry_price, s.stop_loss, s.tp1, s.tp2, s.tp3, token, chat_id), daemon=True)
+                        t.start()
+
+        except Exception as e:
+            print(f"[SCAN] Error processing {sym}: {e}")
+
+    # EXPORTS FOR FULL SCAN
+    if args.export:
+        out_csv = args.export
+        rows = [s.to_json() for s in all_signals]
+        pd.DataFrame(rows).to_csv(out_csv, index=False)
+        print(f"[EXPORT] Signals exported to {out_csv}")
+
+    if args.json:
+        out_json = args.json
+        rows = [s.to_json() for s in all_signals]
+        json.dump(rows, open(out_json, "w"), indent=2, default=str)
+        print(f"[EXPORT] Signals JSON exported to {out_json}")
+
+    print("[DONE] Scan finished.")
+
+
+if __name__ == "__main__":
+    main()
 
 # Otherwise: scan top40 (default) using Bybit API
 symbols = symbols_to_scan if symbols_to_scan else TOP_40_SYMBOLS
