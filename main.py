@@ -36,63 +36,82 @@ db_lock = asyncio.Lock()
 # ---------------- TELEGRAM ----------------
 async def tg(msg: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram credentials missing")
         return
-    async with httpx.AsyncClient() as client:
-        await client.post(
-            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
-        )
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
+            )
+    except Exception as e:
+        log.error(f"Telegram send failed: {e}")
 
 # ---------------- OPTIMIZED DATABASE ----------------
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS btc_winners (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            entry REAL, sl REAL, tp1 REAL, tp2 REAL, tp3 REAL,
-            timestamp TEXT, score INTEGER, trend_aligned INTEGER,
-            volume_confirm INTEGER, timeframe TEXT,
-            status TEXT DEFAULT 'OPEN'
-        );
-        """)
-        await db.commit()
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("""
+            CREATE TABLE IF NOT EXISTS btc_winners (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                entry REAL, sl REAL, tp1 REAL, tp2 REAL, tp3 REAL,
+                timestamp TEXT, score INTEGER, trend_aligned INTEGER,
+                volume_confirm INTEGER, timeframe TEXT,
+                status TEXT DEFAULT 'OPEN'
+            );
+            """)
+            await db.commit()
+        log.info("Database initialized successfully")
+    except Exception as e:
+        log.error(f"Database init failed: {e}")
 
 # ---------------- WINNER DETECTION CORE ----------------
 def calculate_trend_strength(df_1h, df_4h):
     """Return trend strength: 0-100, >60 = strong trend"""
-    if df_1h is None or df_4h is None:
+    if df_1h is None or df_4h is None or len(df_1h) < 50 or len(df_4h) < 50:
         return 0
     
-    # Multi-timeframe EMA alignment
-    ema_1h_20 = df_1h['close'].ewm(span=20).mean().iloc[-1]
-    ema_1h_50 = df_1h['close'].ewm(span=50).mean().iloc[-1]
-    ema_4h_20 = df_4h['close'].ewm(span=20).mean().iloc[-1]
-    ema_4h_50 = df_4h['close'].ewm(span=50).mean().iloc[-1]
-    
-    current_price = df_1h['close'].iloc[-1]
-    
-    # Score trend alignment (0-100 points)
-    score = 0
-    if current_price > ema_1h_20: score += 25
-    if current_price > ema_1h_50: score += 25  
-    if current_price > ema_4h_20: score += 25
-    if current_price > ema_4h_50: score += 25
-    
-    return score
+    try:
+        # Multi-timeframe EMA alignment
+        ema_1h_20 = df_1h['close'].ewm(span=20).mean().iloc[-1]
+        ema_1h_50 = df_1h['close'].ewm(span=50).mean().iloc[-1]
+        ema_4h_20 = df_4h['close'].ewm(span=20).mean().iloc[-1]
+        ema_4h_50 = df_4h['close'].ewm(span=50).mean().iloc[-1]
+        
+        current_price = df_1h['close'].iloc[-1]
+        
+        # Score trend alignment (0-100 points)
+        score = 0
+        if current_price > ema_1h_20: score += 25
+        if current_price > ema_1h_50: score += 25  
+        if current_price > ema_4h_20: score += 25
+        if current_price > ema_4h_50: score += 25
+        
+        return score
+    except Exception as e:
+        log.error(f"Trend calculation error: {e}")
+        return 0
 
 def volume_confirmation(current_df, higher_tf_df):
     """Check if volume supports the move"""
-    if higher_tf_df is None or len(higher_tf_df) < 20:
+    if higher_tf_df is None or len(higher_tf_df) < 20 or len(current_df) < 1:
         return False
     
-    current_volume = current_df['vol'].iloc[-1]
-    avg_volume = higher_tf_df['vol'].tail(20).mean()
-    
-    return current_volume > avg_volume * 1.2  # 20% above average
+    try:
+        current_volume = current_df['vol'].iloc[-1]
+        avg_volume = higher_tf_df['vol'].tail(20).mean()
+        
+        return current_volume > avg_volume * 1.2  # 20% above average
+    except Exception as e:
+        log.error(f"Volume confirmation error: {e}")
+        return False
 
 def detect_high_probability_setup(df, higher_tf_df, trend_strength):
     """Only trigger on high-probability patterns"""
     if trend_strength < 60:  # Must have strong trend alignment
+        return None
+    
+    if df is None or len(df) < 6:
         return None
     
     # Your existing SMC logic but filtered
@@ -156,24 +175,39 @@ def detect_high_probability_setup(df, higher_tf_df, trend_strength):
 
 # ---------------- KEEP YOUR EXISTING SMC FUNCTIONS ----------------
 def detect_order_blocks(df: pd.DataFrame):
-    if len(df) < 3: return None, None, None
-    candle = df.iloc[-3]
-    if candle["close"] > candle["open"]:
-        return "bullish", candle["open"], candle["low"]
-    return "bearish", candle["high"], candle["open"]
+    if len(df) < 3: 
+        return None, None, None
+    try:
+        candle = df.iloc[-3]
+        if candle["close"] > candle["open"]:
+            return "bullish", candle["open"], candle["low"]
+        return "bearish", candle["high"], candle["open"]
+    except Exception as e:
+        log.error(f"Order block detection error: {e}")
+        return None, None, None
 
 def detect_fvg(df: pd.DataFrame):
-    if len(df) < 3: return False, False
-    c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
-    bull = c2["low"] > c1["high"] and c3["low"] > c2["high"]
-    bear = c2["high"] < c1["low"] and c3["high"] < c2["low"]
-    return bull, bear
+    if len(df) < 3: 
+        return False, False
+    try:
+        c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
+        bull = c2["low"] > c1["high"] and c3["low"] > c2["high"]
+        bear = c2["high"] < c1["low"] and c3["high"] < c2["low"]
+        return bull, bear
+    except Exception as e:
+        log.error(f"FVG detection error: {e}")
+        return False, False
 
 def detect_sweep(df: pd.DataFrame):
-    if len(df) < 6: return False, False
-    last = df.iloc[-1]
-    prev = df.iloc[-5:-1]
-    return last["high"] > prev["high"].max(), last["low"] < prev["low"].min()
+    if len(df) < 6: 
+        return False, False
+    try:
+        last = df.iloc[-1]
+        prev = df.iloc[-5:-1]
+        return last["high"] > prev["high"].max(), last["low"] < prev["low"].min()
+    except Exception as e:
+        log.error(f"Sweep detection error: {e}")
+        return False, False
 
 def detect_bos_mss(df: pd.DataFrame):
     return detect_sweep(df)
@@ -190,7 +224,7 @@ def calculate_optimal_tp_sl(signal, atr_val, trend_strength):
     else:
         tp_mult, sl_mult = 0.8, 1.0  # Conservative in weaker trends
     
-    if atr_val:
+    if atr_val and atr_val > 0:
         if side == "BUY":
             sl = entry - sl_mult * atr_val
             tp1 = entry + tp_mult * atr_val
@@ -219,14 +253,17 @@ def calculate_optimal_tp_sl(signal, atr_val, trend_strength):
 # ---------------- OPTIMIZED SCAN LOOP ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
     try:
-        return await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        log.info(f"📊 Fetching {symbol} {timeframe}...")
+        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        log.info(f"✅ Successfully fetched {len(ohlcv)} candles for {timeframe}")
+        return ohlcv
     except Exception as e:
-        log.warning(f"OHLCV failed {timeframe}: {e}")
+        log.warning(f"❌ OHLCV failed for {timeframe}: {e}")
         return None
 
 async def optimized_btc_scan(exchange):
     """Scan only BTC on optimized timeframes"""
-    log.info("Starting BTC winner scan...")
+    log.info("🔍 Starting BTC winner scan...")
     
     # Fetch multi-timeframe data for context
     timeframe_data = {}
@@ -237,20 +274,28 @@ async def optimized_btc_scan(exchange):
             for col in ["open", "high", "low", "close", "vol"]:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
             timeframe_data[tf] = df
+            log.info(f"✅ Loaded {tf} data: {len(df)} candles")
+        else:
+            log.warning(f"❌ Failed to load {tf} data")
     
     if TREND_CONFIRMATION_TF not in timeframe_data:
-        return  # Need trend data
+        log.error("❌ Cannot scan: Missing trend confirmation data")
+        return
     
+    log.info("📈 Calculating trend strength...")
     trend_strength = calculate_trend_strength(
         timeframe_data.get("1h"), 
         timeframe_data[TREND_CONFIRMATION_TF]
     )
+    log.info(f"📊 Current trend strength: {trend_strength}%")
     
     # Scan only winning timeframes
+    signals_found = 0
     for tf in WINNING_TIMEFRAMES:
         if tf not in timeframe_data:
             continue
             
+        log.info(f"🔎 Scanning {tf} for setups...")
         signal = detect_high_probability_setup(
             timeframe_data[tf],
             timeframe_data[TREND_CONFIRMATION_TF], 
@@ -258,6 +303,9 @@ async def optimized_btc_scan(exchange):
         )
         
         if signal:
+            signals_found += 1
+            log.info(f"🎯 HIGH PROBABILITY SIGNAL FOUND on {tf}")
+            
             # Calculate ATR for better TP/SL
             atr_val = None
             if "1h" in timeframe_data:
@@ -269,6 +317,7 @@ async def optimized_btc_scan(exchange):
                     "l-pc": (low - close.shift(1)).abs()
                 }).max(axis=1)
                 atr_val = float(tr.rolling(14).mean().iloc[-1])
+                log.info(f"📏 ATR calculated: {atr_val:.2f}")
             
             sl, tp1, tp2, tp3 = calculate_optimal_tp_sl(signal, atr_val, trend_strength)
             
@@ -283,6 +332,7 @@ async def optimized_btc_scan(exchange):
             )
             
             await tg(message)
+            log.info("✅ Signal sent to Telegram")
             
             # Log to database
             async with db_lock:
@@ -295,19 +345,37 @@ async def optimized_btc_scan(exchange):
                           datetime.datetime.utcnow().isoformat(),
                           signal["score"], trend_strength, 1, tf))
                     await db.commit()
+            log.info("✅ Signal logged to database")
+        else:
+            log.info(f"❌ No high-probability setup found on {tf}")
+    
+    log.info(f"📊 Scan complete. Found {signals_found} high-probability signals")
 
 # ---------------- MAIN LOOP ----------------
 async def main_loop():
+    log.info("🚀 INITIALIZING BTC WINNER SCANNER...")
     await init_db()
-    exchange = ccxt.okx({"enableRateLimit": True})
     
+    # Send startup message
+    startup_msg = "🤖 BTC WINNER SCANNER STARTED\n• 15m+ timeframes only\n• Trend alignment required\n• Volume confirmation\n• High-probability setups only"
+    await tg(startup_msg)
+    log.info("✅ Startup Telegram message sent")
+    
+    exchange = ccxt.okx({"enableRateLimit": True})
+    log.info("✅ Exchange connection established")
+    
+    scan_count = 0
     while True:
         try:
+            scan_count += 1
+            log.info(f"🔄 SCAN CYCLE #{scan_count} STARTING...")
             await optimized_btc_scan(exchange)
+            log.info(f"💤 Waiting {SCAN_INTERVAL} seconds until next scan...")
             await asyncio.sleep(SCAN_INTERVAL)
         except Exception as e:
-            log.error(f"Main loop error: {e}")
+            log.error(f"💥 Main loop error: {e}")
             await asyncio.sleep(30)
 
 if __name__ == "__main__":
+    log.info("⭐ BTC WINNER SCANNER SCRIPT STARTING ⭐")
     asyncio.run(main_loop())
