@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-OPTIMIZED BTC WINNER SCANNER
-- 15m+ timeframes only
-- Trend alignment filter
-- Volume confirmation
-- Reduced noise signals
+ULTIMATE WINNER SCANNER + BTC DIRECTION FILTER
+- All timeframes (1m-30m) 
+- Winner pattern filters
+- BTC direction alignment for all altcoins
+- Top 40 coins
 """
 
 import os, time, asyncio, logging, datetime
@@ -14,29 +14,26 @@ import aiosqlite
 import httpx
 import ccxt.async_support as ccxt
 import pandas as pd
-import numpy as np
-from collections import deque
 
 # ---------------- CONFIG ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-DB_PATH = "/app/data/btc_winners.db"
+DB_PATH = "/app/data/winner_signals.db"
 
-# OPTIMIZED SETTINGS FOR BTC ONLY
-SCAN_INTERVAL = 120  # Less frequent, higher quality
-BTC_SYMBOL = "BTC/USDT"
-WINNING_TIMEFRAMES = ["15m", "30m", "1h"]  # Remove noisy low TFs
-TREND_CONFIRMATION_TF = "4h"  # For trend alignment
+# SCANNING SETTINGS
+SCAN_INTERVAL = 60
+TOP_COINS_COUNT = 40
+ALL_TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
+TREND_CONFIRMATION_TFS = ["15m", "30m", "1h"]
 
 # ---------------- LOGGING ----------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | BTC-WINNER | %(message)s")
-log = logging.getLogger("btc_winner_scanner")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | WINNER-SCANNER | %(message)s")
+log = logging.getLogger("winner_scanner")
 db_lock = asyncio.Lock()
 
 # ---------------- TELEGRAM ----------------
 async def tg(msg: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram credentials missing")
         return
     try:
         async with httpx.AsyncClient() as client:
@@ -45,337 +42,383 @@ async def tg(msg: str):
                 json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"}
             )
     except Exception as e:
-        log.error(f"Telegram send failed: {e}")
+        log.error(f"Telegram error: {e}")
 
-# ---------------- OPTIMIZED DATABASE ----------------
-async def init_db():
-    try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("""
-            CREATE TABLE IF NOT EXISTS btc_winners (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                entry REAL, sl REAL, tp1 REAL, tp2 REAL, tp3 REAL,
-                timestamp TEXT, score INTEGER, trend_aligned INTEGER,
-                volume_confirm INTEGER, timeframe TEXT,
-                status TEXT DEFAULT 'OPEN'
-            );
-            """)
-            await db.commit()
-        log.info("Database initialized successfully")
-    except Exception as e:
-        log.error(f"Database init failed: {e}")
-
-# ---------------- WINNER DETECTION CORE ----------------
-def calculate_trend_strength(df_1h, df_4h):
-    """Return trend strength: 0-100, >60 = strong trend"""
-    if df_1h is None or df_4h is None or len(df_1h) < 50 or len(df_4h) < 50:
-        return 0
+# ---------------- BTC DIRECTION DETECTION ----------------
+def get_btc_direction(btc_data_15m, btc_data_1h):
+    """
+    Determine BTC overall direction
+    Returns: "BULLISH", "BEARISH", or "NEUTRAL"
+    """
+    if btc_data_15m is None or btc_data_1h is None:
+        return "NEUTRAL"
     
     try:
-        # Multi-timeframe EMA alignment
-        ema_1h_20 = df_1h['close'].ewm(span=20).mean().iloc[-1]
-        ema_1h_50 = df_1h['close'].ewm(span=50).mean().iloc[-1]
-        ema_4h_20 = df_4h['close'].ewm(span=20).mean().iloc[-1]
-        ema_4h_50 = df_4h['close'].ewm(span=50).mean().iloc[-1]
+        current_price = btc_data_15m['close'].iloc[-1]
         
-        current_price = df_1h['close'].iloc[-1]
+        # 1H EMA for primary trend
+        ema_1h_50 = btc_data_1h['close'].ewm(span=50).mean().iloc[-1]
+        ema_1h_20 = btc_data_1h['close'].ewm(span=20).mean().iloc[-1]
         
-        # Score trend alignment (0-100 points)
-        score = 0
-        if current_price > ema_1h_20: score += 25
-        if current_price > ema_1h_50: score += 25  
-        if current_price > ema_4h_20: score += 25
-        if current_price > ema_4h_50: score += 25
+        # 15M EMA for short-term direction
+        ema_15m_20 = btc_data_15m['close'].ewm(span=20).mean().iloc[-1]
         
-        return score
+        # Strong bullish: Above all EMAs
+        if current_price > ema_1h_50 and current_price > ema_1h_20 and current_price > ema_15m_20:
+            return "BULLISH"
+        
+        # Strong bearish: Below all EMAs  
+        elif current_price < ema_1h_50 and current_price < ema_1h_20 and current_price < ema_15m_20:
+            return "BEARISH"
+        
+        # Mild bullish: Above 1H EMAs
+        elif current_price > ema_1h_20 and current_price > ema_1h_50:
+            return "BULLISH"
+            
+        # Mild bearish: Below 1H EMAs
+        elif current_price < ema_1h_20 and current_price < ema_1h_50:
+            return "BEARISH"
+        
+        else:
+            return "NEUTRAL"
+            
     except Exception as e:
-        log.error(f"Trend calculation error: {e}")
-        return 0
+        log.error(f"BTC direction error: {e}")
+        return "NEUTRAL"
 
-def volume_confirmation(current_df, higher_tf_df):
-    """Check if volume supports the move"""
-    if higher_tf_df is None or len(higher_tf_df) < 20 or len(current_df) < 1:
+def is_trade_allowed(signal_side, btc_direction):
+    """
+    CRITICAL FILTER: Only allow trades that align with BTC direction
+    - BTC BULLISH: Only allow BUY signals
+    - BTC BEARISH: Only allow SELL signals  
+    - BTC NEUTRAL: Allow both
+    """
+    if btc_direction == "BULLISH":
+        allowed = signal_side == "BUY"
+        if not allowed:
+            log.info(f"❌ Blocked {signal_side} signal - BTC is BULLISH")
+        return allowed
+        
+    elif btc_direction == "BEARISH":
+        allowed = signal_side == "SELL"
+        if not allowed:
+            log.info(f"❌ Blocked {signal_side} signal - BTC is BEARISH")
+        return allowed
+        
+    else:  # NEUTRAL
+        return True
+
+# ---------------- GET TOP COINS ----------------
+async def get_top_coins(exchange, top_n=40):
+    """Get top N coins by volume"""
+    try:
+        tickers = await exchange.fetch_tickers()
+        usdt_pairs = [(symbol, data.get('quoteVolume', 0)) 
+                      for symbol, data in tickers.items() 
+                      if symbol.endswith('/USDT')]
+        
+        # Sort by volume and get top N
+        top_coins = sorted(usdt_pairs, key=lambda x: x[1], reverse=True)[:top_n]
+        return [coin[0] for coin in top_coins]
+        
+    except Exception as e:
+        log.error(f"Error getting top coins: {e}")
+        return ["BTC/USDT"]  # Fallback to BTC only
+
+# ---------------- WINNER PATTERN FILTERS ----------------
+def check_higher_tf_alignment(signal, higher_tf_data):
+    if higher_tf_data is None or len(higher_tf_data) < 20:
         return False
-    
     try:
-        current_volume = current_df['vol'].iloc[-1]
-        avg_volume = higher_tf_df['vol'].tail(20).mean()
+        current_price = signal['entry']
+        higher_tf_ema_20 = higher_tf_data['close'].ewm(span=20).mean().iloc[-1]
+        higher_tf_ema_50 = higher_tf_data['close'].ewm(span=50).mean().iloc[-1]
         
-        return current_volume > avg_volume * 1.2  # 20% above average
+        if signal['side'] == 'BUY':
+            return current_price > higher_tf_ema_20 and current_price > higher_tf_ema_50
+        else:
+            return current_price < higher_tf_ema_20 and current_price < higher_tf_ema_50
     except Exception as e:
-        log.error(f"Volume confirmation error: {e}")
+        log.error(f"Higher TF alignment error: {e}")
         return False
 
-def detect_high_probability_setup(df, higher_tf_df, trend_strength):
-    """Only trigger on high-probability patterns"""
-    if trend_strength < 60:  # Must have strong trend alignment
-        return None
-    
-    if df is None or len(df) < 6:
-        return None
-    
-    # Your existing SMC logic but filtered
-    ob_type, ob_hi, ob_lo = detect_order_blocks(df)
-    if ob_type is None:
-        return None
-    
-    bull_fvg, bear_fvg = detect_fvg(df)
-    sweep_h, sweep_l = detect_sweep(df)
-    bos_hh, bos_ll = detect_bos_mss(df)
-    
-    if not (bos_hh or bos_ll):
-        return None
-    
-    # Volume confirmation required
-    if not volume_confirmation(df, higher_tf_df):
-        return None
-    
-    # Enhanced scoring for winners
-    score = 0
-    reasons = []
-    
-    # Trend alignment bonus
-    if trend_strength >= 80:
-        score += 3
-        reasons.append("Strong Trend +3")
-    else:
-        score += 1
-        reasons.append("Good Trend +1")
-    
-    # Core SMC components
-    if ob_type == "bullish": 
-        score += 2
-        reasons.append("OB Bull +2")
-    else: 
-        score += 2
-        reasons.append("OB Bear +2")
-    
-    if bull_fvg or bear_fvg: 
-        score += 2
-        reasons.append("FVG +2")
-    
-    score += 2
-    reasons.append("BOS +2")
-    
-    if sweep_h or sweep_l: 
-        score += 1
-        reasons.append("Sweep +1")
-    
-    # Minimum score threshold for winners
-    if score < 8:  # Increased from 5
-        return None
-    
-    return {
-        "side": "BUY" if ob_type == "bullish" else "SELL",
-        "entry": float(df['close'].iloc[-1]),
-        "score": score,
-        "trend_strength": trend_strength,
-        "reasons": reasons
-    }
+def check_entry_zone_quality(df, signal_direction):
+    if len(df) < 15:
+        return False
+    try:
+        recent_high = df['high'].tail(15).max()
+        recent_low = df['low'].tail(15).min()
+        current_price = df['close'].iloc[-1]
+        
+        if recent_high == recent_low:
+            return False
+            
+        range_position = (current_price - recent_low) / (recent_high - recent_low)
+        
+        if signal_direction == 'BUY':
+            return range_position < 0.3
+        else:
+            return range_position > 0.7
+    except Exception as e:
+        log.error(f"Zone quality error: {e}")
+        return False
 
-# ---------------- KEEP YOUR EXISTING SMC FUNCTIONS ----------------
+def detect_choppy_market(df):
+    if len(df) < 25:
+        return True
+    try:
+        high, low, close = df['high'], df['low'], df['close']
+        tr1 = high - low
+        tr2 = (high - close.shift(1)).abs()
+        tr3 = (low - close.shift(1)).abs()
+        true_range = pd.DataFrame({'tr1': tr1, 'tr2': tr2, 'tr3': tr3}).max(axis=1)
+        atr = true_range.rolling(14).mean().iloc[-1]
+        
+        current_price = close.iloc[-1]
+        price_range_pct = (df['high'].tail(20).max() - df['low'].tail(20).min()) / current_price
+        
+        return (atr < (current_price * 0.002) and price_range_pct < 0.02)
+    except Exception as e:
+        log.error(f"Market condition error: {e}")
+        return True
+
+# ---------------- YOUR EXISTING SMC FUNCTIONS ----------------
 def detect_order_blocks(df: pd.DataFrame):
-    if len(df) < 3: 
-        return None, None, None
+    if len(df) < 3: return None, None, None
     try:
         candle = df.iloc[-3]
         if candle["close"] > candle["open"]:
             return "bullish", candle["open"], candle["low"]
         return "bearish", candle["high"], candle["open"]
-    except Exception as e:
-        log.error(f"Order block detection error: {e}")
-        return None, None, None
+    except: return None, None, None
 
 def detect_fvg(df: pd.DataFrame):
-    if len(df) < 3: 
-        return False, False
+    if len(df) < 3: return False, False
     try:
         c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
         bull = c2["low"] > c1["high"] and c3["low"] > c2["high"]
         bear = c2["high"] < c1["low"] and c3["high"] < c2["low"]
         return bull, bear
-    except Exception as e:
-        log.error(f"FVG detection error: {e}")
-        return False, False
+    except: return False, False
 
 def detect_sweep(df: pd.DataFrame):
-    if len(df) < 6: 
-        return False, False
+    if len(df) < 6: return False, False
     try:
         last = df.iloc[-1]
         prev = df.iloc[-5:-1]
         return last["high"] > prev["high"].max(), last["low"] < prev["low"].min()
-    except Exception as e:
-        log.error(f"Sweep detection error: {e}")
-        return False, False
+    except: return False, False
 
 def detect_bos_mss(df: pd.DataFrame):
     return detect_sweep(df)
 
-# ---------------- OPTIMIZED POSITION SIZING ----------------
-def calculate_optimal_tp_sl(signal, atr_val, trend_strength):
-    """Better TP/SL based on trend strength"""
-    entry = signal["entry"]
-    side = signal["side"]
+def generate_base_signal(df, symbol, context):
+    if df is None or len(df) < 6:
+        return None
+
+    ob_type, ob_hi, ob_lo = detect_order_blocks(df)
+    if ob_type is None:
+        return None
+
+    bull_fvg, bear_fvg = detect_fvg(df)
+    sweep_h, sweep_l = detect_sweep(df)
+    bos_hh, bos_ll = detect_bos_mss(df)
+
+    if not (bos_hh or bos_ll):
+        return None
+
+    score = 0
+    reasons = []
+
+    if ob_type == "bullish": 
+        score += 2; reasons.append("OB Bull +2")
+    else: 
+        score += 2; reasons.append("OB Bear +2")
+
+    if bull_fvg: 
+        score += 2; reasons.append("FVG Bull +2")
+    elif bear_fvg: 
+        score += 2; reasons.append("FVG Bear +2")
+
+    score += 2; reasons.append("BOS +2")
     
-    # Dynamic multipliers based on trend strength
-    if trend_strength >= 80:
-        tp_mult, sl_mult = 1.2, 0.8  # Let winners run in strong trends
+    if sweep_h or sweep_l: 
+        score += 1; reasons.append("Sweep +1")
+    else: 
+        reasons.append("No Sweep +0")
+
+    side = "BUY" if ob_type == "bullish" else "SELL"
+
+    # ATR-based TP/SL
+    entry = float(df['close'].iloc[-1])
+    
+    if side == "BUY":
+        sl = entry * 0.995
+        tp1 = entry * 1.005
+        tp2 = entry * 1.010
+        tp3 = entry * 1.015
     else:
-        tp_mult, sl_mult = 0.8, 1.0  # Conservative in weaker trends
+        sl = entry * 1.005
+        tp1 = entry * 0.995
+        tp2 = entry * 0.990
+        tp3 = entry * 0.985
+
+    return {
+        "symbol": symbol,
+        "side": side,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "score": score,
+        "reason_list": reasons
+    }
+
+# ---------------- ULTIMATE WINNER SIGNAL GENERATOR ----------------
+def generate_winner_signal(df, symbol, context, btc_direction):
+    """
+    Only generate signals that pass ALL winner filters + BTC direction
+    """
+    # 1. Generate base SMC signal
+    base_signal = generate_base_signal(df, symbol, context)
+    if not base_signal:
+        return None
     
-    if atr_val and atr_val > 0:
-        if side == "BUY":
-            sl = entry - sl_mult * atr_val
-            tp1 = entry + tp_mult * atr_val
-            tp2 = entry + tp_mult * 1.8 * atr_val  # Wider spacing
-            tp3 = entry + tp_mult * 3.0 * atr_val
-        else:
-            sl = entry + sl_mult * atr_val
-            tp1 = entry - tp_mult * atr_val
-            tp2 = entry - tp_mult * 1.8 * atr_val
-            tp3 = entry - tp_mult * 3.0 * atr_val
-    else:
-        # Fallback to percentage-based
-        if side == "BUY":
-            sl = entry * 0.994
-            tp1 = entry * 1.006
-            tp2 = entry * 1.012
-            tp3 = entry * 1.020
-        else:
-            sl = entry * 1.006
-            tp1 = entry * 0.994
-            tp2 = entry * 0.988
-            tp3 = entry * 0.980
+    # 2. BTC DIRECTION FILTER (CRITICAL)
+    if not is_trade_allowed(base_signal['side'], btc_direction):
+        return None
     
-    return sl, tp1, tp2, tp3
+    # 3. Get higher timeframe data
+    higher_tf_data = None
+    current_tf = context.get('tf', '')
+    
+    if current_tf in ['1m', '3m']:
+        higher_tf_data = context.get('df_15m') or context.get('df_30m')
+    elif current_tf == '5m':
+        higher_tf_data = context.get('df_30m') or context.get('df_1h')
+    elif current_tf in ['15m', '30m']:
+        higher_tf_data = context.get('df_1h') or context.get('df_4h')
+    
+    # 4. Apply winner filters
+    if not check_higher_tf_alignment(base_signal, higher_tf_data):
+        return None
+    
+    if not check_entry_zone_quality(df, base_signal['side']):
+        return None
+    
+    if detect_choppy_market(df):
+        return None
+    
+    # 5. Add winner bonus
+    base_signal['score'] += 5
+    base_signal['reason_list'].append("WINNER PATTERN +5")
+    base_signal['reason_list'].append(f"BTC {btc_direction} ✓")
+    
+    return base_signal
 
 # ---------------- OPTIMIZED SCAN LOOP ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
     try:
-        log.info(f"📊 Fetching {symbol} {timeframe}...")
         ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        log.info(f"✅ Successfully fetched {len(ohlcv)} candles for {timeframe}")
-        return ohlcv
-    except Exception as e:
-        log.warning(f"❌ OHLCV failed for {timeframe}: {e}")
-        return None
-
-async def optimized_btc_scan(exchange):
-    """Scan only BTC on optimized timeframes"""
-    log.info("🔍 Starting BTC winner scan...")
-    
-    # Fetch multi-timeframe data for context
-    timeframe_data = {}
-    for tf in WINNING_TIMEFRAMES + [TREND_CONFIRMATION_TF]:
-        ohlcv = await fetch_ohlcv(exchange, BTC_SYMBOL, tf, 200)
         if ohlcv:
             df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
             for col in ["open", "high", "low", "close", "vol"]:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
-            timeframe_data[tf] = df
-            log.info(f"✅ Loaded {tf} data: {len(df)} candles")
-        else:
-            log.warning(f"❌ Failed to load {tf} data")
+            return df
+        return None
+    except:
+        return None
+
+async def winner_scan_loop(exchange):
+    """Scan top 40 coins with BTC direction filter"""
+    log.info("🔄 Starting winner scan cycle...")
     
-    if TREND_CONFIRMATION_TF not in timeframe_data:
-        log.error("❌ Cannot scan: Missing trend confirmation data")
-        return
+    # Get top coins
+    top_coins = await get_top_coins(exchange, TOP_COINS_COUNT)
+    log.info(f"📊 Scanning top {len(top_coins)} coins")
     
-    log.info("📈 Calculating trend strength...")
-    trend_strength = calculate_trend_strength(
-        timeframe_data.get("1h"), 
-        timeframe_data[TREND_CONFIRMATION_TF]
-    )
-    log.info(f"📊 Current trend strength: {trend_strength}%")
+    # First, get BTC data for direction
+    btc_data = {}
+    for tf in ["15m", "1h"]:
+        btc_data[tf] = await fetch_ohlcv(exchange, "BTC/USDT", tf, 200)
     
-    # Scan only winning timeframes
+    btc_direction = get_btc_direction(btc_data.get("15m"), btc_data.get("1h"))
+    log.info(f"🎯 BTC Direction: {btc_direction}")
+    
     signals_found = 0
-    for tf in WINNING_TIMEFRAMES:
-        if tf not in timeframe_data:
-            continue
-            
-        log.info(f"🔎 Scanning {tf} for setups...")
-        signal = detect_high_probability_setup(
-            timeframe_data[tf],
-            timeframe_data[TREND_CONFIRMATION_TF], 
-            trend_strength
-        )
-        
-        if signal:
-            signals_found += 1
-            log.info(f"🎯 HIGH PROBABILITY SIGNAL FOUND on {tf}")
-            
-            # Calculate ATR for better TP/SL
-            atr_val = None
-            if "1h" in timeframe_data:
-                df_1h = timeframe_data["1h"]
-                high, low, close = df_1h["high"], df_1h["low"], df_1h["close"]
-                tr = pd.DataFrame({
-                    "h-l": high - low,
-                    "h-pc": (high - close.shift(1)).abs(),
-                    "l-pc": (low - close.shift(1)).abs()
-                }).max(axis=1)
-                atr_val = float(tr.rolling(14).mean().iloc[-1])
-                log.info(f"📏 ATR calculated: {atr_val:.2f}")
-            
-            sl, tp1, tp2, tp3 = calculate_optimal_tp_sl(signal, atr_val, trend_strength)
-            
-            # Send high-confidence signal
-            message = (
-                f"🏆 BTC HIGH CONFIDENCE ({tf})\n"
-                f"Direction: {signal['side']}\n"
-                f"Entry: {signal['entry']:.1f}\n"
-                f"SL: {sl:.1f} | TP: {tp1:.1f} / {tp2:.1f} / {tp3:.1f}\n"
-                f"Score: {signal['score']}/10 | Trend: {trend_strength}%\n"
-                f"Reasons: {', '.join(signal['reasons'])}"
-            )
-            
-            await tg(message)
-            log.info("✅ Signal sent to Telegram")
-            
-            # Log to database
-            async with db_lock:
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute("""
-                        INSERT INTO btc_winners 
-                        (entry, sl, tp1, tp2, tp3, timestamp, score, trend_aligned, volume_confirm, timeframe)
-                        VALUES (?,?,?,?,?,?,?,?,?,?)
-                    """, (signal["entry"], sl, tp1, tp2, tp3, 
-                          datetime.datetime.utcnow().isoformat(),
-                          signal["score"], trend_strength, 1, tf))
-                    await db.commit()
-            log.info("✅ Signal logged to database")
-        else:
-            log.info(f"❌ No high-probability setup found on {tf}")
     
-    log.info(f"📊 Scan complete. Found {signals_found} high-probability signals")
+    # Scan each coin
+    for symbol in top_coins:
+        if signals_found >= 10:  # Limit signals per scan
+            break
+            
+        # Fetch data for this coin
+        coin_data = {}
+        for tf in ALL_TIMEFRAMES:
+            df = await fetch_ohlcv(exchange, symbol, tf, 100)  # Smaller limit for speed
+            if df is not None:
+                coin_data[tf] = df
+        
+        if not coin_data:
+            continue
+        
+        # Scan all timeframes for this coin
+        for tf in ALL_TIMEFRAMES:
+            if tf not in coin_data:
+                continue
+            
+            # Prepare context
+            context = {
+                "tf": tf,
+                "df_15m": coin_data.get("15m"),
+                "df_30m": coin_data.get("30m"), 
+                "df_1h": coin_data.get("1h")
+            }
+            
+            signal = generate_winner_signal(coin_data[tf], symbol, context, btc_direction)
+            
+            if signal:
+                signals_found += 1
+                
+                message = (
+                    f"🏆 {symbol} WINNER ({tf}) | BTC: {btc_direction}\n"
+                    f"Direction: {signal['side']}\n"
+                    f"Entry: {signal['entry']:.4f}\n"
+                    f"SL: {signal['sl']:.4f} | TP: {signal['tp1']:.4f}/{signal['tp2']:.4f}/{signal['tp3']:.4f}\n"
+                    f"Score: {signal['score']}/10+\n"
+                    f"Filters: {', '.join(signal['reason_list'])}"
+                )
+                
+                await tg(message)
+                log.info(f"✅ Winner signal: {symbol} {signal['side']}")
+    
+    log.info(f"📊 Scan complete: {signals_found} winner signals found (BTC: {btc_direction})")
 
 # ---------------- MAIN LOOP ----------------
 async def main_loop():
-    log.info("🚀 INITIALIZING BTC WINNER SCANNER...")
-    await init_db()
+    log.info("🚀 INITIALIZING WINNER SCANNER + BTC FILTER...")
     
-    # Send startup message
-    startup_msg = "🤖 BTC WINNER SCANNER STARTED\n• 15m+ timeframes only\n• Trend alignment required\n• Volume confirmation\n• High-probability setups only"
+    startup_msg = (
+        "🏆 ULTIMATE WINNER SCANNER STARTED\n"
+        "• Top 40 coins + all timeframes\n" 
+        "• BTC direction alignment enforced\n"
+        "• Winner pattern filters active\n"
+        "🎯 Target: 80%+ Win Rate"
+    )
     await tg(startup_msg)
-    log.info("✅ Startup Telegram message sent")
     
     exchange = ccxt.okx({"enableRateLimit": True})
-    log.info("✅ Exchange connection established")
     
-    scan_count = 0
     while True:
         try:
-            scan_count += 1
-            log.info(f"🔄 SCAN CYCLE #{scan_count} STARTING...")
-            await optimized_btc_scan(exchange)
-            log.info(f"💤 Waiting {SCAN_INTERVAL} seconds until next scan...")
+            await winner_scan_loop(exchange)
+            log.info(f"💤 Waiting {SCAN_INTERVAL}s for next scan...")
             await asyncio.sleep(SCAN_INTERVAL)
+            
         except Exception as e:
             log.error(f"💥 Main loop error: {e}")
             await asyncio.sleep(30)
 
 if __name__ == "__main__":
-    log.info("⭐ BTC WINNER SCANNER SCRIPT STARTING ⭐")
     asyncio.run(main_loop())
