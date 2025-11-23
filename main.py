@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-INSTITUTIONAL QUANT SCANNER v2.0 - FIXED VERSION
-- All async/sync issues resolved
+INSTITUTIONAL QUANT SCANNER v2.0 - VOLUME FIXED
+- Fixed 'vol' vs 'volume' column naming issue
 - Ready for production
 """
 
@@ -173,8 +173,8 @@ class DataQualityEngine:
         if invalid_hl:
             issues.append("High < Low inconsistency")
             
-        # Check for volume anomalies
-        if (df['vol'] < 0).any():
+        # Check for volume anomalies - FIXED: use 'volume' instead of 'vol'
+        if 'volume' in df.columns and (df['volume'] < 0).any():
             issues.append("Negative volume")
             
         # Check for price spikes (potential errors)
@@ -515,10 +515,11 @@ class MarketRegimeDetector:
         if len(df) < 20:
             return "neutral"
             
-        volume = df['vol']
+        # FIXED: Use 'volume' instead of 'vol'  
+        volume = df['volume'] if 'volume' in df.columns else pd.Series([0] * len(df))
         volume_sma = volume.rolling(20).mean()
-        current_volume = volume.iloc[-1]
-        volume_trend = volume.rolling(5).mean().iloc[-1] > volume.rolling(20).mean().iloc[-1]
+        current_volume = volume.iloc[-1] if len(volume) > 0 else 0
+        volume_trend = volume.rolling(5).mean().iloc[-1] > volume.rolling(20).mean().iloc[-1] if len(volume) >= 20 else False
         
         if current_volume > volume_sma.iloc[-1] * 1.5 and volume_trend:
             return "expanding"
@@ -830,6 +831,8 @@ class InstitutionalSignalGenerator:
         historical_vol = returns.std() * np.sqrt(365)  # Annualized
         
         volatility_regime = self.regime_detector._analyze_volatility(df)
+        
+        # FIXED: Use 'volume' instead of 'vol'
         volume_profile = self._analyze_volume_characteristics(df)
         volume_delta = self._calculate_volume_delta(df)
         
@@ -913,7 +916,7 @@ class InstitutionalSignalGenerator:
         else:
             rejection_reasons.append("Unfavorable volatility regime")
             
-        # 4. BTC Alignment Filter - FIXED: No await in sync function
+        # 4. BTC Alignment Filter
         if self._check_btc_alignment(signal, context):
             filters_passed.append("BTC_ALIGNMENT")
         else:
@@ -1023,7 +1026,8 @@ class InstitutionalSignalGenerator:
             
         # Use volume profile to find liquidity concentrations
         typical_price = (df['high'] + df['low'] + df['close']) / 3
-        volume = df['vol']
+        # FIXED: Use 'volume' instead of 'vol'
+        volume = df['volume'] if 'volume' in df.columns else pd.Series([1] * len(df))
         
         high_volume_levels = typical_price[volume > volume.quantile(0.7)]
         
@@ -1123,12 +1127,13 @@ class InstitutionalSignalGenerator:
         if len(df) < 20:
             return {}
             
-        volume = df['vol']
+        # FIXED: Use 'volume' instead of 'vol'  
+        volume = df['volume'] if 'volume' in df.columns else pd.Series([0] * len(df))
         return {
-            'current': volume.iloc[-1],
-            'average_20': volume.rolling(20).mean().iloc[-1],
-            'max_20': volume.rolling(20).max().iloc[-1],
-            'min_20': volume.rolling(20).min().iloc[-1]
+            'current': volume.iloc[-1] if len(volume) > 0 else 0,
+            'average_20': volume.rolling(20).mean().iloc[-1] if len(volume) >= 20 else 0,
+            'max_20': volume.rolling(20).max().iloc[-1] if len(volume) >= 20 else 0,
+            'min_20': volume.rolling(20).min().iloc[-1] if len(volume) >= 20 else 0
         }
     
     def _calculate_volume_delta(self, df: pd.DataFrame) -> float:
@@ -1136,9 +1141,14 @@ class InstitutionalSignalGenerator:
         if len(df) < 20:
             return 0.0
             
-        current_volume = df['vol'].iloc[-1]
-        avg_volume = df['vol'].rolling(20).mean().iloc[-1]
+        # FIXED: Use 'volume' instead of 'vol'
+        volume = df['volume'] if 'volume' in df.columns else pd.Series([0] * len(df))
+        current_volume = volume.iloc[-1] if len(volume) > 0 else 0
+        avg_volume = volume.rolling(20).mean().iloc[-1] if len(volume) >= 20 else 0
         
+        if avg_volume == 0:
+            return 0.0
+            
         return (current_volume - avg_volume) / avg_volume
 
 # ==================== ENHANCED SCANNER CORE ====================
@@ -1217,6 +1227,8 @@ class InstitutionalScanner:
                 # Update performance metrics
                 self._update_performance_metrics(signals_found, start_time)
                 
+                self.log.info(f"📊 Scan completed. Signals found: {signals_found}")
+                
             except Exception as e:
                 self.log.error(f"Scan error: {e}")
                 
@@ -1232,10 +1244,9 @@ class InstitutionalScanner:
         try:
             # BTC analysis
             btc_1h = await self._fetch_ohlcv("BTC/USDT", Timeframe.H1)
-            btc_4h = await self._fetch_ohlcv("BTC/USDT", Timeframe.H4)
             
             if btc_1h is not None:
-                btc_regime = MarketRegimeDetector().detect_regime(btc_1h, btc_4h)
+                btc_regime = MarketRegimeDetector().detect_regime(btc_1h)
                 context['btc_regime'] = btc_regime
                 
                 # Simple BTC direction
@@ -1335,6 +1346,7 @@ class InstitutionalScanner:
         try:
             ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=timeframe.value, limit=limit)
             if ohlcv:
+                # FIXED: Use 'volume' as column name (not 'vol')
                 df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
                 for col in ['open', 'high', 'low', 'close', 'volume']:
                     df[col] = pd.to_numeric(df[col], errors='coerce')
