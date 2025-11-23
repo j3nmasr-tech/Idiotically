@@ -6,7 +6,7 @@ PRODUCTION SCANNER - OLD SYSTEM + ELITE SYSTEM
 - Your exact old winner filters + scoring
 - PLUS new elite signals for maximum confidence
 - Market regime protection
-- Safe OKX wrapper for FUTURES
+- Safe OKX wrapper with OLD DATA STYLE
 """
 
 import os, time, asyncio, logging, datetime
@@ -25,12 +25,12 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
-TOP_N = int(os.getenv("TOP_N", 100))
+TOP_N = int(os.getenv("TOP_N", 40))
 MIN_VOLUME = float(os.getenv("MIN_VOLUME", 1000000))
 MAX_SPREAD = float(os.getenv("MAX_SPREAD", 0.002))
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", 3600))
 DAILY_SUMMARY_HOUR = int(os.getenv("DAILY_SUMMARY_HOUR", 23))
-TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h"]  # Futures support 30m
+TIMEFRAMES = ["1m", "3m", "5m", "15m", "1h"]  # Spot timeframes
 
 # ---------------- EXACT ORIGINAL LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -82,50 +82,24 @@ async def init_db():
         """)
         await db.commit()
 
-# ---------------- FUTURES SYMBOLS (OKX FUTURES) ----------------
-POPULAR_SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", 
-    "AVAXUSDT", "DOTUSDT", "LINKUSDT", "MATICUSDT", "LTCUSDT", "BCHUSDT",
-    "ATOMUSDT", "ETCUSDT", "XLMUSDT", "FILUSDT", "THETAUSDT", "VETUSDT",
-    "TRXUSDT", "EOSUSDT", "AAVEUSDT", "MKRUSDT", "COMPUSDT", "YFIUSDT",
-    "SUSHIUSDT", "UNIUSDT", "CRVUSDT", "SNXUSDT", "BALUSDT", "RENUSDT",
-    "DOGEUSDT", "SHIBUSDT", "APEUSDT", "SANDUSDT", "MANAUSDT", "GALAUSDT",
-    "ENJUSDT", "CHZUSDT", "ALGOUSDT", "NEARUSDT", "FTMUSDT", "ONEUSDT",
-    "EGLDUSDT", "ICPUSDT", "XTZUSDT", "HBARUSDT", "GRTUSDT", "BATUSDT",
-    "ZILUSDT", "IOTAUSDT", "WAVESUSDT", "RVNUSDT", "SCUSDT", "STORJUSDT",
-    "KAVAUSDT", "RUNEUSDT", "OCEANUSDT", "CELOUSDT", "RSRUSDT", "COTIUSDT",
-    "ANKRUSDT", "ARUSDT", "RNDRUSDT", "HNTUSDT", "FLOWUSDT", "KSMUSDT",
-    "DASHUSDT", "ZECUSDT", "XMRUSDT", "DCRUSDT", "QTUMUSDT", "ONTUSDT",
-    "IOSTUSDT", "NEOUSDT", "VTHOUSDT", "TFUELUSDT", "HOTUSDT", "STMXUSDT",
-    "PERPUSDT", "RAYUSDT", "SRMUSDT", "FTTUSDT", "ROSEUSDT", "CELRUSDT",
-    "OMGUSDT", "SKLUSDT", "CVCUSDT", "BANDUSDT", "OXTUSDT", "LRCUSDT",
-    "NKNUSDT", "DODOUSDT", "TRBUSDT", "BADGERUSDT", "LPTUSDT", "GLMUSDT"
-]
-
-# ---------------- SAFE OKX WRAPPER FOR FUTURES ----------------
+# ---------------- SAFE OKX WRAPPER FOR SPOT (OLD DATA STYLE) ----------------
 class SafeOKX:
     def __init__(self):
         self.exchange = ccxt.okx({
             "enableRateLimit": True,
-            "options": {
-                "defaultType": "swap",  # FUTURES MODE
-                "defaultAccount": "futures",
-            }
+            "options": {"defaultType": "spot"}
         })
-        log.info("🎯 OKX configured for FUTURES trading")
         
     async def safe_fetch_tickers(self):
-        """Safe ticker fetch for futures"""
-        tickers = {}
-        for symbol in POPULAR_SYMBOLS[:TOP_N]:
-            try:
-                ticker = await self.exchange.fetch_ticker(symbol)
-                if ticker and 'last' in ticker and ticker['last'] is not None:
-                    tickers[symbol] = ticker
-            except Exception as e:
-                log.debug(f"Failed to fetch {symbol}: {e}")
-                continue
-        return tickers
+        """EXACT SAME as your original - gets all USDT pairs automatically"""
+        try:
+            tickers = await self.exchange.fetch_tickers()
+            # Filter for USDT pairs like your original code
+            usdt_tickers = {s: v for s, v in tickers.items() if s.endswith("/USDT")}
+            return usdt_tickers
+        except Exception as e:
+            log.error(f"Error fetching tickers: {e}")
+            return {}
     
     async def safe_fetch_ticker(self, symbol):
         """Safe single ticker fetch"""
@@ -491,103 +465,51 @@ async def monitor_signals(exchange):
             log.exception("monitor error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
 
-# ---------------- DUAL SYSTEM SCAN LOOP (OLD + ELITE) WITH DETAILED DEBUG ----------------
+# ---------------- DUAL SYSTEM SCAN LOOP (OLD + ELITE) ----------------
 last_signal_time = {}
 async def scan_loop(exchange):
     while True:
         t0=time.time()
         try:
-            log.info("🔄 Starting new scan cycle...")
-            
-            # Get BTC direction first - USING FUTURES SYMBOL
-            log.info("📊 Fetching BTC data for direction...")
-            btc_15m_data = await exchange.fetch_ohlcv("BTCUSDT", "15m", 100)
-            btc_1h_data = await exchange.fetch_ohlcv("BTCUSDT", "1h", 100)
-            log.info(f"✅ BTC 15m data: {len(btc_15m_data) if btc_15m_data else 0} candles")
-            log.info(f"✅ BTC 1h data: {len(btc_1h_data) if btc_1h_data else 0} candles")
-            
+            # Get BTC direction first - USING SPOT SYMBOL
+            btc_15m_data = await exchange.fetch_ohlcv("BTC/USDT", "15m", 100)
+            btc_1h_data = await exchange.fetch_ohlcv("BTC/USDT", "1h", 100)
             btc_15m = pd.DataFrame(btc_15m_data, columns=["ts","open","high","low","close","vol"]) if btc_15m_data else None
             btc_1h = pd.DataFrame(btc_1h_data, columns=["ts","open","high","low","close","vol"]) if btc_1h_data else None
             btc_direction = get_btc_direction(btc_15m, btc_1h)
             log.info(f"🎯 BTC Direction: {btc_direction}")
             
-            # SAFE: Use safe ticker fetch instead of fetch_tickers()
-            log.info("🔄 Fetching futures tickers...")
+            # Get top coins - USING OLD DATA STYLE
             tickers = await exchange.safe_fetch_tickers()
-            log.info(f"📈 Raw tickers fetched: {len(tickers)} symbols")
-            
-            if not tickers:
-                log.error("❌ CRITICAL: No tickers fetched! Checking API connection...")
-                # Test with a single symbol
-                test_symbol = "BTCUSDT"
-                try:
-                    test_ticker = await exchange.safe_fetch_ticker(test_symbol)
-                    if test_ticker:
-                        log.info(f"✅ Single ticker test PASSED: {test_symbol} = {test_ticker.get('last')}")
-                    else:
-                        log.error(f"❌ Single ticker test FAILED: {test_symbol}")
-                except Exception as e:
-                    log.error(f"❌ Single ticker test ERROR: {e}")
-            
-            top = [(symbol, tickers[symbol].get("quoteVolume", 0)) for symbol in tickers]
-            log.info(f"📊 Symbols with volume data: {len(top)}")
-            
-            top = sorted(top, key=lambda x: x[1], reverse=True)[:TOP_N]
-            log.info(f"🏆 Top {TOP_N} symbols by volume: {len(top)}")
-            
-            # Show top 5 symbols for debugging
-            for i, (symbol, volume) in enumerate(top[:5]):
-                log.info(f"  {i+1}. {symbol} - Volume: {volume}")
+            top = sorted([(s, v.get("quoteVolume", 0)) for s, v in tickers.items()], 
+                        key=lambda x: x[1], reverse=True)[:TOP_N]
             
             signals_found = 0
             elite_signals = 0
             old_signals = 0
-            total_symbols_processed = 0
-            total_ohlcv_fetched = 0
-            total_smc_patterns = 0
             
-            for symbol, volume in top:
-                total_symbols_processed += 1
-                log.info(f"🔍 Processing {symbol} ({total_symbols_processed}/{len(top)}) - Volume: {volume}")
-                
-                if deprioritized(symbol): 
-                    log.info(f"⏸️ {symbol} deprioritized - SL hits")
-                    continue
-                    
-                ohlcvs={}
+            for symbol, _ in top:
+                if deprioritized(symbol): continue
+                ohlcvs = {}
                 for tf in TIMEFRAMES:
-                    key=f"{symbol}:{tf}"
-                    if key in last_signal_time and time.time()-last_signal_time[key]<1800: 
-                        log.debug(f"⏸️ {key} cooldown active")
-                        continue
-                        
-                    log.info(f"⏰ Fetching {symbol} {tf} OHLCV...")
-                    ohlcv = await exchange.fetch_ohlcv(symbol,tf,200)
-                    if not ohlcv: 
-                        log.warning(f"❌ {symbol} {tf} no OHLCV data")
-                        continue
+                    key = f"{symbol}:{tf}"
+                    if key in last_signal_time and time.time() - last_signal_time[key] < 1800: continue
+                    ohlcv = await exchange.fetch_ohlcv(symbol, tf, 200)
+                    if not ohlcv: continue
+                    df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
+                    for c in ["open", "high", "low", "close", "vol"]: 
+                        df[c] = pd.to_numeric(df[c], errors="coerce")
+                    context = {"tf": tf, "df_15m": ohlcvs.get("15m"), "df_1h": ohlcvs.get("1h")}
                     
-                    total_ohlcv_fetched += 1
-                    log.info(f"✅ {symbol} {tf} OHLCV fetched: {len(ohlcv)} candles")
-                    
-                    df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
-                    for c in ["open","high","low","close","vol"]: 
-                        df[c]=pd.to_numeric(df[c],errors="coerce")
-                    
-                    context={"tf":tf,"df_15m":ohlcvs.get("15m"),"df_1h":ohlcvs.get("1h")}
-                    
-                    if tf in ("1m","3m","5m"):
+                    if tf in ("1m", "3m", "5m"):
                         if "15m" not in ohlcvs: 
-                            ohlcv15 = await exchange.fetch_ohlcv(symbol,"15m",200)
-                            if ohlcv15: 
-                                ohlcvs["15m"]=pd.DataFrame(ohlcv15,columns=["ts","open","high","low","close","vol"])
-                                log.debug(f"✅ {symbol} 15m context loaded")
+                            ohlcv15 = await exchange.fetch_ohlcv(symbol, "15m", 200)
+                            if ohlcv15: ohlcvs["15m"] = pd.DataFrame(ohlcv15, columns=["ts", "open", "high", "low", "close", "vol"])
                         if "1h" not in ohlcvs:
-                            ohlcv1h = await exchange.fetch_ohlcv(symbol,"1h",200)
-                            if ohlcv1h: 
-                                ohlcvs["1h"]=pd.DataFrame(ohlcv1h,columns=["ts","open","high","low","close","vol"])
-                                log.debug(f"✅ {symbol} 1h context loaded")
-                        context["df_15m"]=ohlcvs.get("15m"); context["df_1h"]=ohlcvs.get("1h")
+                            ohlcv1h = await exchange.fetch_ohlcv(symbol, "1h", 200)
+                            if ohlcv1h: ohlcvs["1h"] = pd.DataFrame(ohlcv1h, columns=["ts", "open", "high", "low", "close", "vol"])
+                        context["df_15m"] = ohlcvs.get("15m")
+                        context["df_1h"] = ohlcvs.get("1h")
                     
                     # Additional timeframes for elite filters
                     if tf not in ["3m", "5m"]:
@@ -595,79 +517,42 @@ async def scan_loop(exchange):
                             if add_tf not in ohlcvs:
                                 add_ohlcv = await exchange.fetch_ohlcv(symbol, add_tf, 200)
                                 if add_ohlcv: 
-                                    ohlcvs[add_tf] = pd.DataFrame(add_ohlcv,columns=["ts","open","high","low","close","vol"])
-                                    for col in ["open","high","low","close","vol"]:
-                                        ohlcvs[add_tf][col] = pd.to_numeric(ohlcvs[add_tf][col],errors="coerce")
-                                    log.debug(f"✅ {symbol} {add_tf} elite context loaded")
-                        context["df_3m"]=ohlcvs.get("3m")
-                        context["df_5m"]=ohlcvs.get("5m")
+                                    ohlcvs[add_tf] = pd.DataFrame(add_ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
+                                    for col in ["open", "high", "low", "close", "vol"]:
+                                        ohlcvs[add_tf][col] = pd.to_numeric(ohlcvs[add_tf][col], errors="coerce")
+                        context["df_3m"] = ohlcvs.get("3m")
+                        context["df_5m"] = ohlcvs.get("5m")
                     
                     # Generate original signal
-                    log.info(f"🔍 Analyzing {symbol} {tf} for SMC patterns...")
-                    sig = generate_signal(df,symbol,context)
+                    sig = generate_signal(df, symbol, context)
                     
                     if sig:
-                        total_smc_patterns += 1
-                        log.info(f"🎯 SMC PATTERN FOUND: {sig['symbol']} {tf} {sig['side']} | Base Score: {sig['score']} | Reasons: {', '.join(sig['reason_list'])}")
-                        
                         # SYSTEM 1: YOUR EXACT OLD SYSTEM (All original filters + Market Regime)
                         filters_passed = True
-                        failed_filters = []
                         
                         # 1. BTC Direction Filter
-                        btc_allowed = is_trade_allowed(sig['side'], btc_direction)
-                        if not btc_allowed:
-                            failed_filters.append(f"BTC Direction ({btc_direction} vs {sig['side']})")
+                        if not is_trade_allowed(sig['side'], btc_direction):
                             filters_passed = False
-                        else:
-                            log.debug(f"✅ {symbol} {tf} BTC Direction PASS")
                             
                         # 2. Higher TF Alignment
-                        if filters_passed:
-                            higher_tf_passed = check_higher_tf_alignment(sig, context.get("df_15m"))
-                            if not higher_tf_passed:
-                                failed_filters.append("Higher TF Alignment")
-                                filters_passed = False
-                            else:
-                                log.debug(f"✅ {symbol} {tf} Higher TF PASS")
-                                
+                        elif not check_higher_tf_alignment(sig, context.get("df_15m")):
+                            filters_passed = False
+                            
                         # 3. Momentum Confirmation (skip for 1m/3m)
-                        if filters_passed and tf not in ["1m", "3m"]:
-                            momentum_passed = check_momentum_confirmation(df, sig['side'])
-                            if not momentum_passed:
-                                failed_filters.append("Momentum")
-                                filters_passed = False
-                            else:
-                                log.debug(f"✅ {symbol} {tf} Momentum PASS")
-                        elif tf in ["1m", "3m"]:
-                            log.debug(f"⏭️ {symbol} {tf} Momentum skipped (1m/3m)")
+                        elif tf not in ["1m", "3m"] and not check_momentum_confirmation(df, sig['side']):
+                            filters_passed = False
                             
                         # 4. Zone Quality
-                        if filters_passed:
-                            zone_passed = check_entry_zone_quality(df, sig['side'])
-                            if not zone_passed:
-                                failed_filters.append("Zone Quality")
-                                filters_passed = False
-                            else:
-                                log.debug(f"✅ {symbol} {tf} Zone Quality PASS")
-                                
+                        elif not check_entry_zone_quality(df, sig['side']):
+                            filters_passed = False
+                            
                         # 5. Market Condition
-                        if filters_passed:
-                            choppy = detect_choppy_market(df)
-                            if choppy:
-                                failed_filters.append("Choppy Market")
-                                filters_passed = False
-                            else:
-                                log.debug(f"✅ {symbol} {tf} Market Condition PASS")
+                        elif detect_choppy_market(df):
+                            filters_passed = False
                         
                         # 6. NEW: Market Regime Filter (only new addition to old system)
-                        if filters_passed:
-                            regime_allowed = check_market_regime(sig['symbol'], sig['side'], context)
-                            if not regime_allowed:
-                                failed_filters.append("Market Regime")
-                                filters_passed = False
-                            else:
-                                log.debug(f"✅ {symbol} {tf} Market Regime PASS")
+                        elif not check_market_regime(sig['symbol'], sig['side'], context):
+                            filters_passed = False
                         
                         if filters_passed:
                             # Add winner bonuses (EXACTLY like your old system)
@@ -679,12 +564,10 @@ async def scan_loop(exchange):
                                 sig['reason_list'].append("Momentum ✓")
                             sig['score'] += 5
                             
-                            log.info(f"🚀 OLD SYSTEM SIGNAL READY: {sig['symbol']} {tf} {sig['side']} | Final Score: {sig['score']}")
-                            
                             # Send OLD SYSTEM signal
                             await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{sig['score']}\nBreakdown:{', '.join(sig['reason_list'])}")
                             await log_signal(sig)
-                            last_signal_time[key]=time.time()
+                            last_signal_time[key] = time.time()
                             old_signals += 1
                             signals_found += 1
                             
@@ -696,60 +579,50 @@ async def scan_loop(exchange):
                                 elite_reasons = sig['reason_list'] + elite_details
                                 elite_score = sig['score'] + 10  # Elite bonus
                                 
-                                log.info(f"💎 ELITE SIGNAL READY: {sig['symbol']} {tf} {sig['side']} | Elite Score: {elite_score}")
-                                
                                 await tg(f"🎯 ELITE | {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{elite_score} (3X SIZE)\nBreakdown:{', '.join(elite_reasons)}")
-                                # Don't log elite separately - they're already logged as old signals
                                 elite_signals += 1
-                            else:
-                                log.debug(f"⏭️ {symbol} {tf} Not elite - failed elite checklist")
-                        else:
-                            log.info(f"❌ {symbol} {tf} {sig['side']} FAILED FILTERS: {', '.join(failed_filters)}")
-                    else:
-                        log.debug(f"❌ {symbol} {tf} No SMC pattern detected")
                             
-            log.info(f"📊 SCAN SUMMARY: Processed {total_symbols_processed} symbols | Fetched {total_ohlcv_fetched} OHLCV datasets | Found {total_smc_patterns} SMC patterns | Sent {signals_found} signals ({old_signals} old system, {elite_signals} elite)")
+            log.info(f"📊 Scan complete: {signals_found} total signals ({old_signals} old system, {elite_signals} elite)")
                         
         except Exception as e: 
-            log.exception("MAIN SCAN ERROR: %s", e)
-        elapsed=time.time()-t0
-        log.info(f"⏱️ Scan completed in {elapsed:.2f}s, sleeping {max(1,SCAN_INTERVAL-elapsed)}s")
-        await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
+            log.exception("scan error: %s", e)
+        elapsed = time.time() - t0
+        await asyncio.sleep(max(1, SCAN_INTERVAL - elapsed))
 
 # ---------------- EXACT ORIGINAL FASTAPI ----------------
 app = FastAPI()
 @app.post("/webhook")
 async def webhook(request: Request):
-    token = request.headers.get("X-Auth","")
-    if token!=WEBHOOK_SECRET: raise HTTPException(403,"Invalid secret")
+    token = request.headers.get("X-Auth", "")
+    if token != WEBHOOK_SECRET: raise HTTPException(403, "Invalid secret")
     data = await request.json()
     log.info("Webhook received: %s", data)
-    return {"ok":True}
+    return {"ok": True}
 
-# ---------------- UPDATED MAIN WITH FUTURES WRAPPER ----------------
+# ---------------- UPDATED MAIN WITH SAFE WRAPPER ----------------
 async def main():
     await init_db()
-    exchange = SafeOKX()  # Use futures wrapper
+    exchange = SafeOKX()  # Use safe wrapper
     
     # Startup message
     startup_msg = (
-        "🏆 DUAL SYSTEM SCANNER STARTED - FUTURES MODE\n"
+        "🏆 DUAL SYSTEM SCANNER STARTED\n"
         "• OLD SYSTEM: Your exact 10-score signals + all original filters\n"
         "• ELITE SYSTEM: Ultra-filtered elite signals (3X size)\n" 
         "• Market regime protection for both systems\n"
-        "• OKX Futures - No broken markets\n"
+        "• Safe OKX wrapper - OLD DATA STYLE\n"
         "🎯 OLD: 11-15 score | ELITE: 21-25+ score"
     )
     await tg(startup_msg)
-    log.info("✅ Dual system scanner started for FUTURES")
+    log.info("✅ Dual system scanner started with OLD DATA STYLE")
     
     await asyncio.gather(scan_loop(exchange), monitor_signals(exchange))
 
-if __name__=="__main__":
+if __name__ == "__main__":
     import argparse
-    p=argparse.ArgumentParser()
+    p = argparse.ArgumentParser()
     p.add_argument("--http", action="store_true")
-    args=p.parse_args()
+    args = p.parse_args()
     if args.http:
         uvicorn.run(app, host="0.0.0.0", port=9000)
     else:
