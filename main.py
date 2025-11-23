@@ -150,17 +150,37 @@ def detect_order_blocks(df: pd.DataFrame):
         return "bullish", candle["open"], candle["low"]
     return "bearish", candle["high"], candle["open"]
 
-# ---------------- EXACT ORIGINAL SL-CLUSTER ----------------
+# ---------------- FIXED SL-CLUSTER ----------------
 recent_sl = defaultdict(lambda: deque())
 def record_sl_hit(symbol: str, lookback_minutes=30):
     now = time.time(); dq = recent_sl[symbol]; dq.append(now)
     cutoff = now - lookback_minutes * 60
     while dq and dq[0] < cutoff: dq.popleft()
     
-def deprioritized(signal: str, threshold=3, lookback=30):
+def deprioritized(symbol: str, threshold=3, lookback=30):
     dq = recent_sl[symbol]; now = time.time(); cutoff = now - lookback * 60
     while dq and dq[0] < cutoff: dq.popleft()
     return len(dq) >= threshold
+
+# ---------------- VERIFIED SYMBOLS (OKX SPOT) ----------------
+POPULAR_SYMBOLS = [
+    "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT", 
+    "AVAX/USDT", "DOT/USDT", "LINK/USDT", "MATIC/USDT", "LTC/USDT", "BCH/USDT",
+    "ATOM/USDT", "ETC/USDT", "XLM/USDT", "FIL/USDT", "THETA/USDT", "VET/USDT",
+    "TRX/USDT", "EOS/USDT", "AAVE/USDT", "MKR/USDT", "COMP/USDT", "YFI/USDT",
+    "SUSHI/USDT", "UNI/USDT", "CRV/USDT", "SNX/USDT", "BAL/USDT", "REN/USDT",
+    "DOGE/USDT", "SHIB/USDT", "APE/USDT", "SAND/USDT", "MANA/USDT", "GALA/USDT",
+    "ENJ/USDT", "CHZ/USDT", "ALGO/USDT", "NEAR/USDT", "FTM/USDT", "ONE/USDT",
+    "EGLD/USDT", "ICP/USDT", "XTZ/USDT", "HBAR/USDT", "GRT/USDT", "BAT/USDT",
+    "ZIL/USDT", "IOTA/USDT", "WAVES/USDT", "RVN/USDT", "SC/USDT", "STORJ/USDT",
+    "KAVA/USDT", "RUNE/USDT", "OCEAN/USDT", "CELO/USDT", "RSR/USDT", "COTI/USDT",
+    "ANKR/USDT", "AR/USDT", "RNDR/USDT", "HNT/USDT", "FLOW/USDT", "KSM/USDT",
+    "DASH/USDT", "ZEC/USDT", "XMR/USDT", "DCR/USDT", "QTUM/USDT", "ONT/USDT",
+    "IOST/USDT", "NEO/USDT", "VTHO/USDT", "TFUEL/USDT", "HOT/USDT", "STMX/USDT",
+    "PERP/USDT", "RAY/USDT", "SRM/USDT", "FTT/USDT", "ROSE/USDT", "CELR/USDT",
+    "OMG/USDT", "SKL/USDT", "CVC/USDT", "BAND/USDT", "OXT/USDT", "LRC/USDT",
+    "NKN/USDT", "DODO/USDT", "TRB/USDT", "BADGER/USDT", "LPT/USDT", "GLM/USDT"
+]
 
 # ---------------- EXACT ORIGINAL SIGNAL GENERATOR ----------------
 def generate_signal(df: pd.DataFrame, symbol: str, context=None):
@@ -436,7 +456,7 @@ async def monitor_signals(exchange):
         except Exception as e: log.exception("monitor error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
 
-# ---------------- OPTIMIZED SCAN LOOP WITH ALL FILTERS + NEW FEATURES ----------------
+# ---------------- FIXED SCAN LOOP WITH SAFE SYMBOL HANDLING ----------------
 last_signal_time = {}
 async def scan_loop(exchange):
     while True:
@@ -450,114 +470,120 @@ async def scan_loop(exchange):
             btc_direction = get_btc_direction(btc_15m, btc_1h)
             log.info(f"🎯 BTC Direction: {btc_direction}")
             
-            # Get top coins
-            tickers = await exchange.fetch_tickers()
-            top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")], 
-                        key=lambda x:x[1], reverse=True)[:TOP_N]
+            # USE PREDEFINED SYMBOLS TO AVOID CCXT PARSING ERRORS
+            top = POPULAR_SYMBOLS[:TOP_N]
+            log.info(f"📊 Processing {len(top)} verified symbols")
             
             signals_found = 0
             elite_signals = 0
             
-            for symbol,_ in top:
+            for symbol in top:
                 if deprioritized(symbol): continue
                 ohlcvs={}
                 for tf in TIMEFRAMES:
                     key=f"{symbol}:{tf}"
                     if key in last_signal_time and time.time()-last_signal_time[key]<1800: continue
-                    ohlcv = await fetch_ohlcv(exchange,symbol,tf,200)
-                    if not ohlcv: continue
-                    df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
-                    for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
-                    context={"tf":tf,"df_15m":ohlcvs.get("15m"),"df_1h":ohlcvs.get("1h")}
-                    if tf in ("1m","3m","5m"):
-                        if "15m" not in ohlcvs: 
-                            ohlcv15 = await fetch_ohlcv(exchange,symbol,"15m",200)
-                            if ohlcv15: ohlcvs["15m"]=pd.DataFrame(ohlcv15,columns=["ts","open","high","low","close","vol"])
-                        if "1h" not in ohlcvs:
-                            ohlcv1h = await fetch_ohlcv(exchange,symbol,"1h",200)
-                            if ohlcv1h: ohlcvs["1h"]=pd.DataFrame(ohlcv1h,columns=["ts","open","high","low","close","vol"])
-                        context["df_15m"]=ohlcvs.get("15m"); context["df_1h"]=ohlcvs.get("1h")
                     
-                    # Additional timeframes for elite filters
-                    if tf not in ["3m", "5m"]:
-                        for add_tf in ["3m", "5m"]:
-                            if add_tf not in ohlcvs:
-                                add_ohlcv = await fetch_ohlcv(exchange, symbol, add_tf, 200)
-                                if add_ohlcv: 
-                                    ohlcvs[add_tf] = pd.DataFrame(add_ohlcv,columns=["ts","open","high","low","close","vol"])
-                                    for col in ["open","high","low","close","vol"]:
-                                        ohlcvs[add_tf][col] = pd.to_numeric(ohlcvs[add_tf][col],errors="coerce")
-                        context["df_3m"]=ohlcvs.get("3m")
-                        context["df_5m"]=ohlcvs.get("5m")
-                    
-                    # Generate original signal
-                    sig = generate_signal(df,symbol,context)
-                    
-                    # APPLY ALL WINNER FILTERS + NEW FEATURES
-                    if sig:
-                        filters_passed = True
+                    try:
+                        ohlcv = await fetch_ohlcv(exchange,symbol,tf,200)
+                        if not ohlcv: continue
+                        df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
+                        for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
+                        context={"tf":tf,"df_15m":ohlcvs.get("15m"),"df_1h":ohlcvs.get("1h")}
+                        if tf in ("1m","3m","5m"):
+                            if "15m" not in ohlcvs: 
+                                ohlcv15 = await fetch_ohlcv(exchange,symbol,"15m",200)
+                                if ohlcv15: ohlcvs["15m"]=pd.DataFrame(ohlcv15,columns=["ts","open","high","low","close","vol"])
+                            if "1h" not in ohlcvs:
+                                ohlcv1h = await fetch_ohlcv(exchange,symbol,"1h",200)
+                                if ohlcv1h: ohlcvs["1h"]=pd.DataFrame(ohlcv1h,columns=["ts","open","high","low","close","vol"])
+                            context["df_15m"]=ohlcvs.get("15m"); context["df_1h"]=ohlcvs.get("1h")
                         
-                        # NEW: Market Regime Filter (applied first)
-                        if not check_market_regime(sig['symbol'], sig['side'], context):
-                            log.info(f"⏸️ Blocked by Market Regime: {sig['side']} signal in wrong regime")
-                            filters_passed = False
-                            
-                        # 1. BTC Direction Filter
-                        elif not is_trade_allowed(sig['side'], btc_direction):
-                            log.info(f"⏸️ Blocked: {sig['side']} vs BTC {btc_direction}")
-                            filters_passed = False
-                            
-                        # 2. Higher TF Alignment
-                        elif not check_higher_tf_alignment(sig, context.get("df_15m")):
-                            log.info(f"⏸️ Blocked: Higher TF misalignment")
-                            filters_passed = False
-                            
-                        # 3. Momentum Confirmation (skip for 1m/3m)
-                        elif tf not in ["1m", "3m"] and not check_momentum_confirmation(df, sig['side']):
-                            log.info(f"⏸️ Blocked: No momentum confirmation")
-                            filters_passed = False
-                            
-                        # 4. Zone Quality
-                        elif not check_entry_zone_quality(df, sig['side']):
-                            log.info(f"⏸️ Blocked: Poor entry zone")
-                            filters_passed = False
-                            
-                        # 5. Market Condition
-                        elif detect_choppy_market(df):
-                            log.info(f"⏸️ Blocked: Choppy market")
-                            filters_passed = False
+                        # Additional timeframes for elite filters
+                        if tf not in ["3m", "5m"]:
+                            for add_tf in ["3m", "5m"]:
+                                if add_tf not in ohlcvs:
+                                    add_ohlcv = await fetch_ohlcv(exchange, symbol, add_tf, 200)
+                                    if add_ohlcv: 
+                                        ohlcvs[add_tf] = pd.DataFrame(add_ohlcv,columns=["ts","open","high","low","close","vol"])
+                                        for col in ["open","high","low","close","vol"]:
+                                            ohlcvs[add_tf][col] = pd.to_numeric(ohlcvs[add_tf][col],errors="coerce")
+                            context["df_3m"]=ohlcvs.get("3m")
+                            context["df_5m"]=ohlcvs.get("5m")
                         
-                        if filters_passed:
-                            # NEW: Elite Classification
-                            is_elite, elite_details = check_elite_filters(sig, df, context)
+                        # Generate original signal
+                        sig = generate_signal(df,symbol,context)
+                        
+                        # APPLY ALL WINNER FILTERS + NEW FEATURES
+                        if sig:
+                            filters_passed = True
                             
-                            # Add winner bonuses
-                            sig['reason_list'].extend([
-                                f"BTC {btc_direction} ✓", "Higher TF ✓", 
-                                "Zone ✓", "Trending ✓", "Regime ✓"
-                            ])
-                            if tf not in ["1m", "3m"]:
-                                sig['reason_list'].append("Momentum ✓")
-                            sig['score'] += 5
+                            # NEW: Market Regime Filter (applied first)
+                            if not check_market_regime(sig['symbol'], sig['side'], context):
+                                log.info(f"⏸️ Blocked by Market Regime: {sig['side']} signal in wrong regime")
+                                filters_passed = False
+                                
+                            # 1. BTC Direction Filter
+                            elif not is_trade_allowed(sig['side'], btc_direction):
+                                log.info(f"⏸️ Blocked: {sig['side']} vs BTC {btc_direction}")
+                                filters_passed = False
+                                
+                            # 2. Higher TF Alignment
+                            elif not check_higher_tf_alignment(sig, context.get("df_15m")):
+                                log.info(f"⏸️ Blocked: Higher TF misalignment")
+                                filters_passed = False
+                                
+                            # 3. Momentum Confirmation (skip for 1m/3m)
+                            elif tf not in ["1m", "3m"] and not check_momentum_confirmation(df, sig['side']):
+                                log.info(f"⏸️ Blocked: No momentum confirmation")
+                                filters_passed = False
+                                
+                            # 4. Zone Quality
+                            elif not check_entry_zone_quality(df, sig['side']):
+                                log.info(f"⏸️ Blocked: Poor entry zone")
+                                filters_passed = False
+                                
+                            # 5. Market Condition
+                            elif detect_choppy_market(df):
+                                log.info(f"⏸️ Blocked: Choppy market")
+                                filters_passed = False
                             
-                            # Elite classification
-                            if is_elite:
-                                elite_signals += 1
-                                icon = "🎯"
-                                elite_note = "ELITE - 3X SIZE"
-                                sig['reason_list'].extend(elite_details)
-                            else:
-                                icon = "🏆"
-                                elite_note = f"Score: {sig['score']}"
-                            
-                            await tg(f"{icon} {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\n{elite_note}\nBreakdown:{', '.join(sig['reason_list'])}")
-                            await log_signal(sig)
-                            last_signal_time[key]=time.time()
-                            signals_found += 1
+                            if filters_passed:
+                                # NEW: Elite Classification
+                                is_elite, elite_details = check_elite_filters(sig, df, context)
+                                
+                                # Add winner bonuses
+                                sig['reason_list'].extend([
+                                    f"BTC {btc_direction} ✓", "Higher TF ✓", 
+                                    "Zone ✓", "Trending ✓", "Regime ✓"
+                                ])
+                                if tf not in ["1m", "3m"]:
+                                    sig['reason_list'].append("Momentum ✓")
+                                sig['score'] += 5
+                                
+                                # Elite classification
+                                if is_elite:
+                                    elite_signals += 1
+                                    icon = "🎯"
+                                    elite_note = "ELITE - 3X SIZE"
+                                    sig['reason_list'].extend(elite_details)
+                                else:
+                                    icon = "🏆"
+                                    elite_note = f"Score: {sig['score']}"
+                                
+                                await tg(f"{icon} {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\n{elite_note}\nBreakdown:{', '.join(sig['reason_list'])}")
+                                await log_signal(sig)
+                                last_signal_time[key]=time.time()
+                                signals_found += 1
+                    
+                    except Exception as e:
+                        log.error(f"Error processing {symbol} {tf}: {e}")
+                        continue
                             
             log.info(f"📊 Scan complete: {signals_found} signals ({elite_signals} elite)")
                         
-        except Exception as e: log.exception("scan error: %s", e)
+        except Exception as e: 
+            log.exception("scan error: %s", e)
         elapsed=time.time()-t0
         await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
 
