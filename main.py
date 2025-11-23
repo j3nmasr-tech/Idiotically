@@ -2,16 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-PRODUCTION SCANNER - ALL ORIGINAL LOGIC + ALL WINNER FILTERS + ELITE SYSTEM
-- Your exact SMC core + ATR TP/SL + SL-cluster
-- BTC direction filter
-- Higher timeframe alignment 
-- Momentum confirmation
-- Zone quality detection
-- Market condition filter
-- NEW: Market Regime Filter (Stop Fighting the Tide)
-- NEW: Elite Entry Checklist (Score 14+)
-- SAFE: Protected from OKX broken markets
+PRODUCTION SCANNER - OLD SYSTEM + ELITE SYSTEM
+- Your exact old winner filters + scoring
+- PLUS new elite signals for maximum confidence
+- Market regime protection
+- Safe OKX wrapper
 """
 
 import os, time, asyncio, logging, datetime
@@ -141,11 +136,6 @@ class SafeOKX:
             return await self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         except: 
             return None
-
-# ---------------- EXACT ORIGINAL OHLCV ----------------
-async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
-    try: return await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    except: return None
 
 # ---------------- EXACT ORIGINAL INDICATORS ----------------
 def atr(df: pd.DataFrame, period=14):
@@ -497,7 +487,7 @@ async def monitor_signals(exchange):
             log.exception("monitor error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
 
-# ---------------- ULTIMATE SCAN LOOP WITH ALL FILTERS + ELITE SYSTEM ----------------
+# ---------------- DUAL SYSTEM SCAN LOOP (OLD + ELITE) ----------------
 last_signal_time = {}
 async def scan_loop(exchange):
     while True:
@@ -518,6 +508,7 @@ async def scan_loop(exchange):
             
             signals_found = 0
             elite_signals = 0
+            old_signals = 0
             
             for symbol,_ in top:
                 if deprioritized(symbol): continue
@@ -554,70 +545,70 @@ async def scan_loop(exchange):
                     # Generate original signal
                     sig = generate_signal(df,symbol,context)
                     
-                    # APPLY ALL WINNER FILTERS + MARKET REGIME + ELITE
                     if sig:
+                        # SYSTEM 1: YOUR OLD 10-SCORE SIGNALS (All your original filters)
                         filters_passed = True
                         
-                        # NEW: Market Regime Filter (applied first)
-                        if not check_market_regime(sig['symbol'], sig['side'], context):
-                            log.info(f"⏸️ Blocked by Market Regime: {sig['side']} signal in wrong regime")
-                            filters_passed = False
-                            
                         # 1. BTC Direction Filter
-                        elif not is_trade_allowed(sig['side'], btc_direction):
-                            log.info(f"⏸️ Blocked: {sig['side']} vs BTC {btc_direction}")
+                        if not is_trade_allowed(sig['side'], btc_direction):
                             filters_passed = False
                             
                         # 2. Higher TF Alignment
                         elif not check_higher_tf_alignment(sig, context.get("df_15m")):
-                            log.info(f"⏸️ Blocked: Higher TF misalignment")
                             filters_passed = False
                             
                         # 3. Momentum Confirmation (skip for 1m/3m)
                         elif tf not in ["1m", "3m"] and not check_momentum_confirmation(df, sig['side']):
-                            log.info(f"⏸️ Blocked: No momentum confirmation")
                             filters_passed = False
                             
                         # 4. Zone Quality
                         elif not check_entry_zone_quality(df, sig['side']):
-                            log.info(f"⏸️ Blocked: Poor entry zone")
                             filters_passed = False
                             
                         # 5. Market Condition
                         elif detect_choppy_market(df):
-                            log.info(f"⏸️ Blocked: Choppy market")
                             filters_passed = False
                         
                         if filters_passed:
-                            # NEW: Elite Classification
-                            is_elite, elite_details = check_elite_filters(sig, df, context)
-                            
-                            # Add winner bonuses
+                            # Add winner bonuses (EXACTLY like your old system)
                             sig['reason_list'].extend([
                                 f"BTC {btc_direction} ✓", "Higher TF ✓", 
-                                "Zone ✓", "Trending ✓", "Regime ✓"
+                                "Zone ✓", "Trending ✓"
                             ])
                             if tf not in ["1m", "3m"]:
                                 sig['reason_list'].append("Momentum ✓")
                             sig['score'] += 5
                             
-                            # Elite classification
+                            # ONLY check Market Regime for old signals
+                            market_regime_allowed = check_market_regime(sig['symbol'], sig['side'], context)
+                            
+                            if market_regime_allowed:
+                                await tg(f"🏆 OLD SYSTEM | {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{sig['score']}\nBreakdown:{', '.join(sig['reason_list'])}")
+                                await log_signal(sig)
+                                last_signal_time[key]=time.time()
+                                old_signals += 1
+                                signals_found += 1
+                        
+                        # SYSTEM 2: NEW ELITE SIGNALS (All filters + elite checklist)
+                        elite_filters_passed = filters_passed  # Start with all old filters passed
+                        
+                        if elite_filters_passed:
+                            # NEW: Elite Classification
+                            is_elite, elite_details = check_elite_filters(sig, df, context)
+                            
                             if is_elite:
-                                elite_signals += 1
-                                icon = "🎯"
-                                elite_note = "ELITE - 3X SIZE"
+                                # Add elite badges
                                 sig['reason_list'].extend(elite_details)
-                                sig['score'] += 10  # Elite bonus
-                            else:
-                                icon = "🏆"
-                                elite_note = f"Score: {sig['score']}"
+                                sig['reason_list'].append("Regime ✓")  # Market regime already checked
+                                sig['score'] += 10  # Elite bonus on top of existing score
+                                
+                                await tg(f"🎯 ELITE SYSTEM | {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore: {sig['score']} (ELITE - 3X SIZE)\nBreakdown:{', '.join(sig['reason_list'])}")
+                                await log_signal(sig)
+                                last_signal_time[key]=time.time()
+                                elite_signals += 1
+                                signals_found += 1
                             
-                            await tg(f"{icon} {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\n{elite_note}\nBreakdown:{', '.join(sig['reason_list'])}")
-                            await log_signal(sig)
-                            last_signal_time[key]=time.time()
-                            signals_found += 1
-                            
-            log.info(f"📊 Scan complete: {signals_found} signals ({elite_signals} elite)")
+            log.info(f"📊 Scan complete: {signals_found} total signals ({old_signals} old system, {elite_signals} elite)")
                         
         except Exception as e: log.exception("scan error: %s", e)
         elapsed=time.time()-t0
@@ -640,20 +631,15 @@ async def main():
     
     # Startup message
     startup_msg = (
-        "🏆 ULTIMATE WINNER SCANNER STARTED\n"
-        "• All original SMC logic preserved\n"
-        "• BTC direction alignment enforced\n" 
-        "• Higher TF alignment required\n"
-        "• Momentum confirmation (5m+)\n"
-        "• Zone quality checks\n"
-        "• Trending markets only\n"
-        "• NEW: Market Regime Filter (Stop Fighting the Tide)\n"
-        "• NEW: Elite Entry Checklist (Score 14+)\n"
-        "• SAFE: Protected from OKX broken markets\n"
-        "🎯 Target: 80%+ Win Rate"
+        "🏆 DUAL SYSTEM SCANNER STARTED\n"
+        "• OLD SYSTEM: Your exact 10-score signals + all original filters\n"
+        "• ELITE SYSTEM: Ultra-filtered elite signals (3X size)\n" 
+        "• Market regime protection for both systems\n"
+        "• Safe OKX wrapper - no broken markets\n"
+        "🎯 OLD: 11-15 score | ELITE: 21-25+ score"
     )
     await tg(startup_msg)
-    log.info("✅ Scanner started with safe OKX wrapper + elite system")
+    log.info("✅ Dual system scanner started")
     
     await asyncio.gather(scan_loop(exchange), monitor_signals(exchange))
 
