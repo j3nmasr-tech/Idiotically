@@ -588,3 +588,23 @@ async def main():
     log.info("✅ Scanner started with all winner filters + market regime")
     
     await asyncio.gather(scan_loop(exchange), monitor_signals(exchange))
+
+# ---------------- SCRIPT ENTRY POINT ----------------
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--http", action="store_true", help="Run as HTTP server")
+    args = parser.parse_args()
+    
+    if args.http:
+        uvicorn.run(app, host="0.0.0.0", port=9000, log_level="info")
+    else:
+        # Run the main scanner
+        log.info("🚀 Starting Ultimate Winner Scanner...")
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            log.info("🛑 Scanner stopped by user")
+        except Exception as e:
+            log.error(f"💥 Scanner crashed: {e}")
+            asyncio.run(tg(f"💥 Scanner Crashed: {e}"))
