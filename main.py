@@ -416,7 +416,7 @@ def detect_choppy_market(df):
     price_range_pct = (df['high'].tail(20).max() - df['low'].tail(20).min()) / current_price
     return (atr < (current_price * 0.002) and price_range_pct < 0.02)
 
-# ---------------- EXACT ORIGINAL MONITOR ----------------
+# ---------------- FIXED MONITOR - NO MARKET LOADING ----------------
 async def monitor_signals(exchange):
     while True:
         try:
@@ -428,10 +428,14 @@ async def monitor_signals(exchange):
                     async for row in cursor:
                         sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status = row
                         try:
-                            ticker = await exchange.fetch_ticker(symbol)
-                            last_price = ticker.get("last")
-                            if last_price is None: continue
-
+                            # ✅ FIXED: Use fetch_ohlcv instead of fetch_ticker - NO MARKET LOADING!
+                            ohlcv = await fetch_ohlcv(exchange, symbol, "1m", 1)
+                            if not ohlcv or len(ohlcv) == 0:
+                                continue
+                                
+                            # Get last price from OHLCV data (index 4 is close price)
+                            last_price = ohlcv[0][4]  # [timestamp, open, high, low, close, volume]
+                            
                             hits=[]; sl_hit=False
                             if side=="BUY":
                                 if not tp1_hit and last_price>=tp1: hits.append("TP1"); tp1_hit=1
@@ -460,7 +464,7 @@ async def monitor_signals(exchange):
         except Exception as e: 
             log.exception("monitor error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
-
+        
 # ---------------- PERFECT SCAN LOOP - NO ERRORS ----------------
 last_signal_time = {}
 async def scan_loop(exchange):
