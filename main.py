@@ -24,7 +24,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 90))  # Increased for safety
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 20))  # Increased for safety
 TOP_N = int(os.getenv("TOP_N", 30))  # Reduced for fewer API calls
 MIN_VOLUME = float(os.getenv("MIN_VOLUME", 1000000))
 MAX_SPREAD = float(os.getenv("MAX_SPREAD", 0.002))
