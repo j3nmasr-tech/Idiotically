@@ -2,8 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-INSTITUTIONAL QUANT SCANNER v2.0 - VOLUME FIXED
+INSTITUTIONAL QUANT SCANNER v2.0 - WITH COMPLETE MONITORING
 - Fixed 'vol' vs 'volume' column naming issue
+- Complete trade monitoring system
+- 2-hour performance summaries
 - Ready for production
 """
 
@@ -146,6 +148,237 @@ class TradingSignal:
     # Metadata
     signal_id: str
     version: str = "2.0"
+
+# ==================== TRADE MONITORING SYSTEM ====================
+
+class TradeMonitor:
+    """Monitors open signals for TP/SL hits and updates performance"""
+    
+    def __init__(self, scanner):
+        self.scanner = scanner
+        self.open_signals = {}  # signal_id -> TradingSignal
+        self.closed_trades = []
+        self.all_signals = []  # Track all signals for summaries
+        self.last_summary_time = time.time()
+        
+    async def add_signal(self, signal: TradingSignal):
+        """Add a new signal to monitor"""
+        self.open_signals[signal.signal_id] = signal
+        self.all_signals.append({
+            'signal': signal,
+            'status': 'OPEN',
+            'added_time': datetime.datetime.utcnow()
+        })
+        logging.info(f"📈 Now monitoring signal: {signal.symbol} {signal.side}")
+        
+    async def check_signal_status(self, signal: TradingSignal, current_price: float):
+        """Check if signal hit TP/SL"""
+        if signal.side == SignalSide.BUY:
+            # Check Take Profits
+            if current_price >= signal.risk_parameters.take_profit_1:
+                return "TP1_HIT"
+            elif current_price >= signal.risk_parameters.take_profit_2:
+                return "TP2_HIT" 
+            elif current_price >= signal.risk_parameters.take_profit_3:
+                return "TP3_HIT"
+            # Check Stop Loss
+            elif current_price <= signal.risk_parameters.stop_loss:
+                return "SL_HIT"
+                
+        else:  # SELL
+            # Check Take Profits
+            if current_price <= signal.risk_parameters.take_profit_1:
+                return "TP1_HIT"
+            elif current_price <= signal.risk_parameters.take_profit_2:
+                return "TP2_HIT"
+            elif current_price <= signal.risk_parameters.take_profit_3:
+                return "TP3_HIT"
+            # Check Stop Loss  
+            elif current_price >= signal.risk_parameters.stop_loss:
+                return "SL_HIT"
+                
+        return "OPEN"
+    
+    async def monitor_open_signals(self):
+        """Check all open signals for TP/SL hits"""
+        if not self.open_signals:
+            return
+            
+        signals_to_remove = []
+        
+        for signal_id, signal in self.open_signals.items():
+            try:
+                # Get current price
+                ticker = await self.scanner.exchange.fetch_ticker(signal.symbol)
+                current_price = ticker['last']
+                
+                # Check status
+                status = await self.check_signal_status(signal, current_price)
+                
+                if status != "OPEN":
+                    # Signal hit TP/SL - process it
+                    await self._process_closed_signal(signal, status, current_price)
+                    signals_to_remove.append(signal_id)
+                    
+            except Exception as e:
+                logging.error(f"Error monitoring {signal.symbol}: {e}")
+        
+        # Remove closed signals
+        for signal_id in signals_to_remove:
+            del self.open_signals[signal_id]
+    
+    async def _process_closed_signal(self, signal: TradingSignal, status: str, close_price: float):
+        """Process a signal that hit TP/SL"""
+        # Calculate P&L
+        if signal.side == SignalSide.BUY:
+            pnl_pct = (close_price - signal.entry_price) / signal.entry_price * 100
+        else:  # SELL
+            pnl_pct = (signal.entry_price - close_price) / signal.entry_price * 100
+        
+        # Create trade record
+        trade_record = {
+            'signal_id': signal.signal_id,
+            'symbol': signal.symbol,
+            'side': signal.side.value,
+            'entry_price': signal.entry_price,
+            'close_price': close_price,
+            'pnl_pct': pnl_pct,
+            'status': status,
+            'entry_time': signal.timestamp,
+            'exit_time': datetime.datetime.utcnow(),
+            'timeframe': signal.timeframe.value,
+            'confidence_score': signal.confidence_score
+        }
+        
+        self.closed_trades.append(trade_record)
+        
+        # Update signal status in all_signals
+        for sig_data in self.all_signals:
+            if sig_data['signal'].signal_id == signal.signal_id:
+                sig_data['status'] = status
+                sig_data['close_price'] = close_price
+                sig_data['pnl_pct'] = pnl_pct
+                sig_data['exit_time'] = datetime.datetime.utcnow()
+                break
+        
+        # Send notification
+        await self._send_trade_update(signal, status, close_price, pnl_pct)
+        
+        logging.info(f"🎯 Trade closed: {signal.symbol} {status} | P&L: {pnl_pct:.2f}%")
+    
+    async def _send_trade_update(self, signal: TradingSignal, status: str, close_price: float, pnl_pct: float):
+        """Send trade update to Telegram"""
+        emoji = "🟢" if "TP" in status else "🔴"
+        
+        message = f"""
+{emoji} **TRADE UPDATE** {emoji}
+
+Symbol: {signal.symbol}
+Status: {status}
+Side: {signal.side.value}
+
+Entry: {signal.entry_price:.6f}
+Exit: {close_price:.6f}
+P&L: {pnl_pct:+.2f}%
+
+Duration: {self._get_duration_str(signal.timestamp)}
+
+Original Confidence: {signal.confidence_score}/10
+        """
+        
+        await tg(message)
+    
+    def _get_duration_str(self, start_time: datetime.datetime) -> str:
+        """Calculate duration string"""
+        duration = datetime.datetime.utcnow() - start_time
+        hours = duration.total_seconds() / 3600
+        
+        if hours < 1:
+            return f"{int(hours * 60)} minutes"
+        elif hours < 24:
+            return f"{hours:.1f} hours"
+        else:
+            return f"{hours/24:.1f} days"
+    
+    async def send_performance_summary(self):
+        """Send 2-hour performance summary"""
+        now = time.time()
+        if now - self.last_summary_time < 7200:  # 2 hours
+            return False
+            
+        self.last_summary_time = now
+        
+        # Get signals from last 2 hours
+        two_hours_ago = datetime.datetime.utcnow() - datetime.timedelta(hours=2)
+        recent_signals = [s for s in self.all_signals if s['added_time'] >= two_hours_ago]
+        
+        if not recent_signals:
+            return True
+            
+        # Calculate statistics
+        open_signals = [s for s in recent_signals if s['status'] == 'OPEN']
+        closed_signals = [s for s in recent_signals if s['status'] != 'OPEN']
+        winning_trades = [s for s in closed_signals if s.get('pnl_pct', 0) > 0]
+        
+        total_signals = len(recent_signals)
+        win_rate = len(winning_trades) / len(closed_signals) * 100 if closed_signals else 0
+        avg_confidence = sum(s['signal'].confidence_score for s in recent_signals) / total_signals
+        
+        # Create summary message
+        message = f"""
+📊 **2-HOUR PERFORMANCE SUMMARY** 📊
+
+⏰ Period: Last 2 hours
+📈 Total Signals: {total_signals}
+🟢 Open Signals: {len(open_signals)}
+🔒 Closed Signals: {len(closed_signals)}
+🎯 Win Rate: {win_rate:.1f}%
+⭐ Avg Confidence: {avg_confidence:.1f}/10
+
+📋 **RECENT SIGNALS:**
+"""
+        
+        # Add recent signals details
+        for i, sig_data in enumerate(recent_signals[-10:], 1):  # Last 10 signals
+            signal = sig_data['signal']
+            status = sig_data['status']
+            pnl = sig_data.get('pnl_pct', 0)
+            
+            status_emoji = "🟢" if "TP" in status else "🔴" if status == "SL_HIT" else "🟡"
+            pnl_str = f"{pnl:+.2f}%" if status != "OPEN" else "OPEN"
+            
+            message += f"{i}. {status_emoji} {signal.symbol} {signal.side.value} | Conf: {signal.confidence_score}/10 | {pnl_str}\n"
+        
+        # Add performance stats
+        stats = self.get_performance_stats()
+        if stats['total_trades'] > 0:
+            message += f"""
+🏆 **OVERALL PERFORMANCE:**
+Total Trades: {stats['total_trades']}
+Win Rate: {stats['win_rate']:.1f}%
+Avg P&L: {stats['avg_pnl']:+.2f}%
+Total P&L: {stats['total_pnl']:+.2f}%
+"""
+        
+        await tg(message)
+        logging.info("📊 2-hour performance summary sent")
+        return True
+    
+    def get_performance_stats(self):
+        """Get trading performance statistics"""
+        if not self.closed_trades:
+            return {"total_trades": 0, "win_rate": 0, "avg_pnl": 0, "total_pnl": 0}
+        
+        winning_trades = [t for t in self.closed_trades if t['pnl_pct'] > 0]
+        total_pnl = sum(t['pnl_pct'] for t in self.closed_trades)
+        
+        return {
+            'total_trades': len(self.closed_trades),
+            'winning_trades': len(winning_trades),
+            'win_rate': len(winning_trades) / len(self.closed_trades) * 100,
+            'avg_pnl': total_pnl / len(self.closed_trades),
+            'total_pnl': total_pnl
+        }
 
 # ==================== ENHANCED DATA QUALITY ENGINE ====================
 
@@ -1159,6 +1392,7 @@ class InstitutionalScanner:
     def __init__(self, config: ScannerConfig):
         self.config = config
         self.signal_generator = InstitutionalSignalGenerator(config)
+        self.trade_monitor = TradeMonitor(self)  # ← MONITORING ADDED
         self.exchange = None
         self.performance_metrics = defaultdict(list)
         self.signal_cooldown = {}
@@ -1207,6 +1441,12 @@ class InstitutionalScanner:
             start_time = time.time()
             
             try:
+                # MONITOR EXISTING SIGNALS FIRST ← MONITORING ADDED
+                await self.trade_monitor.monitor_open_signals()
+                
+                # SEND 2-HOUR SUMMARY ← SUMMARY ADDED
+                await self.trade_monitor.send_performance_summary()
+                
                 # Get market context
                 market_context = await self._get_market_context()
                 
@@ -1364,6 +1604,9 @@ class InstitutionalScanner:
             # Send notification - FIXED: Actually sends to Telegram now
             await self._send_notification(signal)
             
+            # START MONITORING THIS SIGNAL ← MONITORING ADDED
+            await self.trade_monitor.add_signal(signal)
+            
             # Store in database
             await self._store_signal(signal)
             
@@ -1371,7 +1614,7 @@ class InstitutionalScanner:
             cooldown_key = f"{signal.symbol}_{signal.timeframe.value}"
             self.signal_cooldown[cooldown_key] = time.time() + (self.config.COOLDOWN_MINUTES * 60)
             
-            self.log.info(f"🎯 Signal processed: {signal.symbol} {signal.side} (Score: {signal.confidence_score:.1f})")
+            self.log.info(f"🎯 Signal processed and now monitoring: {signal.symbol} {signal.side} (Score: {signal.confidence_score:.1f})")
             
         except Exception as e:
             self.log.error(f"Signal processing error: {e}")
@@ -1511,7 +1754,7 @@ async def health_check():
 async def get_performance():
     """Get performance metrics"""
     if scanner:
-        return scanner.get_performance_summary()
+        return scanner.trade_monitor.get_performance_stats()
     else:
         return {"error": "Scanner not initialized"}
 
@@ -1552,7 +1795,7 @@ async def main():
         logging.info("✅ Institutional Scanner Started")
         
         # Test Telegram on startup - FIXED: Actually sends now
-        await tg("🤖 <b>Institutional Scanner Started Successfully!</b>\n\n✅ Exchange connected\n📊 Monitoring 80+ symbols\n🎯 All filters active\n\nReady to find high-probability trading opportunities!")
+        await tg("🤖 <b>Institutional Scanner Started Successfully!</b>\n\n✅ Exchange connected\n📊 Monitoring 80+ symbols\n🎯 All filters active\n📈 Trade monitoring ENABLED\n⏰ 2-hour summaries ENABLED\n\nReady to find high-probability trading opportunities!")
         
         await scanner.scan_market()
     else:
