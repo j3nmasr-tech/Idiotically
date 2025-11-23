@@ -6,7 +6,7 @@ PRODUCTION SCANNER - OLD SYSTEM + ELITE SYSTEM
 - Your exact old winner filters + scoring
 - PLUS new elite signals for maximum confidence
 - Market regime protection
-- Safe OKX wrapper
+- Safe OKX wrapper for FUTURES
 """
 
 import os, time, asyncio, logging, datetime
@@ -30,7 +30,7 @@ MIN_VOLUME = float(os.getenv("MIN_VOLUME", 1000000))
 MAX_SPREAD = float(os.getenv("MAX_SPREAD", 0.002))
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", 3600))
 DAILY_SUMMARY_HOUR = int(os.getenv("DAILY_SUMMARY_HOUR", 23))
-TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
+TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h"]  # Futures support 30m
 
 # ---------------- EXACT ORIGINAL LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -82,36 +82,40 @@ async def init_db():
         """)
         await db.commit()
 
-# ---------------- VERIFIED SYMBOLS (OKX SPOT) ----------------
+# ---------------- FUTURES SYMBOLS (OKX FUTURES) ----------------
 POPULAR_SYMBOLS = [
-    "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT", 
-    "AVAX/USDT", "DOT/USDT", "LINK/USDT", "MATIC/USDT", "LTC/USDT", "BCH/USDT",
-    "ATOM/USDT", "ETC/USDT", "XLM/USDT", "FIL/USDT", "THETA/USDT", "VET/USDT",
-    "TRX/USDT", "EOS/USDT", "AAVE/USDT", "MKR/USDT", "COMP/USDT", "YFI/USDT",
-    "SUSHI/USDT", "UNI/USDT", "CRV/USDT", "SNX/USDT", "BAL/USDT", "REN/USDT",
-    "DOGE/USDT", "SHIB/USDT", "APE/USDT", "SAND/USDT", "MANA/USDT", "GALA/USDT",
-    "ENJ/USDT", "CHZ/USDT", "ALGO/USDT", "NEAR/USDT", "FTM/USDT", "ONE/USDT",
-    "EGLD/USDT", "ICP/USDT", "XTZ/USDT", "HBAR/USDT", "GRT/USDT", "BAT/USDT",
-    "ZIL/USDT", "IOTA/USDT", "WAVES/USDT", "RVN/USDT", "SC/USDT", "STORJ/USDT",
-    "KAVA/USDT", "RUNE/USDT", "OCEAN/USDT", "CELO/USDT", "RSR/USDT", "COTI/USDT",
-    "ANKR/USDT", "AR/USDT", "RNDR/USDT", "HNT/USDT", "FLOW/USDT", "KSM/USDT",
-    "DASH/USDT", "ZEC/USDT", "XMR/USDT", "DCR/USDT", "QTUM/USDT", "ONT/USDT",
-    "IOST/USDT", "NEO/USDT", "VTHO/USDT", "TFUEL/USDT", "HOT/USDT", "STMX/USDT",
-    "PERP/USDT", "RAY/USDT", "SRM/USDT", "FTT/USDT", "ROSE/USDT", "CELR/USDT",
-    "OMG/USDT", "SKL/USDT", "CVC/USDT", "BAND/USDT", "OXT/USDT", "LRC/USDT",
-    "NKN/USDT", "DODO/USDT", "TRB/USDT", "BADGER/USDT", "LPT/USDT", "GLM/USDT"
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "ADAUSDT", 
+    "AVAXUSDT", "DOTUSDT", "LINKUSDT", "MATICUSDT", "LTCUSDT", "BCHUSDT",
+    "ATOMUSDT", "ETCUSDT", "XLMUSDT", "FILUSDT", "THETAUSDT", "VETUSDT",
+    "TRXUSDT", "EOSUSDT", "AAVEUSDT", "MKRUSDT", "COMPUSDT", "YFIUSDT",
+    "SUSHIUSDT", "UNIUSDT", "CRVUSDT", "SNXUSDT", "BALUSDT", "RENUSDT",
+    "DOGEUSDT", "SHIBUSDT", "APEUSDT", "SANDUSDT", "MANAUSDT", "GALAUSDT",
+    "ENJUSDT", "CHZUSDT", "ALGOUSDT", "NEARUSDT", "FTMUSDT", "ONEUSDT",
+    "EGLDUSDT", "ICPUSDT", "XTZUSDT", "HBARUSDT", "GRTUSDT", "BATUSDT",
+    "ZILUSDT", "IOTAUSDT", "WAVESUSDT", "RVNUSDT", "SCUSDT", "STORJUSDT",
+    "KAVAUSDT", "RUNEUSDT", "OCEANUSDT", "CELOUSDT", "RSRUSDT", "COTIUSDT",
+    "ANKRUSDT", "ARUSDT", "RNDRUSDT", "HNTUSDT", "FLOWUSDT", "KSMUSDT",
+    "DASHUSDT", "ZECUSDT", "XMRUSDT", "DCRUSDT", "QTUMUSDT", "ONTUSDT",
+    "IOSTUSDT", "NEOUSDT", "VTHOUSDT", "TFUELUSDT", "HOTUSDT", "STMXUSDT",
+    "PERPUSDT", "RAYUSDT", "SRMUSDT", "FTTUSDT", "ROSEUSDT", "CELRUSDT",
+    "OMGUSDT", "SKLUSDT", "CVCUSDT", "BANDUSDT", "OXTUSDT", "LRCUSDT",
+    "NKNUSDT", "DODOUSDT", "TRBUSDT", "BADGERUSDT", "LPTUSDT", "GLMUSDT"
 ]
 
-# ---------------- SAFE OKX WRAPPER (NO MARKET LOADING ERRORS) ----------------
+# ---------------- SAFE OKX WRAPPER FOR FUTURES ----------------
 class SafeOKX:
     def __init__(self):
         self.exchange = ccxt.okx({
             "enableRateLimit": True,
-            "options": {"defaultType": "spot"}
+            "options": {
+                "defaultType": "swap",  # FUTURES MODE
+                "defaultAccount": "futures",
+            }
         })
+        log.info("🎯 OKX configured for FUTURES trading")
         
     async def safe_fetch_tickers(self):
-        """Safe ticker fetch - only uses predefined symbols, no market loading"""
+        """Safe ticker fetch for futures"""
         tickers = {}
         for symbol in POPULAR_SYMBOLS[:TOP_N]:
             try:
@@ -487,130 +491,125 @@ async def monitor_signals(exchange):
             log.exception("monitor error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
 
-# ---------------- DUAL SYSTEM SCAN LOOP (OLD + ELITE) WITH DEBUG ----------------
+# ---------------- DUAL SYSTEM SCAN LOOP (OLD + ELITE) ----------------
 last_signal_time = {}
 async def scan_loop(exchange):
     while True:
         t0=time.time()
         try:
-            # Get BTC direction first
-            btc_15m_data = await exchange.fetch_ohlcv("BTC/USDT", "15m", 100)
-            btc_1h_data = await exchange.fetch_ohlcv("BTC/USDT", "1h", 100)
+            # Get BTC direction first - USING FUTURES SYMBOL
+            btc_15m_data = await exchange.fetch_ohlcv("BTCUSDT", "15m", 100)
+            btc_1h_data = await exchange.fetch_ohlcv("BTCUSDT", "1h", 100)
             btc_15m = pd.DataFrame(btc_15m_data, columns=["ts","open","high","low","close","vol"]) if btc_15m_data else None
             btc_1h = pd.DataFrame(btc_1h_data, columns=["ts","open","high","low","close","vol"]) if btc_1h_data else None
             btc_direction = get_btc_direction(btc_15m, btc_1h)
             log.info(f"🎯 BTC Direction: {btc_direction}")
             
             # SAFE: Use safe ticker fetch instead of fetch_tickers()
-            log.info("🔄 Fetching tickers...")
             tickers = await exchange.safe_fetch_tickers()
-            log.info(f"📊 Raw tickers fetched: {len(tickers)} symbols")
-            
-            # Debug: Show what tickers we got
-            for i, (symbol, ticker) in enumerate(list(tickers.items())[:5]):  # Show first 5
-                volume = ticker.get('quoteVolume', 0)
-                log.info(f"  {i+1}. {symbol} - Volume: {volume}")
-            
             top = [(symbol, tickers[symbol].get("quoteVolume", 0)) for symbol in tickers]
-            log.info(f"📈 Top symbols before sorting: {len(top)}")
-            
             top = sorted(top, key=lambda x: x[1], reverse=True)[:TOP_N]
-            log.info(f"🏆 Top {TOP_N} symbols after sorting: {len(top)}")
-            
-            # Debug: Show top symbols
-            for i, (symbol, volume) in enumerate(top[:10]):  # Show top 10
-                log.info(f"  {i+1}. {symbol} - Volume: {volume}")
             
             signals_found = 0
             elite_signals = 0
             old_signals = 0
-            total_symbols_checked = 0
-            total_signals_generated = 0
             
-            if not top:
-                log.error("❌ CRITICAL: No symbols in top list! Check ticker fetching.")
-                # Try alternative approach
-                log.info("🔄 Trying alternative symbol list...")
-                alternative_symbols = POPULAR_SYMBOLS[:TOP_N]
-                top = [(symbol, 1000000) for symbol in alternative_symbols]  # Fake volume
-                log.info(f"🔧 Using {len(top)} predefined symbols")
-            
-            for symbol, volume in top:
-                log.info(f"🔍 Processing {symbol} (Volume: {volume})")
-                
-                if deprioritized(symbol): 
-                    log.info(f"⏸️ {symbol} deprioritized - SL hits")
-                    continue
-                    
-                total_symbols_checked += 1
-                log.info(f"📊 Now checked {total_symbols_checked} symbols")
+            for symbol,_ in top:
+                if deprioritized(symbol): continue
                 ohlcvs={}
-                
                 for tf in TIMEFRAMES:
                     key=f"{symbol}:{tf}"
-                    if key in last_signal_time and time.time()-last_signal_time[key]<1800: 
-                        log.debug(f"⏸️ {key} cooldown active")
-                        continue
-                        
-                    log.info(f"⏰ Fetching {symbol} {tf} OHLCV...")
+                    if key in last_signal_time and time.time()-last_signal_time[key]<1800: continue
                     ohlcv = await exchange.fetch_ohlcv(symbol,tf,200)
-                    if not ohlcv: 
-                        log.warning(f"❌ {symbol} {tf} no OHLCV data - symbol may not exist")
-                        continue
-                        
-                    log.info(f"✅ {symbol} {tf} OHLCV fetched: {len(ohlcv)} candles")
+                    if not ohlcv: continue
                     df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
                     for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
                     context={"tf":tf,"df_15m":ohlcvs.get("15m"),"df_1h":ohlcvs.get("1h")}
-                    
                     if tf in ("1m","3m","5m"):
                         if "15m" not in ohlcvs: 
-                            log.info(f"🔄 Fetching {symbol} 15m for context...")
                             ohlcv15 = await exchange.fetch_ohlcv(symbol,"15m",200)
-                            if ohlcv15: 
-                                ohlcvs["15m"]=pd.DataFrame(ohlcv15,columns=["ts","open","high","low","close","vol"])
-                                log.info(f"✅ {symbol} 15m context loaded")
+                            if ohlcv15: ohlcvs["15m"]=pd.DataFrame(ohlcv15,columns=["ts","open","high","low","close","vol"])
                         if "1h" not in ohlcvs:
-                            log.info(f"🔄 Fetching {symbol} 1h for context...")
                             ohlcv1h = await exchange.fetch_ohlcv(symbol,"1h",200)
-                            if ohlcv1h: 
-                                ohlcvs["1h"]=pd.DataFrame(ohlcv1h,columns=["ts","open","high","low","close","vol"])
-                                log.info(f"✅ {symbol} 1h context loaded")
+                            if ohlcv1h: ohlcvs["1h"]=pd.DataFrame(ohlcv1h,columns=["ts","open","high","low","close","vol"])
                         context["df_15m"]=ohlcvs.get("15m"); context["df_1h"]=ohlcvs.get("1h")
                     
                     # Additional timeframes for elite filters
                     if tf not in ["3m", "5m"]:
                         for add_tf in ["3m", "5m"]:
                             if add_tf not in ohlcvs:
-                                log.info(f"🔄 Fetching {symbol} {add_tf} for elite filters...")
                                 add_ohlcv = await exchange.fetch_ohlcv(symbol, add_tf, 200)
                                 if add_ohlcv: 
                                     ohlcvs[add_tf] = pd.DataFrame(add_ohlcv,columns=["ts","open","high","low","close","vol"])
                                     for col in ["open","high","low","close","vol"]:
                                         ohlcvs[add_tf][col] = pd.to_numeric(ohlcvs[add_tf][col],errors="coerce")
-                                    log.info(f"✅ {symbol} {add_tf} elite context loaded")
                         context["df_3m"]=ohlcvs.get("3m")
                         context["df_5m"]=ohlcvs.get("5m")
                     
                     # Generate original signal
-                    log.info(f"🔍 Analyzing {symbol} {tf} for SMC patterns...")
                     sig = generate_signal(df,symbol,context)
                     
                     if sig:
-                        total_signals_generated += 1
-                        log.info(f"🎯 SMC PATTERN FOUND: {sig['symbol']} {tf} {sig['side']} | Base Score: {sig['score']} | Reasons: {', '.join(sig['reason_list'])}")
+                        # SYSTEM 1: YOUR EXACT OLD SYSTEM (All original filters + Market Regime)
+                        filters_passed = True
                         
-                        # [Rest of your existing filter logic...]
-                        
-                    else:
-                        log.debug(f"❌ {symbol} {tf} No SMC pattern detected")
+                        # 1. BTC Direction Filter
+                        if not is_trade_allowed(sig['side'], btc_direction):
+                            filters_passed = False
                             
-            log.info(f"📊 SCAN SUMMARY: Checked {total_symbols_checked} symbols | Generated {total_signals_generated} SMC patterns | Sent {signals_found} signals ({old_signals} old system, {elite_signals} elite)")
+                        # 2. Higher TF Alignment
+                        elif not check_higher_tf_alignment(sig, context.get("df_15m")):
+                            filters_passed = False
+                            
+                        # 3. Momentum Confirmation (skip for 1m/3m)
+                        elif tf not in ["1m", "3m"] and not check_momentum_confirmation(df, sig['side']):
+                            filters_passed = False
+                            
+                        # 4. Zone Quality
+                        elif not check_entry_zone_quality(df, sig['side']):
+                            filters_passed = False
+                            
+                        # 5. Market Condition
+                        elif detect_choppy_market(df):
+                            filters_passed = False
                         
-        except Exception as e: 
-            log.exception("MAIN SCAN ERROR: %s", e)
+                        # 6. NEW: Market Regime Filter (only new addition to old system)
+                        elif not check_market_regime(sig['symbol'], sig['side'], context):
+                            filters_passed = False
+                        
+                        if filters_passed:
+                            # Add winner bonuses (EXACTLY like your old system)
+                            sig['reason_list'].extend([
+                                f"BTC {btc_direction} ✓", "Higher TF ✓", 
+                                "Zone ✓", "Trending ✓"
+                            ])
+                            if tf not in ["1m", "3m"]:
+                                sig['reason_list'].append("Momentum ✓")
+                            sig['score'] += 5
+                            
+                            # Send OLD SYSTEM signal
+                            await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{sig['score']}\nBreakdown:{', '.join(sig['reason_list'])}")
+                            await log_signal(sig)
+                            last_signal_time[key]=time.time()
+                            old_signals += 1
+                            signals_found += 1
+                            
+                            # SYSTEM 2: NEW ELITE SYSTEM (Same filters + Elite checklist)
+                            is_elite, elite_details = check_elite_filters(sig, df, context)
+                            
+                            if is_elite:
+                                # Create elite version with elite badges
+                                elite_reasons = sig['reason_list'] + elite_details
+                                elite_score = sig['score'] + 10  # Elite bonus
+                                
+                                await tg(f"🎯 ELITE | {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{elite_score} (3X SIZE)\nBreakdown:{', '.join(elite_reasons)}")
+                                # Don't log elite separately - they're already logged as old signals
+                                elite_signals += 1
+                            
+            log.info(f"📊 Scan complete: {signals_found} total signals ({old_signals} old system, {elite_signals} elite)")
+                        
+        except Exception as e: log.exception("scan error: %s", e)
         elapsed=time.time()-t0
-        log.info(f"⏱️ Scan completed in {elapsed:.2f}s, sleeping {max(1,SCAN_INTERVAL-elapsed)}s")
         await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
 
 # ---------------- EXACT ORIGINAL FASTAPI ----------------
@@ -623,22 +622,22 @@ async def webhook(request: Request):
     log.info("Webhook received: %s", data)
     return {"ok":True}
 
-# ---------------- UPDATED MAIN WITH SAFE WRAPPER ----------------
+# ---------------- UPDATED MAIN WITH FUTURES WRAPPER ----------------
 async def main():
     await init_db()
-    exchange = SafeOKX()  # Use safe wrapper instead of direct CCXT
+    exchange = SafeOKX()  # Use futures wrapper
     
     # Startup message
     startup_msg = (
-        "🏆 DUAL SYSTEM SCANNER STARTED\n"
+        "🏆 DUAL SYSTEM SCANNER STARTED - FUTURES MODE\n"
         "• OLD SYSTEM: Your exact 10-score signals + all original filters\n"
         "• ELITE SYSTEM: Ultra-filtered elite signals (3X size)\n" 
         "• Market regime protection for both systems\n"
-        "• Safe OKX wrapper - no broken markets\n"
+        "• OKX Futures - No broken markets\n"
         "🎯 OLD: 11-15 score | ELITE: 21-25+ score"
     )
     await tg(startup_msg)
-    log.info("✅ Dual system scanner started")
+    log.info("✅ Dual system scanner started for FUTURES")
     
     await asyncio.gather(scan_loop(exchange), monitor_signals(exchange))
 
