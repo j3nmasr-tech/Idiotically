@@ -487,7 +487,7 @@ async def monitor_signals(exchange):
             log.exception("monitor error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
 
-# ---------------- DUAL SYSTEM SCAN LOOP (OLD + ELITE) ----------------
+# ---------------- DUAL SYSTEM SCAN LOOP (OLD + ELITE) WITH DEBUG ----------------
 last_signal_time = {}
 async def scan_loop(exchange):
     while True:
@@ -509,15 +509,27 @@ async def scan_loop(exchange):
             signals_found = 0
             elite_signals = 0
             old_signals = 0
+            total_symbols_checked = 0
+            total_signals_generated = 0
             
             for symbol,_ in top:
-                if deprioritized(symbol): continue
+                if deprioritized(symbol): 
+                    log.debug(f"⏸️ {symbol} deprioritized - SL hits")
+                    continue
+                    
+                total_symbols_checked += 1
                 ohlcvs={}
                 for tf in TIMEFRAMES:
                     key=f"{symbol}:{tf}"
-                    if key in last_signal_time and time.time()-last_signal_time[key]<1800: continue
+                    if key in last_signal_time and time.time()-last_signal_time[key]<1800: 
+                        log.debug(f"⏸️ {key} cooldown active")
+                        continue
+                        
                     ohlcv = await exchange.fetch_ohlcv(symbol,tf,200)
-                    if not ohlcv: continue
+                    if not ohlcv: 
+                        log.debug(f"❌ {symbol} {tf} no OHLCV data")
+                        continue
+                        
                     df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
                     for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
                     context={"tf":tf,"df_15m":ohlcvs.get("15m"),"df_1h":ohlcvs.get("1h")}
@@ -546,32 +558,67 @@ async def scan_loop(exchange):
                     sig = generate_signal(df,symbol,context)
                     
                     if sig:
+                        total_signals_generated += 1
+                        log.info(f"🔍 SMC PATTERN FOUND: {sig['symbol']} {tf} {sig['side']} | Base Score: {sig['score']} | Reasons: {', '.join(sig['reason_list'])}")
+                        
                         # SYSTEM 1: YOUR EXACT OLD SYSTEM (All original filters + Market Regime)
                         filters_passed = True
+                        failed_filters = []
                         
                         # 1. BTC Direction Filter
-                        if not is_trade_allowed(sig['side'], btc_direction):
+                        btc_allowed = is_trade_allowed(sig['side'], btc_direction)
+                        if not btc_allowed:
+                            failed_filters.append(f"BTC Direction ({btc_direction} vs {sig['side']})")
                             filters_passed = False
+                        else:
+                            log.debug(f"✅ {symbol} {tf} BTC Direction PASS: {btc_direction} allows {sig['side']}")
                             
                         # 2. Higher TF Alignment
-                        elif not check_higher_tf_alignment(sig, context.get("df_15m")):
-                            filters_passed = False
-                            
+                        if filters_passed:
+                            higher_tf_passed = check_higher_tf_alignment(sig, context.get("df_15m"))
+                            if not higher_tf_passed:
+                                failed_filters.append("Higher TF Alignment")
+                                filters_passed = False
+                            else:
+                                log.debug(f"✅ {symbol} {tf} Higher TF PASS")
+                                
                         # 3. Momentum Confirmation (skip for 1m/3m)
-                        elif tf not in ["1m", "3m"] and not check_momentum_confirmation(df, sig['side']):
-                            filters_passed = False
+                        if filters_passed and tf not in ["1m", "3m"]:
+                            momentum_passed = check_momentum_confirmation(df, sig['side'])
+                            if not momentum_passed:
+                                failed_filters.append("Momentum")
+                                filters_passed = False
+                            else:
+                                log.debug(f"✅ {symbol} {tf} Momentum PASS")
+                        elif tf in ["1m", "3m"]:
+                            log.debug(f"⏭️ {symbol} {tf} Momentum skipped (1m/3m)")
                             
                         # 4. Zone Quality
-                        elif not check_entry_zone_quality(df, sig['side']):
-                            filters_passed = False
-                            
+                        if filters_passed:
+                            zone_passed = check_entry_zone_quality(df, sig['side'])
+                            if not zone_passed:
+                                failed_filters.append("Zone Quality")
+                                filters_passed = False
+                            else:
+                                log.debug(f"✅ {symbol} {tf} Zone Quality PASS")
+                                
                         # 5. Market Condition
-                        elif detect_choppy_market(df):
-                            filters_passed = False
+                        if filters_passed:
+                            choppy = detect_choppy_market(df)
+                            if choppy:
+                                failed_filters.append("Choppy Market")
+                                filters_passed = False
+                            else:
+                                log.debug(f"✅ {symbol} {tf} Market Condition PASS")
                         
                         # 6. NEW: Market Regime Filter (only new addition to old system)
-                        elif not check_market_regime(sig['symbol'], sig['side'], context):
-                            filters_passed = False
+                        if filters_passed:
+                            regime_allowed = check_market_regime(sig['symbol'], sig['side'], context)
+                            if not regime_allowed:
+                                failed_filters.append("Market Regime")
+                                filters_passed = False
+                            else:
+                                log.debug(f"✅ {symbol} {tf} Market Regime PASS")
                         
                         if filters_passed:
                             # Add winner bonuses (EXACTLY like your old system)
@@ -582,6 +629,8 @@ async def scan_loop(exchange):
                             if tf not in ["1m", "3m"]:
                                 sig['reason_list'].append("Momentum ✓")
                             sig['score'] += 5
+                            
+                            log.info(f"🎯 OLD SYSTEM SIGNAL READY: {sig['symbol']} {tf} {sig['side']} | Final Score: {sig['score']}")
                             
                             # Send OLD SYSTEM signal
                             await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{sig['score']}\nBreakdown:{', '.join(sig['reason_list'])}")
@@ -598,13 +647,22 @@ async def scan_loop(exchange):
                                 elite_reasons = sig['reason_list'] + elite_details
                                 elite_score = sig['score'] + 10  # Elite bonus
                                 
+                                log.info(f"💎 ELITE SIGNAL READY: {sig['symbol']} {tf} {sig['side']} | Elite Score: {elite_score}")
+                                
                                 await tg(f"🎯 ELITE | {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{elite_score} (3X SIZE)\nBreakdown:{', '.join(elite_reasons)}")
                                 # Don't log elite separately - they're already logged as old signals
                                 elite_signals += 1
+                            else:
+                                log.debug(f"⏭️ {symbol} {tf} Not elite - failed elite checklist")
+                        else:
+                            log.info(f"❌ {symbol} {tf} {sig['side']} FAILED FILTERS: {', '.join(failed_filters)}")
+                    else:
+                        log.debug(f"❌ {symbol} {tf} No SMC pattern detected")
                             
-            log.info(f"📊 Scan complete: {signals_found} total signals ({old_signals} old system, {elite_signals} elite)")
+            log.info(f"📊 SCAN SUMMARY: Checked {total_symbols_checked} symbols | Generated {total_signals_generated} SMC patterns | Sent {signals_found} signals ({old_signals} old system, {elite_signals} elite)")
                         
-        except Exception as e: log.exception("scan error: %s", e)
+        except Exception as e: 
+            log.exception("scan error: %s", e)
         elapsed=time.time()-t0
         await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
 
