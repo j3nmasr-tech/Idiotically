@@ -2,14 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-ULTRA-SCALP SCANNER - OPTIMIZED FOR SPEED
-- Your exact SMC signals but 10x faster
-- Focused on 1m, 3m, 5m scalp timeframes
-- Top 40 high-volume pairs only
-- Lightning-fast scanning
+PRODUCTION SCANNER - ALL ORIGINAL LOGIC + ALL WINNER FILTERS + MARKET REGIME
+- Your exact SMC core + ATR TP/SL + SL-cluster
+- BTC direction filter
+- Higher timeframe alignment 
+- Momentum confirmation
+- Zone quality detection
+- Market condition filter
+- Market Regime - Don't Fight the Tide
 """
 
-import os, time, asyncio, logging, datetime, random
+import os, time, asyncio, logging, datetime
 import aiosqlite
 import httpx
 import ccxt.async_support as ccxt
@@ -18,16 +21,19 @@ from fastapi import FastAPI, Request, HTTPException
 import uvicorn
 from collections import defaultdict, deque
 
-# ---------------- ULTRA-SCALP CONFIG ----------------
+# ---------------- EXACT ORIGINAL CONFIG ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))  # 15s for scalping
-TOP_N = int(os.getenv("TOP_N", 40))  # Top 40 pairs for scalping
-MIN_VOLUME = float(os.getenv("MIN_VOLUME", 2000000))  # Higher volume filter
-ULTRA_TIMEFRAMES = ["1m", "3m", "5m"]  # SCALP ONLY - removed 15m, 1h
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
+TOP_N = int(os.getenv("TOP_N", 40))
+MIN_VOLUME = float(os.getenv("MIN_VOLUME", 1000000))
+MAX_SPREAD = float(os.getenv("MAX_SPREAD", 0.002))
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", 3600))
+DAILY_SUMMARY_HOUR = int(os.getenv("DAILY_SUMMARY_HOUR", 23))
+TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
 
 # ---------------- EXACT ORIGINAL LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -79,102 +85,12 @@ async def init_db():
         """)
         await db.commit()
 
-# ---------------- ULTRA-FAST KUCOIN WRAPPER ----------------
-class SafeKucoin:
-    def __init__(self):
-        self.exchange = ccxt.kucoin({
-            "enableRateLimit": True,
-            "rateLimit": 200,
-            "timeout": 15000,  # Reduced timeout for speed
-            "options": {
-                "defaultType": "spot",
-                "adjustForTimeDifference": True,
-            }
-        })
-        self.request_times = deque()
-        self.max_requests_per_minute = 60  # Increased for scalping
-        self.last_request = 0
-        self.min_interval = 0.1  # Faster: 100ms between requests
-        self.consecutive_errors = 0
-        
-    async def _respect_rate_limit(self):
-        now = time.time()
-        while self.request_times and self.request_times[0] < now - 60:
-            self.request_times.popleft()
-            
-        if len(self.request_times) >= self.max_requests_per_minute:
-            sleep_time = 60 - (now - self.request_times[0])
-            if sleep_time > 0:
-                await asyncio.sleep(sleep_time)
-        
-        elapsed = now - self.last_request
-        if elapsed < self.min_interval:
-            await asyncio.sleep(self.min_interval - elapsed)
-            
-        self.last_request = time.time()
-        self.request_times.append(time.time())
-    
-    async def safe_fetch_tickers(self):
-        """ULTRA-FAST: Only fetch high-volume pairs"""
-        await self._respect_rate_limit()
-        try:
-            tickers = await self.exchange.fetch_tickers()
-            
-            # ULTRA-FAST FILTER: Only high-volume USDT pairs
-            high_volume_pairs = {}
-            for s, v in tickers.items():
-                if s and (s.endswith("/USDT") or '/USDT:' in s):
-                    volume = v.get('quoteVolume', 0)
-                    if volume > MIN_VOLUME:  # Only high volume pairs
-                        high_volume_pairs[s] = v
-            
-            # IMMEDIATELY return top pairs by volume
-            top_tickers = dict(sorted(
-                high_volume_pairs.items(), 
-                key=lambda x: x[1].get('quoteVolume', 0), 
-                reverse=True
-            )[:TOP_N])  # Get exactly TOP_N pairs
-            
-            log.info(f"⚡ ULTRA-FAST: Fetched {len(top_tickers)} high-volume pairs")
-            self.consecutive_errors = 0
-            return top_tickers
-            
-        except Exception as e:
-            log.error(f"❌ Ticker error: {str(e)}")
-            await asyncio.sleep(5)
-            return {}
-    
-    async def safe_fetch_ticker(self, symbol):
-        return await self._fetch_with_retry(self.exchange.fetch_ticker, symbol)
-    
-    async def fetch_ohlcv(self, symbol, timeframe, limit=100):  # REDUCED: 100 candles for speed
-        return await self._fetch_with_retry(self.exchange.fetch_ohlcv, symbol, 
-                                          timeframe=timeframe, limit=limit)
-    
-    async def _fetch_with_retry(self, method, *args, **kwargs):
-        """FAST RETRY: Only 2 attempts for speed"""
-        for attempt in range(2):  # REDUCED: Only 2 retries
-            try:
-                await self._respect_rate_limit()
-                result = await method(*args, **kwargs)
-                self.consecutive_errors = 0
-                return result
-            except ccxt.BadSymbol as e:
-                return None  # Skip missing symbols immediately
-            except (ccxt.RequestTimeout, ccxt.NetworkError) as e:
-                if attempt == 1:
-                    return None
-                await asyncio.sleep(1)
-            except ccxt.RateLimitExceeded as e:
-                await asyncio.sleep(5)
-                return None
-            except Exception as e:
-                if attempt == 1:
-                    return None
-                await asyncio.sleep(1)
-        return None
+# ---------------- EXACT ORIGINAL OHLCV ----------------
+async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
+    try: return await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    except: return None
 
-# ---------------- EXACT ORIGINAL INDICATORS (UNCHANGED) ----------------
+# ---------------- EXACT ORIGINAL INDICATORS ----------------
 def atr(df: pd.DataFrame, period=14):
     high, low, close = df["high"], df["low"], df["close"]
     tr = pd.DataFrame({
@@ -187,14 +103,7 @@ def atr(df: pd.DataFrame, period=14):
 def sma(series: pd.Series, period: int):
     return series.rolling(period, min_periods=1).mean()
 
-def rsi(series: pd.Series, period: int):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
-# ---------------- EXACT ORIGINAL SMC CORE (UNCHANGED) ----------------
+# ---------------- EXACT ORIGINAL SMC CORE ----------------
 def detect_swing_points(df: pd.DataFrame):
     if len(df) < 5: return None
     last = df.iloc[-1]; prev = df.iloc[-3:-1]
@@ -233,7 +142,7 @@ def detect_order_blocks(df: pd.DataFrame):
         return "bullish", candle["open"], candle["low"]
     return "bearish", candle["high"], candle["open"]
 
-# ---------------- EXACT ORIGINAL SL-CLUSTER (UNCHANGED) ----------------
+# ---------------- EXACT ORIGINAL SL-CLUSTER ----------------
 recent_sl = defaultdict(lambda: deque())
 def record_sl_hit(symbol: str, lookback_minutes=30):
     now = time.time(); dq = recent_sl[symbol]; dq.append(now)
@@ -245,34 +154,7 @@ def deprioritized(symbol: str, threshold=3, lookback=30):
     while dq and dq[0] < cutoff: dq.popleft()
     return len(dq) >= threshold
 
-# ---------------- SIMPLIFIED MARKET REGIME FOR SPEED ----------------
-def check_market_regime(symbol, signal_direction, context):
-    """FAST VERSION: Skip complex analysis for scalping"""
-    return True  # Allow all trades for ultra-scalping
-
-# ---------------- SIMPLIFIED ELITE FILTERS FOR SPEED ----------------
-def check_elite_filters(signal, df, context):
-    """FAST VERSION: Basic elite checks only"""
-    elite_score = 0
-    
-    # 1. Volume check (fast)
-    if len(df) >= 10:
-        current_volume = df['vol'].iloc[-1]
-        avg_volume = df['vol'].tail(10).mean()
-        if current_volume > avg_volume * 1.3:
-            elite_score += 1
-    
-    # 2. RSI momentum (fast)
-    if len(df) >= 14:
-        rsi_val = rsi(df['close'], 14).iloc[-1]
-        if signal["side"] == "BUY" and 40 < rsi_val < 80:
-            elite_score += 1
-        elif signal["side"] == "SELL" and 20 < rsi_val < 60:
-            elite_score += 1
-    
-    return elite_score == 2, ["Volume ✓", "Momentum ✓"]
-
-# ---------------- EXACT ORIGINAL SIGNAL GENERATOR (UNCHANGED) ----------------
+# ---------------- EXACT ORIGINAL SIGNAL GENERATOR ----------------
 def generate_signal(df: pd.DataFrame, symbol: str, context=None):
     if context is None: context = {}
     tf = context.get("tf","15m")
@@ -304,18 +186,34 @@ def generate_signal(df: pd.DataFrame, symbol: str, context=None):
 
     side = "BUY" if ob_type=="bullish" else "SELL"
 
-    # SIMPLIFIED TP/SL for scalping
+    # EXACT ORIGINAL ATR-based TP/SL
+    atr_val = None
+    df15 = context.get("df_15m")
+    if df15 is not None and len(df15)>=10:
+        atr_val = float(atr(df15,14).iloc[-1])
     entry = float(last)
-    if side=="BUY":
-        sl = entry * 0.997
-        tp1 = entry * 1.004
-        tp2 = entry * 1.008
-        tp3 = entry * 1.012
+    tp_mult, sl_mult = 0.8, 1.0
+    if atr_val:
+        if side=="BUY":
+            sl = entry - sl_mult*atr_val
+            tp1 = entry + tp_mult*atr_val
+            tp2 = entry + tp_mult*1.5*atr_val
+            tp3 = entry + tp_mult*2.5*atr_val
+        else:
+            sl = entry + sl_mult*atr_val
+            tp1 = entry - tp_mult*atr_val
+            tp2 = entry - tp_mult*1.5*atr_val
+            tp3 = entry - tp_mult*2.5*atr_val
     else:
-        sl = entry * 1.003
-        tp1 = entry * 0.996
-        tp2 = entry * 0.992
-        tp3 = entry * 0.988
+        if side=="BUY":
+            sl = float(ob_lo)
+            tp1 = entry*1.004; tp2 = entry*1.008; tp3 = entry*1.012
+        else:
+            sl = float(ob_hi)
+            tp1 = entry*0.996; tp2 = entry*0.992; tp3 = entry*0.988
+
+    if sl==entry:
+        sl = entry - entry*0.002 if side=="BUY" else entry + entry*0.002
 
     return {
         "symbol": symbol,
@@ -326,11 +224,11 @@ def generate_signal(df: pd.DataFrame, symbol: str, context=None):
         "tp2": tp2,
         "tp3": tp3,
         "score": score,
-        "reason": "ULTRA-SCALP Signal",
+        "reason": "Set B SMC Signal",
         "reason_list": reasons
     }
 
-# ---------------- EXACT ORIGINAL LOG SIGNAL (UNCHANGED) ----------------
+# ---------------- EXACT ORIGINAL LOG SIGNAL ----------------
 async def log_signal(sig):
     async with db_lock:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -341,34 +239,163 @@ async def log_signal(sig):
                   datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"]))
             await db.commit()
 
-# ---------------- SIMPLIFIED WINNER FILTERS FOR SPEED ----------------
-def get_btc_direction_simple():
-    """FAST: Skip BTC analysis for ultra-scalping"""
-    return "NEUTRAL"
+# ---------------- WINNER FILTERS ----------------
+def get_btc_direction(btc_15m, btc_1h):
+    """BTC direction detection"""
+    if btc_15m is None or btc_1h is None: return "NEUTRAL"
+    try:
+        price = btc_15m['close'].iloc[-1]
+        ema_1h_50 = btc_1h['close'].ewm(span=50).mean().iloc[-1]
+        ema_15m_20 = btc_15m['close'].ewm(span=20).mean().iloc[-1]
+        
+        if price > ema_1h_50 and price > ema_15m_20: return "BULLISH"
+        elif price < ema_1h_50 and price < ema_15m_20: return "BEARISH"
+        else: return "NEUTRAL"
+    except: return "NEUTRAL"
 
 def is_trade_allowed(signal_side, btc_direction):
-    return True  # Allow all trades for speed
+    """BTC BULLISH: Only BUY allowed | BTC BEARISH: Only SELL allowed"""
+    if btc_direction == "BULLISH": return signal_side == "BUY"
+    elif btc_direction == "BEARISH": return signal_side == "SELL"
+    else: return True
 
 def check_higher_tf_alignment(signal, higher_tf_data):
-    return True  # Skip for scalping
+    """Higher timeframe alignment filter"""
+    if higher_tf_data is None or len(higher_tf_data) < 20:
+        return False
+    current_price = signal['entry']
+    higher_tf_ema_20 = higher_tf_data['close'].ewm(span=20).mean().iloc[-1]
+    higher_tf_ema_50 = higher_tf_data['close'].ewm(span=50).mean().iloc[-1]
+    if signal['side'] == 'BUY':
+        return current_price > higher_tf_ema_20 and current_price > higher_tf_ema_50
+    else:
+        return current_price < higher_tf_ema_20 and current_price < higher_tf_ema_50
 
 def check_momentum_confirmation(df, signal_direction):
-    """FAST: Simple momentum check"""
+    """Momentum confirmation filter"""
     if len(df) < 3: return False
     current_candle = df.iloc[-1]
-    return (signal_direction == 'BUY' and current_candle['close'] > current_candle['open']) or \
-           (signal_direction == 'SELL' and current_candle['close'] < current_candle['open'])
+    prev_candle = df.iloc[-2]
+    if signal_direction == 'BUY':
+        return (current_candle['close'] > current_candle['open'] and 
+                current_candle['close'] > prev_candle['close'])
+    else:
+        return (current_candle['close'] < current_candle['open'] and
+                current_candle['close'] < prev_candle['close'])
 
 def check_entry_zone_quality(df, signal_direction):
-    return True  # Skip for scalping
+    """Zone quality detection"""
+    if len(df) < 15: return False
+    recent_high = df['high'].tail(15).max()
+    recent_low = df['low'].tail(15).min()
+    current_price = df['close'].iloc[-1]
+    if recent_high == recent_low: return False
+    range_position = (current_price - recent_low) / (recent_high - recent_low)
+    if signal_direction == 'BUY':
+        return range_position < 0.3
+    else:
+        return range_position > 0.7
 
 def detect_choppy_market(df):
-    """FAST: Simple choppy market detection"""
-    if len(df) < 20: return False
-    price_range = (df['high'].tail(20).max() - df['low'].tail(20).min()) / df['close'].iloc[-1]
-    return price_range < 0.01  # Very narrow range = choppy
+    """Market condition filter"""
+    if len(df) < 25: return True
+    high, low, close = df['high'], df['low'], df['close']
+    tr1 = high - low
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    true_range = pd.DataFrame({'tr1': tr1, 'tr2': tr2, 'tr3': tr3}).max(axis=1)
+    atr = true_range.rolling(14).mean().iloc[-1]
+    current_price = close.iloc[-1]
+    price_range_pct = (df['high'].tail(20).max() - df['low'].tail(20).min()) / current_price
+    return (atr < (current_price * 0.002) and price_range_pct < 0.02)
 
-# ---------------- EXACT ORIGINAL MONITOR (UNCHANGED) ----------------
+# ---------------- MARKET REGIME FILTER - DON'T FIGHT THE TIDE ----------------
+def detect_market_regime(df_1h, df_4h=None):
+    """
+    Market Regime Detection - Don't Fight the Tide
+    Returns: "BULLISH", "BEARISH", or "RANGING"
+    """
+    if df_1h is None or len(df_1h) < 100:
+        return "RANGING"
+    
+    try:
+        # Use 1h data for primary regime detection
+        close = df_1h['close']
+        
+        # Key EMAs for trend detection
+        ema_20 = close.ewm(span=20).mean()
+        ema_50 = close.ewm(span=50).mean()
+        ema_100 = close.ewm(span=100).mean()
+        
+        # Current price position relative to EMAs
+        current_price = close.iloc[-1]
+        price_above_ema20 = current_price > ema_20.iloc[-1]
+        price_above_ema50 = current_price > ema_50.iloc[-1]
+        price_above_ema100 = current_price > ema_100.iloc[-1]
+        
+        # EMA alignment (classic trend definition)
+        ema_bull_aligned = ema_20.iloc[-1] > ema_50.iloc[-1] > ema_100.iloc[-1]
+        ema_bear_aligned = ema_20.iloc[-1] < ema_50.iloc[-1] < ema_100.iloc[-1]
+        
+        # Momentum confirmation (RSI for overbought/oversold context)
+        delta = close.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        current_rsi = rsi.iloc[-1] if not pd.isna(rsi.iloc[-1]) else 50
+        
+        # Volume trend (optional confirmation)
+        volume = df_1h['vol']
+        volume_sma = volume.rolling(20).mean()
+        current_volume = volume.iloc[-1]
+        volume_above_avg = current_volume > volume_sma.iloc[-1] if not pd.isna(volume_sma.iloc[-1]) else False
+        
+        # Regime Classification
+        bullish_conditions = (
+            price_above_ema20 and 
+            price_above_ema50 and 
+            ema_bull_aligned and
+            current_rsi > 40  # Not oversold
+        )
+        
+        bearish_conditions = (
+            not price_above_ema20 and 
+            not price_above_ema50 and 
+            ema_bear_aligned and
+            current_rsi < 60  # Not overbought
+        )
+        
+        if bullish_conditions:
+            return "BULLISH"
+        elif bearish_conditions:
+            return "BEARISH"
+        else:
+            return "RANGING"
+            
+    except Exception as e:
+        log.error(f"Market regime detection error: {e}")
+        return "RANGING"
+
+def should_trade_in_regime(signal_side, market_regime, strict_mode=True):
+    """
+    Don't Fight the Tide logic:
+    - BULLISH regime: Only take BUY signals
+    - BEARISH regime: Only take SELL signals  
+    - RANGING regime: Take both but with caution
+    - Strict mode: Block trades in ranging markets
+    """
+    if market_regime == "BULLISH":
+        return signal_side == "BUY"
+    elif market_regime == "BEARISH":
+        return signal_side == "SELL"
+    else:  # RANGING
+        if strict_mode:
+            return False  # Avoid ranging markets completely
+        else:
+            return True   # Allow both sides in ranging markets
+
+# ---------------- EXACT ORIGINAL MONITOR ----------------
 async def monitor_signals(exchange):
     while True:
         try:
@@ -379,156 +406,185 @@ async def monitor_signals(exchange):
                 """) as cursor:
                     async for row in cursor:
                         sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status = row
-                        try:
-                            ticker = await exchange.safe_fetch_ticker(symbol)
-                            last_price = ticker.get("last") if ticker else None
-                            if last_price is None: continue
+                        ticker = await exchange.fetch_ticker(symbol)
+                        last_price = ticker.get("last")
+                        if last_price is None: continue
 
-                            hits=[]; sl_hit=False
-                            if side=="BUY":
-                                if not tp1_hit and last_price>=tp1: hits.append("TP1"); tp1_hit=1
-                                if not tp2_hit and last_price>=tp2: hits.append("TP2"); tp2_hit=1
-                                if not tp3_hit and last_price>=tp3: hits.append("TP3"); tp3_hit=1
-                                if last_price<=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
-                            else:
-                                if not tp1_hit and last_price<=tp1: hits.append("TP1"); tp1_hit=1
-                                if not tp2_hit and last_price<=tp2: hits.append("TP2"); tp2_hit=1
-                                if not tp3_hit and last_price<=tp3: hits.append("TP3"); tp3_hit=1
-                                if last_price>=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
+                        hits=[]; sl_hit=False
+                        if side=="BUY":
+                            if not tp1_hit and last_price>=tp1: hits.append("TP1"); tp1_hit=1
+                            if not tp2_hit and last_price>=tp2: hits.append("TP2"); tp2_hit=1
+                            if not tp3_hit and last_price>=tp3: hits.append("TP3"); tp3_hit=1
+                            if last_price<=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
+                        else:
+                            if not tp1_hit and last_price<=tp1: hits.append("TP1"); tp1_hit=1
+                            if not tp2_hit and last_price<=tp2: hits.append("TP2"); tp2_hit=1
+                            if not tp3_hit and last_price<=tp3: hits.append("TP3"); tp3_hit=1
+                            if last_price>=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
 
-                            if hits:
-                                await tg(f"🎯 {symbol} {side} HIT: {','.join(hits)}")
+                        if hits:
+                            await tg(f"🎯 {symbol} {side} update\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP1:{tp1} TP2:{tp2} TP3:{tp3}")
 
-                            if sl_hit: record_sl_hit(symbol)
+                        if sl_hit: record_sl_hit(symbol)
 
-                            async with db_lock:
-                                await db.execute("""
-                                    UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?
-                                """,(tp1_hit,tp2_hit,tp3_hit,status,sig_id))
-                        except Exception as e:
-                            continue
+                        async with db_lock:
+                            await db.execute("""
+                                UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?
+                            """,(tp1_hit,tp2_hit,tp3_hit,status,sig_id))
                 await db.commit()
-        except Exception as e: 
-            log.error(f"Monitor error: {e}")
+        except Exception as e: log.exception("monitor error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
 
-# ---------------- ULTRA-FAST SCAN LOOP ----------------
+# ---------------- OPTIMIZED SCAN LOOP WITH ALL FILTERS ----------------
 last_signal_time = {}
 async def scan_loop(exchange):
-    consecutive_errors = 0
-    
     while True:
-        t0 = time.time()
+        t0=time.time()
         try:
-            # ULTRA-FAST: Skip BTC analysis
-            btc_direction = "NEUTRAL"
+            # Get BTC direction first
+            btc_15m_data = await fetch_ohlcv(exchange, "BTC/USDT", "15m", 100)
+            btc_1h_data = await fetch_ohlcv(exchange, "BTC/USDT", "1h", 100)
+            btc_15m = pd.DataFrame(btc_15m_data, columns=["ts","open","high","low","close","vol"]) if btc_15m_data else None
+            btc_1h = pd.DataFrame(btc_1h_data, columns=["ts","open","high","low","close","vol"]) if btc_1h_data else None
+            btc_direction = get_btc_direction(btc_15m, btc_1h)
+
+            # Market Regime Detection
+            market_regime = detect_market_regime(btc_1h)
+            log.info(f"🎯 BTC Direction: {btc_direction} | Market Regime: {market_regime}")
             
-            # ULTRA-FAST: Get top pairs immediately
-            tickers = await exchange.safe_fetch_tickers()
-            if not tickers:
-                await asyncio.sleep(5)
-                continue
-                
-            # Use the pre-sorted top pairs
-            top_pairs = list(tickers.items())[:TOP_N]
-            
-            log.info(f"⚡ ULTRA-SCALP: Scanning {len(top_pairs)} pairs")
+            # Get top coins
+            tickers = await exchange.fetch_tickers()
+            top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")], 
+                        key=lambda x:x[1], reverse=True)[:TOP_N]
             
             signals_found = 0
-            scanned_pairs = 0
-            
-            for symbol, ticker_data in top_pairs:
-                if deprioritized(symbol):
-                    continue
+            for symbol,_ in top:
+                if deprioritized(symbol): continue
+                ohlcvs={}
+                for tf in TIMEFRAMES:
+                    key=f"{symbol}:{tf}"
+                    if key in last_signal_time and time.time()-last_signal_time[key]<1800: continue
+                    ohlcv = await fetch_ohlcv(exchange,symbol,tf,200)
+                    if not ohlcv: continue
+                    df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
+                    for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
+                    context={"tf":tf,"df_15m":ohlcvs.get("15m"),"df_1h":ohlcvs.get("1h")}
+                    if tf in ("1m","3m","5m"):
+                        if "15m" not in ohlcvs: 
+                            ohlcv15 = await fetch_ohlcv(exchange,symbol,"15m",200)
+                            if ohlcv15: ohlcvs["15m"]=pd.DataFrame(ohlcv15,columns=["ts","open","high","low","close","vol"])
+                        if "1h" not in ohlcvs:
+                            ohlcv1h = await fetch_ohlcv(exchange,symbol,"1h",200)
+                            if ohlcv1h: ohlcvs["1h"]=pd.DataFrame(ohlcv1h,columns=["ts","open","high","low","close","vol"])
+                        context["df_15m"]=ohlcvs.get("15m"); context["df_1h"]=ohlcvs.get("1h")
                     
-                scanned_pairs += 1
-                
-                # ULTRA-FAST: Only check scalp timeframes
-                for tf in ULTRA_TIMEFRAMES:
-                    key = f"{symbol}:{tf}"
+                    # Generate original signal
+                    sig = generate_signal(df,symbol,context)
                     
-                    # Short cooldown for scalp signals
-                    if key in last_signal_time and time.time() - last_signal_time[key] < 300:
-                        continue
+                    # APPLY ALL WINNER FILTERS
+                    if sig:
+                        filters_passed = True
                         
-                    try:
-                        # ULTRA-FAST: Only 100 candles needed
-                        ohlcv = await exchange.fetch_ohlcv(symbol, tf, 100)
-                        if not ohlcv or len(ohlcv) < 20:
-                            continue
+                        # 1. BTC Direction Filter
+                        if not is_trade_allowed(sig['side'], btc_direction):
+                            log.info(f"⏸️ Blocked: {sig['side']} vs BTC {btc_direction}")
+                            filters_passed = False
                             
-                        df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
-                        for c in ["open", "high", "low", "close", "vol"]: 
-                            df[c] = pd.to_numeric(df[c], errors="coerce")
+                        # 2. MARKET REGIME - DON'T FIGHT THE TIDE
+                        elif not should_trade_in_regime(sig['side'], market_regime, strict_mode=True):
+                            log.info(f"⏸️ Blocked: {sig['side']} vs Market Regime {market_regime}")
+                            filters_passed = False
                             
-                        # ULTRA-FAST: Minimal context
-                        context = {"tf": tf}
+                        # 3. Higher TF Alignment
+                        elif not check_higher_tf_alignment(sig, context.get("df_15m")):
+                            log.info(f"⏸️ Blocked: Higher TF misalignment")
+                            filters_passed = False
+                            
+                        # 4. Momentum Confirmation (skip for 1m/3m)
+                        elif tf not in ["1m", "3m"] and not check_momentum_confirmation(df, sig['side']):
+                            log.info(f"⏸️ Blocked: No momentum confirmation")
+                            filters_passed = False
+                            
+                        # 5. Zone Quality
+                        elif not check_entry_zone_quality(df, sig['side']):
+                            log.info(f"⏸️ Blocked: Poor entry zone")
+                            filters_passed = False
+                            
+                        # 6. Market Condition
+                        elif detect_choppy_market(df):
+                            log.info(f"⏸️ Blocked: Choppy market")
+                            filters_passed = False
                         
-                        # Generate signal
-                        sig = generate_signal(df, symbol, context)
+                        if filters_passed:
+                            # Add winner bonuses
+                            sig['reason_list'].extend([
+                                f"BTC {btc_direction} ✓", 
+                                f"Regime {market_regime} ✓",
+                                "Higher TF ✓", 
+                                "Zone ✓", 
+                                "Trending ✓"
+                            ])
+                            if tf not in ["1m", "3m"]:
+                                sig['reason_list'].append("Momentum ✓")
+                            sig['score'] += 5
+                            
+                            await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{sig['score']}\nBreakdown:{', '.join(sig['reason_list'])}")
+                            await log_signal(sig)
+                            last_signal_time[key]=time.time()
+                            signals_found += 1
+                            
+            log.info(f"📊 Scan complete: {signals_found} winner signals found")
                         
-                        if sig and sig['score'] >= 6:  # Lower threshold for more scalp signals
-                            # ULTRA-FAST: Basic filters only
-                            if not detect_choppy_market(df):
-                                # Send IMMEDIATE scalp signal
-                                await tg(f"⚡ SCALP | {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']:.4f}\nSL:{sig['sl']:.4f}\nTP1:{sig['tp1']:.4f}\nScore:{sig['score']}")
-                                await log_signal(sig)
-                                last_signal_time[key] = time.time()
-                                signals_found += 1
-                                
-                    except Exception as e:
-                        continue  # ULTRA-FAST: Skip errors immediately
-                        
-            log.info(f"🎯 ULTRA-SCALP: {signals_found} signals from {scanned_pairs} pairs")
-            consecutive_errors = 0
-                        
-        except Exception as e:
-            consecutive_errors += 1
-            log.error(f"⚡ Scan error: {str(e)}")
-            await asyncio.sleep(5)
-                
-        elapsed = time.time() - t0
-        sleep_time = max(2, SCAN_INTERVAL - elapsed)
-        if sleep_time > 2:
-            log.info(f"⏱️ Next scan in {sleep_time:.1f}s")
-        await asyncio.sleep(sleep_time)
+        except Exception as e: log.exception("scan error: %s", e)
+        elapsed=time.time()-t0
+        await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
 
-# ---------------- EXACT ORIGINAL FASTAPI (UNCHANGED) ----------------
+# ---------------- EXACT ORIGINAL FASTAPI ----------------
 app = FastAPI()
 @app.post("/webhook")
 async def webhook(request: Request):
-    token = request.headers.get("X-Auth", "")
-    if token != WEBHOOK_SECRET: raise HTTPException(403, "Invalid secret")
+    token = request.headers.get("X-Auth","")
+    if token!=WEBHOOK_SECRET: raise HTTPException(403,"Invalid secret")
     data = await request.json()
     log.info("Webhook received: %s", data)
-    return {"ok": True}
+    return {"ok":True}
 
-# ---------------- UPDATED MAIN WITH ULTRA-SCALP MODE ----------------
+# ---------------- EXACT ORIGINAL MAIN ----------------
 async def main():
     await init_db()
-    exchange = SafeKucoin()
     
-    # Ultra-scalp startup message
+    # OKX EXCHANGE SETUP WITH ENVIRONMENT VARIABLES
+    exchange = ccxt.okx({
+        "enableRateLimit": True,
+        "apiKey": os.getenv("OKX_API_KEY"),
+        "secret": os.getenv("OKX_SECRET_KEY"),  
+        "password": os.getenv("OKX_PASSWORD"),
+        "sandbox": os.getenv("OKX_SANDBOX", "false").lower() == "true",  # Default to false
+    })
+    
+    # Test connection
+    try:
+        balance = await exchange.fetch_balance()
+        log.info("✅ OKX connection successful")
+        await tg("✅ OKX Connection Successful - Scanner Started")
+    except Exception as e:
+        log.error(f"❌ OKX connection failed: {e}")
+        await tg(f"❌ OKX Connection Failed: {e}")
+        return
+    
+    # Startup message
     startup_msg = (
-        "⚡ ULTRA-SCALP MODE ACTIVATED\n"
-        "• Top 40 high-volume pairs only\n"
-        "• 1m, 3m, 5m timeframes only\n" 
-        "• 15-second scan cycles\n"
-        "• Simplified filters for speed\n"
-        "• KuCoin API with anti-blocking\n"
-        "🎯 Ready for scalp signals!"
+        "🏆 ULTIMATE WINNER SCANNER STARTED\n"
+        "• All original SMC logic preserved\n"
+        "• BTC direction alignment enforced\n" 
+        "• Higher TF alignment required\n"
+        "• Momentum confirmation (5m+)\n"
+        "• Zone quality checks\n"
+        "• Trending markets only\n"
+        "• Market Regime - Don't Fight the Tide\n"
+        "🎯 Target: 80%+ Win Rate"
     )
     await tg(startup_msg)
-    log.info("⚡ ULTRA-SCALP scanner started!")
+    log.info("✅ Scanner started with all winner filters + market regime")
     
     await asyncio.gather(scan_loop(exchange), monitor_signals(exchange))
-
-if __name__ == "__main__":
-    import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument("--http", action="store_true")
-    args = p.parse_args()
-    if args.http:
-        uvicorn.run(app, host="0.0.0.0", port=9000)
-    else:
-        asyncio.run(main())
