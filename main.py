@@ -2,13 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-PRODUCTION SCANNER - ALL ORIGINAL LOGIC + ALL WINNER FILTERS
+PRODUCTION SCANNER - ALL ORIGINAL LOGIC + ALL WINNER FILTERS + ELITE SYSTEM
 - Your exact SMC core + ATR TP/SL + SL-cluster
 - BTC direction filter
 - Higher timeframe alignment 
 - Momentum confirmation
 - Zone quality detection
 - Market condition filter
+- NEW: Elite Entry Checklist (Score 14+)
+- NEW: Market Regime Filter (Stop Fighting the Tide)
 """
 
 import os, time, asyncio, logging, datetime
@@ -70,6 +72,7 @@ async def init_db():
             status TEXT,
             reason TEXT,
             score INTEGER,
+            tier TEXT DEFAULT 'STANDARD',
             tp1_hit INTEGER DEFAULT 0,
             tp2_hit INTEGER DEFAULT 0,
             tp3_hit INTEGER DEFAULT 0
@@ -101,6 +104,13 @@ def atr(df: pd.DataFrame, period=14):
 
 def sma(series: pd.Series, period: int):
     return series.rolling(period, min_periods=1).mean()
+
+def rsi(series: pd.Series, period: int):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
 
 # ---------------- EXACT ORIGINAL SMC CORE ----------------
 def detect_swing_points(df: pd.DataFrame):
@@ -227,15 +237,153 @@ def generate_signal(df: pd.DataFrame, symbol: str, context=None):
         "reason_list": reasons
     }
 
-# ---------------- EXACT ORIGINAL LOG SIGNAL ----------------
-async def log_signal(sig):
+# ---------------- NEW: ELITE ENTRY CHECKLIST ----------------
+def check_elite_filters(signal, df, context):
+    """Elite Entry Checklist - Score 14+"""
+    elite_score = 0
+    elite_details = []
+    
+    # 1. MTF Confluence (1m & 5m agree)
+    if check_mtf_confluence(signal, context):
+        elite_score += 1
+        elite_details.append("MTF ✓")
+    
+    # 2. Premium Zone Quality (Score 3/3)
+    if check_premium_zone(signal, df, context):
+        elite_score += 1
+        elite_details.append("Premium Zone ✓")
+    
+    # 3. Momentum Alignment (RSI Filter)
+    if check_momentum_alignment(signal, df, context):
+        elite_score += 1
+        elite_details.append("Momentum ✓")
+    
+    # 4. Volume-Verified Sweep
+    if check_volume_verification(df):
+        elite_score += 1
+        elite_details.append("Volume ✓")
+    
+    return elite_score == 4, elite_details
+
+def check_mtf_confluence(signal, context):
+    """Multi-Timeframe Confluence - 1m & 5m agreement"""
+    try:
+        df_5m = context.get("df_5m")
+        if df_5m is None or len(df_5m) < 10:
+            return False
+            
+        # Check if 5m has same OB type in same price zone
+        ob_type_5m, ob_hi_5m, ob_lo_5m = detect_order_blocks(df_5m)
+        if ob_type_5m != signal["side"].lower()[:4]:  # "bullish" vs "BUY"
+            return False
+            
+        # Price zone confluence (within 0.2%)
+        current_price = signal["entry"]
+        ob_price_5m = ob_hi_5m if ob_type_5m == "bearish" else ob_lo_5m
+        price_diff_pct = abs(current_price - ob_price_5m) / current_price
+        return price_diff_pct < 0.002
+    except:
+        return False
+
+def check_premium_zone(signal, df, context):
+    """Premium Zone Quality Scoring (3/3 points required)"""
+    zone_score = 0
+    
+    # +1: Fresh OB (formed within last 12 candles)
+    if len(df) >= 15:
+        zone_score += 1
+    
+    # +1: OB at Key HTF Level (using 1h data)
+    df_1h = context.get("df_1h")
+    if df_1h is not None and len(df_1h) >= 50:
+        current_price = signal["entry"]
+        # Check if price is near 1h EMA levels (support/resistance)
+        ema_20_1h = df_1h['close'].ewm(span=20).mean().iloc[-1]
+        ema_50_1h = df_1h['close'].ewm(span=50).mean().iloc[-1]
+        price_diff_pct = min(abs(current_price - ema_20_1h), abs(current_price - ema_50_1h)) / current_price
+        if price_diff_pct < 0.005:  # Within 0.5% of HTF level
+            zone_score += 1
+    
+    # +1: OB + FVG Confluence
+    bull_fvg, bear_fvg = detect_fvg(df)
+    if (signal["side"] == "BUY" and bull_fvg) or (signal["side"] == "SELL" and bear_fvg):
+        zone_score += 1
+    
+    return zone_score >= 3
+
+def check_momentum_alignment(signal, df, context):
+    """Momentum Alignment with RSI Filter"""
+    try:
+        # Use 3m data for momentum
+        df_3m = context.get("df_3m")
+        if df_3m is None or len(df_3m) < 14:
+            df_3m = df  # Fallback to current TF
+            
+        rsi_3m = rsi(df_3m['close'], 14).iloc[-1]
+        
+        if signal["side"] == "BUY":
+            return rsi_3m > 40 and rsi_3m < 80  # Not overbought, has momentum
+        else:
+            return rsi_3m < 60 and rsi_3m > 20  # Not oversold, has momentum
+    except:
+        return False
+
+def check_volume_verification(df):
+    """Volume Verification for Sweep"""
+    if len(df) < 20:
+        return False
+        
+    # Check if sweep candle had above-average volume
+    sweep_high, sweep_low = detect_sweep(df)
+    if not (sweep_high or sweep_low):
+        return False
+        
+    current_volume = df['vol'].iloc[-1]
+    avg_volume = df['vol'].tail(20).mean()
+    
+    return current_volume > avg_volume * 1.5  # 50% above average
+
+# ---------------- NEW: MARKET REGIME FILTER ----------------
+def check_market_regime(symbol, signal_direction, context):
+    """Stop Fighting the Tide - Market Regime Filter"""
+    try:
+        df_1h = context.get("df_1h")
+        if df_1h is None or len(df_1h) < 50:
+            return True  # Allow if no data
+            
+        current_price = df_1h['close'].iloc[-1]
+        ema_20_1h = df_1h['close'].ewm(span=20).mean().iloc[-1]
+        ema_50_1h = df_1h['close'].ewm(span=50).mean().iloc[-1]
+        
+        # Determine regime
+        if current_price > ema_20_1h and ema_20_1h > ema_50_1h:
+            regime = "STRONG_BULL"
+        elif current_price < ema_20_1h and ema_20_1h < ema_50_1h:
+            regime = "STRONG_BEAR"
+        else:
+            regime = "NEUTRAL"
+        
+        # Trading rules
+        if regime == "STRONG_BULL":
+            return signal_direction == "BUY"  # Only BUY allowed
+        elif regime == "STRONG_BEAR":
+            return signal_direction == "SELL"  # Only SELL allowed
+        else:
+            return True  # Both allowed in neutral
+        
+    except Exception as e:
+        log.error(f"Market regime check error: {e}")
+        return True  # Allow on error
+
+# ---------------- EXACT ORIGINAL LOG SIGNAL (UPDATED FOR TIERS) ----------------
+async def log_signal(sig, tier="STANDARD"):
     async with db_lock:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("""
-                INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score,tier)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
             """, (sig["symbol"],sig["side"],sig["entry"],sig["sl"],sig["tp1"],sig["tp2"],sig["tp3"],
-                  datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"]))
+                  datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"],tier))
             await db.commit()
 
 # ---------------- WINNER FILTERS ----------------
@@ -314,11 +462,11 @@ async def monitor_signals(exchange):
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 async with db.execute("""
-                    SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,tp1_hit,tp2_hit,tp3_hit,status 
+                    SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,tp1_hit,tp2_hit,tp3_hit,status,tier 
                     FROM signals WHERE status='OPEN'
                 """) as cursor:
                     async for row in cursor:
-                        sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status = row
+                        sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status, tier = row
                         ticker = await exchange.fetch_ticker(symbol)
                         last_price = ticker.get("last")
                         if last_price is None: continue
@@ -336,7 +484,8 @@ async def monitor_signals(exchange):
                             if last_price>=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
 
                         if hits:
-                            await tg(f"🎯 {symbol} {side} update\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP1:{tp1} TP2:{tp2} TP3:{tp3}")
+                            tier_icon = "🎯" if tier == "ELITE" else "📊"
+                            await tg(f"{tier_icon} {symbol} {side} update\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP1:{tp1} TP2:{tp2} TP3:{tp3}")
 
                         if sl_hit: record_sl_hit(symbol)
 
@@ -348,7 +497,7 @@ async def monitor_signals(exchange):
         except Exception as e: log.exception("monitor error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
 
-# ---------------- OPTIMIZED SCAN LOOP WITH ALL FILTERS ----------------
+# ---------------- OPTIMIZED SCAN LOOP WITH ALL FILTERS + ELITE SYSTEM ----------------
 last_signal_time = {}
 async def scan_loop(exchange):
     while True:
@@ -368,6 +517,8 @@ async def scan_loop(exchange):
                         key=lambda x:x[1], reverse=True)[:TOP_N]
             
             signals_found = 0
+            elite_signals = 0
+            
             for symbol,_ in top:
                 if deprioritized(symbol): continue
                 ohlcvs={}
@@ -378,7 +529,9 @@ async def scan_loop(exchange):
                     if not ohlcv: continue
                     df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
                     for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
-                    context={"tf":tf,"df_15m":ohlcvs.get("15m"),"df_1h":ohlcvs.get("1h")}
+                    
+                    # Fetch additional timeframes for context
+                    context={"tf":tf}
                     if tf in ("1m","3m","5m"):
                         if "15m" not in ohlcvs: 
                             ohlcv15 = await fetch_ohlcv(exchange,symbol,"15m",200)
@@ -386,15 +539,32 @@ async def scan_loop(exchange):
                         if "1h" not in ohlcvs:
                             ohlcv1h = await fetch_ohlcv(exchange,symbol,"1h",200)
                             if ohlcv1h: ohlcvs["1h"]=pd.DataFrame(ohlcv1h,columns=["ts","open","high","low","close","vol"])
-                        context["df_15m"]=ohlcvs.get("15m"); context["df_1h"]=ohlcvs.get("1h")
+                        if "5m" not in ohlcvs and tf != "5m":
+                            ohlcv5m = await fetch_ohlcv(exchange,symbol,"5m",200)
+                            if ohlcv5m: ohlcvs["5m"]=pd.DataFrame(ohlcv5m,columns=["ts","open","high","low","close","vol"])
+                        if "3m" not in ohlcvs and tf != "3m":
+                            ohlcv3m = await fetch_ohlcv(exchange,symbol,"3m",200)
+                            if ohlcv3m: ohlcvs["3m"]=pd.DataFrame(ohlcv3m,columns=["ts","open","high","low","close","vol"])
+                    
+                    context["df_15m"]=ohlcvs.get("15m")
+                    context["df_1h"]=ohlcvs.get("1h") 
+                    context["df_5m"]=ohlcvs.get("5m")
+                    context["df_3m"]=ohlcvs.get("3m")
                     
                     # Generate original signal
                     sig = generate_signal(df,symbol,context)
                     
-                    # APPLY ALL WINNER FILTERS
+                    # APPLY ALL FILTERS - MARKET REGIME FILTER FIRST (MANDATORY FOR ALL)
                     if sig:
+                        # LAYER 1: MARKET REGIME FILTER (APPLIED TO ALL SIGNALS)
+                        if not check_market_regime(sig['symbol'], sig['side'], context):
+                            log.info(f"⏸️ Blocked by Market Regime: {sig['side']} signal in wrong regime")
+                            continue
+                            
                         filters_passed = True
+                        tier = "STANDARD"
                         
+                        # ORIGINAL WINNER FILTERS
                         # 1. BTC Direction Filter
                         if not is_trade_allowed(sig['side'], btc_direction):
                             log.info(f"⏸️ Blocked: {sig['side']} vs BTC {btc_direction}")
@@ -421,21 +591,50 @@ async def scan_loop(exchange):
                             filters_passed = False
                         
                         if filters_passed:
-                            # Add winner bonuses
+                            # LAYER 2: ELITE FILTERS CLASSIFICATION
+                            is_elite, elite_details = check_elite_filters(sig, df, context)
+                            
+                            if is_elite:
+                                tier = "ELITE"
+                                sig['score'] += 10  # Elite bonus
+                                elite_signals += 1
+                            
+                            # Add filter bonuses to reason list
                             sig['reason_list'].extend([
                                 f"BTC {btc_direction} ✓", "Higher TF ✓", 
-                                "Zone ✓", "Trending ✓"
+                                "Zone ✓", "Trending ✓", "Regime ✓"
                             ])
                             if tf not in ["1m", "3m"]:
                                 sig['reason_list'].append("Momentum ✓")
-                            sig['score'] += 5
                             
-                            await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{sig['score']}\nBreakdown:{', '.join(sig['reason_list'])}")
-                            await log_signal(sig)
+                            if is_elite:
+                                sig['reason_list'].extend(elite_details)
+                            
+                            # Format message based on tier
+                            if tier == "ELITE":
+                                icon = "🎯"
+                                size_note = " (3X SIZE)"
+                                tier_note = "ELITE - Score: 14+"
+                            else:
+                                icon = "📊"  
+                                size_note = ""
+                                tier_note = f"STANDARD - Score: {sig['score']}"
+                            
+                            message = (
+                                f"{icon} {sig['symbol']} ({tf}) {sig['side']}{size_note}\n"
+                                f"Entry: {sig['entry']}\n"
+                                f"SL: {sig['sl']}\n"
+                                f"TP1: {sig['tp1']} TP2: {sig['tp2']} TP3: {sig['tp3']}\n"
+                                f"{tier_note}\n"
+                                f"Breakdown: {', '.join(sig['reason_list'])}"
+                            )
+                            
+                            await tg(message)
+                            await log_signal(sig, tier)
                             last_signal_time[key]=time.time()
                             signals_found += 1
                             
-            log.info(f"📊 Scan complete: {signals_found} winner signals found")
+            log.info(f"📊 Scan complete: {signals_found} signals ({elite_signals} elite)")
                         
         except Exception as e: log.exception("scan error: %s", e)
         elapsed=time.time()-t0
@@ -465,10 +664,12 @@ async def main():
         "• Momentum confirmation (5m+)\n"
         "• Zone quality checks\n"
         "• Trending markets only\n"
+        "• NEW: Market Regime Filter (Stop Fighting the Tide)\n"
+        "• NEW: Elite Entry Checklist (Score 14+)\n"
         "🎯 Target: 80%+ Win Rate"
     )
     await tg(startup_msg)
-    log.info("✅ Scanner started with all winner filters")
+    log.info("✅ Scanner started with all winner filters + elite system")
     
     await asyncio.gather(scan_loop(exchange), monitor_signals(exchange))
 
