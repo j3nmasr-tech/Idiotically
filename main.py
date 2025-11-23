@@ -10,6 +10,7 @@ PRODUCTION SCANNER - ALL ORIGINAL LOGIC + ALL WINNER FILTERS + MARKET REGIME
 - Zone quality detection
 - Market condition filter
 - NEW: Market Regime Filter (Stop Fighting the Tide)
+- SAFE: Protected from OKX broken markets
 """
 
 import os, time, asyncio, logging, datetime
@@ -84,6 +85,61 @@ async def init_db():
         );
         """)
         await db.commit()
+
+# ---------------- VERIFIED SYMBOLS (OKX SPOT) ----------------
+POPULAR_SYMBOLS = [
+    "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT", 
+    "AVAX/USDT", "DOT/USDT", "LINK/USDT", "MATIC/USDT", "LTC/USDT", "BCH/USDT",
+    "ATOM/USDT", "ETC/USDT", "XLM/USDT", "FIL/USDT", "THETA/USDT", "VET/USDT",
+    "TRX/USDT", "EOS/USDT", "AAVE/USDT", "MKR/USDT", "COMP/USDT", "YFI/USDT",
+    "SUSHI/USDT", "UNI/USDT", "CRV/USDT", "SNX/USDT", "BAL/USDT", "REN/USDT",
+    "DOGE/USDT", "SHIB/USDT", "APE/USDT", "SAND/USDT", "MANA/USDT", "GALA/USDT",
+    "ENJ/USDT", "CHZ/USDT", "ALGO/USDT", "NEAR/USDT", "FTM/USDT", "ONE/USDT",
+    "EGLD/USDT", "ICP/USDT", "XTZ/USDT", "HBAR/USDT", "GRT/USDT", "BAT/USDT",
+    "ZIL/USDT", "IOTA/USDT", "WAVES/USDT", "RVN/USDT", "SC/USDT", "STORJ/USDT",
+    "KAVA/USDT", "RUNE/USDT", "OCEAN/USDT", "CELO/USDT", "RSR/USDT", "COTI/USDT",
+    "ANKR/USDT", "AR/USDT", "RNDR/USDT", "HNT/USDT", "FLOW/USDT", "KSM/USDT",
+    "DASH/USDT", "ZEC/USDT", "XMR/USDT", "DCR/USDT", "QTUM/USDT", "ONT/USDT",
+    "IOST/USDT", "NEO/USDT", "VTHO/USDT", "TFUEL/USDT", "HOT/USDT", "STMX/USDT",
+    "PERP/USDT", "RAY/USDT", "SRM/USDT", "FTT/USDT", "ROSE/USDT", "CELR/USDT",
+    "OMG/USDT", "SKL/USDT", "CVC/USDT", "BAND/USDT", "OXT/USDT", "LRC/USDT",
+    "NKN/USDT", "DODO/USDT", "TRB/USDT", "BADGER/USDT", "LPT/USDT", "GLM/USDT"
+]
+
+# ---------------- SAFE OKX WRAPPER (NO MARKET LOADING ERRORS) ----------------
+class SafeOKX:
+    def __init__(self):
+        self.exchange = ccxt.okx({
+            "enableRateLimit": True,
+            "options": {"defaultType": "spot"}
+        })
+        
+    async def safe_fetch_tickers(self):
+        """Safe ticker fetch - only uses predefined symbols, no market loading"""
+        tickers = {}
+        for symbol in POPULAR_SYMBOLS[:TOP_N]:
+            try:
+                ticker = await self.exchange.fetch_ticker(symbol)
+                if ticker and 'last' in ticker and ticker['last'] is not None:
+                    tickers[symbol] = ticker
+            except Exception as e:
+                log.debug(f"Failed to fetch {symbol}: {e}")
+                continue
+        return tickers
+    
+    async def safe_fetch_ticker(self, symbol):
+        """Safe single ticker fetch"""
+        try:
+            return await self.exchange.fetch_ticker(symbol)
+        except:
+            return None
+    
+    async def fetch_ohlcv(self, symbol, timeframe, limit=200):
+        """OHLCV passthrough"""
+        try: 
+            return await self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        except: 
+            return None
 
 # ---------------- EXACT ORIGINAL OHLCV ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
@@ -347,33 +403,38 @@ async def monitor_signals(exchange):
                 """) as cursor:
                     async for row in cursor:
                         sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status = row
-                        ticker = await exchange.fetch_ticker(symbol)
-                        last_price = ticker.get("last")
-                        if last_price is None: continue
+                        try:
+                            ticker = await exchange.safe_fetch_ticker(symbol)
+                            last_price = ticker.get("last") if ticker else None
+                            if last_price is None: continue
 
-                        hits=[]; sl_hit=False
-                        if side=="BUY":
-                            if not tp1_hit and last_price>=tp1: hits.append("TP1"); tp1_hit=1
-                            if not tp2_hit and last_price>=tp2: hits.append("TP2"); tp2_hit=1
-                            if not tp3_hit and last_price>=tp3: hits.append("TP3"); tp3_hit=1
-                            if last_price<=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
-                        else:
-                            if not tp1_hit and last_price<=tp1: hits.append("TP1"); tp1_hit=1
-                            if not tp2_hit and last_price<=tp2: hits.append("TP2"); tp2_hit=1
-                            if not tp3_hit and last_price<=tp3: hits.append("TP3"); tp3_hit=1
-                            if last_price>=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
+                            hits=[]; sl_hit=False
+                            if side=="BUY":
+                                if not tp1_hit and last_price>=tp1: hits.append("TP1"); tp1_hit=1
+                                if not tp2_hit and last_price>=tp2: hits.append("TP2"); tp2_hit=1
+                                if not tp3_hit and last_price>=tp3: hits.append("TP3"); tp3_hit=1
+                                if last_price<=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
+                            else:
+                                if not tp1_hit and last_price<=tp1: hits.append("TP1"); tp1_hit=1
+                                if not tp2_hit and last_price<=tp2: hits.append("TP2"); tp2_hit=1
+                                if not tp3_hit and last_price<=tp3: hits.append("TP3"); tp3_hit=1
+                                if last_price>=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
 
-                        if hits:
-                            await tg(f"🎯 {symbol} {side} update\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP1:{tp1} TP2:{tp2} TP3:{tp3}")
+                            if hits:
+                                await tg(f"🎯 {symbol} {side} update\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP1:{tp1} TP2:{tp2} TP3:{tp3}")
 
-                        if sl_hit: record_sl_hit(symbol)
+                            if sl_hit: record_sl_hit(symbol)
 
-                        async with db_lock:
-                            await db.execute("""
-                                UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?
-                            """,(tp1_hit,tp2_hit,tp3_hit,status,sig_id))
+                            async with db_lock:
+                                await db.execute("""
+                                    UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?
+                                """,(tp1_hit,tp2_hit,tp3_hit,status,sig_id))
+                        except Exception as e:
+                            log.error(f"Error monitoring {symbol}: {e}")
+                            continue
                 await db.commit()
-        except Exception as e: log.exception("monitor error: %s", e)
+        except Exception as e: 
+            log.exception("monitor error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
 
 # ---------------- OPTIMIZED SCAN LOOP WITH ALL FILTERS + MARKET REGIME ----------------
@@ -383,17 +444,17 @@ async def scan_loop(exchange):
         t0=time.time()
         try:
             # Get BTC direction first
-            btc_15m_data = await fetch_ohlcv(exchange, "BTC/USDT", "15m", 100)
-            btc_1h_data = await fetch_ohlcv(exchange, "BTC/USDT", "1h", 100)
+            btc_15m_data = await exchange.fetch_ohlcv("BTC/USDT", "15m", 100)
+            btc_1h_data = await exchange.fetch_ohlcv("BTC/USDT", "1h", 100)
             btc_15m = pd.DataFrame(btc_15m_data, columns=["ts","open","high","low","close","vol"]) if btc_15m_data else None
             btc_1h = pd.DataFrame(btc_1h_data, columns=["ts","open","high","low","close","vol"]) if btc_1h_data else None
             btc_direction = get_btc_direction(btc_15m, btc_1h)
             log.info(f"🎯 BTC Direction: {btc_direction}")
             
-            # Get top coins
-            tickers = await exchange.fetch_tickers()
-            top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")], 
-                        key=lambda x:x[1], reverse=True)[:TOP_N]
+            # SAFE: Use safe ticker fetch instead of fetch_tickers()
+            tickers = await exchange.safe_fetch_tickers()
+            top = [(symbol, tickers[symbol].get("quoteVolume", 0)) for symbol in tickers]
+            top = sorted(top, key=lambda x: x[1], reverse=True)[:TOP_N]
             
             signals_found = 0
             for symbol,_ in top:
@@ -402,17 +463,17 @@ async def scan_loop(exchange):
                 for tf in TIMEFRAMES:
                     key=f"{symbol}:{tf}"
                     if key in last_signal_time and time.time()-last_signal_time[key]<1800: continue
-                    ohlcv = await fetch_ohlcv(exchange,symbol,tf,200)
+                    ohlcv = await exchange.fetch_ohlcv(symbol,tf,200)
                     if not ohlcv: continue
                     df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
                     for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
                     context={"tf":tf,"df_15m":ohlcvs.get("15m"),"df_1h":ohlcvs.get("1h")}
                     if tf in ("1m","3m","5m"):
                         if "15m" not in ohlcvs: 
-                            ohlcv15 = await fetch_ohlcv(exchange,symbol,"15m",200)
+                            ohlcv15 = await exchange.fetch_ohlcv(symbol,"15m",200)
                             if ohlcv15: ohlcvs["15m"]=pd.DataFrame(ohlcv15,columns=["ts","open","high","low","close","vol"])
                         if "1h" not in ohlcvs:
-                            ohlcv1h = await fetch_ohlcv(exchange,symbol,"1h",200)
+                            ohlcv1h = await exchange.fetch_ohlcv(symbol,"1h",200)
                             if ohlcv1h: ohlcvs["1h"]=pd.DataFrame(ohlcv1h,columns=["ts","open","high","low","close","vol"])
                         context["df_15m"]=ohlcvs.get("15m"); context["df_1h"]=ohlcvs.get("1h")
                     
@@ -484,10 +545,10 @@ async def webhook(request: Request):
     log.info("Webhook received: %s", data)
     return {"ok":True}
 
-# ---------------- EXACT ORIGINAL MAIN ----------------
+# ---------------- UPDATED MAIN WITH SAFE WRAPPER ----------------
 async def main():
     await init_db()
-    exchange = ccxt.okx({"enableRateLimit": True})
+    exchange = SafeOKX()  # Use safe wrapper instead of direct CCXT
     
     # Startup message
     startup_msg = (
@@ -499,10 +560,11 @@ async def main():
         "• Zone quality checks\n"
         "• Trending markets only\n"
         "• NEW: Market Regime Filter (Stop Fighting the Tide)\n"
+        "• SAFE: Protected from OKX broken markets\n"
         "🎯 Target: 80%+ Win Rate"
     )
     await tg(startup_msg)
-    log.info("✅ Scanner started with all winner filters + market regime")
+    log.info("✅ Scanner started with safe OKX wrapper + market regime filter")
     
     await asyncio.gather(scan_loop(exchange), monitor_signals(exchange))
 
