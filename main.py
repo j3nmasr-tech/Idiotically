@@ -491,47 +491,102 @@ async def monitor_signals(exchange):
             log.exception("monitor error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
 
-# ---------------- DUAL SYSTEM SCAN LOOP (OLD + ELITE) ----------------
+# ---------------- DUAL SYSTEM SCAN LOOP (OLD + ELITE) WITH DETAILED DEBUG ----------------
 last_signal_time = {}
 async def scan_loop(exchange):
     while True:
         t0=time.time()
         try:
+            log.info("🔄 Starting new scan cycle...")
+            
             # Get BTC direction first - USING FUTURES SYMBOL
+            log.info("📊 Fetching BTC data for direction...")
             btc_15m_data = await exchange.fetch_ohlcv("BTCUSDT", "15m", 100)
             btc_1h_data = await exchange.fetch_ohlcv("BTCUSDT", "1h", 100)
+            log.info(f"✅ BTC 15m data: {len(btc_15m_data) if btc_15m_data else 0} candles")
+            log.info(f"✅ BTC 1h data: {len(btc_1h_data) if btc_1h_data else 0} candles")
+            
             btc_15m = pd.DataFrame(btc_15m_data, columns=["ts","open","high","low","close","vol"]) if btc_15m_data else None
             btc_1h = pd.DataFrame(btc_1h_data, columns=["ts","open","high","low","close","vol"]) if btc_1h_data else None
             btc_direction = get_btc_direction(btc_15m, btc_1h)
             log.info(f"🎯 BTC Direction: {btc_direction}")
             
             # SAFE: Use safe ticker fetch instead of fetch_tickers()
+            log.info("🔄 Fetching futures tickers...")
             tickers = await exchange.safe_fetch_tickers()
+            log.info(f"📈 Raw tickers fetched: {len(tickers)} symbols")
+            
+            if not tickers:
+                log.error("❌ CRITICAL: No tickers fetched! Checking API connection...")
+                # Test with a single symbol
+                test_symbol = "BTCUSDT"
+                try:
+                    test_ticker = await exchange.safe_fetch_ticker(test_symbol)
+                    if test_ticker:
+                        log.info(f"✅ Single ticker test PASSED: {test_symbol} = {test_ticker.get('last')}")
+                    else:
+                        log.error(f"❌ Single ticker test FAILED: {test_symbol}")
+                except Exception as e:
+                    log.error(f"❌ Single ticker test ERROR: {e}")
+            
             top = [(symbol, tickers[symbol].get("quoteVolume", 0)) for symbol in tickers]
+            log.info(f"📊 Symbols with volume data: {len(top)}")
+            
             top = sorted(top, key=lambda x: x[1], reverse=True)[:TOP_N]
+            log.info(f"🏆 Top {TOP_N} symbols by volume: {len(top)}")
+            
+            # Show top 5 symbols for debugging
+            for i, (symbol, volume) in enumerate(top[:5]):
+                log.info(f"  {i+1}. {symbol} - Volume: {volume}")
             
             signals_found = 0
             elite_signals = 0
             old_signals = 0
+            total_symbols_processed = 0
+            total_ohlcv_fetched = 0
+            total_smc_patterns = 0
             
-            for symbol,_ in top:
-                if deprioritized(symbol): continue
+            for symbol, volume in top:
+                total_symbols_processed += 1
+                log.info(f"🔍 Processing {symbol} ({total_symbols_processed}/{len(top)}) - Volume: {volume}")
+                
+                if deprioritized(symbol): 
+                    log.info(f"⏸️ {symbol} deprioritized - SL hits")
+                    continue
+                    
                 ohlcvs={}
                 for tf in TIMEFRAMES:
                     key=f"{symbol}:{tf}"
-                    if key in last_signal_time and time.time()-last_signal_time[key]<1800: continue
+                    if key in last_signal_time and time.time()-last_signal_time[key]<1800: 
+                        log.debug(f"⏸️ {key} cooldown active")
+                        continue
+                        
+                    log.info(f"⏰ Fetching {symbol} {tf} OHLCV...")
                     ohlcv = await exchange.fetch_ohlcv(symbol,tf,200)
-                    if not ohlcv: continue
+                    if not ohlcv: 
+                        log.warning(f"❌ {symbol} {tf} no OHLCV data")
+                        continue
+                    
+                    total_ohlcv_fetched += 1
+                    log.info(f"✅ {symbol} {tf} OHLCV fetched: {len(ohlcv)} candles")
+                    
                     df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
-                    for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
+                    for c in ["open","high","low","close","vol"]: 
+                        df[c]=pd.to_numeric(df[c],errors="coerce")
+                    
                     context={"tf":tf,"df_15m":ohlcvs.get("15m"),"df_1h":ohlcvs.get("1h")}
+                    
                     if tf in ("1m","3m","5m"):
                         if "15m" not in ohlcvs: 
                             ohlcv15 = await exchange.fetch_ohlcv(symbol,"15m",200)
-                            if ohlcv15: ohlcvs["15m"]=pd.DataFrame(ohlcv15,columns=["ts","open","high","low","close","vol"])
+                            if ohlcv15: 
+                                ohlcvs["15m"]=pd.DataFrame(ohlcv15,columns=["ts","open","high","low","close","vol"])
+                                log.debug(f"✅ {symbol} 15m context loaded")
                         if "1h" not in ohlcvs:
                             ohlcv1h = await exchange.fetch_ohlcv(symbol,"1h",200)
-                            if ohlcv1h: ohlcvs["1h"]=pd.DataFrame(ohlcv1h,columns=["ts","open","high","low","close","vol"])
+                            if ohlcv1h: 
+                                ohlcvs["1h"]=pd.DataFrame(ohlcv1h,columns=["ts","open","high","low","close","vol"])
+                                log.debug(f"✅ {symbol} 1h context loaded")
                         context["df_15m"]=ohlcvs.get("15m"); context["df_1h"]=ohlcvs.get("1h")
                     
                     # Additional timeframes for elite filters
@@ -543,39 +598,76 @@ async def scan_loop(exchange):
                                     ohlcvs[add_tf] = pd.DataFrame(add_ohlcv,columns=["ts","open","high","low","close","vol"])
                                     for col in ["open","high","low","close","vol"]:
                                         ohlcvs[add_tf][col] = pd.to_numeric(ohlcvs[add_tf][col],errors="coerce")
+                                    log.debug(f"✅ {symbol} {add_tf} elite context loaded")
                         context["df_3m"]=ohlcvs.get("3m")
                         context["df_5m"]=ohlcvs.get("5m")
                     
                     # Generate original signal
+                    log.info(f"🔍 Analyzing {symbol} {tf} for SMC patterns...")
                     sig = generate_signal(df,symbol,context)
                     
                     if sig:
+                        total_smc_patterns += 1
+                        log.info(f"🎯 SMC PATTERN FOUND: {sig['symbol']} {tf} {sig['side']} | Base Score: {sig['score']} | Reasons: {', '.join(sig['reason_list'])}")
+                        
                         # SYSTEM 1: YOUR EXACT OLD SYSTEM (All original filters + Market Regime)
                         filters_passed = True
+                        failed_filters = []
                         
                         # 1. BTC Direction Filter
-                        if not is_trade_allowed(sig['side'], btc_direction):
+                        btc_allowed = is_trade_allowed(sig['side'], btc_direction)
+                        if not btc_allowed:
+                            failed_filters.append(f"BTC Direction ({btc_direction} vs {sig['side']})")
                             filters_passed = False
+                        else:
+                            log.debug(f"✅ {symbol} {tf} BTC Direction PASS")
                             
                         # 2. Higher TF Alignment
-                        elif not check_higher_tf_alignment(sig, context.get("df_15m")):
-                            filters_passed = False
-                            
+                        if filters_passed:
+                            higher_tf_passed = check_higher_tf_alignment(sig, context.get("df_15m"))
+                            if not higher_tf_passed:
+                                failed_filters.append("Higher TF Alignment")
+                                filters_passed = False
+                            else:
+                                log.debug(f"✅ {symbol} {tf} Higher TF PASS")
+                                
                         # 3. Momentum Confirmation (skip for 1m/3m)
-                        elif tf not in ["1m", "3m"] and not check_momentum_confirmation(df, sig['side']):
-                            filters_passed = False
+                        if filters_passed and tf not in ["1m", "3m"]:
+                            momentum_passed = check_momentum_confirmation(df, sig['side'])
+                            if not momentum_passed:
+                                failed_filters.append("Momentum")
+                                filters_passed = False
+                            else:
+                                log.debug(f"✅ {symbol} {tf} Momentum PASS")
+                        elif tf in ["1m", "3m"]:
+                            log.debug(f"⏭️ {symbol} {tf} Momentum skipped (1m/3m)")
                             
                         # 4. Zone Quality
-                        elif not check_entry_zone_quality(df, sig['side']):
-                            filters_passed = False
-                            
+                        if filters_passed:
+                            zone_passed = check_entry_zone_quality(df, sig['side'])
+                            if not zone_passed:
+                                failed_filters.append("Zone Quality")
+                                filters_passed = False
+                            else:
+                                log.debug(f"✅ {symbol} {tf} Zone Quality PASS")
+                                
                         # 5. Market Condition
-                        elif detect_choppy_market(df):
-                            filters_passed = False
+                        if filters_passed:
+                            choppy = detect_choppy_market(df)
+                            if choppy:
+                                failed_filters.append("Choppy Market")
+                                filters_passed = False
+                            else:
+                                log.debug(f"✅ {symbol} {tf} Market Condition PASS")
                         
                         # 6. NEW: Market Regime Filter (only new addition to old system)
-                        elif not check_market_regime(sig['symbol'], sig['side'], context):
-                            filters_passed = False
+                        if filters_passed:
+                            regime_allowed = check_market_regime(sig['symbol'], sig['side'], context)
+                            if not regime_allowed:
+                                failed_filters.append("Market Regime")
+                                filters_passed = False
+                            else:
+                                log.debug(f"✅ {symbol} {tf} Market Regime PASS")
                         
                         if filters_passed:
                             # Add winner bonuses (EXACTLY like your old system)
@@ -586,6 +678,8 @@ async def scan_loop(exchange):
                             if tf not in ["1m", "3m"]:
                                 sig['reason_list'].append("Momentum ✓")
                             sig['score'] += 5
+                            
+                            log.info(f"🚀 OLD SYSTEM SIGNAL READY: {sig['symbol']} {tf} {sig['side']} | Final Score: {sig['score']}")
                             
                             # Send OLD SYSTEM signal
                             await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{sig['score']}\nBreakdown:{', '.join(sig['reason_list'])}")
@@ -602,14 +696,24 @@ async def scan_loop(exchange):
                                 elite_reasons = sig['reason_list'] + elite_details
                                 elite_score = sig['score'] + 10  # Elite bonus
                                 
+                                log.info(f"💎 ELITE SIGNAL READY: {sig['symbol']} {tf} {sig['side']} | Elite Score: {elite_score}")
+                                
                                 await tg(f"🎯 ELITE | {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{elite_score} (3X SIZE)\nBreakdown:{', '.join(elite_reasons)}")
                                 # Don't log elite separately - they're already logged as old signals
                                 elite_signals += 1
+                            else:
+                                log.debug(f"⏭️ {symbol} {tf} Not elite - failed elite checklist")
+                        else:
+                            log.info(f"❌ {symbol} {tf} {sig['side']} FAILED FILTERS: {', '.join(failed_filters)}")
+                    else:
+                        log.debug(f"❌ {symbol} {tf} No SMC pattern detected")
                             
-            log.info(f"📊 Scan complete: {signals_found} total signals ({old_signals} old system, {elite_signals} elite)")
+            log.info(f"📊 SCAN SUMMARY: Processed {total_symbols_processed} symbols | Fetched {total_ohlcv_fetched} OHLCV datasets | Found {total_smc_patterns} SMC patterns | Sent {signals_found} signals ({old_signals} old system, {elite_signals} elite)")
                         
-        except Exception as e: log.exception("scan error: %s", e)
+        except Exception as e: 
+            log.exception("MAIN SCAN ERROR: %s", e)
         elapsed=time.time()-t0
+        log.info(f"⏱️ Scan completed in {elapsed:.2f}s, sleeping {max(1,SCAN_INTERVAL-elapsed)}s")
         await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
 
 # ---------------- EXACT ORIGINAL FASTAPI ----------------
