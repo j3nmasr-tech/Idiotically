@@ -6,7 +6,7 @@ PRODUCTION SCANNER - OLD SYSTEM + ELITE SYSTEM
 - Your exact old winner filters + scoring
 - PLUS new elite signals for maximum confidence
 - Market regime protection
-- Safe OKX wrapper with OLD DATA STYLE
+- OLD DIRECT CALL (no wrapper)
 """
 
 import os, time, asyncio, logging, datetime
@@ -82,44 +82,10 @@ async def init_db():
         """)
         await db.commit()
 
-# ---------------- SAFE OKX WRAPPER FOR SPOT (OLD DATA STYLE) ----------------
-class SafeOKX:
-    def __init__(self):
-        self.exchange = ccxt.okx({
-            "enableRateLimit": True,
-            "options": {"defaultType": "spot"}
-        })
-        
-    async def safe_fetch_tickers(self):
-        """EXACT SAME as your original - gets all USDT pairs automatically"""
-        try:
-            tickers = await self.exchange.fetch_tickers()
-            # Filter for USDT pairs like your original code
-            usdt_tickers = {}
-            for s, v in tickers.items():
-                if s and s.endswith("/USDT"):  # Added None check
-                    usdt_tickers[s] = v
-            log.info(f"✅ Fetched {len(usdt_tickers)} USDT pairs")
-            return usdt_tickers
-        except Exception as e:
-            log.error(f"❌ Error fetching tickers: {str(e)}")  # Fixed string conversion
-            return {}
-    
-    async def safe_fetch_ticker(self, symbol):
-        """Safe single ticker fetch"""
-        try:
-            return await self.exchange.fetch_ticker(symbol)
-        except Exception as e:
-            log.debug(f"Failed to fetch ticker for {symbol}: {str(e)}")
-            return None
-    
-    async def fetch_ohlcv(self, symbol, timeframe, limit=200):
-        """OHLCV passthrough"""
-        try: 
-            return await self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        except Exception as e:
-            log.debug(f"Failed to fetch OHLCV for {symbol} {timeframe}: {str(e)}")
-            return None
+# ---------------- EXACT ORIGINAL OHLCV ----------------
+async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
+    try: return await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    except: return None
 
 # ---------------- EXACT ORIGINAL INDICATORS ----------------
 def atr(df: pd.DataFrame, period=14):
@@ -438,8 +404,8 @@ async def monitor_signals(exchange):
                     async for row in cursor:
                         sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status = row
                         try:
-                            ticker = await exchange.safe_fetch_ticker(symbol)
-                            last_price = ticker.get("last") if ticker else None
+                            ticker = await exchange.fetch_ticker(symbol)
+                            last_price = ticker.get("last")
                             if last_price is None: continue
 
                             hits=[]; sl_hit=False
@@ -485,9 +451,9 @@ async def scan_loop(exchange):
             btc_direction = get_btc_direction(btc_15m, btc_1h)
             log.info(f"🎯 BTC Direction: {btc_direction}")
             
-            # Get top coins - USING OLD DATA STYLE
-            tickers = await exchange.safe_fetch_tickers()
-            top = sorted([(s, v.get("quoteVolume", 0)) for s, v in tickers.items()], 
+            # OLD DIRECT CALL - Get top coins
+            tickers = await exchange.fetch_tickers()
+            top = sorted([(s, v.get("quoteVolume", 0)) for s, v in tickers.items() if s.endswith("/USDT")], 
                         key=lambda x: x[1], reverse=True)[:TOP_N]
             
             signals_found = 0
@@ -605,10 +571,10 @@ async def webhook(request: Request):
     log.info("Webhook received: %s", data)
     return {"ok": True}
 
-# ---------------- UPDATED MAIN WITH SAFE WRAPPER ----------------
+# ---------------- UPDATED MAIN WITH DIRECT CALLS ----------------
 async def main():
     await init_db()
-    exchange = SafeOKX()  # Use safe wrapper
+    exchange = ccxt.okx({"enableRateLimit": True})  # DIRECT CALL
     
     # Startup message
     startup_msg = (
@@ -616,11 +582,11 @@ async def main():
         "• OLD SYSTEM: Your exact 10-score signals + all original filters\n"
         "• ELITE SYSTEM: Ultra-filtered elite signals (3X size)\n" 
         "• Market regime protection for both systems\n"
-        "• Safe OKX wrapper - OLD DATA STYLE\n"
+        "• OLD DIRECT CALLS - No wrapper\n"
         "🎯 OLD: 11-15 score | ELITE: 21-25+ score"
     )
     await tg(startup_msg)
-    log.info("✅ Dual system scanner started with OLD DATA STYLE")
+    log.info("✅ Dual system scanner started with OLD DIRECT CALLS")
     
     await asyncio.gather(scan_loop(exchange), monitor_signals(exchange))
 
