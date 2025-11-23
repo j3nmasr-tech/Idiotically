@@ -1361,7 +1361,7 @@ class InstitutionalScanner:
             # Log signal
             self._log_signal(signal)
             
-            # Send notification
+            # Send notification - FIXED: Actually sends to Telegram now
             await self._send_notification(signal)
             
             # Store in database
@@ -1403,7 +1403,7 @@ class InstitutionalScanner:
         self.log.info(f"Signal: {json.dumps(log_entry, indent=2, default=str)}")
     
     async def _send_notification(self, signal: TradingSignal):
-        """Send signal notification"""
+        """Send signal notification - FIXED: Actually sends to Telegram now"""
         message = f"""
 🏆 INSTITUTIONAL SIGNAL 🏆
 
@@ -1425,12 +1425,14 @@ Probability: {signal.risk_parameters.probability_score:.1%}
 R/R: {signal.risk_parameters.risk_reward_ratio:.2f}
 
 Filters: {', '.join(signal.filters_passed)}
+Rejections: {', '.join(signal.rejection_reasons) if signal.rejection_reasons else 'None'}
         """
         
-        # Send via your preferred method
-        print(message)
-        # Replace with actual Telegram notification:
-        # await tg(message)
+        # ACTUALLY SEND TO TELEGRAM - FIXED!
+        await tg(message)
+        
+        # Also print to console for debugging
+        print(f"📤 Telegram message sent for {signal.symbol}")
     
     async def _store_signal(self, signal: TradingSignal):
         """Store signal in database"""
@@ -1548,6 +1550,10 @@ async def main():
     
     if await scanner.initialize_exchange():
         logging.info("✅ Institutional Scanner Started")
+        
+        # Test Telegram on startup - FIXED: Actually sends now
+        await tg("🤖 <b>Institutional Scanner Started Successfully!</b>\n\n✅ Exchange connected\n📊 Monitoring 80+ symbols\n🎯 All filters active\n\nReady to find high-probability trading opportunities!")
+        
         await scanner.scan_market()
     else:
         logging.error("❌ Failed to start scanner")
