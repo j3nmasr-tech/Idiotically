@@ -546,7 +546,7 @@ async def scan_loop(exchange):
                     sig = generate_signal(df,symbol,context)
                     
                     if sig:
-                        # SYSTEM 1: YOUR OLD 10-SCORE SIGNALS (All your original filters)
+                        # SYSTEM 1: YOUR EXACT OLD SYSTEM (All original filters + Market Regime)
                         filters_passed = True
                         
                         # 1. BTC Direction Filter
@@ -569,6 +569,10 @@ async def scan_loop(exchange):
                         elif detect_choppy_market(df):
                             filters_passed = False
                         
+                        # 6. NEW: Market Regime Filter (only new addition to old system)
+                        elif not check_market_regime(sig['symbol'], sig['side'], context):
+                            filters_passed = False
+                        
                         if filters_passed:
                             # Add winner bonuses (EXACTLY like your old system)
                             sig['reason_list'].extend([
@@ -579,34 +583,24 @@ async def scan_loop(exchange):
                                 sig['reason_list'].append("Momentum ✓")
                             sig['score'] += 5
                             
-                            # ONLY check Market Regime for old signals
-                            market_regime_allowed = check_market_regime(sig['symbol'], sig['side'], context)
+                            # Send OLD SYSTEM signal
+                            await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{sig['score']}\nBreakdown:{', '.join(sig['reason_list'])}")
+                            await log_signal(sig)
+                            last_signal_time[key]=time.time()
+                            old_signals += 1
+                            signals_found += 1
                             
-                            if market_regime_allowed:
-                                await tg(f"🏆 OLD SYSTEM | {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{sig['score']}\nBreakdown:{', '.join(sig['reason_list'])}")
-                                await log_signal(sig)
-                                last_signal_time[key]=time.time()
-                                old_signals += 1
-                                signals_found += 1
-                        
-                        # SYSTEM 2: NEW ELITE SIGNALS (All filters + elite checklist)
-                        elite_filters_passed = filters_passed  # Start with all old filters passed
-                        
-                        if elite_filters_passed:
-                            # NEW: Elite Classification
+                            # SYSTEM 2: NEW ELITE SYSTEM (Same filters + Elite checklist)
                             is_elite, elite_details = check_elite_filters(sig, df, context)
                             
                             if is_elite:
-                                # Add elite badges
-                                sig['reason_list'].extend(elite_details)
-                                sig['reason_list'].append("Regime ✓")  # Market regime already checked
-                                sig['score'] += 10  # Elite bonus on top of existing score
+                                # Create elite version with elite badges
+                                elite_reasons = sig['reason_list'] + elite_details
+                                elite_score = sig['score'] + 10  # Elite bonus
                                 
-                                await tg(f"🎯 ELITE SYSTEM | {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore: {sig['score']} (ELITE - 3X SIZE)\nBreakdown:{', '.join(sig['reason_list'])}")
-                                await log_signal(sig)
-                                last_signal_time[key]=time.time()
+                                await tg(f"🎯 ELITE | {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{elite_score} (3X SIZE)\nBreakdown:{', '.join(elite_reasons)}")
+                                # Don't log elite separately - they're already logged as old signals
                                 elite_signals += 1
-                                signals_found += 1
                             
             log.info(f"📊 Scan complete: {signals_found} total signals ({old_signals} old system, {elite_signals} elite)")
                         
