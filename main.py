@@ -55,10 +55,9 @@ async def tg(msg: str):
             await client.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": safe_msg, "parse_mode":"HTML"})
         except: pass
 
-# ---------------- SAFE DATABASE UPDATE ----------------
+# ---------------- EXACT ORIGINAL DATABASE ----------------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        # Create table if it doesn't exist
         await db.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -78,17 +77,6 @@ async def init_db():
             tp3_hit INTEGER DEFAULT 0
         );
         """)
-        
-        # SAFELY add tier column if it doesn't exist
-        try:
-            await db.execute("ALTER TABLE signals ADD COLUMN tier TEXT DEFAULT 'STANDARD'")
-            log.info("✅ Added tier column to signals table")
-        except aiosqlite.OperationalError as e:
-            if "duplicate column name" not in str(e):
-                log.info("✅ Tier column already exists")
-            else:
-                log.info("✅ Tier column already exists")
-        
         await db.execute("""
         CREATE TABLE IF NOT EXISTS pauses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -402,18 +390,17 @@ def check_market_regime(symbol, signal_direction, context):
         log.error(f"Market regime check error: {e}")
         return True  # Allow on error
 
-# ---------------- EXACT ORIGINAL LOG SIGNAL (UPDATED FOR TIERS) ----------------
-async def log_signal(sig, tier="STANDARD"):
+# ---------------- EXACT ORIGINAL LOG SIGNAL ----------------
+async def log_signal(sig):
     async with db_lock:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("""
-                INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score,tier)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
             """, (sig["symbol"],sig["side"],sig["entry"],sig["sl"],sig["tp1"],sig["tp2"],sig["tp3"],
-                  datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"],tier))
+                  datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"]))
             await db.commit()
 
-    
 # ---------------- WINNER FILTERS ----------------
 def get_btc_direction(btc_15m, btc_1h):
     """BTC direction detection"""
@@ -459,16 +446,12 @@ def check_momentum_confirmation(df, signal_direction):
                 current_candle['close'] < prev_candle['close'])
 
 def check_entry_zone_quality(df, signal_direction):
-    """Zone quality detection - SAFE VERSION"""
+    """Zone quality detection"""
     if len(df) < 15: return False
     recent_high = df['high'].tail(15).max()
     recent_low = df['low'].tail(15).min()
     current_price = df['close'].iloc[-1]
-    
-    # SAFETY CHECK: Avoid division by zero
-    if recent_high == recent_low: 
-        return False
-        
+    if recent_high == recent_low: return False
     range_position = (current_price - recent_low) / (recent_high - recent_low)
     if signal_direction == 'BUY':
         return range_position < 0.3
@@ -488,73 +471,47 @@ def detect_choppy_market(df):
     price_range_pct = (df['high'].tail(20).max() - df['low'].tail(20).min()) / current_price
     return (atr < (current_price * 0.002) and price_range_pct < 0.02)
 
-# ---------------- UPDATED MONITOR WITH TIER COLUMN ----------------
+# ---------------- EXACT ORIGINAL MONITOR (UNCHANGED) ----------------
 async def monitor_signals(exchange):
     while True:
         try:
             async with aiosqlite.connect(DB_PATH) as db:
                 async with db.execute("""
-                    SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,tp1_hit,tp2_hit,tp3_hit,status,tier 
+                    SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,tp1_hit,tp2_hit,tp3_hit,status 
                     FROM signals WHERE status='OPEN'
                 """) as cursor:
                     async for row in cursor:
-                        sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status, tier = row
-                        try:
-                            ticker = await exchange.fetch_ticker(symbol)
-                            last_price = ticker.get("last")
-                            if last_price is None: continue
+                        sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status = row
+                        ticker = await exchange.fetch_ticker(symbol)
+                        last_price = ticker.get("last")
+                        if last_price is None: continue
 
-                            hits=[]; sl_hit=False
-                            if side=="BUY":
-                                if not tp1_hit and last_price>=tp1: hits.append("TP1"); tp1_hit=1
-                                if not tp2_hit and last_price>=tp2: hits.append("TP2"); tp2_hit=1
-                                if not tp3_hit and last_price>=tp3: hits.append("TP3"); tp3_hit=1
-                                if last_price<=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
-                            else:
-                                if not tp1_hit and last_price<=tp1: hits.append("TP1"); tp1_hit=1
-                                if not tp2_hit and last_price<=tp2: hits.append("TP2"); tp2_hit=1
-                                if not tp3_hit and last_price<=tp3: hits.append("TP3"); tp3_hit=1
-                                if last_price>=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
+                        hits=[]; sl_hit=False
+                        if side=="BUY":
+                            if not tp1_hit and last_price>=tp1: hits.append("TP1"); tp1_hit=1
+                            if not tp2_hit and last_price>=tp2: hits.append("TP2"); tp2_hit=1
+                            if not tp3_hit and last_price>=tp3: hits.append("TP3"); tp3_hit=1
+                            if last_price<=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
+                        else:
+                            if not tp1_hit and last_price<=tp1: hits.append("TP1"); tp1_hit=1
+                            if not tp2_hit and last_price<=tp2: hits.append("TP2"); tp2_hit=1
+                            if not tp3_hit and last_price<=tp3: hits.append("TP3"); tp3_hit=1
+                            if last_price>=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
 
-                            if hits:
-                                tier_icon = "🎯" if tier == "ELITE" else "📊"
-                                await tg(f"{tier_icon} {symbol} {side} update\nEntry:{entry:.6f}\nLast:{last_price:.6f}\nHits:{','.join(hits)}\nSL:{sl:.6f}\nTP1:{tp1:.6f} TP2:{tp2:.6f} TP3:{tp3:.6f}")
+                        if hits:
+                            await tg(f"🎯 {symbol} {side} update\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP1:{tp1} TP2:{tp2} TP3:{tp3}")
 
-                            if sl_hit: record_sl_hit(symbol)
+                        if sl_hit: record_sl_hit(symbol)
 
-                            async with db_lock:
-                                await db.execute("""
-                                    UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?
-                                """,(tp1_hit,tp2_hit,tp3_hit,status,sig_id))
-                        except Exception as e:
-                            log.error(f"Error monitoring {symbol}: {e}")
-                            continue
+                        async with db_lock:
+                            await db.execute("""
+                                UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?
+                            """,(tp1_hit,tp2_hit,tp3_hit,status,sig_id))
                 await db.commit()
-        except Exception as e: 
-            log.exception("monitor error: %s", e)
+        except Exception as e: log.exception("monitor error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
 
-# ---------------- EXPANDED SYMBOL LIST ----------------
-POPULAR_SYMBOLS = [
-    "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT", 
-    "AVAX/USDT", "DOT/USDT", "LINK/USDT", "MATIC/USDT", "LTC/USDT", "BCH/USDT",
-    "ATOM/USDT", "ETC/USDT", "XLM/USDT", "FIL/USDT", "THETA/USDT", "VET/USDT",
-    "TRX/USDT", "EOS/USDT", "AAVE/USDT", "MKR/USDT", "COMP/USDT", "YFI/USDT",
-    "SUSHI/USDT", "UNI/USDT", "CRV/USDT", "SNX/USDT", "BAL/USDT", "REN/USDT",
-    "DOGE/USDT", "SHIB/USDT", "APE/USDT", "SAND/USDT", "MANA/USDT", "GALA/USDT",
-    "ENJ/USDT", "CHZ/USDT", "ALGO/USDT", "NEAR/USDT", "FTM/USDT", "ONE/USDT",
-    "EGLD/USDT", "ICP/USDT", "XTZ/USDT", "HBAR/USDT", "GRT/USDT", "BAT/USDT",
-    "ZIL/USDT", "IOTA/USDT", "WAVES/USDT", "RVN/USDT", "SC/USDT", "STORJ/USDT",
-    "KAVA/USDT", "RUNE/USDT", "OCEAN/USDT", "CELO/USDT", "RSR/USDT", "COTI/USDT",
-    "ANKR/USDT", "AR/USDT", "RNDR/USDT", "HNT/USDT", "FLOW/USDT", "KSM/USDT",
-    "DASH/USDT", "ZEC/USDT", "XMR/USDT", "DCR/USDT", "QTUM/USDT", "ONT/USDT",
-    "IOST/USDT", "NEO/USDT", "VTHO/USDT", "TFUEL/USDT", "HOT/USDT", "STMX/USDT",
-    "PERP/USDT", "RAY/USDT", "SRM/USDT", "FTT/USDT", "ROSE/USDT", "CELR/USDT",
-    "OMG/USDT", "SKL/USDT", "CVC/USDT", "BAND/USDT", "OXT/USDT", "LRC/USDT",
-    "NKN/USDT", "DODO/USDT", "TRB/USDT", "BADGER/USDT", "LPT/USDT", "GLM/USDT"
-]
-
-# ---------------- FIXED SCAN LOOP WITH MANUAL SYMBOL LIST ----------------
+# ---------------- OPTIMIZED SCAN LOOP WITH ALL FILTERS + NEW FEATURES ----------------
 last_signal_time = {}
 async def scan_loop(exchange):
     while True:
@@ -568,194 +525,158 @@ async def scan_loop(exchange):
             btc_direction = get_btc_direction(btc_15m, btc_1h)
             log.info(f"🎯 BTC Direction: {btc_direction}")
             
-            # Use predefined symbol list instead of exchange.fetch_tickers()
-            top = POPULAR_SYMBOLS[:TOP_N]
-            log.info(f"📊 Processing {len(top)} symbols from predefined list")
+            # Get top coins - WITH ERROR HANDLING LIKE ORIGINAL
+            try:
+                tickers = await exchange.fetch_tickers()
+                top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")], 
+                            key=lambda x:x[1], reverse=True)[:TOP_N]
+            except Exception as e:
+                log.error(f"Error fetching tickers: {e}")
+                await asyncio.sleep(SCAN_INTERVAL)
+                continue
             
             signals_found = 0
             elite_signals = 0
             
-            for symbol in top:
-                if deprioritized(symbol): 
-                    continue
-                    
-                ohlcvs = {}
-                
+            for symbol,_ in top:
+                if deprioritized(symbol): continue
+                ohlcvs={}
                 for tf in TIMEFRAMES:
-                    key = f"{symbol}:{tf}"
-                    if key in last_signal_time and time.time() - last_signal_time[key] < 1800: 
-                        continue
+                    key=f"{symbol}:{tf}"
+                    if key in last_signal_time and time.time()-last_signal_time[key]<1800: continue
+                    ohlcv = await fetch_ohlcv(exchange,symbol,tf,200)
+                    if not ohlcv: continue
+                    df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
+                    for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
                     
-                    try:
-                        ohlcv = await fetch_ohlcv(exchange, symbol, tf, 200)
-                        if not ohlcv: 
-                            continue
-                        
-                        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-                        for c in ["open","high","low","close","vol"]: 
-                            df[c] = pd.to_numeric(df[c], errors="coerce")
-                        
-                        # Fetch additional timeframes for context
-                        context = {"tf": tf}
-                        additional_tfs = ["15m", "1h", "5m", "3m"]
-                        
-                        for add_tf in additional_tfs:
-                            if add_tf not in ohlcvs and add_tf != tf:
-                                try:
-                                    add_ohlcv = await fetch_ohlcv(exchange, symbol, add_tf, 200)
-                                    if add_ohlcv:
-                                        ohlcvs[add_tf] = pd.DataFrame(add_ohlcv, columns=["ts","open","high","low","close","vol"])
-                                        for col in ["open","high","low","close","vol"]:
-                                            ohlcvs[add_tf][col] = pd.to_numeric(ohlcvs[add_tf][col], errors="coerce")
-                                except:
-                                    continue
-                        
-                        # Add all available timeframes to context
-                        for tf_key in additional_tfs:
-                            context[f"df_{tf_key}"] = ohlcvs.get(tf_key)
-                        
-                        # Generate original signal
-                        sig = generate_signal(df, symbol, context)
-                        
-                        # APPLY ALL FILTERS - MARKET REGIME FILTER FIRST (MANDATORY FOR ALL)
-                        if sig:
-                            # LAYER 1: MARKET REGIME FILTER (APPLIED TO ALL SIGNALS)
-                            if not check_market_regime(sig['symbol'], sig['side'], context):
-                                log.info(f"⏸️ Blocked by Market Regime: {sig['side']} signal in wrong regime")
+                    # EXACT ORIGINAL CONTEXT BUILDING + additional timeframes for elite filters
+                    context={"tf":tf}
+                    
+                    # Original timeframe fetching logic
+                    if tf in ("1m","3m","5m"):
+                        if "15m" not in ohlcvs: 
+                            ohlcv15 = await fetch_ohlcv(exchange,symbol,"15m",200)
+                            if ohlcv15: 
+                                ohlcvs["15m"]=pd.DataFrame(ohlcv15,columns=["ts","open","high","low","close","vol"])
+                                for col in ["open","high","low","close","vol"]:
+                                    ohlcvs["15m"][col]=pd.to_numeric(ohlcvs["15m"][col],errors="coerce")
+                        if "1h" not in ohlcvs:
+                            ohlcv1h = await fetch_ohlcv(exchange,symbol,"1h",200)
+                            if ohlcv1h: 
+                                ohlcvs["1h"]=pd.DataFrame(ohlcv1h,columns=["ts","open","high","low","close","vol"])
+                                for col in ["open","high","low","close","vol"]:
+                                    ohlcvs["1h"][col]=pd.to_numeric(ohlcvs["1h"][col],errors="coerce")
+                    
+                    # Additional timeframes for elite filters (3m, 5m)
+                    additional_tfs = ["3m", "5m"] if tf not in ["3m", "5m"] else []
+                    for add_tf in additional_tfs:
+                        if add_tf not in ohlcvs:
+                            try:
+                                add_ohlcv = await fetch_ohlcv(exchange, symbol, add_tf, 200)
+                                if add_ohlcv:
+                                    ohlcvs[add_tf] = pd.DataFrame(add_ohlcv,columns=["ts","open","high","low","close","vol"])
+                                    for col in ["open","high","low","close","vol"]:
+                                        ohlcvs[add_tf][col] = pd.to_numeric(ohlcvs[add_tf][col],errors="coerce")
+                            except:
                                 continue
-                                
-                            filters_passed = True
-                            tier = "STANDARD"
-                            
-                            # ORIGINAL WINNER FILTERS
-                            # 1. BTC Direction Filter
-                            if not is_trade_allowed(sig['side'], btc_direction):
-                                log.info(f"⏸️ Blocked: {sig['side']} vs BTC {btc_direction}")
-                                filters_passed = False
-                                
-                            # 2. Higher TF Alignment
-                            elif not check_higher_tf_alignment(sig, context.get("df_15m")):
-                                log.info(f"⏸️ Blocked: Higher TF misalignment")
-                                filters_passed = False
-                                
-                            # 3. Momentum Confirmation (skip for 1m/3m)
-                            elif tf not in ["1m", "3m"] and not check_momentum_confirmation(df, sig['side']):
-                                log.info(f"⏸️ Blocked: No momentum confirmation")
-                                filters_passed = False
-                                
-                            # 4. Zone Quality
-                            elif not check_entry_zone_quality(df, sig['side']):
-                                log.info(f"⏸️ Blocked: Poor entry zone")
-                                filters_passed = False
-                                
-                            # 5. Market Condition
-                            elif detect_choppy_market(df):
-                                log.info(f"⏸️ Blocked: Choppy market")
-                                filters_passed = False
-                            
-                            if filters_passed:
-                                # LAYER 2: ELITE FILTERS CLASSIFICATION
-                                is_elite, elite_details = check_elite_filters(sig, df, context)
-                                
-                                if is_elite:
-                                    tier = "ELITE"
-                                    sig['score'] += 10  # Elite bonus
-                                    elite_signals += 1
-                                
-                                # Add filter bonuses to reason list
-                                sig['reason_list'].extend([
-                                    f"BTC {btc_direction} ✓", "Higher TF ✓", 
-                                    "Zone ✓", "Trending ✓", "Regime ✓"
-                                ])
-                                if tf not in ["1m", "3m"]:
-                                    sig['reason_list'].append("Momentum ✓")
-                                
-                                if is_elite:
-                                    sig['reason_list'].extend(elite_details)
-                                
-                                # Format message based on tier
-                                if tier == "ELITE":
-                                    icon = "🎯"
-                                    size_note = " (3X SIZE)"
-                                    tier_note = "ELITE - Score: 14+"
-                                else:
-                                    icon = "📊"  
-                                    size_note = ""
-                                    tier_note = f"STANDARD - Score: {sig['score']}"
-                                
-                                message = (
-                                    f"{icon} {sig['symbol']} ({tf}) {sig['side']}{size_note}\n"
-                                    f"Entry: {sig['entry']:.6f}\n"
-                                    f"SL: {sig['sl']:.6f}\n"
-                                    f"TP1: {sig['tp1']:.6f} TP2: {sig['tp2']:.6f} TP3: {sig['tp3']:.6f}\n"
-                                    f"{tier_note}\n"
-                                    f"Breakdown: {', '.join(sig['reason_list'])}"
-                                )
-                                
-                                await tg(message)
-                                await log_signal(sig, tier)
-                                last_signal_time[key] = time.time()
-                                signals_found += 1
                     
-                    except Exception as e:
-                        log.error(f"Error processing {symbol} {tf}: {e}")
-                        continue
+                    # Set context with all available timeframes
+                    context["df_15m"]=ohlcvs.get("15m")
+                    context["df_1h"]=ohlcvs.get("1h") 
+                    context["df_3m"]=ohlcvs.get("3m")
+                    context["df_5m"]=ohlcvs.get("5m")
+                    
+                    # Generate original signal
+                    sig = generate_signal(df,symbol,context)
+                    
+                    # APPLY ALL WINNER FILTERS + NEW FEATURES
+                    if sig:
+                        filters_passed = True
+                        
+                        # NEW: Market Regime Filter (applied first)
+                        if not check_market_regime(sig['symbol'], sig['side'], context):
+                            log.info(f"⏸️ Blocked by Market Regime: {sig['side']} signal in wrong regime")
+                            filters_passed = False
+                            
+                        # 1. BTC Direction Filter
+                        elif not is_trade_allowed(sig['side'], btc_direction):
+                            log.info(f"⏸️ Blocked: {sig['side']} vs BTC {btc_direction}")
+                            filters_passed = False
+                            
+                        # 2. Higher TF Alignment
+                        elif not check_higher_tf_alignment(sig, context.get("df_15m")):
+                            log.info(f"⏸️ Blocked: Higher TF misalignment")
+                            filters_passed = False
+                            
+                        # 3. Momentum Confirmation (skip for 1m/3m)
+                        elif tf not in ["1m", "3m"] and not check_momentum_confirmation(df, sig['side']):
+                            log.info(f"⏸️ Blocked: No momentum confirmation")
+                            filters_passed = False
+                            
+                        # 4. Zone Quality
+                        elif not check_entry_zone_quality(df, sig['side']):
+                            log.info(f"⏸️ Blocked: Poor entry zone")
+                            filters_passed = False
+                            
+                        # 5. Market Condition
+                        elif detect_choppy_market(df):
+                            log.info(f"⏸️ Blocked: Choppy market")
+                            filters_passed = False
+                        
+                        if filters_passed:
+                            # NEW: Elite Classification
+                            is_elite, elite_details = check_elite_filters(sig, df, context)
+                            
+                            # Add winner bonuses (ORIGINAL LOGIC + new filters)
+                            sig['reason_list'].extend([
+                                f"BTC {btc_direction} ✓", "Higher TF ✓", 
+                                "Zone ✓", "Trending ✓"
+                            ])
+                            if tf not in ["1m", "3m"]:
+                                sig['reason_list'].append("Momentum ✓")
+                            
+                            # Elite bonus
+                            elite_bonus = 0
+                            if is_elite:
+                                elite_bonus = 10
+                                sig['reason_list'].extend(elite_details)
+                                elite_signals += 1
+                                icon = "🎯"
+                                elite_note = "ELITE - 3X SIZE"
+                            else:
+                                icon = "🏆" 
+                                elite_note = f"Score: {sig['score'] + 5}"
+                            
+                            # ORIGINAL SCORING + elite bonus
+                            sig['score'] += 5 + elite_bonus
+                            
+                            # ORIGINAL MESSAGE FORMAT with elite indicator
+                            await tg(f"{icon} {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\n{elite_note}\nBreakdown:{', '.join(sig['reason_list'])}")
+                            await log_signal(sig)
+                            last_signal_time[key]=time.time()
+                            signals_found += 1
                             
             log.info(f"📊 Scan complete: {signals_found} signals ({elite_signals} elite)")
                         
         except Exception as e: 
             log.exception("scan error: %s", e)
-        elapsed = time.time() - t0
-        sleep_time = max(1, SCAN_INTERVAL - elapsed)
-        await asyncio.sleep(sleep_time)
+        elapsed=time.time()-t0
+        await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
 
 # ---------------- EXACT ORIGINAL FASTAPI ----------------
 app = FastAPI()
-
 @app.post("/webhook")
 async def webhook(request: Request):
     token = request.headers.get("X-Auth","")
-    if token != WEBHOOK_SECRET: 
-        raise HTTPException(status_code=403, detail="Invalid secret")
+    if token!=WEBHOOK_SECRET: raise HTTPException(403,"Invalid secret")
     data = await request.json()
     log.info("Webhook received: %s", data)
-    return {"ok": True}
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy", "timestamp": datetime.datetime.utcnow().isoformat()}
-
-@app.get("/stats")
-async def stats():
-    async with aiosqlite.connect(DB_PATH) as db:
-        # Total signals
-        async with db.execute("SELECT COUNT(*) FROM signals") as cursor:
-            total = (await cursor.fetchone())[0]
-        
-        # Open signals
-        async with db.execute("SELECT COUNT(*) FROM signals WHERE status='OPEN'") as cursor:
-            open_count = (await cursor.fetchone())[0]
-            
-        # Elite signals
-        async with db.execute("SELECT COUNT(*) FROM signals WHERE tier='ELITE'") as cursor:
-            elite_count = (await cursor.fetchone())[0]
-            
-    return {
-        "total_signals": total,
-        "open_signals": open_count,
-        "elite_signals": elite_count,
-        "timestamp": datetime.datetime.utcnow().isoformat()
-    }
+    return {"ok":True}
 
 # ---------------- EXACT ORIGINAL MAIN ----------------
 async def main():
     await init_db()
-    exchange = ccxt.okx({
-        "enableRateLimit": True,
-        "options": {
-            "defaultType": "spot"
-        }
-    })
+    exchange = ccxt.okx({"enableRateLimit": True})
     
     # Startup message
     startup_msg = (
@@ -775,11 +696,11 @@ async def main():
     
     await asyncio.gather(scan_loop(exchange), monitor_signals(exchange))
 
-if __name__ == "__main__":
+if __name__=="__main__":
     import argparse
-    p = argparse.ArgumentParser()
+    p=argparse.ArgumentParser()
     p.add_argument("--http", action="store_true")
-    args = p.parse_args()
+    args=p.parse_args()
     if args.http:
         uvicorn.run(app, host="0.0.0.0", port=9000)
     else:
