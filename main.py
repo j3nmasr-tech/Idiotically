@@ -2,14 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-PRODUCTION SCANNER - ALL ORIGINAL LOGIC + ALL WINNER FILTERS + ELITE SYSTEM
+PRODUCTION SCANNER - ALL ORIGINAL LOGIC + ALL WINNER FILTERS + MARKET REGIME
 - Your exact SMC core + ATR TP/SL + SL-cluster
 - BTC direction filter
 - Higher timeframe alignment 
 - Momentum confirmation
 - Zone quality detection
 - Market condition filter
-- NEW: Elite Entry Checklist (Score 14+)
 - NEW: Market Regime Filter (Stop Fighting the Tide)
 """
 
@@ -104,13 +103,6 @@ def atr(df: pd.DataFrame, period=14):
 def sma(series: pd.Series, period: int):
     return series.rolling(period, min_periods=1).mean()
 
-def rsi(series: pd.Series, period: int):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
 # ---------------- EXACT ORIGINAL SMC CORE ----------------
 def detect_swing_points(df: pd.DataFrame):
     if len(df) < 5: return None
@@ -150,7 +142,7 @@ def detect_order_blocks(df: pd.DataFrame):
         return "bullish", candle["open"], candle["low"]
     return "bearish", candle["high"], candle["open"]
 
-# ---------------- FIXED SL-CLUSTER ----------------
+# ---------------- EXACT ORIGINAL SL-CLUSTER ----------------
 recent_sl = defaultdict(lambda: deque())
 def record_sl_hit(symbol: str, lookback_minutes=30):
     now = time.time(); dq = recent_sl[symbol]; dq.append(now)
@@ -162,25 +154,32 @@ def deprioritized(symbol: str, threshold=3, lookback=30):
     while dq and dq[0] < cutoff: dq.popleft()
     return len(dq) >= threshold
 
-# ---------------- VERIFIED SYMBOLS (OKX SPOT) ----------------
-POPULAR_SYMBOLS = [
-    "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT", 
-    "AVAX/USDT", "DOT/USDT", "LINK/USDT", "MATIC/USDT", "LTC/USDT", "BCH/USDT",
-    "ATOM/USDT", "ETC/USDT", "XLM/USDT", "FIL/USDT", "THETA/USDT", "VET/USDT",
-    "TRX/USDT", "EOS/USDT", "AAVE/USDT", "MKR/USDT", "COMP/USDT", "YFI/USDT",
-    "SUSHI/USDT", "UNI/USDT", "CRV/USDT", "SNX/USDT", "BAL/USDT", "REN/USDT",
-    "DOGE/USDT", "SHIB/USDT", "APE/USDT", "SAND/USDT", "MANA/USDT", "GALA/USDT",
-    "ENJ/USDT", "CHZ/USDT", "ALGO/USDT", "NEAR/USDT", "FTM/USDT", "ONE/USDT",
-    "EGLD/USDT", "ICP/USDT", "XTZ/USDT", "HBAR/USDT", "GRT/USDT", "BAT/USDT",
-    "ZIL/USDT", "IOTA/USDT", "WAVES/USDT", "RVN/USDT", "SC/USDT", "STORJ/USDT",
-    "KAVA/USDT", "RUNE/USDT", "OCEAN/USDT", "CELO/USDT", "RSR/USDT", "COTI/USDT",
-    "ANKR/USDT", "AR/USDT", "RNDR/USDT", "HNT/USDT", "FLOW/USDT", "KSM/USDT",
-    "DASH/USDT", "ZEC/USDT", "XMR/USDT", "DCR/USDT", "QTUM/USDT", "ONT/USDT",
-    "IOST/USDT", "NEO/USDT", "VTHO/USDT", "TFUEL/USDT", "HOT/USDT", "STMX/USDT",
-    "PERP/USDT", "RAY/USDT", "SRM/USDT", "FTT/USDT", "ROSE/USDT", "CELR/USDT",
-    "OMG/USDT", "SKL/USDT", "CVC/USDT", "BAND/USDT", "OXT/USDT", "LRC/USDT",
-    "NKN/USDT", "DODO/USDT", "TRB/USDT", "BADGER/USDT", "LPT/USDT", "GLM/USDT"
-]
+# ---------------- NEW: MARKET REGIME FILTER ----------------
+def check_market_regime(symbol, signal_direction, context):
+    """Stop Fighting the Tide - Market Regime Filter"""
+    df_1h = context.get("df_1h")
+    if df_1h is None or len(df_1h) < 50:
+        return True  # Allow if no data
+    
+    current_price = df_1h['close'].iloc[-1]
+    ema_20_1h = df_1h['close'].ewm(span=20).mean().iloc[-1]
+    ema_50_1h = df_1h['close'].ewm(span=50).mean().iloc[-1]
+    
+    # Determine regime
+    if current_price > ema_20_1h and ema_20_1h > ema_50_1h:
+        regime = "STRONG_BULL"
+    elif current_price < ema_20_1h and ema_20_1h < ema_50_1h:
+        regime = "STRONG_BEAR"
+    else:
+        regime = "NEUTRAL"
+    
+    # Trading rules - Don't fight the tide!
+    if regime == "STRONG_BULL":
+        return signal_direction == "BUY"  # Only BUY allowed
+    elif regime == "STRONG_BEAR":
+        return signal_direction == "SELL"  # Only SELL allowed
+    else:
+        return True  # Both allowed in neutral
 
 # ---------------- EXACT ORIGINAL SIGNAL GENERATOR ----------------
 def generate_signal(df: pd.DataFrame, symbol: str, context=None):
@@ -255,85 +254,6 @@ def generate_signal(df: pd.DataFrame, symbol: str, context=None):
         "reason": "Set B SMC Signal",
         "reason_list": reasons
     }
-
-# ---------------- NEW: ELITE ENTRY CHECKLIST ----------------
-def check_elite_filters(signal, df, context):
-    """Elite Entry Checklist - Score 14+"""
-    elite_score = 0
-    elite_details = []
-    
-    # 1. Multi-Timeframe Confluence (1m & 5m agree)
-    df_5m = context.get("df_5m")
-    if df_5m is not None and len(df_5m) > 10:
-        ob_type_5m, _, _ = detect_order_blocks(df_5m)
-        if ob_type_5m is not None:
-            signal_ob_type = "bullish" if signal["side"] == "BUY" else "bearish"
-            if ob_type_5m == signal_ob_type:
-                elite_score += 1
-                elite_details.append("MTF ✓")
-    
-    # 2. Premium Zone Quality
-    df_1h = context.get("df_1h")
-    if df_1h is not None and len(df_1h) > 50:
-        current_price = signal["entry"]
-        ema_20_1h = df_1h['close'].ewm(span=20).mean().iloc[-1]
-        ema_50_1h = df_1h['close'].ewm(span=50).mean().iloc[-1]
-        price_diff_pct_20 = abs(current_price - ema_20_1h) / current_price
-        price_diff_pct_50 = abs(current_price - ema_50_1h) / current_price
-        if price_diff_pct_20 < 0.005 or price_diff_pct_50 < 0.005:
-            elite_score += 1
-            elite_details.append("Premium Zone ✓")
-    
-    # 3. Momentum Alignment (RSI Filter)
-    df_3m = context.get("df_3m", df)
-    if len(df_3m) >= 14:
-        rsi_3m = rsi(df_3m['close'], 14).iloc[-1]
-        if signal["side"] == "BUY":
-            if rsi_3m > 40 and rsi_3m < 80:
-                elite_score += 1
-                elite_details.append("Momentum ✓")
-        else:
-            if rsi_3m < 60 and rsi_3m > 20:
-                elite_score += 1
-                elite_details.append("Momentum ✓")
-    
-    # 4. Volume-Verified Sweep
-    if len(df) >= 20:
-        sweep_high, sweep_low = detect_sweep(df)
-        current_volume = df['vol'].iloc[-1]
-        avg_volume = df['vol'].tail(20).mean()
-        if (sweep_high or sweep_low) and current_volume > avg_volume * 1.5:
-            elite_score += 1
-            elite_details.append("Volume ✓")
-    
-    return elite_score == 4, elite_details
-
-# ---------------- NEW: MARKET REGIME FILTER ----------------
-def check_market_regime(symbol, signal_direction, context):
-    """Stop Fighting the Tide - Market Regime Filter"""
-    df_1h = context.get("df_1h")
-    if df_1h is None or len(df_1h) < 50:
-        return True  # Allow if no data
-    
-    current_price = df_1h['close'].iloc[-1]
-    ema_20_1h = df_1h['close'].ewm(span=20).mean().iloc[-1]
-    ema_50_1h = df_1h['close'].ewm(span=50).mean().iloc[-1]
-    
-    # Determine regime
-    if current_price > ema_20_1h and ema_20_1h > ema_50_1h:
-        regime = "STRONG_BULL"
-    elif current_price < ema_20_1h and ema_20_1h < ema_50_1h:
-        regime = "STRONG_BEAR"
-    else:
-        regime = "NEUTRAL"
-    
-    # Trading rules - Don't fight the tide!
-    if regime == "STRONG_BULL":
-        return signal_direction == "BUY"  # Only BUY allowed
-    elif regime == "STRONG_BEAR":
-        return signal_direction == "SELL"  # Only SELL allowed
-    else:
-        return True  # Both allowed in neutral
 
 # ---------------- EXACT ORIGINAL LOG SIGNAL ----------------
 async def log_signal(sig):
@@ -416,7 +336,7 @@ def detect_choppy_market(df):
     price_range_pct = (df['high'].tail(20).max() - df['low'].tail(20).min()) / current_price
     return (atr < (current_price * 0.002) and price_range_pct < 0.02)
 
-# ---------------- FIXED MONITOR - NO MARKET LOADING ----------------
+# ---------------- EXACT ORIGINAL MONITOR ----------------
 async def monitor_signals(exchange):
     while True:
         try:
@@ -427,49 +347,40 @@ async def monitor_signals(exchange):
                 """) as cursor:
                     async for row in cursor:
                         sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status = row
-                        try:
-                            # ✅ FIXED: Use fetch_ohlcv instead of fetch_ticker - NO MARKET LOADING!
-                            ohlcv = await fetch_ohlcv(exchange, symbol, "1m", 1)
-                            if not ohlcv or len(ohlcv) == 0:
-                                continue
-                                
-                            # Get last price from OHLCV data (index 4 is close price)
-                            last_price = ohlcv[0][4]  # [timestamp, open, high, low, close, volume]
-                            
-                            hits=[]; sl_hit=False
-                            if side=="BUY":
-                                if not tp1_hit and last_price>=tp1: hits.append("TP1"); tp1_hit=1
-                                if not tp2_hit and last_price>=tp2: hits.append("TP2"); tp2_hit=1
-                                if not tp3_hit and last_price>=tp3: hits.append("TP3"); tp3_hit=1
-                                if last_price<=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
-                            else:
-                                if not tp1_hit and last_price<=tp1: hits.append("TP1"); tp1_hit=1
-                                if not tp2_hit and last_price<=tp2: hits.append("TP2"); tp2_hit=1
-                                if not tp3_hit and last_price<=tp3: hits.append("TP3"); tp3_hit=1
-                                if last_price>=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
+                        ticker = await exchange.fetch_ticker(symbol)
+                        last_price = ticker.get("last")
+                        if last_price is None: continue
 
-                            if hits:
-                                await tg(f"🎯 {symbol} {side} update\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP1:{tp1} TP2:{tp2} TP3:{tp3}")
+                        hits=[]; sl_hit=False
+                        if side=="BUY":
+                            if not tp1_hit and last_price>=tp1: hits.append("TP1"); tp1_hit=1
+                            if not tp2_hit and last_price>=tp2: hits.append("TP2"); tp2_hit=1
+                            if not tp3_hit and last_price>=tp3: hits.append("TP3"); tp3_hit=1
+                            if last_price<=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
+                        else:
+                            if not tp1_hit and last_price<=tp1: hits.append("TP1"); tp1_hit=1
+                            if not tp2_hit and last_price<=tp2: hits.append("TP2"); tp2_hit=1
+                            if not tp3_hit and last_price<=tp3: hits.append("TP3"); tp3_hit=1
+                            if last_price>=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
 
-                            if sl_hit: record_sl_hit(symbol)
+                        if hits:
+                            await tg(f"🎯 {symbol} {side} update\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP1:{tp1} TP2:{tp2} TP3:{tp3}")
 
-                            async with db_lock:
-                                await db.execute("""
-                                    UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?
-                                """,(tp1_hit,tp2_hit,tp3_hit,status,sig_id))
-                        except Exception as e:
-                            log.error(f"Error monitoring {symbol}: {e}")
-                            continue
+                        if sl_hit: record_sl_hit(symbol)
+
+                        async with db_lock:
+                            await db.execute("""
+                                UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?
+                            """,(tp1_hit,tp2_hit,tp3_hit,status,sig_id))
                 await db.commit()
-        except Exception as e: 
-            log.exception("monitor error: %s", e)
+        except Exception as e: log.exception("monitor error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
-        
-# ---------------- PERFECT SCAN LOOP - NO ERRORS ----------------
+
+# ---------------- OPTIMIZED SCAN LOOP WITH ALL FILTERS + MARKET REGIME ----------------
 last_signal_time = {}
 async def scan_loop(exchange):
     while True:
-        t0 = time.time()
+        t0=time.time()
         try:
             # Get BTC direction first
             btc_15m_data = await fetch_ohlcv(exchange, "BTC/USDT", "15m", 100)
@@ -479,138 +390,99 @@ async def scan_loop(exchange):
             btc_direction = get_btc_direction(btc_15m, btc_1h)
             log.info(f"🎯 BTC Direction: {btc_direction}")
             
-            # USE PREDEFINED SYMBOLS ONLY - NO CCXT ERRORS
-            top = POPULAR_SYMBOLS[:TOP_N]
-            log.info(f"📊 Processing {len(top)} verified symbols")
+            # Get top coins
+            tickers = await exchange.fetch_tickers()
+            top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")], 
+                        key=lambda x:x[1], reverse=True)[:TOP_N]
             
             signals_found = 0
-            elite_signals = 0
-            
-            for symbol in top:
+            for symbol,_ in top:
                 if deprioritized(symbol): continue
-                
+                ohlcvs={}
                 for tf in TIMEFRAMES:
-                    key = f"{symbol}:{tf}"
-                    if key in last_signal_time and time.time() - last_signal_time[key] < 1800: 
-                        continue
+                    key=f"{symbol}:{tf}"
+                    if key in last_signal_time and time.time()-last_signal_time[key]<1800: continue
+                    ohlcv = await fetch_ohlcv(exchange,symbol,tf,200)
+                    if not ohlcv: continue
+                    df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
+                    for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
+                    context={"tf":tf,"df_15m":ohlcvs.get("15m"),"df_1h":ohlcvs.get("1h")}
+                    if tf in ("1m","3m","5m"):
+                        if "15m" not in ohlcvs: 
+                            ohlcv15 = await fetch_ohlcv(exchange,symbol,"15m",200)
+                            if ohlcv15: ohlcvs["15m"]=pd.DataFrame(ohlcv15,columns=["ts","open","high","low","close","vol"])
+                        if "1h" not in ohlcvs:
+                            ohlcv1h = await fetch_ohlcv(exchange,symbol,"1h",200)
+                            if ohlcv1h: ohlcvs["1h"]=pd.DataFrame(ohlcv1h,columns=["ts","open","high","low","close","vol"])
+                        context["df_15m"]=ohlcvs.get("15m"); context["df_1h"]=ohlcvs.get("1h")
                     
-                    try:
-                        # Fetch main timeframe
-                        ohlcv = await fetch_ohlcv(exchange, symbol, tf, 200)
-                        if not ohlcv: continue
-                        
-                        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-                        for c in ["open","high","low","close","vol"]: 
-                            df[c] = pd.to_numeric(df[c], errors="coerce")
-                        
-                        # Build context with all timeframes
-                        context = {"tf": tf}
-                        ohlcvs = {}
-                        
-                        # Fetch additional timeframes for context
-                        for additional_tf in ["15m", "1h", "3m", "5m"]:
-                            if additional_tf != tf:
-                                add_ohlcv = await fetch_ohlcv(exchange, symbol, additional_tf, 200)
-                                if add_ohlcv:
-                                    ohlcvs[additional_tf] = pd.DataFrame(add_ohlcv, columns=["ts","open","high","low","close","vol"])
-                                    for col in ["open","high","low","close","vol"]:
-                                        ohlcvs[additional_tf][col] = pd.to_numeric(ohlcvs[additional_tf][col], errors="coerce")
-                        
-                        # Set context
-                        context["df_15m"] = ohlcvs.get("15m")
-                        context["df_1h"] = ohlcvs.get("1h")
-                        context["df_3m"] = ohlcvs.get("3m") 
-                        context["df_5m"] = ohlcvs.get("5m")
-                        
-                        # Generate signal
-                        sig = generate_signal(df, symbol, context)
-                        
-                        # APPLY ALL FILTERS
-                        if sig:
-                            filters_passed = True
-                            
-                            # 1. Market Regime Filter
-                            if not check_market_regime(sig['symbol'], sig['side'], context):
-                                log.info(f"⏸️ Blocked by Market Regime: {sig['side']} signal in wrong regime")
-                                filters_passed = False
-                                
-                            # 2. BTC Direction Filter  
-                            elif not is_trade_allowed(sig['side'], btc_direction):
-                                log.info(f"⏸️ Blocked: {sig['side']} vs BTC {btc_direction}")
-                                filters_passed = False
-                                
-                            # 3. Higher TF Alignment
-                            elif not check_higher_tf_alignment(sig, context.get("df_15m")):
-                                log.info(f"⏸️ Blocked: Higher TF misalignment")
-                                filters_passed = False
-                                
-                            # 4. Momentum Confirmation (skip for 1m/3m)
-                            elif tf not in ["1m", "3m"] and not check_momentum_confirmation(df, sig['side']):
-                                log.info(f"⏸️ Blocked: No momentum confirmation")
-                                filters_passed = False
-                                
-                            # 5. Zone Quality
-                            elif not check_entry_zone_quality(df, sig['side']):
-                                log.info(f"⏸️ Blocked: Poor entry zone")
-                                filters_passed = False
-                                
-                            # 6. Market Condition
-                            elif detect_choppy_market(df):
-                                log.info(f"⏸️ Blocked: Choppy market")
-                                filters_passed = False
-                            
-                            if filters_passed:
-                                # Elite classification
-                                is_elite, elite_details = check_elite_filters(sig, df, context)
-                                
-                                # Add filter bonuses
-                                sig['reason_list'].extend([
-                                    f"BTC {btc_direction} ✓", "Higher TF ✓", 
-                                    "Zone ✓", "Trending ✓", "Regime ✓"
-                                ])
-                                if tf not in ["1m", "3m"]:
-                                    sig['reason_list'].append("Momentum ✓")
-                                sig['score'] += 5
-                                
-                                # Elite classification
-                                if is_elite:
-                                    elite_signals += 1
-                                    icon = "🎯"
-                                    elite_note = "ELITE - 3X SIZE"
-                                    sig['reason_list'].extend(elite_details)
-                                else:
-                                    icon = "🏆"
-                                    elite_note = f"Score: {sig['score']}"
-                                
-                                # Send signal
-                                await tg(f"{icon} {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\n{elite_note}\nBreakdown:{', '.join(sig['reason_list'])}")
-                                await log_signal(sig)
-                                last_signal_time[key] = time.time()
-                                signals_found += 1
+                    # Generate original signal
+                    sig = generate_signal(df,symbol,context)
                     
-                    except Exception as e:
-                        log.error(f"Error processing {symbol} {tf}: {e}")
-                        continue
-                            
-            log.info(f"📊 Scan complete: {signals_found} signals ({elite_signals} elite)")
+                    # APPLY ALL WINNER FILTERS + MARKET REGIME
+                    if sig:
+                        filters_passed = True
                         
-        except Exception as e: 
-            log.exception("scan error: %s", e)
-        
-        elapsed = time.time() - t0
-        sleep_time = max(1, SCAN_INTERVAL - elapsed)
-        await asyncio.sleep(sleep_time)
+                        # NEW: Market Regime Filter (applied first)
+                        if not check_market_regime(sig['symbol'], sig['side'], context):
+                            log.info(f"⏸️ Blocked by Market Regime: {sig['side']} signal in wrong regime")
+                            filters_passed = False
+                            
+                        # 1. BTC Direction Filter
+                        elif not is_trade_allowed(sig['side'], btc_direction):
+                            log.info(f"⏸️ Blocked: {sig['side']} vs BTC {btc_direction}")
+                            filters_passed = False
+                            
+                        # 2. Higher TF Alignment
+                        elif not check_higher_tf_alignment(sig, context.get("df_15m")):
+                            log.info(f"⏸️ Blocked: Higher TF misalignment")
+                            filters_passed = False
+                            
+                        # 3. Momentum Confirmation (skip for 1m/3m)
+                        elif tf not in ["1m", "3m"] and not check_momentum_confirmation(df, sig['side']):
+                            log.info(f"⏸️ Blocked: No momentum confirmation")
+                            filters_passed = False
+                            
+                        # 4. Zone Quality
+                        elif not check_entry_zone_quality(df, sig['side']):
+                            log.info(f"⏸️ Blocked: Poor entry zone")
+                            filters_passed = False
+                            
+                        # 5. Market Condition
+                        elif detect_choppy_market(df):
+                            log.info(f"⏸️ Blocked: Choppy market")
+                            filters_passed = False
+                        
+                        if filters_passed:
+                            # Add winner bonuses
+                            sig['reason_list'].extend([
+                                f"BTC {btc_direction} ✓", "Higher TF ✓", 
+                                "Zone ✓", "Trending ✓", "Regime ✓"
+                            ])
+                            if tf not in ["1m", "3m"]:
+                                sig['reason_list'].append("Momentum ✓")
+                            sig['score'] += 5
+                            
+                            await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{sig['score']}\nBreakdown:{', '.join(sig['reason_list'])}")
+                            await log_signal(sig)
+                            last_signal_time[key]=time.time()
+                            signals_found += 1
+                            
+            log.info(f"📊 Scan complete: {signals_found} winner signals found")
+                        
+        except Exception as e: log.exception("scan error: %s", e)
+        elapsed=time.time()-t0
+        await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
 
 # ---------------- EXACT ORIGINAL FASTAPI ----------------
 app = FastAPI()
 @app.post("/webhook")
 async def webhook(request: Request):
     token = request.headers.get("X-Auth","")
-    if token != WEBHOOK_SECRET: 
-        raise HTTPException(status_code=403, detail="Invalid secret")
+    if token!=WEBHOOK_SECRET: raise HTTPException(403,"Invalid secret")
     data = await request.json()
     log.info("Webhook received: %s", data)
-    return {"ok": True}
+    return {"ok":True}
 
 # ---------------- EXACT ORIGINAL MAIN ----------------
 async def main():
@@ -627,19 +499,18 @@ async def main():
         "• Zone quality checks\n"
         "• Trending markets only\n"
         "• NEW: Market Regime Filter (Stop Fighting the Tide)\n"
-        "• NEW: Elite Entry Checklist (Score 14+)\n"
         "🎯 Target: 80%+ Win Rate"
     )
     await tg(startup_msg)
-    log.info("✅ Scanner started with all winner filters + elite system")
+    log.info("✅ Scanner started with all winner filters + market regime")
     
     await asyncio.gather(scan_loop(exchange), monitor_signals(exchange))
 
-if __name__ == "__main__":
+if __name__=="__main__":
     import argparse
-    p = argparse.ArgumentParser()
+    p=argparse.ArgumentParser()
     p.add_argument("--http", action="store_true")
-    args = p.parse_args()
+    args=p.parse_args()
     if args.http:
         uvicorn.run(app, host="0.0.0.0", port=9000)
     else:
