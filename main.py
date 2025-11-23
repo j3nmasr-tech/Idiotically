@@ -55,9 +55,10 @@ async def tg(msg: str):
             await client.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": safe_msg, "parse_mode":"HTML"})
         except: pass
 
-# ---------------- EXACT ORIGINAL DATABASE ----------------
+# ---------------- SAFE DATABASE UPDATE ----------------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
+        # Create table if it doesn't exist
         await db.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,12 +73,22 @@ async def init_db():
             status TEXT,
             reason TEXT,
             score INTEGER,
-            tier TEXT DEFAULT 'STANDARD',
             tp1_hit INTEGER DEFAULT 0,
             tp2_hit INTEGER DEFAULT 0,
             tp3_hit INTEGER DEFAULT 0
         );
         """)
+        
+        # SAFELY add tier column if it doesn't exist
+        try:
+            await db.execute("ALTER TABLE signals ADD COLUMN tier TEXT DEFAULT 'STANDARD'")
+            log.info("✅ Added tier column to signals table")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                log.info("✅ Tier column already exists")
+            else:
+                log.info("✅ Tier column already exists")
+        
         await db.execute("""
         CREATE TABLE IF NOT EXISTS pauses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -240,30 +251,34 @@ def generate_signal(df: pd.DataFrame, symbol: str, context=None):
 # ---------------- NEW: ELITE ENTRY CHECKLIST ----------------
 def check_elite_filters(signal, df, context):
     """Elite Entry Checklist - Score 14+"""
-    elite_score = 0
-    elite_details = []
-    
-    # 1. MTF Confluence (1m & 5m agree)
-    if check_mtf_confluence(signal, context):
-        elite_score += 1
-        elite_details.append("MTF ✓")
-    
-    # 2. Premium Zone Quality (Score 3/3)
-    if check_premium_zone(signal, df, context):
-        elite_score += 1
-        elite_details.append("Premium Zone ✓")
-    
-    # 3. Momentum Alignment (RSI Filter)
-    if check_momentum_alignment(signal, df, context):
-        elite_score += 1
-        elite_details.append("Momentum ✓")
-    
-    # 4. Volume-Verified Sweep
-    if check_volume_verification(df):
-        elite_score += 1
-        elite_details.append("Volume ✓")
-    
-    return elite_score == 4, elite_details
+    try:
+        elite_score = 0
+        elite_details = []
+        
+        # 1. MTF Confluence (1m & 5m agree)
+        if check_mtf_confluence(signal, context):
+            elite_score += 1
+            elite_details.append("MTF ✓")
+        
+        # 2. Premium Zone Quality (Score 3/3)
+        if check_premium_zone(signal, df, context):
+            elite_score += 1
+            elite_details.append("Premium Zone ✓")
+        
+        # 3. Momentum Alignment (RSI Filter)
+        if check_momentum_alignment(signal, df, context):
+            elite_score += 1
+            elite_details.append("Momentum ✓")
+        
+        # 4. Volume-Verified Sweep
+        if check_volume_verification(df):
+            elite_score += 1
+            elite_details.append("Volume ✓")
+        
+        return elite_score == 4, elite_details
+    except Exception as e:
+        log.error(f"Elite filter error for {signal.get('symbol', 'unknown')}: {e}")
+        return False, []
 
 def check_mtf_confluence(signal, context):
     """Multi-Timeframe Confluence - 1m & 5m agreement"""
@@ -292,30 +307,33 @@ def check_mtf_confluence(signal, context):
 
 def check_premium_zone(signal, df, context):
     """Premium Zone Quality Scoring (3/3 points required)"""
-    zone_score = 0
-    
-    # +1: Fresh OB (formed within last 12 candles)
-    if len(df) >= 15:
-        zone_score += 1
-    
-    # +1: OB at Key HTF Level (using 1h data)
-    df_1h = context.get("df_1h")
-    if df_1h is not None and len(df_1h) >= 50:
-        current_price = signal["entry"]
-        # Check if price is near 1h EMA levels (support/resistance)
-        ema_20_1h = df_1h['close'].ewm(span=20).mean().iloc[-1]
-        ema_50_1h = df_1h['close'].ewm(span=50).mean().iloc[-1]
-        price_diff_pct_20 = abs(current_price - ema_20_1h) / current_price
-        price_diff_pct_50 = abs(current_price - ema_50_1h) / current_price
-        if price_diff_pct_20 < 0.005 or price_diff_pct_50 < 0.005:  # Within 0.5% of HTF level
+    try:
+        zone_score = 0
+        
+        # +1: Fresh OB (formed within last 12 candles)
+        if len(df) >= 15:
             zone_score += 1
-    
-    # +1: OB + FVG Confluence
-    bull_fvg, bear_fvg = detect_fvg(df)
-    if (signal["side"] == "BUY" and bull_fvg) or (signal["side"] == "SELL" and bear_fvg):
-        zone_score += 1
-    
-    return zone_score >= 3
+        
+        # +1: OB at Key HTF Level (using 1h data)
+        df_1h = context.get("df_1h")
+        if df_1h is not None and len(df_1h) >= 50:
+            current_price = signal["entry"]
+            # Check if price is near 1h EMA levels (support/resistance)
+            ema_20_1h = df_1h['close'].ewm(span=20).mean().iloc[-1]
+            ema_50_1h = df_1h['close'].ewm(span=50).mean().iloc[-1]
+            price_diff_pct_20 = abs(current_price - ema_20_1h) / current_price
+            price_diff_pct_50 = abs(current_price - ema_50_1h) / current_price
+            if price_diff_pct_20 < 0.005 or price_diff_pct_50 < 0.005:  # Within 0.5% of HTF level
+                zone_score += 1
+        
+        # +1: OB + FVG Confluence
+        bull_fvg, bear_fvg = detect_fvg(df)
+        if (signal["side"] == "BUY" and bull_fvg) or (signal["side"] == "SELL" and bear_fvg):
+            zone_score += 1
+        
+        return zone_score >= 3
+    except:
+        return False
 
 def check_momentum_alignment(signal, df, context):
     """Momentum Alignment with RSI Filter"""
@@ -336,18 +354,21 @@ def check_momentum_alignment(signal, df, context):
 
 def check_volume_verification(df):
     """Volume Verification for Sweep"""
-    if len(df) < 20:
-        return False
+    try:
+        if len(df) < 20:
+            return False
+            
+        # Check if sweep candle had above-average volume
+        sweep_high, sweep_low = detect_sweep(df)
+        if not (sweep_high or sweep_low):
+            return False
+            
+        current_volume = df['vol'].iloc[-1]
+        avg_volume = df['vol'].tail(20).mean()
         
-    # Check if sweep candle had above-average volume
-    sweep_high, sweep_low = detect_sweep(df)
-    if not (sweep_high or sweep_low):
+        return current_volume > avg_volume * 1.5  # 50% above average
+    except:
         return False
-        
-    current_volume = df['vol'].iloc[-1]
-    avg_volume = df['vol'].tail(20).mean()
-    
-    return current_volume > avg_volume * 1.5  # 50% above average
 
 # ---------------- NEW: MARKET REGIME FILTER ----------------
 def check_market_regime(symbol, signal_direction, context):
@@ -392,6 +413,7 @@ async def log_signal(sig, tier="STANDARD"):
                   datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"],tier))
             await db.commit()
 
+    
 # ---------------- WINNER FILTERS ----------------
 def get_btc_direction(btc_15m, btc_1h):
     """BTC direction detection"""
@@ -437,12 +459,16 @@ def check_momentum_confirmation(df, signal_direction):
                 current_candle['close'] < prev_candle['close'])
 
 def check_entry_zone_quality(df, signal_direction):
-    """Zone quality detection"""
+    """Zone quality detection - SAFE VERSION"""
     if len(df) < 15: return False
     recent_high = df['high'].tail(15).max()
     recent_low = df['low'].tail(15).min()
     current_price = df['close'].iloc[-1]
-    if recent_high == recent_low: return False
+    
+    # SAFETY CHECK: Avoid division by zero
+    if recent_high == recent_low: 
+        return False
+        
     range_position = (current_price - recent_low) / (recent_high - recent_low)
     if signal_direction == 'BUY':
         return range_position < 0.3
@@ -462,7 +488,7 @@ def detect_choppy_market(df):
     price_range_pct = (df['high'].tail(20).max() - df['low'].tail(20).min()) / current_price
     return (atr < (current_price * 0.002) and price_range_pct < 0.02)
 
-# ---------------- EXACT ORIGINAL MONITOR ----------------
+# ---------------- UPDATED MONITOR WITH TIER COLUMN ----------------
 async def monitor_signals(exchange):
     while True:
         try:
@@ -473,37 +499,62 @@ async def monitor_signals(exchange):
                 """) as cursor:
                     async for row in cursor:
                         sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status, tier = row
-                        ticker = await exchange.fetch_ticker(symbol)
-                        last_price = ticker.get("last")
-                        if last_price is None: continue
+                        try:
+                            ticker = await exchange.fetch_ticker(symbol)
+                            last_price = ticker.get("last")
+                            if last_price is None: continue
 
-                        hits=[]; sl_hit=False
-                        if side=="BUY":
-                            if not tp1_hit and last_price>=tp1: hits.append("TP1"); tp1_hit=1
-                            if not tp2_hit and last_price>=tp2: hits.append("TP2"); tp2_hit=1
-                            if not tp3_hit and last_price>=tp3: hits.append("TP3"); tp3_hit=1
-                            if last_price<=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
-                        else:
-                            if not tp1_hit and last_price<=tp1: hits.append("TP1"); tp1_hit=1
-                            if not tp2_hit and last_price<=tp2: hits.append("TP2"); tp2_hit=1
-                            if not tp3_hit and last_price<=tp3: hits.append("TP3"); tp3_hit=1
-                            if last_price>=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
+                            hits=[]; sl_hit=False
+                            if side=="BUY":
+                                if not tp1_hit and last_price>=tp1: hits.append("TP1"); tp1_hit=1
+                                if not tp2_hit and last_price>=tp2: hits.append("TP2"); tp2_hit=1
+                                if not tp3_hit and last_price>=tp3: hits.append("TP3"); tp3_hit=1
+                                if last_price<=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
+                            else:
+                                if not tp1_hit and last_price<=tp1: hits.append("TP1"); tp1_hit=1
+                                if not tp2_hit and last_price<=tp2: hits.append("TP2"); tp2_hit=1
+                                if not tp3_hit and last_price<=tp3: hits.append("TP3"); tp3_hit=1
+                                if last_price>=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
 
-                        if hits:
-                            tier_icon = "🎯" if tier == "ELITE" else "📊"
-                            await tg(f"{tier_icon} {symbol} {side} update\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP1:{tp1} TP2:{tp2} TP3:{tp3}")
+                            if hits:
+                                tier_icon = "🎯" if tier == "ELITE" else "📊"
+                                await tg(f"{tier_icon} {symbol} {side} update\nEntry:{entry:.6f}\nLast:{last_price:.6f}\nHits:{','.join(hits)}\nSL:{sl:.6f}\nTP1:{tp1:.6f} TP2:{tp2:.6f} TP3:{tp3:.6f}")
 
-                        if sl_hit: record_sl_hit(symbol)
+                            if sl_hit: record_sl_hit(symbol)
 
-                        async with db_lock:
-                            await db.execute("""
-                                UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?
-                            """,(tp1_hit,tp2_hit,tp3_hit,status,sig_id))
+                            async with db_lock:
+                                await db.execute("""
+                                    UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?
+                                """,(tp1_hit,tp2_hit,tp3_hit,status,sig_id))
+                        except Exception as e:
+                            log.error(f"Error monitoring {symbol}: {e}")
+                            continue
                 await db.commit()
-        except Exception as e: log.exception("monitor error: %s", e)
+        except Exception as e: 
+            log.exception("monitor error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
 
-# ---------------- FIXED SCAN LOOP WITH ERROR HANDLING ----------------
+# ---------------- EXPANDED SYMBOL LIST ----------------
+POPULAR_SYMBOLS = [
+    "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT", 
+    "AVAX/USDT", "DOT/USDT", "LINK/USDT", "MATIC/USDT", "LTC/USDT", "BCH/USDT",
+    "ATOM/USDT", "ETC/USDT", "XLM/USDT", "FIL/USDT", "THETA/USDT", "VET/USDT",
+    "TRX/USDT", "EOS/USDT", "AAVE/USDT", "MKR/USDT", "COMP/USDT", "YFI/USDT",
+    "SUSHI/USDT", "UNI/USDT", "CRV/USDT", "SNX/USDT", "BAL/USDT", "REN/USDT",
+    "DOGE/USDT", "SHIB/USDT", "APE/USDT", "SAND/USDT", "MANA/USDT", "GALA/USDT",
+    "ENJ/USDT", "CHZ/USDT", "ALGO/USDT", "NEAR/USDT", "FTM/USDT", "ONE/USDT",
+    "EGLD/USDT", "ICP/USDT", "XTZ/USDT", "HBAR/USDT", "GRT/USDT", "BAT/USDT",
+    "ZIL/USDT", "IOTA/USDT", "WAVES/USDT", "RVN/USDT", "SC/USDT", "STORJ/USDT",
+    "KAVA/USDT", "RUNE/USDT", "OCEAN/USDT", "CELO/USDT", "RSR/USDT", "COTI/USDT",
+    "ANKR/USDT", "AR/USDT", "RNDR/USDT", "HNT/USDT", "FLOW/USDT", "KSM/USDT",
+    "DASH/USDT", "ZEC/USDT", "XMR/USDT", "DCR/USDT", "QTUM/USDT", "ONT/USDT",
+    "IOST/USDT", "NEO/USDT", "VTHO/USDT", "TFUEL/USDT", "HOT/USDT", "STMX/USDT",
+    "PERP/USDT", "RAY/USDT", "SRM/USDT", "FTT/USDT", "ROSE/USDT", "CELR/USDT",
+    "OMG/USDT", "SKL/USDT", "CVC/USDT", "BAND/USDT", "OXT/USDT", "LRC/USDT",
+    "NKN/USDT", "DODO/USDT", "TRB/USDT", "BADGER/USDT", "LPT/USDT", "GLM/USDT"
+]
+
+# ---------------- FIXED SCAN LOOP WITH MANUAL SYMBOL LIST ----------------
 last_signal_time = {}
 async def scan_loop(exchange):
     while True:
@@ -517,32 +568,17 @@ async def scan_loop(exchange):
             btc_direction = get_btc_direction(btc_15m, btc_1h)
             log.info(f"🎯 BTC Direction: {btc_direction}")
             
-            # FIXED: Get top coins with proper error handling
-            try:
-                tickers = await exchange.fetch_tickers()
-                # Filter valid USDT pairs only
-                valid_pairs = []
-                for symbol, data in tickers.items():
-                    if symbol.endswith("/USDT") and data.get('quoteVolume', 0) > MIN_VOLUME:
-                        try:
-                            # Validate symbol structure
-                            if symbol.count('/') == 1 and len(symbol.split('/')[0]) > 0:
-                                valid_pairs.append((symbol, data.get('quoteVolume', 0)))
-                        except:
-                            continue
-                
-                top = sorted(valid_pairs, key=lambda x: x[1], reverse=True)[:TOP_N]
-                log.info(f"📊 Processing {len(top)} valid symbols")
-                
-            except Exception as e:
-                log.error(f"Error fetching tickers: {e}")
-                top = []
+            # Use predefined symbol list instead of exchange.fetch_tickers()
+            top = POPULAR_SYMBOLS[:TOP_N]
+            log.info(f"📊 Processing {len(top)} symbols from predefined list")
             
             signals_found = 0
             elite_signals = 0
             
-            for symbol, volume in top:
-                if deprioritized(symbol): continue
+            for symbol in top:
+                if deprioritized(symbol): 
+                    continue
+                    
                 ohlcvs = {}
                 
                 for tf in TIMEFRAMES:
@@ -552,7 +588,8 @@ async def scan_loop(exchange):
                     
                     try:
                         ohlcv = await fetch_ohlcv(exchange, symbol, tf, 200)
-                        if not ohlcv: continue
+                        if not ohlcv: 
+                            continue
                         
                         df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
                         for c in ["open","high","low","close","vol"]: 
@@ -669,18 +706,46 @@ async def scan_loop(exchange):
         except Exception as e: 
             log.exception("scan error: %s", e)
         elapsed = time.time() - t0
-        await asyncio.sleep(max(1, SCAN_INTERVAL - elapsed))
+        sleep_time = max(1, SCAN_INTERVAL - elapsed)
+        await asyncio.sleep(sleep_time)
 
 # ---------------- EXACT ORIGINAL FASTAPI ----------------
 app = FastAPI()
+
 @app.post("/webhook")
 async def webhook(request: Request):
     token = request.headers.get("X-Auth","")
     if token != WEBHOOK_SECRET: 
-        raise HTTPException(403, "Invalid secret")
+        raise HTTPException(status_code=403, detail="Invalid secret")
     data = await request.json()
     log.info("Webhook received: %s", data)
     return {"ok": True}
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "timestamp": datetime.datetime.utcnow().isoformat()}
+
+@app.get("/stats")
+async def stats():
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Total signals
+        async with db.execute("SELECT COUNT(*) FROM signals") as cursor:
+            total = (await cursor.fetchone())[0]
+        
+        # Open signals
+        async with db.execute("SELECT COUNT(*) FROM signals WHERE status='OPEN'") as cursor:
+            open_count = (await cursor.fetchone())[0]
+            
+        # Elite signals
+        async with db.execute("SELECT COUNT(*) FROM signals WHERE tier='ELITE'") as cursor:
+            elite_count = (await cursor.fetchone())[0]
+            
+    return {
+        "total_signals": total,
+        "open_signals": open_count,
+        "elite_signals": elite_count,
+        "timestamp": datetime.datetime.utcnow().isoformat()
+    }
 
 # ---------------- EXACT ORIGINAL MAIN ----------------
 async def main():
