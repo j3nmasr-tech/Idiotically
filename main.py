@@ -157,7 +157,7 @@ def record_sl_hit(symbol: str, lookback_minutes=30):
     cutoff = now - lookback_minutes * 60
     while dq and dq[0] < cutoff: dq.popleft()
     
-def deprioritized(symbol: str, threshold=3, lookback=30):
+def deprioritized(signal: str, threshold=3, lookback=30):
     dq = recent_sl[symbol]; now = time.time(); cutoff = now - lookback * 60
     while dq and dq[0] < cutoff: dq.popleft()
     return len(dq) >= threshold
@@ -239,156 +239,81 @@ def generate_signal(df: pd.DataFrame, symbol: str, context=None):
 # ---------------- NEW: ELITE ENTRY CHECKLIST ----------------
 def check_elite_filters(signal, df, context):
     """Elite Entry Checklist - Score 14+"""
-    try:
-        elite_score = 0
-        elite_details = []
-        
-        # 1. MTF Confluence (1m & 5m agree)
-        if check_mtf_confluence(signal, context):
-            elite_score += 1
-            elite_details.append("MTF ✓")
-        
-        # 2. Premium Zone Quality (Score 3/3)
-        if check_premium_zone(signal, df, context):
+    elite_score = 0
+    elite_details = []
+    
+    # 1. Multi-Timeframe Confluence (1m & 5m agree)
+    df_5m = context.get("df_5m")
+    if df_5m is not None and len(df_5m) > 10:
+        ob_type_5m, _, _ = detect_order_blocks(df_5m)
+        if ob_type_5m is not None:
+            signal_ob_type = "bullish" if signal["side"] == "BUY" else "bearish"
+            if ob_type_5m == signal_ob_type:
+                elite_score += 1
+                elite_details.append("MTF ✓")
+    
+    # 2. Premium Zone Quality
+    df_1h = context.get("df_1h")
+    if df_1h is not None and len(df_1h) > 50:
+        current_price = signal["entry"]
+        ema_20_1h = df_1h['close'].ewm(span=20).mean().iloc[-1]
+        ema_50_1h = df_1h['close'].ewm(span=50).mean().iloc[-1]
+        price_diff_pct_20 = abs(current_price - ema_20_1h) / current_price
+        price_diff_pct_50 = abs(current_price - ema_50_1h) / current_price
+        if price_diff_pct_20 < 0.005 or price_diff_pct_50 < 0.005:
             elite_score += 1
             elite_details.append("Premium Zone ✓")
-        
-        # 3. Momentum Alignment (RSI Filter)
-        if check_momentum_alignment(signal, df, context):
-            elite_score += 1
-            elite_details.append("Momentum ✓")
-        
-        # 4. Volume-Verified Sweep
-        if check_volume_verification(df):
-            elite_score += 1
-            elite_details.append("Volume ✓")
-        
-        return elite_score == 4, elite_details
-    except Exception as e:
-        log.error(f"Elite filter error for {signal.get('symbol', 'unknown')}: {e}")
-        return False, []
-
-def check_mtf_confluence(signal, context):
-    """Multi-Timeframe Confluence - 1m & 5m agreement"""
-    try:
-        df_5m = context.get("df_5m")
-        if df_5m is None or len(df_5m) < 10:
-            return False
-            
-        # Check if 5m has same OB type in same price zone
-        ob_type_5m, ob_hi_5m, ob_lo_5m = detect_order_blocks(df_5m)
-        if ob_type_5m is None:
-            return False
-            
-        # Convert signal side to match OB type
-        signal_ob_type = "bullish" if signal["side"] == "BUY" else "bearish"
-        if ob_type_5m != signal_ob_type:
-            return False
-            
-        # Price zone confluence (within 0.2%)
-        current_price = signal["entry"]
-        ob_price_5m = ob_hi_5m if ob_type_5m == "bearish" else ob_lo_5m
-        price_diff_pct = abs(current_price - ob_price_5m) / current_price
-        return price_diff_pct < 0.002
-    except:
-        return False
-
-def check_premium_zone(signal, df, context):
-    """Premium Zone Quality Scoring (3/3 points required)"""
-    try:
-        zone_score = 0
-        
-        # +1: Fresh OB (formed within last 12 candles)
-        if len(df) >= 15:
-            zone_score += 1
-        
-        # +1: OB at Key HTF Level (using 1h data)
-        df_1h = context.get("df_1h")
-        if df_1h is not None and len(df_1h) >= 50:
-            current_price = signal["entry"]
-            # Check if price is near 1h EMA levels (support/resistance)
-            ema_20_1h = df_1h['close'].ewm(span=20).mean().iloc[-1]
-            ema_50_1h = df_1h['close'].ewm(span=50).mean().iloc[-1]
-            price_diff_pct_20 = abs(current_price - ema_20_1h) / current_price
-            price_diff_pct_50 = abs(current_price - ema_50_1h) / current_price
-            if price_diff_pct_20 < 0.005 or price_diff_pct_50 < 0.005:  # Within 0.5% of HTF level
-                zone_score += 1
-        
-        # +1: OB + FVG Confluence
-        bull_fvg, bear_fvg = detect_fvg(df)
-        if (signal["side"] == "BUY" and bull_fvg) or (signal["side"] == "SELL" and bear_fvg):
-            zone_score += 1
-        
-        return zone_score >= 3
-    except:
-        return False
-
-def check_momentum_alignment(signal, df, context):
-    """Momentum Alignment with RSI Filter"""
-    try:
-        # Use 3m data for momentum
-        df_3m = context.get("df_3m")
-        if df_3m is None or len(df_3m) < 14:
-            df_3m = df  # Fallback to current TF
-            
+    
+    # 3. Momentum Alignment (RSI Filter)
+    df_3m = context.get("df_3m", df)
+    if len(df_3m) >= 14:
         rsi_3m = rsi(df_3m['close'], 14).iloc[-1]
-        
         if signal["side"] == "BUY":
-            return rsi_3m > 40 and rsi_3m < 80  # Not overbought, has momentum
+            if rsi_3m > 40 and rsi_3m < 80:
+                elite_score += 1
+                elite_details.append("Momentum ✓")
         else:
-            return rsi_3m < 60 and rsi_3m > 20  # Not oversold, has momentum
-    except:
-        return False
-
-def check_volume_verification(df):
-    """Volume Verification for Sweep"""
-    try:
-        if len(df) < 20:
-            return False
-            
-        # Check if sweep candle had above-average volume
+            if rsi_3m < 60 and rsi_3m > 20:
+                elite_score += 1
+                elite_details.append("Momentum ✓")
+    
+    # 4. Volume-Verified Sweep
+    if len(df) >= 20:
         sweep_high, sweep_low = detect_sweep(df)
-        if not (sweep_high or sweep_low):
-            return False
-            
         current_volume = df['vol'].iloc[-1]
         avg_volume = df['vol'].tail(20).mean()
-        
-        return current_volume > avg_volume * 1.5  # 50% above average
-    except:
-        return False
+        if (sweep_high or sweep_low) and current_volume > avg_volume * 1.5:
+            elite_score += 1
+            elite_details.append("Volume ✓")
+    
+    return elite_score == 4, elite_details
 
 # ---------------- NEW: MARKET REGIME FILTER ----------------
 def check_market_regime(symbol, signal_direction, context):
     """Stop Fighting the Tide - Market Regime Filter"""
-    try:
-        df_1h = context.get("df_1h")
-        if df_1h is None or len(df_1h) < 50:
-            return True  # Allow if no data
-            
-        current_price = df_1h['close'].iloc[-1]
-        ema_20_1h = df_1h['close'].ewm(span=20).mean().iloc[-1]
-        ema_50_1h = df_1h['close'].ewm(span=50).mean().iloc[-1]
-        
-        # Determine regime
-        if current_price > ema_20_1h and ema_20_1h > ema_50_1h:
-            regime = "STRONG_BULL"
-        elif current_price < ema_20_1h and ema_20_1h < ema_50_1h:
-            regime = "STRONG_BEAR"
-        else:
-            regime = "NEUTRAL"
-        
-        # Trading rules
-        if regime == "STRONG_BULL":
-            return signal_direction == "BUY"  # Only BUY allowed
-        elif regime == "STRONG_BEAR":
-            return signal_direction == "SELL"  # Only SELL allowed
-        else:
-            return True  # Both allowed in neutral
-        
-    except Exception as e:
-        log.error(f"Market regime check error: {e}")
-        return True  # Allow on error
+    df_1h = context.get("df_1h")
+    if df_1h is None or len(df_1h) < 50:
+        return True  # Allow if no data
+    
+    current_price = df_1h['close'].iloc[-1]
+    ema_20_1h = df_1h['close'].ewm(span=20).mean().iloc[-1]
+    ema_50_1h = df_1h['close'].ewm(span=50).mean().iloc[-1]
+    
+    # Determine regime
+    if current_price > ema_20_1h and ema_20_1h > ema_50_1h:
+        regime = "STRONG_BULL"
+    elif current_price < ema_20_1h and ema_20_1h < ema_50_1h:
+        regime = "STRONG_BEAR"
+    else:
+        regime = "NEUTRAL"
+    
+    # Trading rules - Don't fight the tide!
+    if regime == "STRONG_BULL":
+        return signal_direction == "BUY"  # Only BUY allowed
+    elif regime == "STRONG_BEAR":
+        return signal_direction == "SELL"  # Only SELL allowed
+    else:
+        return True  # Both allowed in neutral
 
 # ---------------- EXACT ORIGINAL LOG SIGNAL ----------------
 async def log_signal(sig):
@@ -471,7 +396,7 @@ def detect_choppy_market(df):
     price_range_pct = (df['high'].tail(20).max() - df['low'].tail(20).min()) / current_price
     return (atr < (current_price * 0.002) and price_range_pct < 0.02)
 
-# ---------------- EXACT ORIGINAL MONITOR (UNCHANGED) ----------------
+# ---------------- EXACT ORIGINAL MONITOR ----------------
 async def monitor_signals(exchange):
     while True:
         try:
@@ -525,7 +450,7 @@ async def scan_loop(exchange):
             btc_direction = get_btc_direction(btc_15m, btc_1h)
             log.info(f"🎯 BTC Direction: {btc_direction}")
             
-            # EXACT ORIGINAL CODE - Get top coins
+            # Get top coins
             tickers = await exchange.fetch_tickers()
             top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")], 
                         key=lambda x:x[1], reverse=True)[:TOP_N]
@@ -543,8 +468,6 @@ async def scan_loop(exchange):
                     if not ohlcv: continue
                     df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
                     for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
-                    
-                    # EXACT ORIGINAL CONTEXT BUILDING
                     context={"tf":tf,"df_15m":ohlcvs.get("15m"),"df_1h":ohlcvs.get("1h")}
                     if tf in ("1m","3m","5m"):
                         if "15m" not in ohlcvs: 
@@ -554,6 +477,18 @@ async def scan_loop(exchange):
                             ohlcv1h = await fetch_ohlcv(exchange,symbol,"1h",200)
                             if ohlcv1h: ohlcvs["1h"]=pd.DataFrame(ohlcv1h,columns=["ts","open","high","low","close","vol"])
                         context["df_15m"]=ohlcvs.get("15m"); context["df_1h"]=ohlcvs.get("1h")
+                    
+                    # Additional timeframes for elite filters
+                    if tf not in ["3m", "5m"]:
+                        for add_tf in ["3m", "5m"]:
+                            if add_tf not in ohlcvs:
+                                add_ohlcv = await fetch_ohlcv(exchange, symbol, add_tf, 200)
+                                if add_ohlcv: 
+                                    ohlcvs[add_tf] = pd.DataFrame(add_ohlcv,columns=["ts","open","high","low","close","vol"])
+                                    for col in ["open","high","low","close","vol"]:
+                                        ohlcvs[add_tf][col] = pd.to_numeric(ohlcvs[add_tf][col],errors="coerce")
+                        context["df_3m"]=ohlcvs.get("3m")
+                        context["df_5m"]=ohlcvs.get("5m")
                     
                     # Generate original signal
                     sig = generate_signal(df,symbol,context)
@@ -593,19 +528,19 @@ async def scan_loop(exchange):
                             filters_passed = False
                         
                         if filters_passed:
-                            # NEW: Elite Classification (NON-BREAKING - just adds to message)
+                            # NEW: Elite Classification
                             is_elite, elite_details = check_elite_filters(sig, df, context)
                             
-                            # EXACT ORIGINAL winner bonuses
+                            # Add winner bonuses
                             sig['reason_list'].extend([
                                 f"BTC {btc_direction} ✓", "Higher TF ✓", 
-                                "Zone ✓", "Trending ✓"
+                                "Zone ✓", "Trending ✓", "Regime ✓"
                             ])
                             if tf not in ["1m", "3m"]:
                                 sig['reason_list'].append("Momentum ✓")
                             sig['score'] += 5
                             
-                            # Elite classification (doesn't affect database)
+                            # Elite classification
                             if is_elite:
                                 elite_signals += 1
                                 icon = "🎯"
@@ -615,14 +550,56 @@ async def scan_loop(exchange):
                                 icon = "🏆"
                                 elite_note = f"Score: {sig['score']}"
                             
-                            # EXACT ORIGINAL MESSAGE with elite indicator
                             await tg(f"{icon} {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\n{elite_note}\nBreakdown:{', '.join(sig['reason_list'])}")
                             await log_signal(sig)
                             last_signal_time[key]=time.time()
                             signals_found += 1
                             
-            log.info(f"📊 Scan complete: {signals_found} winner signals found ({elite_signals} elite)")
+            log.info(f"📊 Scan complete: {signals_found} signals ({elite_signals} elite)")
                         
         except Exception as e: log.exception("scan error: %s", e)
         elapsed=time.time()-t0
         await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
+
+# ---------------- EXACT ORIGINAL FASTAPI ----------------
+app = FastAPI()
+@app.post("/webhook")
+async def webhook(request: Request):
+    token = request.headers.get("X-Auth","")
+    if token!=WEBHOOK_SECRET: raise HTTPException(403,"Invalid secret")
+    data = await request.json()
+    log.info("Webhook received: %s", data)
+    return {"ok":True}
+
+# ---------------- EXACT ORIGINAL MAIN ----------------
+async def main():
+    await init_db()
+    exchange = ccxt.okx({"enableRateLimit": True})
+    
+    # Startup message
+    startup_msg = (
+        "🏆 ULTIMATE WINNER SCANNER STARTED\n"
+        "• All original SMC logic preserved\n"
+        "• BTC direction alignment enforced\n" 
+        "• Higher TF alignment required\n"
+        "• Momentum confirmation (5m+)\n"
+        "• Zone quality checks\n"
+        "• Trending markets only\n"
+        "• NEW: Market Regime Filter (Stop Fighting the Tide)\n"
+        "• NEW: Elite Entry Checklist (Score 14+)\n"
+        "🎯 Target: 80%+ Win Rate"
+    )
+    await tg(startup_msg)
+    log.info("✅ Scanner started with all winner filters + elite system")
+    
+    await asyncio.gather(scan_loop(exchange), monitor_signals(exchange))
+
+if __name__=="__main__":
+    import argparse
+    p=argparse.ArgumentParser()
+    p.add_argument("--http", action="store_true")
+    args=p.parse_args()
+    if args.http:
+        uvicorn.run(app, host="0.0.0.0", port=9000)
+    else:
+        asyncio.run(main())
