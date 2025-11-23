@@ -95,24 +95,30 @@ class SafeOKX:
         try:
             tickers = await self.exchange.fetch_tickers()
             # Filter for USDT pairs like your original code
-            usdt_tickers = {s: v for s, v in tickers.items() if s.endswith("/USDT")}
+            usdt_tickers = {}
+            for s, v in tickers.items():
+                if s and s.endswith("/USDT"):  # Added None check
+                    usdt_tickers[s] = v
+            log.info(f"✅ Fetched {len(usdt_tickers)} USDT pairs")
             return usdt_tickers
         except Exception as e:
-            log.error(f"Error fetching tickers: {e}")
+            log.error(f"❌ Error fetching tickers: {str(e)}")  # Fixed string conversion
             return {}
     
     async def safe_fetch_ticker(self, symbol):
         """Safe single ticker fetch"""
         try:
             return await self.exchange.fetch_ticker(symbol)
-        except:
+        except Exception as e:
+            log.debug(f"Failed to fetch ticker for {symbol}: {str(e)}")
             return None
     
     async def fetch_ohlcv(self, symbol, timeframe, limit=200):
         """OHLCV passthrough"""
         try: 
             return await self.exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        except: 
+        except Exception as e:
+            log.debug(f"Failed to fetch OHLCV for {symbol} {timeframe}: {str(e)}")
             return None
 
 # ---------------- EXACT ORIGINAL INDICATORS ----------------
