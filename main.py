@@ -525,15 +525,10 @@ async def scan_loop(exchange):
             btc_direction = get_btc_direction(btc_15m, btc_1h)
             log.info(f"🎯 BTC Direction: {btc_direction}")
             
-            # Get top coins - WITH ERROR HANDLING LIKE ORIGINAL
-            try:
-                tickers = await exchange.fetch_tickers()
-                top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")], 
-                            key=lambda x:x[1], reverse=True)[:TOP_N]
-            except Exception as e:
-                log.error(f"Error fetching tickers: {e}")
-                await asyncio.sleep(SCAN_INTERVAL)
-                continue
+            # EXACT ORIGINAL CODE - Get top coins
+            tickers = await exchange.fetch_tickers()
+            top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")], 
+                        key=lambda x:x[1], reverse=True)[:TOP_N]
             
             signals_found = 0
             elite_signals = 0
@@ -549,42 +544,16 @@ async def scan_loop(exchange):
                     df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
                     for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
                     
-                    # EXACT ORIGINAL CONTEXT BUILDING + additional timeframes for elite filters
-                    context={"tf":tf}
-                    
-                    # Original timeframe fetching logic
+                    # EXACT ORIGINAL CONTEXT BUILDING
+                    context={"tf":tf,"df_15m":ohlcvs.get("15m"),"df_1h":ohlcvs.get("1h")}
                     if tf in ("1m","3m","5m"):
                         if "15m" not in ohlcvs: 
                             ohlcv15 = await fetch_ohlcv(exchange,symbol,"15m",200)
-                            if ohlcv15: 
-                                ohlcvs["15m"]=pd.DataFrame(ohlcv15,columns=["ts","open","high","low","close","vol"])
-                                for col in ["open","high","low","close","vol"]:
-                                    ohlcvs["15m"][col]=pd.to_numeric(ohlcvs["15m"][col],errors="coerce")
+                            if ohlcv15: ohlcvs["15m"]=pd.DataFrame(ohlcv15,columns=["ts","open","high","low","close","vol"])
                         if "1h" not in ohlcvs:
                             ohlcv1h = await fetch_ohlcv(exchange,symbol,"1h",200)
-                            if ohlcv1h: 
-                                ohlcvs["1h"]=pd.DataFrame(ohlcv1h,columns=["ts","open","high","low","close","vol"])
-                                for col in ["open","high","low","close","vol"]:
-                                    ohlcvs["1h"][col]=pd.to_numeric(ohlcvs["1h"][col],errors="coerce")
-                    
-                    # Additional timeframes for elite filters (3m, 5m)
-                    additional_tfs = ["3m", "5m"] if tf not in ["3m", "5m"] else []
-                    for add_tf in additional_tfs:
-                        if add_tf not in ohlcvs:
-                            try:
-                                add_ohlcv = await fetch_ohlcv(exchange, symbol, add_tf, 200)
-                                if add_ohlcv:
-                                    ohlcvs[add_tf] = pd.DataFrame(add_ohlcv,columns=["ts","open","high","low","close","vol"])
-                                    for col in ["open","high","low","close","vol"]:
-                                        ohlcvs[add_tf][col] = pd.to_numeric(ohlcvs[add_tf][col],errors="coerce")
-                            except:
-                                continue
-                    
-                    # Set context with all available timeframes
-                    context["df_15m"]=ohlcvs.get("15m")
-                    context["df_1h"]=ohlcvs.get("1h") 
-                    context["df_3m"]=ohlcvs.get("3m")
-                    context["df_5m"]=ohlcvs.get("5m")
+                            if ohlcv1h: ohlcvs["1h"]=pd.DataFrame(ohlcv1h,columns=["ts","open","high","low","close","vol"])
+                        context["df_15m"]=ohlcvs.get("15m"); context["df_1h"]=ohlcvs.get("1h")
                     
                     # Generate original signal
                     sig = generate_signal(df,symbol,context)
@@ -624,84 +593,36 @@ async def scan_loop(exchange):
                             filters_passed = False
                         
                         if filters_passed:
-                            # NEW: Elite Classification
+                            # NEW: Elite Classification (NON-BREAKING - just adds to message)
                             is_elite, elite_details = check_elite_filters(sig, df, context)
                             
-                            # Add winner bonuses (ORIGINAL LOGIC + new filters)
+                            # EXACT ORIGINAL winner bonuses
                             sig['reason_list'].extend([
                                 f"BTC {btc_direction} ✓", "Higher TF ✓", 
                                 "Zone ✓", "Trending ✓"
                             ])
                             if tf not in ["1m", "3m"]:
                                 sig['reason_list'].append("Momentum ✓")
+                            sig['score'] += 5
                             
-                            # Elite bonus
-                            elite_bonus = 0
+                            # Elite classification (doesn't affect database)
                             if is_elite:
-                                elite_bonus = 10
-                                sig['reason_list'].extend(elite_details)
                                 elite_signals += 1
                                 icon = "🎯"
                                 elite_note = "ELITE - 3X SIZE"
+                                sig['reason_list'].extend(elite_details)
                             else:
-                                icon = "🏆" 
-                                elite_note = f"Score: {sig['score'] + 5}"
+                                icon = "🏆"
+                                elite_note = f"Score: {sig['score']}"
                             
-                            # ORIGINAL SCORING + elite bonus
-                            sig['score'] += 5 + elite_bonus
-                            
-                            # ORIGINAL MESSAGE FORMAT with elite indicator
+                            # EXACT ORIGINAL MESSAGE with elite indicator
                             await tg(f"{icon} {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\n{elite_note}\nBreakdown:{', '.join(sig['reason_list'])}")
                             await log_signal(sig)
                             last_signal_time[key]=time.time()
                             signals_found += 1
                             
-            log.info(f"📊 Scan complete: {signals_found} signals ({elite_signals} elite)")
+            log.info(f"📊 Scan complete: {signals_found} winner signals found ({elite_signals} elite)")
                         
-        except Exception as e: 
-            log.exception("scan error: %s", e)
+        except Exception as e: log.exception("scan error: %s", e)
         elapsed=time.time()-t0
         await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
-
-# ---------------- EXACT ORIGINAL FASTAPI ----------------
-app = FastAPI()
-@app.post("/webhook")
-async def webhook(request: Request):
-    token = request.headers.get("X-Auth","")
-    if token!=WEBHOOK_SECRET: raise HTTPException(403,"Invalid secret")
-    data = await request.json()
-    log.info("Webhook received: %s", data)
-    return {"ok":True}
-
-# ---------------- EXACT ORIGINAL MAIN ----------------
-async def main():
-    await init_db()
-    exchange = ccxt.okx({"enableRateLimit": True})
-    
-    # Startup message
-    startup_msg = (
-        "🏆 ULTIMATE WINNER SCANNER STARTED\n"
-        "• All original SMC logic preserved\n"
-        "• BTC direction alignment enforced\n" 
-        "• Higher TF alignment required\n"
-        "• Momentum confirmation (5m+)\n"
-        "• Zone quality checks\n"
-        "• Trending markets only\n"
-        "• NEW: Market Regime Filter (Stop Fighting the Tide)\n"
-        "• NEW: Elite Entry Checklist (Score 14+)\n"
-        "🎯 Target: 80%+ Win Rate"
-    )
-    await tg(startup_msg)
-    log.info("✅ Scanner started with all winner filters + elite system")
-    
-    await asyncio.gather(scan_loop(exchange), monitor_signals(exchange))
-
-if __name__=="__main__":
-    import argparse
-    p=argparse.ArgumentParser()
-    p.add_argument("--http", action="store_true")
-    args=p.parse_args()
-    if args.http:
-        uvicorn.run(app, host="0.0.0.0", port=9000)
-    else:
-        asyncio.run(main())
