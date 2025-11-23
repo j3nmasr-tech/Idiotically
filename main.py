@@ -87,7 +87,7 @@ class SafeKucoin:
     def __init__(self):
         self.exchange = ccxt.kucoin({
             "enableRateLimit": True,
-            "rateLimit": 200,  # KuCoin public endpoints
+            "rateLimit": 200,
             "timeout": 30000,
             "options": {
                 "defaultType": "spot",
@@ -95,26 +95,22 @@ class SafeKucoin:
             }
         })
         self.request_times = deque()
-        self.max_requests_per_minute = 45  # Conservative limit
+        self.max_requests_per_minute = 45
         self.last_request = 0
-        self.min_interval = 0.15  # 150ms between requests
+        self.min_interval = 0.15
         self.consecutive_errors = 0
         
     async def _respect_rate_limit(self):
         now = time.time()
-        
-        # Remove requests older than 1 minute
         while self.request_times and self.request_times[0] < now - 60:
             self.request_times.popleft()
             
-        # Check if we're exceeding rate limits
         if len(self.request_times) >= self.max_requests_per_minute:
             sleep_time = 60 - (now - self.request_times[0])
             if sleep_time > 0:
                 log.warning(f"⚠️ Rate limit approaching, sleeping {sleep_time:.1f}s")
                 await asyncio.sleep(sleep_time)
         
-        # Enforce minimum interval between requests
         elapsed = now - self.last_request
         if elapsed < self.min_interval:
             await asyncio.sleep(self.min_interval - elapsed)
@@ -123,14 +119,12 @@ class SafeKucoin:
         self.request_times.append(time.time())
     
     async def safe_fetch_tickers(self):
-        """Safe ticker fetch with anti-blocking"""
         await self._respect_rate_limit()
         try:
             tickers = await self.exchange.fetch_tickers()
-            # Filter for USDT pairs - KuCoin format
             usdt_tickers = {}
             for s, v in tickers.items():
-                if s and (s.endswith("/USDT") or '-USDT' in s.upper()):
+                if s and (s.endswith("/USDT") or '/USDT:' in s):
                     usdt_tickers[s] = v
             log.info(f"✅ Fetched {len(usdt_tickers)} USDT pairs from KuCoin")
             self.consecutive_errors = 0
@@ -154,28 +148,31 @@ class SafeKucoin:
             return {}
     
     async def safe_fetch_ticker(self, symbol):
-        """Safe single ticker fetch with retry logic"""
-        return await self.fetch_with_retry(self.exchange.fetch_ticker, symbol)
+        return await self._fetch_with_retry(self.exchange.fetch_ticker, symbol)
     
     async def fetch_ohlcv(self, symbol, timeframe, limit=200):
-        """OHLCV with anti-blocking protection"""
-        return await self.fetch_with_retry(self.exchange.fetch_ohlcv, symbol, 
-                                         timeframe=timeframe, limit=limit)
+        # FIX: Properly pass keyword arguments
+        return await self._fetch_with_retry(self.exchange.fetch_ohlcv, symbol, 
+                                          timeframe=timeframe, limit=limit)
     
-    async def fetch_with_retry(self, method, *args, max_retries=3):
-        """Retry logic with exponential backoff"""
-        for attempt in range(max_retries):
+    async def _fetch_with_retry(self, method, *args, **kwargs):
+        """FIXED: Properly handles both args and kwargs"""
+        for attempt in range(3):
             try:
                 await self._respect_rate_limit()
-                result = await method(*args)
+                result = await method(*args, **kwargs)  # FIX: Pass both args and kwargs
                 self.consecutive_errors = 0
                 return result
+            except ccxt.BadSymbol as e:
+                # FIX: Handle missing symbols gracefully
+                log.debug(f"📊 Symbol not available on KuCoin: {args[0] if args else 'unknown'}")
+                return None
             except (ccxt.RequestTimeout, ccxt.NetworkError) as e:
-                if attempt == max_retries - 1:
-                    log.error(f"📡 Network error after {max_retries} attempts: {e}")
-                    raise
+                if attempt == 2:
+                    log.debug(f"📡 Network error after 3 attempts: {e}")
+                    return None
                 wait_time = (2 ** attempt) + random.random()
-                log.warning(f"📡 Network error, retry {attempt+1}/{max_retries} in {wait_time:.1f}s")
+                log.warning(f"📡 Network error, retry {attempt+1}/3 in {wait_time:.1f}s")
                 await asyncio.sleep(wait_time)
             except ccxt.RateLimitExceeded as e:
                 wait_time = min(300, 60 * (attempt + 1))
@@ -186,11 +183,11 @@ class SafeKucoin:
                 log.warning(f"🛡️ DDoS protection, waiting {wait_time}s")
                 await asyncio.sleep(wait_time)
             except Exception as e:
-                if attempt == max_retries - 1:
-                    log.error(f"❌ API error after {max_retries} attempts: {e}")
+                if attempt == 2:
+                    log.debug(f"❌ API error after 3 attempts: {e}")
                     return None
                 wait_time = (2 ** attempt) + random.random()
-                log.warning(f"❌ API error, retry {attempt+1}/{max_retries} in {wait_time:.1f}s")
+                log.warning(f"❌ API error, retry {attempt+1}/3 in {wait_time:.1f}s")
                 await asyncio.sleep(wait_time)
         return None
 
@@ -575,7 +572,19 @@ async def scan_loop(exchange):
             elite_signals = 0
             old_signals = 0
             
-            for symbol, _ in top:
+            # FILTER: Only process symbols that actually exist on KuCoin
+            valid_symbols = []
+            for symbol, volume in top:
+                # Quick test to see if symbol has OHLCV data
+                test_data = await exchange.fetch_ohlcv(symbol, "1m", 5)
+                if test_data and len(test_data) > 0:
+                    valid_symbols.append((symbol, volume))
+                else:
+                    log.debug(f"📊 Skipping {symbol} - no data on KuCoin")
+            
+            log.info(f"🔍 Scanning {len(valid_symbols)} valid symbols (filtered from {len(top)})")
+            
+            for symbol, _ in valid_symbols:
                 if deprioritized(symbol): 
                     continue
                     
@@ -585,8 +594,13 @@ async def scan_loop(exchange):
                     if key in last_signal_time and time.time() - last_signal_time[key] < 1800: 
                         continue
                         
-                    ohlcv = await exchange.fetch_ohlcv(symbol, tf, 200)
-                    if not ohlcv: 
+                    try:
+                        ohlcv = await exchange.fetch_ohlcv(symbol, tf, 200)
+                        if not ohlcv: 
+                            continue
+                    except Exception as e:
+                        # Skip symbols that fail OHLCV fetch
+                        log.debug(f"📊 Skip {symbol} {tf}: {str(e)}")
                         continue
                         
                     df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
@@ -596,13 +610,19 @@ async def scan_loop(exchange):
                     
                     if tf in ("1m", "3m", "5m"):
                         if "15m" not in ohlcvs: 
-                            ohlcv15 = await exchange.fetch_ohlcv(symbol, "15m", 200)
-                            if ohlcv15: 
-                                ohlcvs["15m"] = pd.DataFrame(ohlcv15, columns=["ts", "open", "high", "low", "close", "vol"])
+                            try:
+                                ohlcv15 = await exchange.fetch_ohlcv(symbol, "15m", 200)
+                                if ohlcv15: 
+                                    ohlcvs["15m"] = pd.DataFrame(ohlcv15, columns=["ts", "open", "high", "low", "close", "vol"])
+                            except:
+                                pass
                         if "1h" not in ohlcvs:
-                            ohlcv1h = await exchange.fetch_ohlcv(symbol, "1h", 200)
-                            if ohlcv1h: 
-                                ohlcvs["1h"] = pd.DataFrame(ohlcv1h, columns=["ts", "open", "high", "low", "close", "vol"])
+                            try:
+                                ohlcv1h = await exchange.fetch_ohlcv(symbol, "1h", 200)
+                                if ohlcv1h: 
+                                    ohlcvs["1h"] = pd.DataFrame(ohlcv1h, columns=["ts", "open", "high", "low", "close", "vol"])
+                            except:
+                                pass
                         context["df_15m"] = ohlcvs.get("15m")
                         context["df_1h"] = ohlcvs.get("1h")
                     
@@ -610,11 +630,14 @@ async def scan_loop(exchange):
                     if tf not in ["3m", "5m"]:
                         for add_tf in ["3m", "5m"]:
                             if add_tf not in ohlcvs:
-                                add_ohlcv = await exchange.fetch_ohlcv(symbol, add_tf, 200)
-                                if add_ohlcv: 
-                                    ohlcvs[add_tf] = pd.DataFrame(add_ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
-                                    for col in ["open", "high", "low", "close", "vol"]:
-                                        ohlcvs[add_tf][col] = pd.to_numeric(ohlcvs[add_tf][col], errors="coerce")
+                                try:
+                                    add_ohlcv = await exchange.fetch_ohlcv(symbol, add_tf, 200)
+                                    if add_ohlcv: 
+                                        ohlcvs[add_tf] = pd.DataFrame(add_ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
+                                        for col in ["open", "high", "low", "close", "vol"]:
+                                            ohlcvs[add_tf][col] = pd.to_numeric(ohlcvs[add_tf][col], errors="coerce")
+                                except:
+                                    pass
                         context["df_3m"] = ohlcvs.get("3m")
                         context["df_5m"] = ohlcvs.get("5m")
                     
@@ -705,7 +728,7 @@ async def scan_loop(exchange):
                 
         elapsed = time.time() - t0
         await asyncio.sleep(max(1, SCAN_INTERVAL - elapsed))
-
+        
 # ---------------- EXACT ORIGINAL FASTAPI ----------------
 app = FastAPI()
 @app.post("/webhook")
