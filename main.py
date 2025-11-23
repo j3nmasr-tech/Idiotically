@@ -377,7 +377,7 @@ def detect_market_regime(df_1h, df_4h=None):
         log.error(f"Market regime detection error: {e}")
         return "RANGING"
 
-def should_trade_in_regime(signal_side, market_regime, strict_mode=True):
+def should_trade_in_regime(signal_side, market_regime, strict_mode=False):  # FIXED: Changed to False
     """
     Don't Fight the Tide logic:
     - BULLISH regime: Only take BUY signals
@@ -490,8 +490,8 @@ async def scan_loop(exchange):
                             log.info(f"⏸️ Blocked: {sig['side']} vs BTC {btc_direction}")
                             filters_passed = False
                             
-                        # 2. MARKET REGIME - DON'T FIGHT THE TIDE
-                        elif not should_trade_in_regime(sig['side'], market_regime, strict_mode=True):
+                        # 2. MARKET REGIME - DON'T FIGHT THE TIDE (FIXED: strict_mode=False)
+                        elif not should_trade_in_regime(sig['side'], market_regime, strict_mode=False):
                             log.info(f"⏸️ Blocked: {sig['side']} vs Market Regime {market_regime}")
                             filters_passed = False
                             
