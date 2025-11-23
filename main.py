@@ -274,7 +274,12 @@ def check_mtf_confluence(signal, context):
             
         # Check if 5m has same OB type in same price zone
         ob_type_5m, ob_hi_5m, ob_lo_5m = detect_order_blocks(df_5m)
-        if ob_type_5m != signal["side"].lower()[:4]:  # "bullish" vs "BUY"
+        if ob_type_5m is None:
+            return False
+            
+        # Convert signal side to match OB type
+        signal_ob_type = "bullish" if signal["side"] == "BUY" else "bearish"
+        if ob_type_5m != signal_ob_type:
             return False
             
         # Price zone confluence (within 0.2%)
@@ -300,8 +305,9 @@ def check_premium_zone(signal, df, context):
         # Check if price is near 1h EMA levels (support/resistance)
         ema_20_1h = df_1h['close'].ewm(span=20).mean().iloc[-1]
         ema_50_1h = df_1h['close'].ewm(span=50).mean().iloc[-1]
-        price_diff_pct = min(abs(current_price - ema_20_1h), abs(current_price - ema_50_1h)) / current_price
-        if price_diff_pct < 0.005:  # Within 0.5% of HTF level
+        price_diff_pct_20 = abs(current_price - ema_20_1h) / current_price
+        price_diff_pct_50 = abs(current_price - ema_50_1h) / current_price
+        if price_diff_pct_20 < 0.005 or price_diff_pct_50 < 0.005:  # Within 0.5% of HTF level
             zone_score += 1
     
     # +1: OB + FVG Confluence
@@ -497,7 +503,7 @@ async def monitor_signals(exchange):
         except Exception as e: log.exception("monitor error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
 
-# ---------------- OPTIMIZED SCAN LOOP WITH ALL FILTERS + ELITE SYSTEM ----------------
+# ---------------- FIXED SCAN LOOP WITH ERROR HANDLING ----------------
 last_signal_time = {}
 async def scan_loop(exchange):
     while True:
@@ -511,149 +517,180 @@ async def scan_loop(exchange):
             btc_direction = get_btc_direction(btc_15m, btc_1h)
             log.info(f"🎯 BTC Direction: {btc_direction}")
             
-            # Get top coins
-            tickers = await exchange.fetch_tickers()
-            top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")], 
-                        key=lambda x:x[1], reverse=True)[:TOP_N]
+            # FIXED: Get top coins with proper error handling
+            try:
+                tickers = await exchange.fetch_tickers()
+                # Filter valid USDT pairs only
+                valid_pairs = []
+                for symbol, data in tickers.items():
+                    if symbol.endswith("/USDT") and data.get('quoteVolume', 0) > MIN_VOLUME:
+                        try:
+                            # Validate symbol structure
+                            if symbol.count('/') == 1 and len(symbol.split('/')[0]) > 0:
+                                valid_pairs.append((symbol, data.get('quoteVolume', 0)))
+                        except:
+                            continue
+                
+                top = sorted(valid_pairs, key=lambda x: x[1], reverse=True)[:TOP_N]
+                log.info(f"📊 Processing {len(top)} valid symbols")
+                
+            except Exception as e:
+                log.error(f"Error fetching tickers: {e}")
+                top = []
             
             signals_found = 0
             elite_signals = 0
             
-            for symbol,_ in top:
+            for symbol, volume in top:
                 if deprioritized(symbol): continue
-                ohlcvs={}
+                ohlcvs = {}
+                
                 for tf in TIMEFRAMES:
-                    key=f"{symbol}:{tf}"
-                    if key in last_signal_time and time.time()-last_signal_time[key]<1800: continue
-                    ohlcv = await fetch_ohlcv(exchange,symbol,tf,200)
-                    if not ohlcv: continue
-                    df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
-                    for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
+                    key = f"{symbol}:{tf}"
+                    if key in last_signal_time and time.time() - last_signal_time[key] < 1800: 
+                        continue
                     
-                    # Fetch additional timeframes for context
-                    context={"tf":tf}
-                    if tf in ("1m","3m","5m"):
-                        if "15m" not in ohlcvs: 
-                            ohlcv15 = await fetch_ohlcv(exchange,symbol,"15m",200)
-                            if ohlcv15: ohlcvs["15m"]=pd.DataFrame(ohlcv15,columns=["ts","open","high","low","close","vol"])
-                        if "1h" not in ohlcvs:
-                            ohlcv1h = await fetch_ohlcv(exchange,symbol,"1h",200)
-                            if ohlcv1h: ohlcvs["1h"]=pd.DataFrame(ohlcv1h,columns=["ts","open","high","low","close","vol"])
-                        if "5m" not in ohlcvs and tf != "5m":
-                            ohlcv5m = await fetch_ohlcv(exchange,symbol,"5m",200)
-                            if ohlcv5m: ohlcvs["5m"]=pd.DataFrame(ohlcv5m,columns=["ts","open","high","low","close","vol"])
-                        if "3m" not in ohlcvs and tf != "3m":
-                            ohlcv3m = await fetch_ohlcv(exchange,symbol,"3m",200)
-                            if ohlcv3m: ohlcvs["3m"]=pd.DataFrame(ohlcv3m,columns=["ts","open","high","low","close","vol"])
-                    
-                    context["df_15m"]=ohlcvs.get("15m")
-                    context["df_1h"]=ohlcvs.get("1h") 
-                    context["df_5m"]=ohlcvs.get("5m")
-                    context["df_3m"]=ohlcvs.get("3m")
-                    
-                    # Generate original signal
-                    sig = generate_signal(df,symbol,context)
-                    
-                    # APPLY ALL FILTERS - MARKET REGIME FILTER FIRST (MANDATORY FOR ALL)
-                    if sig:
-                        # LAYER 1: MARKET REGIME FILTER (APPLIED TO ALL SIGNALS)
-                        if not check_market_regime(sig['symbol'], sig['side'], context):
-                            log.info(f"⏸️ Blocked by Market Regime: {sig['side']} signal in wrong regime")
-                            continue
-                            
-                        filters_passed = True
-                        tier = "STANDARD"
+                    try:
+                        ohlcv = await fetch_ohlcv(exchange, symbol, tf, 200)
+                        if not ohlcv: continue
                         
-                        # ORIGINAL WINNER FILTERS
-                        # 1. BTC Direction Filter
-                        if not is_trade_allowed(sig['side'], btc_direction):
-                            log.info(f"⏸️ Blocked: {sig['side']} vs BTC {btc_direction}")
-                            filters_passed = False
-                            
-                        # 2. Higher TF Alignment
-                        elif not check_higher_tf_alignment(sig, context.get("df_15m")):
-                            log.info(f"⏸️ Blocked: Higher TF misalignment")
-                            filters_passed = False
-                            
-                        # 3. Momentum Confirmation (skip for 1m/3m)
-                        elif tf not in ["1m", "3m"] and not check_momentum_confirmation(df, sig['side']):
-                            log.info(f"⏸️ Blocked: No momentum confirmation")
-                            filters_passed = False
-                            
-                        # 4. Zone Quality
-                        elif not check_entry_zone_quality(df, sig['side']):
-                            log.info(f"⏸️ Blocked: Poor entry zone")
-                            filters_passed = False
-                            
-                        # 5. Market Condition
-                        elif detect_choppy_market(df):
-                            log.info(f"⏸️ Blocked: Choppy market")
-                            filters_passed = False
+                        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+                        for c in ["open","high","low","close","vol"]: 
+                            df[c] = pd.to_numeric(df[c], errors="coerce")
                         
-                        if filters_passed:
-                            # LAYER 2: ELITE FILTERS CLASSIFICATION
-                            is_elite, elite_details = check_elite_filters(sig, df, context)
+                        # Fetch additional timeframes for context
+                        context = {"tf": tf}
+                        additional_tfs = ["15m", "1h", "5m", "3m"]
+                        
+                        for add_tf in additional_tfs:
+                            if add_tf not in ohlcvs and add_tf != tf:
+                                try:
+                                    add_ohlcv = await fetch_ohlcv(exchange, symbol, add_tf, 200)
+                                    if add_ohlcv:
+                                        ohlcvs[add_tf] = pd.DataFrame(add_ohlcv, columns=["ts","open","high","low","close","vol"])
+                                        for col in ["open","high","low","close","vol"]:
+                                            ohlcvs[add_tf][col] = pd.to_numeric(ohlcvs[add_tf][col], errors="coerce")
+                                except:
+                                    continue
+                        
+                        # Add all available timeframes to context
+                        for tf_key in additional_tfs:
+                            context[f"df_{tf_key}"] = ohlcvs.get(tf_key)
+                        
+                        # Generate original signal
+                        sig = generate_signal(df, symbol, context)
+                        
+                        # APPLY ALL FILTERS - MARKET REGIME FILTER FIRST (MANDATORY FOR ALL)
+                        if sig:
+                            # LAYER 1: MARKET REGIME FILTER (APPLIED TO ALL SIGNALS)
+                            if not check_market_regime(sig['symbol'], sig['side'], context):
+                                log.info(f"⏸️ Blocked by Market Regime: {sig['side']} signal in wrong regime")
+                                continue
+                                
+                            filters_passed = True
+                            tier = "STANDARD"
                             
-                            if is_elite:
-                                tier = "ELITE"
-                                sig['score'] += 10  # Elite bonus
-                                elite_signals += 1
+                            # ORIGINAL WINNER FILTERS
+                            # 1. BTC Direction Filter
+                            if not is_trade_allowed(sig['side'], btc_direction):
+                                log.info(f"⏸️ Blocked: {sig['side']} vs BTC {btc_direction}")
+                                filters_passed = False
+                                
+                            # 2. Higher TF Alignment
+                            elif not check_higher_tf_alignment(sig, context.get("df_15m")):
+                                log.info(f"⏸️ Blocked: Higher TF misalignment")
+                                filters_passed = False
+                                
+                            # 3. Momentum Confirmation (skip for 1m/3m)
+                            elif tf not in ["1m", "3m"] and not check_momentum_confirmation(df, sig['side']):
+                                log.info(f"⏸️ Blocked: No momentum confirmation")
+                                filters_passed = False
+                                
+                            # 4. Zone Quality
+                            elif not check_entry_zone_quality(df, sig['side']):
+                                log.info(f"⏸️ Blocked: Poor entry zone")
+                                filters_passed = False
+                                
+                            # 5. Market Condition
+                            elif detect_choppy_market(df):
+                                log.info(f"⏸️ Blocked: Choppy market")
+                                filters_passed = False
                             
-                            # Add filter bonuses to reason list
-                            sig['reason_list'].extend([
-                                f"BTC {btc_direction} ✓", "Higher TF ✓", 
-                                "Zone ✓", "Trending ✓", "Regime ✓"
-                            ])
-                            if tf not in ["1m", "3m"]:
-                                sig['reason_list'].append("Momentum ✓")
-                            
-                            if is_elite:
-                                sig['reason_list'].extend(elite_details)
-                            
-                            # Format message based on tier
-                            if tier == "ELITE":
-                                icon = "🎯"
-                                size_note = " (3X SIZE)"
-                                tier_note = "ELITE - Score: 14+"
-                            else:
-                                icon = "📊"  
-                                size_note = ""
-                                tier_note = f"STANDARD - Score: {sig['score']}"
-                            
-                            message = (
-                                f"{icon} {sig['symbol']} ({tf}) {sig['side']}{size_note}\n"
-                                f"Entry: {sig['entry']}\n"
-                                f"SL: {sig['sl']}\n"
-                                f"TP1: {sig['tp1']} TP2: {sig['tp2']} TP3: {sig['tp3']}\n"
-                                f"{tier_note}\n"
-                                f"Breakdown: {', '.join(sig['reason_list'])}"
-                            )
-                            
-                            await tg(message)
-                            await log_signal(sig, tier)
-                            last_signal_time[key]=time.time()
-                            signals_found += 1
+                            if filters_passed:
+                                # LAYER 2: ELITE FILTERS CLASSIFICATION
+                                is_elite, elite_details = check_elite_filters(sig, df, context)
+                                
+                                if is_elite:
+                                    tier = "ELITE"
+                                    sig['score'] += 10  # Elite bonus
+                                    elite_signals += 1
+                                
+                                # Add filter bonuses to reason list
+                                sig['reason_list'].extend([
+                                    f"BTC {btc_direction} ✓", "Higher TF ✓", 
+                                    "Zone ✓", "Trending ✓", "Regime ✓"
+                                ])
+                                if tf not in ["1m", "3m"]:
+                                    sig['reason_list'].append("Momentum ✓")
+                                
+                                if is_elite:
+                                    sig['reason_list'].extend(elite_details)
+                                
+                                # Format message based on tier
+                                if tier == "ELITE":
+                                    icon = "🎯"
+                                    size_note = " (3X SIZE)"
+                                    tier_note = "ELITE - Score: 14+"
+                                else:
+                                    icon = "📊"  
+                                    size_note = ""
+                                    tier_note = f"STANDARD - Score: {sig['score']}"
+                                
+                                message = (
+                                    f"{icon} {sig['symbol']} ({tf}) {sig['side']}{size_note}\n"
+                                    f"Entry: {sig['entry']:.6f}\n"
+                                    f"SL: {sig['sl']:.6f}\n"
+                                    f"TP1: {sig['tp1']:.6f} TP2: {sig['tp2']:.6f} TP3: {sig['tp3']:.6f}\n"
+                                    f"{tier_note}\n"
+                                    f"Breakdown: {', '.join(sig['reason_list'])}"
+                                )
+                                
+                                await tg(message)
+                                await log_signal(sig, tier)
+                                last_signal_time[key] = time.time()
+                                signals_found += 1
+                    
+                    except Exception as e:
+                        log.error(f"Error processing {symbol} {tf}: {e}")
+                        continue
                             
             log.info(f"📊 Scan complete: {signals_found} signals ({elite_signals} elite)")
                         
-        except Exception as e: log.exception("scan error: %s", e)
-        elapsed=time.time()-t0
-        await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
+        except Exception as e: 
+            log.exception("scan error: %s", e)
+        elapsed = time.time() - t0
+        await asyncio.sleep(max(1, SCAN_INTERVAL - elapsed))
 
 # ---------------- EXACT ORIGINAL FASTAPI ----------------
 app = FastAPI()
 @app.post("/webhook")
 async def webhook(request: Request):
     token = request.headers.get("X-Auth","")
-    if token!=WEBHOOK_SECRET: raise HTTPException(403,"Invalid secret")
+    if token != WEBHOOK_SECRET: 
+        raise HTTPException(403, "Invalid secret")
     data = await request.json()
     log.info("Webhook received: %s", data)
-    return {"ok":True}
+    return {"ok": True}
 
 # ---------------- EXACT ORIGINAL MAIN ----------------
 async def main():
     await init_db()
-    exchange = ccxt.okx({"enableRateLimit": True})
+    exchange = ccxt.okx({
+        "enableRateLimit": True,
+        "options": {
+            "defaultType": "spot"
+        }
+    })
     
     # Startup message
     startup_msg = (
@@ -673,11 +710,11 @@ async def main():
     
     await asyncio.gather(scan_loop(exchange), monitor_signals(exchange))
 
-if __name__=="__main__":
+if __name__ == "__main__":
     import argparse
-    p=argparse.ArgumentParser()
+    p = argparse.ArgumentParser()
     p.add_argument("--http", action="store_true")
-    args=p.parse_args()
+    args = p.parse_args()
     if args.http:
         uvicorn.run(app, host="0.0.0.0", port=9000)
     else:
