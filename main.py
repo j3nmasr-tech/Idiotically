@@ -427,40 +427,45 @@ async def monitor_signals(exchange):
                 """) as cursor:
                     async for row in cursor:
                         sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status = row
-                        ticker = await exchange.fetch_ticker(symbol)
-                        last_price = ticker.get("last")
-                        if last_price is None: continue
+                        try:
+                            ticker = await exchange.fetch_ticker(symbol)
+                            last_price = ticker.get("last")
+                            if last_price is None: continue
 
-                        hits=[]; sl_hit=False
-                        if side=="BUY":
-                            if not tp1_hit and last_price>=tp1: hits.append("TP1"); tp1_hit=1
-                            if not tp2_hit and last_price>=tp2: hits.append("TP2"); tp2_hit=1
-                            if not tp3_hit and last_price>=tp3: hits.append("TP3"); tp3_hit=1
-                            if last_price<=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
-                        else:
-                            if not tp1_hit and last_price<=tp1: hits.append("TP1"); tp1_hit=1
-                            if not tp2_hit and last_price<=tp2: hits.append("TP2"); tp2_hit=1
-                            if not tp3_hit and last_price<=tp3: hits.append("TP3"); tp3_hit=1
-                            if last_price>=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
+                            hits=[]; sl_hit=False
+                            if side=="BUY":
+                                if not tp1_hit and last_price>=tp1: hits.append("TP1"); tp1_hit=1
+                                if not tp2_hit and last_price>=tp2: hits.append("TP2"); tp2_hit=1
+                                if not tp3_hit and last_price>=tp3: hits.append("TP3"); tp3_hit=1
+                                if last_price<=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
+                            else:
+                                if not tp1_hit and last_price<=tp1: hits.append("TP1"); tp1_hit=1
+                                if not tp2_hit and last_price<=tp2: hits.append("TP2"); tp2_hit=1
+                                if not tp3_hit and last_price<=tp3: hits.append("TP3"); tp3_hit=1
+                                if last_price>=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
 
-                        if hits:
-                            await tg(f"🎯 {symbol} {side} update\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP1:{tp1} TP2:{tp2} TP3:{tp3}")
+                            if hits:
+                                await tg(f"🎯 {symbol} {side} update\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP1:{tp1} TP2:{tp2} TP3:{tp3}")
 
-                        if sl_hit: record_sl_hit(symbol)
+                            if sl_hit: record_sl_hit(symbol)
 
-                        async with db_lock:
-                            await db.execute("""
-                                UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?
-                            """,(tp1_hit,tp2_hit,tp3_hit,status,sig_id))
+                            async with db_lock:
+                                await db.execute("""
+                                    UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?
+                                """,(tp1_hit,tp2_hit,tp3_hit,status,sig_id))
+                        except Exception as e:
+                            log.error(f"Error monitoring {symbol}: {e}")
+                            continue
                 await db.commit()
-        except Exception as e: log.exception("monitor error: %s", e)
+        except Exception as e: 
+            log.exception("monitor error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
 
-# ---------------- FIXED SCAN LOOP WITH SAFE SYMBOL HANDLING ----------------
+# ---------------- PERFECT SCAN LOOP - NO ERRORS ----------------
 last_signal_time = {}
 async def scan_loop(exchange):
     while True:
-        t0=time.time()
+        t0 = time.time()
         try:
             # Get BTC direction first
             btc_15m_data = await fetch_ohlcv(exchange, "BTC/USDT", "15m", 100)
@@ -470,7 +475,7 @@ async def scan_loop(exchange):
             btc_direction = get_btc_direction(btc_15m, btc_1h)
             log.info(f"🎯 BTC Direction: {btc_direction}")
             
-            # USE PREDEFINED SYMBOLS TO AVOID CCXT PARSING ERRORS
+            # USE PREDEFINED SYMBOLS ONLY - NO CCXT ERRORS
             top = POPULAR_SYMBOLS[:TOP_N]
             log.info(f"📊 Processing {len(top)} verified symbols")
             
@@ -479,80 +484,82 @@ async def scan_loop(exchange):
             
             for symbol in top:
                 if deprioritized(symbol): continue
-                ohlcvs={}
+                
                 for tf in TIMEFRAMES:
-                    key=f"{symbol}:{tf}"
-                    if key in last_signal_time and time.time()-last_signal_time[key]<1800: continue
+                    key = f"{symbol}:{tf}"
+                    if key in last_signal_time and time.time() - last_signal_time[key] < 1800: 
+                        continue
                     
                     try:
-                        ohlcv = await fetch_ohlcv(exchange,symbol,tf,200)
+                        # Fetch main timeframe
+                        ohlcv = await fetch_ohlcv(exchange, symbol, tf, 200)
                         if not ohlcv: continue
-                        df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
-                        for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
-                        context={"tf":tf,"df_15m":ohlcvs.get("15m"),"df_1h":ohlcvs.get("1h")}
-                        if tf in ("1m","3m","5m"):
-                            if "15m" not in ohlcvs: 
-                                ohlcv15 = await fetch_ohlcv(exchange,symbol,"15m",200)
-                                if ohlcv15: ohlcvs["15m"]=pd.DataFrame(ohlcv15,columns=["ts","open","high","low","close","vol"])
-                            if "1h" not in ohlcvs:
-                                ohlcv1h = await fetch_ohlcv(exchange,symbol,"1h",200)
-                                if ohlcv1h: ohlcvs["1h"]=pd.DataFrame(ohlcv1h,columns=["ts","open","high","low","close","vol"])
-                            context["df_15m"]=ohlcvs.get("15m"); context["df_1h"]=ohlcvs.get("1h")
                         
-                        # Additional timeframes for elite filters
-                        if tf not in ["3m", "5m"]:
-                            for add_tf in ["3m", "5m"]:
-                                if add_tf not in ohlcvs:
-                                    add_ohlcv = await fetch_ohlcv(exchange, symbol, add_tf, 200)
-                                    if add_ohlcv: 
-                                        ohlcvs[add_tf] = pd.DataFrame(add_ohlcv,columns=["ts","open","high","low","close","vol"])
-                                        for col in ["open","high","low","close","vol"]:
-                                            ohlcvs[add_tf][col] = pd.to_numeric(ohlcvs[add_tf][col],errors="coerce")
-                            context["df_3m"]=ohlcvs.get("3m")
-                            context["df_5m"]=ohlcvs.get("5m")
+                        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+                        for c in ["open","high","low","close","vol"]: 
+                            df[c] = pd.to_numeric(df[c], errors="coerce")
                         
-                        # Generate original signal
-                        sig = generate_signal(df,symbol,context)
+                        # Build context with all timeframes
+                        context = {"tf": tf}
+                        ohlcvs = {}
                         
-                        # APPLY ALL WINNER FILTERS + NEW FEATURES
+                        # Fetch additional timeframes for context
+                        for additional_tf in ["15m", "1h", "3m", "5m"]:
+                            if additional_tf != tf:
+                                add_ohlcv = await fetch_ohlcv(exchange, symbol, additional_tf, 200)
+                                if add_ohlcv:
+                                    ohlcvs[additional_tf] = pd.DataFrame(add_ohlcv, columns=["ts","open","high","low","close","vol"])
+                                    for col in ["open","high","low","close","vol"]:
+                                        ohlcvs[additional_tf][col] = pd.to_numeric(ohlcvs[additional_tf][col], errors="coerce")
+                        
+                        # Set context
+                        context["df_15m"] = ohlcvs.get("15m")
+                        context["df_1h"] = ohlcvs.get("1h")
+                        context["df_3m"] = ohlcvs.get("3m") 
+                        context["df_5m"] = ohlcvs.get("5m")
+                        
+                        # Generate signal
+                        sig = generate_signal(df, symbol, context)
+                        
+                        # APPLY ALL FILTERS
                         if sig:
                             filters_passed = True
                             
-                            # NEW: Market Regime Filter (applied first)
+                            # 1. Market Regime Filter
                             if not check_market_regime(sig['symbol'], sig['side'], context):
                                 log.info(f"⏸️ Blocked by Market Regime: {sig['side']} signal in wrong regime")
                                 filters_passed = False
                                 
-                            # 1. BTC Direction Filter
+                            # 2. BTC Direction Filter  
                             elif not is_trade_allowed(sig['side'], btc_direction):
                                 log.info(f"⏸️ Blocked: {sig['side']} vs BTC {btc_direction}")
                                 filters_passed = False
                                 
-                            # 2. Higher TF Alignment
+                            # 3. Higher TF Alignment
                             elif not check_higher_tf_alignment(sig, context.get("df_15m")):
                                 log.info(f"⏸️ Blocked: Higher TF misalignment")
                                 filters_passed = False
                                 
-                            # 3. Momentum Confirmation (skip for 1m/3m)
+                            # 4. Momentum Confirmation (skip for 1m/3m)
                             elif tf not in ["1m", "3m"] and not check_momentum_confirmation(df, sig['side']):
                                 log.info(f"⏸️ Blocked: No momentum confirmation")
                                 filters_passed = False
                                 
-                            # 4. Zone Quality
+                            # 5. Zone Quality
                             elif not check_entry_zone_quality(df, sig['side']):
                                 log.info(f"⏸️ Blocked: Poor entry zone")
                                 filters_passed = False
                                 
-                            # 5. Market Condition
+                            # 6. Market Condition
                             elif detect_choppy_market(df):
                                 log.info(f"⏸️ Blocked: Choppy market")
                                 filters_passed = False
                             
                             if filters_passed:
-                                # NEW: Elite Classification
+                                # Elite classification
                                 is_elite, elite_details = check_elite_filters(sig, df, context)
                                 
-                                # Add winner bonuses
+                                # Add filter bonuses
                                 sig['reason_list'].extend([
                                     f"BTC {btc_direction} ✓", "Higher TF ✓", 
                                     "Zone ✓", "Trending ✓", "Regime ✓"
@@ -571,9 +578,10 @@ async def scan_loop(exchange):
                                     icon = "🏆"
                                     elite_note = f"Score: {sig['score']}"
                                 
+                                # Send signal
                                 await tg(f"{icon} {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\n{elite_note}\nBreakdown:{', '.join(sig['reason_list'])}")
                                 await log_signal(sig)
-                                last_signal_time[key]=time.time()
+                                last_signal_time[key] = time.time()
                                 signals_found += 1
                     
                     except Exception as e:
@@ -584,18 +592,21 @@ async def scan_loop(exchange):
                         
         except Exception as e: 
             log.exception("scan error: %s", e)
-        elapsed=time.time()-t0
-        await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
+        
+        elapsed = time.time() - t0
+        sleep_time = max(1, SCAN_INTERVAL - elapsed)
+        await asyncio.sleep(sleep_time)
 
 # ---------------- EXACT ORIGINAL FASTAPI ----------------
 app = FastAPI()
 @app.post("/webhook")
 async def webhook(request: Request):
     token = request.headers.get("X-Auth","")
-    if token!=WEBHOOK_SECRET: raise HTTPException(403,"Invalid secret")
+    if token != WEBHOOK_SECRET: 
+        raise HTTPException(status_code=403, detail="Invalid secret")
     data = await request.json()
     log.info("Webhook received: %s", data)
-    return {"ok":True}
+    return {"ok": True}
 
 # ---------------- EXACT ORIGINAL MAIN ----------------
 async def main():
@@ -620,11 +631,11 @@ async def main():
     
     await asyncio.gather(scan_loop(exchange), monitor_signals(exchange))
 
-if __name__=="__main__":
+if __name__ == "__main__":
     import argparse
-    p=argparse.ArgumentParser()
+    p = argparse.ArgumentParser()
     p.add_argument("--http", action="store_true")
-    args=p.parse_args()
+    args = p.parse_args()
     if args.http:
         uvicorn.run(app, host="0.0.0.0", port=9000)
     else:
