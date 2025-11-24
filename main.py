@@ -105,15 +105,17 @@ class RomeOptTPSL:
         recent_swing_high = max(swing_highs[-3:]) if swing_highs else entry * 1.01
         tp1 = recent_swing_high
         
-        # TAKE PROFIT 2: Equal highs sweep level (where liquidity is)
+        # TAKE PROFIT 2: Equal highs sweep level (where liquidity is) - FIXED!
         equal_highs = RomeOptTPSL._find_equal_highs(df.tail(30))
         if equal_highs:
-            tp2 = max(equal_highs[-2:])
+            # 🛠️ FIX: Ensure TP2 is HIGHER than TP1
+            potential_tp2 = max(equal_highs[-2:])
+            tp2 = max(potential_tp2, tp1 * 1.005)  # Ensure at least 0.5% above TP1
         else:
-            tp2 = entry + (atr * 2.0)
+            tp2 = max(entry + (atr * 2.0), tp1 * 1.005)  # Ensure progression
             
-        # TAKE PROFIT 3: Extended target (major resistance)
-        tp3 = tp2 + (atr * 1.5)
+        # TAKE PROFIT 3: Extended target (major resistance) - FIXED!
+        tp3 = max(tp2 + (atr * 1.5), tp2 * 1.005)  # Ensure progression
         
         return sl, tp1, tp2, tp3
 
@@ -130,15 +132,17 @@ class RomeOptTPSL:
         recent_swing_low = min(swing_lows[-3:]) if swing_lows else entry * 0.99
         tp1 = recent_swing_low
         
-        # TAKE PROFIT 2: Equal lows sweep level (where liquidity is)
+        # TAKE PROFIT 2: Equal lows sweep level (where liquidity is) - FIXED!
         equal_lows = RomeOptTPSL._find_equal_lows(df.tail(30))
         if equal_lows:
-            tp2 = min(equal_lows[-2:])
+            # 🛠️ FIX: Ensure TP2 is LOWER than TP1
+            potential_tp2 = min(equal_lows[-2:])
+            tp2 = min(potential_tp2, tp1 * 0.995)  # Ensure at least 0.5% below TP1
         else:
-            tp2 = entry - (atr * 2.0)
+            tp2 = min(entry - (atr * 2.0), tp1 * 0.995)  # Ensure progression
             
-        # TAKE PROFIT 3: Extended target (major support)
-        tp3 = tp2 - (atr * 1.5)
+        # TAKE PROFIT 3: Extended target (major support) - FIXED!
+        tp3 = min(tp2 - (atr * 1.5), tp2 * 0.995)  # Ensure progression
         
         return sl, tp1, tp2, tp3
 
