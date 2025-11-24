@@ -70,106 +70,161 @@ class ScannerConfig:
 # ==================== ROMEOPT TP/SL SYSTEM ====================
 
 class RomeOptTPSL:
-    """UNIFIED SMART PROFIT SYSTEM FOR ALL SIGNALS"""
+    """UNIFIED SMART PROFIT SYSTEM FOR ALL SIGNALS - FIXED"""
     
     @staticmethod
     def calculate_rome_tp_sl(df: pd.DataFrame, symbol: str, side: str, entry: float, context: Dict) -> Tuple[float, float, float, float]:
-        """UNIFIED SMART TP/SL: Take profits at NEXT liquidity levels, stop at story break"""
+        """UNIFIED SMART TP/SL: FIXED - WIDER STOPS"""
         try:
             current_price = entry
-            atr_val = RomeOptTPSL.rome_atr(df, 14) if df is not None and len(df) >= 14 else current_price * 0.01
+            atr_val = RomeOptTPSL.rome_atr(df, 14) if df is not None and len(df) >= 14 else current_price * 0.015
+            
+            # 🛡️ MINIMUM ATR PROTECTION - PREVENTS TINY STOPS
+            min_atr = current_price * 0.008  # Minimum 0.8% ATR
+            atr_val = max(atr_val, min_atr)
             
             if side == "BUY":
-                return RomeOptTPSL._calculate_bullish_targets(df, current_price, atr_val)
+                return RomeOptTPSL._calculate_bullish_targets_fixed(df, current_price, atr_val)
             else:
-                return RomeOptTPSL._calculate_bearish_targets(df, current_price, atr_val)
+                return RomeOptTPSL._calculate_bearish_targets_fixed(df, current_price, atr_val)
                 
         except Exception as e:
             logging.error(f"Rome TP/SL error: {e}")
-            # Fallback to conservative values
+            # 🛡️ MORE CONSERVATIVE FALLBACK
             if side == "BUY":
-                return entry * 0.995, entry * 1.008, entry * 1.016, entry * 1.024
+                return entry * 0.985, entry * 1.012, entry * 1.024, entry * 1.036
             else:
-                return entry * 1.005, entry * 0.992, entry * 0.984, entry * 0.976
+                return entry * 1.015, entry * 0.988, entry * 0.976, entry * 0.964
 
     @staticmethod
-    def _calculate_bullish_targets(df: pd.DataFrame, entry: float, atr: float) -> Tuple[float, float, float, float]:
-        """BULLISH: TP at next resistance levels, SL below recent swing low"""
-        # STOP LOSS: Below the recent swing low (where bullish story breaks)
-        swing_lows = RomeOptTPSL._find_swing_lows(df.tail(20))
-        recent_swing_low = min(swing_lows[-3:]) if swing_lows else entry * 0.995
-        sl = recent_swing_low - (atr * 0.2)
-        
-        # TAKE PROFIT 1: First resistance level (recent swing high)
-        swing_highs = RomeOptTPSL._find_swing_highs(df.tail(20))
-        recent_swing_high = max(swing_highs[-3:]) if swing_highs else entry * 1.01
+    def _calculate_bullish_targets_fixed(df: pd.DataFrame, entry: float, atr: float) -> Tuple[float, float, float, float]:
+        """BULLISH: FIXED - WIDER STOPS"""
+        # 🛡️ IMPROVED SWING LOW DETECTION
+        swing_lows = RomeOptTPSL._find_significant_swing_lows(df.tail(50))
+        if not swing_lows:
+            # Fallback: use recent low with buffer
+            recent_low = df["low"].tail(15).min()
+            sl = recent_low - (atr * 0.8)  # 🛡️ WIDER: 0.8 ATR below
+        else:
+            # Use the most recent significant swing low
+            recent_swing_low = min(swing_lows[-2:])
+            sl = recent_swing_low - (atr * 0.5)  # 🛡️ WIDER: 0.5 ATR below swing
+            
+        # 🛡️ ENSURE MINIMUM STOP DISTANCE
+        min_stop_distance = entry * 0.008  # At least 0.8% stop distance
+        current_stop_distance = entry - sl
+        if current_stop_distance < min_stop_distance:
+            sl = entry - min_stop_distance
+
+        # TAKE PROFIT TARGETS
+        swing_highs = RomeOptTPSL._find_significant_swing_highs(df.tail(30))
+        recent_swing_high = max(swing_highs[-3:]) if swing_highs else entry * 1.015
         tp1 = recent_swing_high
         
-        # TAKE PROFIT 2: Equal highs sweep level (where liquidity is) - FIXED!
         equal_highs = RomeOptTPSL._find_equal_highs(df.tail(30))
         if equal_highs:
-            # 🛠️ FIX: Ensure TP2 is HIGHER than TP1
             potential_tp2 = max(equal_highs[-2:])
-            tp2 = max(potential_tp2, tp1 * 1.005)  # Ensure at least 0.5% above TP1
+            tp2 = max(potential_tp2, tp1 * 1.008)
         else:
-            tp2 = max(entry + (atr * 2.0), tp1 * 1.005)  # Ensure progression
+            tp2 = max(entry + (atr * 2.2), tp1 * 1.008)
             
-        # TAKE PROFIT 3: Extended target (major resistance) - FIXED!
-        tp3 = max(tp2 + (atr * 1.5), tp2 * 1.005)  # Ensure progression
+        tp3 = max(tp2 + (atr * 1.8), tp2 * 1.006)
         
         return sl, tp1, tp2, tp3
 
     @staticmethod
-    def _calculate_bearish_targets(df: pd.DataFrame, entry: float, atr: float) -> Tuple[float, float, float, float]:
-        """BEARISH: TP at next support levels, SL above recent swing high"""
-        # STOP LOSS: Above the recent swing high (where bearish story breaks)
-        swing_highs = RomeOptTPSL._find_swing_highs(df.tail(20))
-        recent_swing_high = max(swing_highs[-3:]) if swing_highs else entry * 1.005
-        sl = recent_swing_high + (atr * 0.2)
-        
-        # TAKE PROFIT 1: First support level (recent swing low)
-        swing_lows = RomeOptTPSL._find_swing_lows(df.tail(20))
-        recent_swing_low = min(swing_lows[-3:]) if swing_lows else entry * 0.99
+    def _calculate_bearish_targets_fixed(df: pd.DataFrame, entry: float, atr: float) -> Tuple[float, float, float, float]:
+        """BEARISH: FIXED - WIDER STOPS"""
+        swing_highs = RomeOptTPSL._find_significant_swing_highs(df.tail(50))
+        if not swing_highs:
+            recent_high = df["high"].tail(15).max()
+            sl = recent_high + (atr * 0.8)  # 🛡️ WIDER: 0.8 ATR above
+        else:
+            recent_swing_high = max(swing_highs[-2:])
+            sl = recent_swing_high + (atr * 0.5)  # 🛡️ WIDER: 0.5 ATR above swing
+            
+        # 🛡️ ENSURE MINIMUM STOP DISTANCE
+        min_stop_distance = entry * 0.008
+        current_stop_distance = sl - entry
+        if current_stop_distance < min_stop_distance:
+            sl = entry + min_stop_distance
+
+        swing_lows = RomeOptTPSL._find_significant_swing_lows(df.tail(30))
+        recent_swing_low = min(swing_lows[-3:]) if swing_lows else entry * 0.985
         tp1 = recent_swing_low
         
-        # TAKE PROFIT 2: Equal lows sweep level (where liquidity is) - FIXED!
         equal_lows = RomeOptTPSL._find_equal_lows(df.tail(30))
         if equal_lows:
-            # 🛠️ FIX: Ensure TP2 is LOWER than TP1
             potential_tp2 = min(equal_lows[-2:])
-            tp2 = min(potential_tp2, tp1 * 0.995)  # Ensure at least 0.5% below TP1
+            tp2 = min(potential_tp2, tp1 * 0.992)
         else:
-            tp2 = min(entry - (atr * 2.0), tp1 * 0.995)  # Ensure progression
+            tp2 = min(entry - (atr * 2.2), tp1 * 0.992)
             
-        # TAKE PROFIT 3: Extended target (major support) - FIXED!
-        tp3 = min(tp2 - (atr * 1.5), tp2 * 0.995)  # Ensure progression
+        tp3 = min(tp2 - (atr * 1.8), tp2 * 0.994)
         
         return sl, tp1, tp2, tp3
+
+    # 🆕 NEW: SIGNIFICANT SWING DETECTION - FILTERS OUT NOISE
+    @staticmethod
+    def _find_significant_swing_lows(df: pd.DataFrame, lookback: int = 5, min_change: float = 0.003) -> List[float]:
+        """Find ONLY significant swing lows (filters noise)"""
+        if len(df) < lookback * 2 + 1:
+            return []
+            
+        significant_lows = []
+        for i in range(lookback, len(df) - lookback):
+            current_low = df["low"].iloc[i]
+            
+            # Check if it's a local minimum
+            is_local_min = (current_low == df["low"].iloc[i-lookback:i+lookback+1].min())
+            
+            if is_local_min:
+                # Check if this swing is significant (not just noise)
+                left_avg = df["low"].iloc[i-lookback:i].mean()
+                right_avg = df["low"].iloc[i+1:i+lookback+1].mean()
+                avg_around = (left_avg + right_avg) / 2
+                
+                price_change = abs(avg_around - current_low) / current_low
+                if price_change >= min_change:  # At least 0.3% change
+                    significant_lows.append(current_low)
+                    
+        return significant_lows if significant_lows else [df["low"].min()]
+
+    @staticmethod
+    def _find_significant_swing_highs(df: pd.DataFrame, lookback: int = 5, min_change: float = 0.003) -> List[float]:
+        """Find ONLY significant swing highs (filters noise)"""
+        if len(df) < lookback * 2 + 1:
+            return []
+            
+        significant_highs = []
+        for i in range(lookback, len(df) - lookback):
+            current_high = df["high"].iloc[i]
+            
+            is_local_max = (current_high == df["high"].iloc[i-lookback:i+lookback+1].max())
+            
+            if is_local_max:
+                left_avg = df["high"].iloc[i-lookback:i].mean()
+                right_avg = df["high"].iloc[i+1:i+lookback+1].mean()
+                avg_around = (left_avg + right_avg) / 2
+                
+                price_change = abs(avg_around - current_high) / current_high
+                if price_change >= min_change:
+                    significant_highs.append(current_high)
+                    
+        return significant_highs if significant_highs else [df["high"].max()]
+
+    # 🔄 UPDATE the existing swing methods to use significant ones
+    @staticmethod
+    def _find_swing_lows(df: pd.DataFrame, lookback: int = 3) -> List[float]:
+        """Use significant swing detection"""
+        return RomeOptTPSL._find_significant_swing_lows(df, lookback)
 
     @staticmethod
     def _find_swing_highs(df: pd.DataFrame, lookback: int = 3) -> List[float]:
-        """Find swing highs - price peaks"""
-        if len(df) < lookback * 2 + 1:
-            return [df["high"].max()] if len(df) > 0 else []
-            
-        highs = []
-        for i in range(lookback, len(df) - lookback):
-            if df["high"].iloc[i] == df["high"].iloc[i-lookback:i+lookback+1].max():
-                highs.append(df["high"].iloc[i])
-        return highs if highs else [df["high"].max()]
+        """Use significant swing detection"""
+        return RomeOptTPSL._find_significant_swing_highs(df, lookback)
 
-    @staticmethod
-    def _find_swing_lows(df: pd.DataFrame, lookback: int = 3) -> List[float]:
-        """Find swing lows - price valleys"""
-        if len(df) < lookback * 2 + 1:
-            return [df["low"].min()] if len(df) > 0 else []
-            
-        lows = []
-        for i in range(lookback, len(df) - lookback):
-            if df["low"].iloc[i] == df["low"].iloc[i-lookback:i+lookback+1].min():
-                lows.append(df["low"].iloc[i])
-        return lows if lows else [df["low"].min()]
-
+    # Keep your existing _find_equal_highs, _find_equal_lows, and rome_atr methods unchanged
     @staticmethod
     def _find_equal_highs(df: pd.DataFrame) -> List[float]:
         """Find recent equal highs (liquidity levels)"""
