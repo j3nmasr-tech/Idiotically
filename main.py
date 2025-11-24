@@ -868,6 +868,7 @@ class OldSimpleTPSL:
 @dataclass
 class TradingSignal:
     """Enhanced signal with OLD scoring + new tracking"""
+    # Fields WITHOUT default values (required) - MUST COME FIRST
     symbol: str
     side: SignalSide
     entry_price: float
@@ -877,22 +878,16 @@ class TradingSignal:
     take_profit_3: float
     timestamp: datetime.datetime
     timeframe: str
-    
-    # OLD scoring system
-    base_score: int  # OLD SMC score (4-7)
-    final_score: int  # OLD base_score + 5 bonus
+    base_score: int
+    final_score: int
     filters_passed: List[str]
     rejection_reasons: List[str]
-    
-    # OLD winner filters tracking
     winner_filters_passed: List[str]
     winner_filters_failed: List[str]
-    
-    # Rome sequencing tracking
-    rome_sequence: bool = False
-    
-    # Metadata
     signal_id: str
+    
+    # Fields WITH default values (optional) - MUST COME AFTER all required fields
+    rome_sequence: bool = False
     version: str = "3.1-ROMEOPT"
 
 # ==================== OLD-STYLE FILTER APPLICATION ====================
@@ -1393,8 +1388,8 @@ class UltimateHybridScanner:
                 rejection_reasons=filter_reasons,
                 winner_filters_passed=winner_filters_passed,
                 winner_filters_failed=winner_filters_failed,
-                rome_sequence=rome_sequence,
-                signal_id=f"{old_signal['symbol']}_{old_signal['timeframe']}_{int(time.time())}"
+                signal_id=f"{old_signal['symbol']}_{old_signal['timeframe']}_{int(time.time())}",
+                rome_sequence=rome_sequence
             )
             
             rome_tag = " 🏛️" if rome_sequence else ""
