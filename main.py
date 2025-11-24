@@ -67,6 +67,152 @@ class ScannerConfig:
     # OLD SCORING
     WINNER_BONUS: int = 5  # OLD: Fixed +5 bonus
 
+# ==================== ROMEOPT TP/SL SYSTEM ====================
+
+class RomeOptTPSL:
+    """SMART PROFIT SYSTEM THAT MATCHES ROMEOPT SEQUENCING"""
+    
+    @staticmethod
+    def calculate_rome_tp_sl(df: pd.DataFrame, symbol: str, side: str, entry: float, context: Dict) -> Tuple[float, float, float, float]:
+        """ROMEOPT-STYLE: Take profits at NEXT liquidity levels, stop at story break"""
+        try:
+            current_price = entry
+            atr_val = RomeOptTPSL.rome_atr(df, 14) if df is not None and len(df) >= 14 else current_price * 0.01
+            
+            if side == "BUY":
+                return RomeOptTPSL._calculate_bullish_targets(df, current_price, atr_val)
+            else:
+                return RomeOptTPSL._calculate_bearish_targets(df, current_price, atr_val)
+                
+        except Exception as e:
+            logging.error(f"Rome TP/SL error: {e}")
+            # Fallback to conservative values
+            if side == "BUY":
+                return entry * 0.995, entry * 1.008, entry * 1.016, entry * 1.024
+            else:
+                return entry * 1.005, entry * 0.992, entry * 0.984, entry * 0.976
+
+    @staticmethod
+    def _calculate_bullish_targets(df: pd.DataFrame, entry: float, atr: float) -> Tuple[float, float, float, float]:
+        """BULLISH: TP at next resistance levels, SL below recent swing low"""
+        # STOP LOSS: Below the recent swing low (where bullish story breaks)
+        swing_lows = RomeOptTPSL._find_swing_lows(df.tail(20))
+        recent_swing_low = min(swing_lows[-3:]) if swing_lows else entry * 0.995
+        sl = recent_swing_low - (atr * 0.2)  # Just below swing low
+        
+        # TAKE PROFIT 1: First resistance level (recent swing high)
+        swing_highs = RomeOptTPSL._find_swing_highs(df.tail(20))
+        recent_swing_high = max(swing_highs[-3:]) if swing_highs else entry * 1.01
+        tp1 = recent_swing_high
+        
+        # TAKE PROFIT 2: Equal highs sweep level (where liquidity is)
+        equal_highs = RomeOptTPSL._find_equal_highs(df.tail(30))
+        if equal_highs:
+            tp2 = max(equal_highs[-2:])
+        else:
+            tp2 = entry + (atr * 2.0)  # 2 ATR if no clear level
+            
+        # TAKE PROFIT 3: Extended target (major resistance)
+        tp3 = tp2 + (atr * 1.5)  # Beyond liquidity level
+        
+        return sl, tp1, tp2, tp3
+
+    @staticmethod
+    def _calculate_bearish_targets(df: pd.DataFrame, entry: float, atr: float) -> Tuple[float, float, float, float]:
+        """BEARISH: TP at next support levels, SL above recent swing high"""
+        # STOP LOSS: Above the recent swing high (where bearish story breaks)
+        swing_highs = RomeOptTPSL._find_swing_highs(df.tail(20))
+        recent_swing_high = max(swing_highs[-3:]) if swing_highs else entry * 1.005
+        sl = recent_swing_high + (atr * 0.2)  # Just above swing high
+        
+        # TAKE PROFIT 1: First support level (recent swing low)
+        swing_lows = RomeOptTPSL._find_swing_lows(df.tail(20))
+        recent_swing_low = min(swing_lows[-3:]) if swing_lows else entry * 0.99
+        tp1 = recent_swing_low
+        
+        # TAKE PROFIT 2: Equal lows sweep level (where liquidity is)
+        equal_lows = RomeOptTPSL._find_equal_lows(df.tail(30))
+        if equal_lows:
+            tp2 = min(equal_lows[-2:])
+        else:
+            tp2 = entry - (atr * 2.0)  # 2 ATR if no clear level
+            
+        # TAKE PROFIT 3: Extended target (major support)
+        tp3 = tp2 - (atr * 1.5)  # Beyond liquidity level
+        
+        return sl, tp1, tp2, tp3
+
+    @staticmethod
+    def _find_swing_highs(df: pd.DataFrame, lookback: int = 3) -> List[float]:
+        """Find swing highs - price peaks"""
+        if len(df) < lookback * 2 + 1:
+            return [df["high"].max()] if len(df) > 0 else []
+            
+        highs = []
+        for i in range(lookback, len(df) - lookback):
+            if df["high"].iloc[i] == df["high"].iloc[i-lookback:i+lookback+1].max():
+                highs.append(df["high"].iloc[i])
+        return highs if highs else [df["high"].max()]
+
+    @staticmethod
+    def _find_swing_lows(df: pd.DataFrame, lookback: int = 3) -> List[float]:
+        """Find swing lows - price valleys"""
+        if len(df) < lookback * 2 + 1:
+            return [df["low"].min()] if len(df) > 0 else []
+            
+        lows = []
+        for i in range(lookback, len(df) - lookback):
+            if df["low"].iloc[i] == df["low"].iloc[i-lookback:i+lookback+1].min():
+                lows.append(df["low"].iloc[i])
+        return lows if lows else [df["low"].min()]
+
+    @staticmethod
+    def _find_equal_highs(df: pd.DataFrame) -> List[float]:
+        """Find recent equal highs (liquidity levels)"""
+        if len(df) < 10:
+            return []
+            
+        # Look for similar high prices in recent history
+        recent_highs = df["high"].tail(10).values
+        equal_highs = []
+        
+        for i in range(len(recent_highs)):
+            for j in range(i+1, len(recent_highs)):
+                if abs(recent_highs[i] - recent_highs[j]) < np.mean(recent_highs) * 0.002:  # Within 0.2%
+                    equal_highs.append(max(recent_highs[i], recent_highs[j]))
+                    
+        return list(set(equal_highs))  # Remove duplicates
+
+    @staticmethod
+    def _find_equal_lows(df: pd.DataFrame) -> List[float]:
+        """Find recent equal lows (liquidity levels)"""
+        if len(df) < 10:
+            return []
+            
+        # Look for similar low prices in recent history
+        recent_lows = df["low"].tail(10).values
+        equal_lows = []
+        
+        for i in range(len(recent_lows)):
+            for j in range(i+1, len(recent_lows)):
+                if abs(recent_lows[i] - recent_lows[j]) < np.mean(recent_lows) * 0.002:  # Within 0.2%
+                    equal_lows.append(min(recent_lows[i], recent_lows[j]))
+                    
+        return list(set(equal_lows))  # Remove duplicates
+
+    @staticmethod
+    def rome_atr(df: pd.DataFrame, period: int = 14) -> float:
+        """RomeOPT ATR calculation"""
+        if df is None or len(df) < period:
+            return 0.0
+            
+        high, low, close = df["high"], df["low"], df["close"]
+        tr1 = high - low
+        tr2 = (high - close.shift(1)).abs()
+        tr3 = (low - close.shift(1)).abs()
+        true_range = pd.DataFrame({'tr1': tr1, 'tr2': tr2, 'tr3': tr3}).max(axis=1)
+        return true_range.rolling(period).mean().iloc[-1]
+
 # ==================== ROMEOPT INSTITUTIONAL SEQUENCING ====================
 
 class RomeSMCAnalyzer:
@@ -133,7 +279,7 @@ class RomeSMCAnalyzer:
             
             # ✅ ALL ROME CONDITIONS MET - GENERATE SIGNAL
             self.sequence_complete = True
-            return self._format_rome_signal(momentum_result, symbol, context)
+            return self._format_rome_signal(momentum_result, symbol, context, df)
             
         except Exception as e:
             logging.error(f"Rome sequencing error for {symbol}: {e}")
@@ -396,16 +542,16 @@ class RomeSMCAnalyzer:
             "direction": direction
         }
 
-    def _format_rome_signal(self, final_result: Dict, symbol: str, context: Dict) -> Dict:
+    def _format_rome_signal(self, final_result: Dict, symbol: str, context: Dict, df: pd.DataFrame) -> Dict:
         """Format valid Rome signal with OLD scoring"""
         direction = final_result["direction"]
         side = "BUY" if direction == "bullish" else "SELL"
         current_price = context.get('current_price', 0)
         tf = context.get('tf', '15m')
         
-        # Calculate OLD-style TP/SL
-        sl, tp1, tp2, tp3 = OldSimpleTPSL.calculate_old_tp_sl(
-            pd.DataFrame(), symbol, side, current_price, context
+        # NEW: Use RomeOPT TP/SL for Rome signals
+        sl, tp1, tp2, tp3 = RomeOptTPSL.calculate_rome_tp_sl(
+            df, symbol, side, current_price, context
         )
         
         # OLD scoring system (base + bonus)
@@ -1400,7 +1546,7 @@ class UltimateHybridScanner:
             return None
 
     async def _send_signal_notification(self, hybrid_signal: TradingSignal, old_signal: Dict):
-        """Send signal notification in OLD STYLE"""
+        """Send signal notification - FIXED TO SHOW ROMEOPT CORRECTLY"""
         try:
             rome_tag = "🏛️ ROMEOPT INSTITUTIONAL" if hybrid_signal.rome_sequence else "OLD-STYLE"
             rome_emoji = "🏛️" if hybrid_signal.rome_sequence else "🔹"
@@ -1425,8 +1571,14 @@ Winner Bonus: +{self.config.WINNER_BONUS}
 FINAL SCORE: {hybrid_signal.final_score}
 
 Filters: {', '.join(hybrid_signal.winner_filters_passed)}
-Signal Reasons: {', '.join(old_signal['reason_list'])}
 """
+            
+            # FIX: Show Rome reasons for Rome signals, old reasons for old signals
+            if hybrid_signal.rome_sequence:
+                message += f"Rome Sequence: {', '.join(hybrid_signal.filters_passed)}\n"
+            else:
+                message += f"Signal Reasons: {', '.join(old_signal['reason_list'])}\n"
+        
             await send_telegram_message(message)
         except Exception as e:
             logging.error(f"Send signal notification error: {e}")
