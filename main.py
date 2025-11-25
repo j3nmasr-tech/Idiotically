@@ -195,7 +195,7 @@ class SignalSide(Enum):
 class PureRomeConfig:
     # Core scanning settings
     SCAN_INTERVAL: int = 60
-    TOP_N_SYMBOLS: int = 60
+    TOP_N_SYMBOLS: int = 120
     MIN_VOLUME_USDT: float = 1000000
     MAX_SPREAD_PCT: float = 0.002
     
