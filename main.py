@@ -246,7 +246,7 @@ class PureRomeAnalyzer:
         self.rejection_reason = ""
         
     def generate_signal(self, df: pd.DataFrame, symbol: str, context=None) -> Optional[Dict]:
-        """PURE ROMEOPT 6-STEP INSTITUTIONAL SEQUENCE - RESTORED WORKING VERSION"""
+        """PURE ROMEOPT 6-STEP INSTITUTIONAL SEQUENCE - ONLY CURRENT SIGNALS"""
         if context is None:
             context = {}
             
@@ -257,35 +257,37 @@ class PureRomeAnalyzer:
             return None
 
         try:
-            # 🚨 RESTORED: Use context price directly like your working old code
-            # The context should already have the correct current_price from scan_symbol
-            current_price = context.get('current_price', 0)
+            # 🚨 CRITICAL: Get CURRENT price and timestamp
+            current_price = df["close"].iloc[-1]
+            current_timestamp = df.index[-1] if hasattr(df.index, 'iloc') else len(df) - 1
+            context['current_price'] = current_price
             
-            # 🚨 DEBUG: Verify the price at analysis start
-            logging.info(f"🔍 ROME ANALYSIS START: {symbol} | Context Price: {current_price} | DF Price: {df['close'].iloc[-1]}")
+            # 🚨 CHECK: Only analyze VERY RECENT patterns (last 1-2 candles)
+            # Reject any signal that's based on old data
+            max_lookback_candles = 3  # Only check last 3 candles for patterns
             
-            # 🔥 STEP 1: Liquidity Sweep Condition
-            sweep_result = self._check_liquidity_sweep(df)
+            # 🔥 STEP 1: Liquidity Sweep Condition - MUST BE RECENT
+            sweep_result = self._check_recent_liquidity_sweep(df, max_lookback_candles)
             if not sweep_result["valid"]:
                 self.rejection_reason = f"Step 1 failed: {sweep_result['reason']}"
                 return None
             self.current_step = 1
             
-            # 🔥 STEP 2: Displacement Condition  
-            displacement_result = self._check_displacement(df, sweep_result)
+            # 🔥 STEP 2: Displacement Condition - MUST BE RECENT  
+            displacement_result = self._check_recent_displacement(df, sweep_result, max_lookback_candles)
             if not displacement_result["valid"]:
                 self.rejection_reason = f"Step 2 failed: {displacement_result['reason']}"
                 return None
             self.current_step = 2
             
-            # 🔥 STEP 3: Retracement Into Zone
-            zone_result = self._check_retracement_zone(df, displacement_result, context)
+            # 🔥 STEP 3: Retracement Into Zone - MUST BE CURRENT
+            zone_result = self._check_current_retracement(df, displacement_result, context)
             if not zone_result["valid"]:
                 self.rejection_reason = f"Step 3 failed: {zone_result['reason']}"
                 return None
             self.current_step = 3
             
-            # 🔥 STEP 4: Premium/Discount Filter
+            # 🔥 STEP 4: Premium/Discount Filter - CURRENT PRICE
             equilibrium_result = self._check_premium_discount(df, zone_result, context)
             if not equilibrium_result["valid"]:
                 self.rejection_reason = f"Step 4 failed: {equilibrium_result['reason']}"
@@ -299,8 +301,8 @@ class PureRomeAnalyzer:
                 return None
             self.current_step = 5
             
-            # 🔥 STEP 6: Momentum & Volatility Confirmation
-            momentum_result = self._check_momentum_volatility(df, htf_result, context)
+            # 🔥 STEP 6: Momentum & Volatility Confirmation - CURRENT
+            momentum_result = self._check_current_momentum(df, htf_result, context)
             if not momentum_result["valid"]:
                 self.rejection_reason = f"Step 6 failed: {momentum_result['reason']}"
                 return None
@@ -308,11 +310,18 @@ class PureRomeAnalyzer:
             
             # ✅ ALL ROME CONDITIONS MET - GENERATE SIGNAL
             self.sequence_complete = True
+            
+            # 🚨 FINAL VALIDATION: Ensure this is a CURRENT signal
+            signal_age = self._get_signal_age(sweep_result, displacement_result)
+            if signal_age > max_lookback_candles:
+                logging.info(f"⏰ REJECTED OLD SIGNAL: {symbol} - Signal age: {signal_age} candles")
+                return None
+                
             signal = self._format_pure_rome_signal(momentum_result, symbol, context)
             
-            # 🚨 DEBUG: Final verification
+            # 🚨 DEBUG: Log signal timing
             if signal:
-                logging.info(f"🔍 ROME SIGNAL GENERATED: {symbol} | Entry Price: {signal['entry']} | Should match current market")
+                logging.info(f"🎯 CURRENT ROME SIGNAL: {symbol} | Entry: {signal['entry']} | Fresh signal detected")
             
             return signal
             
@@ -320,24 +329,206 @@ class PureRomeAnalyzer:
             logging.error(f"Rome sequencing error for {symbol}: {e}")
             return None
 
+    def _check_recent_liquidity_sweep(self, df: pd.DataFrame, max_lookback: int) -> Dict:
+        """STEP 1: Check for RECENT liquidity sweep only"""
+        if len(df) < 10:
+            return {"valid": False, "reason": "Insufficient data"}
+            
+        # 🚨 ONLY check recent candles (last N candles)
+        recent_candles = df.iloc[-max_lookback:]
+        
+        for i in range(1, len(recent_candles)):
+            current = recent_candles.iloc[i]
+            previous = recent_candles.iloc[i-1]
+            lookback_candles = recent_candles.iloc[:i]
+            
+            # Sweep of equal highs
+            if self._is_equal_high_sweep(current, previous, lookback_candles):
+                return {
+                    "valid": True, 
+                    "type": "equal_high_sweep", 
+                    "direction": "bearish",
+                    "sweep_index": -len(recent_candles) + i,
+                    "sweep_recency": i  # How recent this sweep is
+                }
+            
+            # Sweep of equal lows  
+            if self._is_equal_low_sweep(current, previous, lookback_candles):
+                return {
+                    "valid": True, 
+                    "type": "equal_low_sweep", 
+                    "direction": "bullish",
+                    "sweep_index": -len(recent_candles) + i,
+                    "sweep_recency": i
+                }
+            
+            # Stop-run wick above/below previous swing
+            stop_run = self._is_stop_run_sweep(current, df)
+            if stop_run["valid"]:
+                stop_run["sweep_index"] = -len(recent_candles) + i
+                stop_run["sweep_recency"] = i
+                return stop_run
+        
+        return {"valid": False, "reason": "No RECENT liquidity sweep detected"}
+
+    def _check_recent_displacement(self, df: pd.DataFrame, sweep_result: Dict, max_lookback: int) -> Dict:
+        """STEP 2: Check for RECENT displacement after sweep"""
+        sweep_recency = sweep_result.get("sweep_recency", 1)
+        
+        # 🚨 Only look for displacement in very recent candles after sweep
+        max_displacement_lookback = min(3, max_lookback - sweep_recency)
+        
+        if max_displacement_lookback <= 0:
+            return {"valid": False, "reason": "Sweep too recent for displacement"}
+            
+        sweep_idx = sweep_result.get("sweep_index", -5)
+        start_idx = max(0, len(df) + sweep_idx + 1)
+        post_sweep_candles = df.iloc[start_idx:start_idx + max_displacement_lookback]
+        
+        if len(post_sweep_candles) == 0:
+            return {"valid": False, "reason": "No candles after sweep"}
+        
+        impulse_candle = None
+        for i in range(len(post_sweep_candles)):
+            candle = post_sweep_candles.iloc[i]
+            body_size = abs(candle["close"] - candle["open"])
+            full_range = candle["high"] - candle["low"]
+            
+            if full_range > 0 and (body_size / full_range) >= 0.6:
+                impulse_candle = candle
+                break
+        
+        if impulse_candle is None:
+            return {"valid": False, "reason": "No RECENT impulse candle"}
+        
+        direction = sweep_result["direction"]
+        is_bullish_impulse = impulse_candle["close"] > impulse_candle["open"]
+        
+        if direction == "bullish" and not is_bullish_impulse:
+            return {"valid": False, "reason": "Bearish impulse after bullish sweep"}
+            
+        if direction == "bearish" and is_bullish_impulse:
+            return {"valid": False, "reason": "Bullish impulse after bearish sweep"}
+        
+        return {
+            "valid": True, 
+            "impulse_candle": impulse_candle,
+            "direction": direction,
+            "displacement_recency": sweep_recency + i + 1
+        }
+
+    def _check_current_retracement(self, df: pd.DataFrame, displacement_result: Dict, context: Dict) -> Dict:
+        """STEP 3: Check CURRENT retracement into zone"""
+        current_price = df["close"].iloc[-1]
+        direction = displacement_result["direction"]
+        
+        # 🚨 Only look for zones that are CURRENTLY being touched
+        fvg_zone = self._find_fvg_zone(df, direction)
+        if fvg_zone and self._price_in_zone(current_price, fvg_zone):
+            # 🚨 Verify this is a recent zone
+            if self._is_recent_zone(df, fvg_zone):
+                return {
+                    "valid": True, 
+                    "zone_type": "fvg", 
+                    "zone": fvg_zone,
+                    "direction": direction
+                }
+        
+        ob_zone = self._find_order_block(df, direction)
+        if ob_zone and self._price_in_zone(current_price, ob_zone):
+            # 🚨 Verify this is a recent zone
+            if self._is_recent_zone(df, ob_zone):
+                return {
+                    "valid": True, 
+                    "zone_type": "order_block", 
+                    "zone": ob_zone,
+                    "direction": direction
+                }
+        
+        return {"valid": False, "reason": "No CURRENT mitigation zone touched"}
+
+    def _check_current_momentum(self, df: pd.DataFrame, htf_result: Dict, context: Dict) -> Dict:
+        """STEP 6: Check CURRENT momentum only"""
+        direction = htf_result["direction"]
+        current_price = df["close"].iloc[-1]
+        
+        # 🚨 STRICT: Only use CURRENT candle for momentum
+        current_candle = df.iloc[-1]
+        
+        if direction == "bullish":
+            if not (current_candle["close"] > current_candle["open"]):
+                return {"valid": False, "reason": "No CURRENT bullish momentum"}
+        else:
+            if not (current_candle["close"] < current_candle["open"]):
+                return {"valid": False, "reason": "No CURRENT bearish momentum"}
+        
+        # Additional volatility check
+        atr_val = self._calculate_atr(df.tail(14))
+        if atr_val and atr_val < current_price * 0.001:
+            return {"valid": False, "reason": "Volatility too low"}
+        
+        return {
+            "valid": True,
+            "momentum_confirmed": True,
+            "volatility_acceptable": True,
+            "direction": direction
+        }
+
+    def _is_recent_zone(self, df: pd.DataFrame, zone: Dict) -> bool:
+        """Check if a zone was formed recently"""
+        # 🚨 Only accept zones formed in the last 10 candles
+        max_zone_age = 10
+        zone_low = zone["low"]
+        zone_high = zone["high"]
+        
+        # Check recent candles to see if this zone was recently formed
+        recent_data = df.tail(max_zone_age * 2)  # Look at more data for context
+        
+        for i in range(len(recent_data) - 1):
+            candle = recent_data.iloc[i]
+            next_candle = recent_data.iloc[i + 1]
+            
+            # Check for FVG formation
+            if (next_candle["low"] > candle["high"] and 
+                zone_low == candle["high"] and zone_high == next_candle["low"]):
+                return True
+                
+            # Check for OB formation  
+            if (abs(candle["close"] - candle["open"]) / (candle["high"] - candle["low"]) >= 0.6):
+                if zone_low == candle["low"] and zone_high == candle["open"]:
+                    return True
+                if zone_low == candle["close"] and zone_high == candle["high"]:
+                    return True
+                    
+        return False
+
+    def _get_signal_age(self, sweep_result: Dict, displacement_result: Dict) -> int:
+        """Calculate how old the signal pattern is in candles"""
+        sweep_recency = sweep_result.get("sweep_recency", 10)  # Default to old if not specified
+        displacement_recency = displacement_result.get("displacement_recency", 10)
+        
+        # Total age is the recency of the sweep + displacement
+        return sweep_recency + displacement_recency
+
     def _format_pure_rome_signal(self, final_result: Dict, symbol: str, context: Dict) -> Dict:
-        """RESTORED WORKING VERSION - Use context price exactly like old code"""
+        """Format pure RomeOPT signal"""
         direction = final_result["direction"]
         side = "BUY" if direction == "bullish" else "SELL"
         
-        # 🎯 RESTORED: Use context price directly - this was working in your old code
         current_price = context.get('current_price', 0)
         tf = context.get('tf', '15m')
         
-        # 🚨 DEBUG: Verify the price in signal formatting
-        logging.info(f"🔍 SIGNAL FORMATTING: {symbol} | Context Price: {current_price}")
-        
+        # 🚨 FINAL PRICE VALIDATION
+        if current_price == 0:
+            logging.error(f"🚨 ZERO PRICE in signal formatting for {symbol}")
+            return None
+            
         sl, tp1, tp2, tp3 = self._calculate_institutional_tpsl(current_price, side, tf)
         
         return {
             "symbol": symbol,
             "side": side,
-            "entry": current_price,  # This should now match current market price
+            "entry": current_price,
             "sl": sl,
             "tp1": tp1,
             "tp2": tp2,
@@ -345,17 +536,19 @@ class PureRomeAnalyzer:
             "score": 11,
             "reason": "PURE ROMEOPT INSTITUTIONAL SEQUENCE",
             "reason_list": [
-                "✅ Liquidity Sweep", 
-                "✅ Strong Displacement", 
-                "✅ Zone Retracement",
+                "✅ Recent Liquidity Sweep", 
+                "✅ Recent Displacement", 
+                "✅ Current Zone Retracement",
                 "✅ Premium/Discount", 
                 "✅ HTF Alignment", 
-                "✅ Momentum Confirmation"
+                "✅ Current Momentum"
             ],
             "timeframe": tf,
             "rome_sequence": True,
             "sequence_steps_passed": 6
         }
+
+    # ... keep all your other existing helper methods the same ...
 
     # ==================== KEEP ALL YOUR EXISTING METHODS EXACTLY AS THEY ARE ====================
     
