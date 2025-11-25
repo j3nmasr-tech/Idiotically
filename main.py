@@ -34,50 +34,35 @@ import hashlib
 # ==================== BINGX API CONFIGURATION - FIXED ====================
 
 class BingXAPI:
-    """BingX API integration for data fetching - FIXED ENDPOINTS"""
+    """BingX API integration for data fetching - USING CORRECT SPOT ENDPOINTS"""
     
     def __init__(self, api_key: str = None, secret_key: str = None):
         self.api_key = api_key or os.getenv('BINGX_API_KEY', '')
         self.secret_key = secret_key or os.getenv('BINGX_SECRET_KEY', '')
         self.base_url = "https://open-api.bingx.com"
         
-    def _generate_signature(self, params: Dict) -> str:
-        """Generate HMAC SHA256 signature for BingX API"""
-        query_string = '&'.join([f"{key}={params[key]}" for key in sorted(params.keys())])
-        return hmac.new(
-            self.secret_key.encode('utf-8'),
-            query_string.encode('utf-8'),
-            hashlib.sha256
-        ).hexdigest()
-    
-    def _get_headers(self) -> Dict:
-        """Get BingX API headers"""
-        return {
-            'X-BX-APIKEY': self.api_key,
-            'Content-Type': 'application/json'
-        }
-    
     def _format_symbol(self, symbol: str) -> str:
-        """Format symbol for BingX API - FIXED"""
-        # Convert BTC/USDT to BTC-USDT
-        # Convert BTC-USDT to BTC-USDT (already formatted)
-        if '/' in symbol:
-            return symbol.replace('/', '-')
+        """Format symbol for BingX API - PROPERLY FIXED"""
+        # Remove any existing dashes and format properly
+        clean_symbol = symbol.replace('-', '').replace('/', '')
+        if clean_symbol.endswith('USDT'):
+            base_currency = clean_symbol.replace('USDT', '')
+            return f"{base_currency}-USDT"
         return symbol
     
     async def fetch_ohlcv(self, symbol: str, timeframe: str = '15m', limit: int = 200) -> Optional[List]:
-        """Fetch OHLCV data from BingX API - FIXED ENDPOINT"""
+        """Fetch OHLCV data from BingX API - USING CORRECT SPOT ENDPOINT"""
         try:
             # Map standard timeframe to BingX format
             tf_mapping = {
                 '1m': '1m', '3m': '3m', '5m': '5m', 
                 '15m': '15m', '30m': '30m', '1h': '1h',
-                '4h': '4h', '1d': '1d'
+                '4h': '4h', '1d': '1d', '1w': '1w'
             }
             bingx_tf = tf_mapping.get(timeframe, '15m')
             
-            # Use correct endpoint for perpetual swap
-            endpoint = "/openApi/swap/v3/quote/klines"
+            # ✅ CORRECT ENDPOINT: Use spot market (not swap)
+            endpoint = "/openApi/spot/v1/market/kline"
             formatted_symbol = self._format_symbol(symbol)
             
             params = {
@@ -87,6 +72,7 @@ class BingXAPI:
             }
             
             url = f"{self.base_url}{endpoint}"
+            
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.get(url, params=params)
                 response.raise_for_status()
@@ -114,10 +100,10 @@ class BingXAPI:
             return None
     
     async def fetch_ticker(self, symbol: str) -> Optional[Dict]:
-        """Fetch ticker data from BingX - FIXED ENDPOINT"""
+        """Fetch ticker data from BingX - USING CORRECT SPOT ENDPOINT"""
         try:
-            # Use correct endpoint for ticker data
-            endpoint = "/openApi/swap/v2/quote/ticker"
+            # ✅ CORRECT ENDPOINT: Use spot market (not swap)
+            endpoint = "/openApi/spot/v1/ticker/24hr"
             formatted_symbol = self._format_symbol(symbol)
             
             params = {
@@ -125,6 +111,7 @@ class BingXAPI:
             }
             
             url = f"{self.base_url}{endpoint}"
+            
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.get(url, params=params)
                 response.raise_for_status()
@@ -154,11 +141,13 @@ class BingXAPI:
             return None
     
     async def fetch_tickers(self) -> Dict:
-        """Fetch all tickers from BingX - FIXED ENDPOINT"""
+        """Fetch all tickers from BingX - USING CORRECT SPOT ENDPOINT"""
         try:
-            endpoint = "/openApi/swap/v2/quote/ticker"
+            # ✅ CORRECT ENDPOINT: Use spot market (not swap)
+            endpoint = "/openApi/spot/v1/ticker/24hr"
             
             url = f"{self.base_url}{endpoint}"
+            
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.get(url)
                 response.raise_for_status()
@@ -169,20 +158,21 @@ class BingXAPI:
                     for ticker_data in data['data']:
                         symbol_str = ticker_data.get('symbol', '')
                         # Convert BTC-USDT to BTC/USDT format
-                        standard_symbol = symbol_str.replace('-', '/')
-                        tickers[standard_symbol] = {
-                            'symbol': standard_symbol,
-                            'last': float(ticker_data.get('lastPrice', 0)),
-                            'bid': float(ticker_data.get('bidPrice', 0)),
-                            'ask': float(ticker_data.get('askPrice', 0)),
-                            'high': float(ticker_data.get('highPrice', 0)),
-                            'low': float(ticker_data.get('lowPrice', 0)),
-                            'volume': float(ticker_data.get('volume', 0)),
-                            'baseVolume': float(ticker_data.get('volume', 0)),
-                            'quoteVolume': float(ticker_data.get('quoteVolume', 0)),
-                            'change': float(ticker_data.get('priceChange', 0)),
-                            'percentage': float(ticker_data.get('priceChangePercent', 0))
-                        }
+                        if '-' in symbol_str:
+                            standard_symbol = symbol_str.replace('-', '/')
+                            tickers[standard_symbol] = {
+                                'symbol': standard_symbol,
+                                'last': float(ticker_data.get('lastPrice', 0)),
+                                'bid': float(ticker_data.get('bidPrice', 0)),
+                                'ask': float(ticker_data.get('askPrice', 0)),
+                                'high': float(ticker_data.get('highPrice', 0)),
+                                'low': float(ticker_data.get('lowPrice', 0)),
+                                'volume': float(ticker_data.get('volume', 0)),
+                                'baseVolume': float(ticker_data.get('volume', 0)),
+                                'quoteVolume': float(ticker_data.get('quoteVolume', 0)),
+                                'change': float(ticker_data.get('priceChange', 0)),
+                                'percentage': float(ticker_data.get('priceChangePercent', 0))
+                            }
                     logging.info(f"✅ Successfully fetched {len(tickers)} tickers from BingX")
                     return tickers
                 else:
@@ -192,42 +182,6 @@ class BingXAPI:
         except Exception as e:
             logging.error(f"BingX tickers fetch error: {e}")
             return {}
-    
-    async def test_connectivity(self) -> bool:
-        """Test BingX API connectivity with multiple endpoints"""
-        try:
-            # Test with multiple endpoints
-            endpoints_to_test = [
-                ('BTC-USDT', 'fetch_ticker'),
-                ('BTC-USDT', 'fetch_ohlcv'),
-                ('fetch_tickers',)
-            ]
-            
-            success_count = 0
-            for test in endpoints_to_test:
-                try:
-                    if test[0] == 'fetch_tickers':
-                        tickers = await self.fetch_tickers()
-                        if tickers:
-                            success_count += 1
-                    else:
-                        symbol, method = test
-                        if method == 'fetch_ticker':
-                            result = await self.fetch_ticker(symbol)
-                        else:
-                            result = await self.fetch_ohlcv(symbol, '15m', 10)
-                        if result:
-                            success_count += 1
-                except Exception as e:
-                    logging.debug(f"Test endpoint failed: {test} - {e}")
-                    continue
-            
-            logging.info(f"✅ BingX connectivity test: {success_count}/{len(endpoints_to_test)} endpoints working")
-            return success_count > 0
-            
-        except Exception as e:
-            logging.error(f"BingX connectivity test error: {e}")
-            return False
 
 # ==================== ENHANCED CONFIGURATION ====================
 
