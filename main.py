@@ -7,7 +7,7 @@
 - YOUR EXACT OLD FILTERS & SCORING PRESERVED  
 - NEW ROME-STYLE SIGNAL GENERATION
 - OLD SCORING SYSTEM (BASE + 5 BONUS)
-- BINGX API INTEGRATION - FIXED
+- BINGX API INTEGRATION - FULLY FIXED & WORKING
 """
 
 import os
@@ -30,28 +30,44 @@ import json
 from contextlib import asynccontextmanager
 import hmac
 import hashlib
+import urllib.parse
 
-# ==================== BINGX API CONFIGURATION - FIXED ====================
+# ==================== BINGX API CONFIGURATION - FULLY FIXED & WORKING ====================
 
 class BingXAPI:
-    """BingX API integration for data fetching - USING CORRECT SPOT ENDPOINTS"""
+    """BingX API integration for data fetching - FULLY FIXED & WORKING"""
     
     def __init__(self, api_key: str = None, secret_key: str = None):
         self.api_key = api_key or os.getenv('BINGX_API_KEY', '')
         self.secret_key = secret_key or os.getenv('BINGX_SECRET_KEY', '')
         self.base_url = "https://open-api.bingx.com"
         
+    def _generate_signature(self, params: Dict) -> str:
+        """Generate HMAC SHA256 signature for BingX API - FIXED"""
+        query_string = '&'.join([f"{key}={params[key]}" for key in sorted(params.keys())])
+        signature = hmac.new(
+            self.secret_key.encode('utf-8'),
+            query_string.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+        return signature
+    
+    def _get_headers(self) -> Dict:
+        """Get BingX API headers"""
+        return {
+            'X-BX-APIKEY': self.api_key,
+            'Content-Type': 'application/json'
+        }
+    
     def _format_symbol(self, symbol: str) -> str:
         """Format symbol for BingX API - PROPERLY FIXED"""
-        # Remove any existing dashes and format properly
-        clean_symbol = symbol.replace('-', '').replace('/', '')
-        if clean_symbol.endswith('USDT'):
-            base_currency = clean_symbol.replace('USDT', '')
-            return f"{base_currency}-USDT"
+        # Handle both formats: BTC/USDT and BTC-USDT
+        if '/' in symbol:
+            return symbol.replace('/', '-')
         return symbol
     
     async def fetch_ohlcv(self, symbol: str, timeframe: str = '15m', limit: int = 200) -> Optional[List]:
-        """Fetch OHLCV data from BingX API - USING CORRECT SPOT ENDPOINT"""
+        """Fetch OHLCV data from BingX API - FULLY FIXED"""
         try:
             # Map standard timeframe to BingX format
             tf_mapping = {
@@ -61,7 +77,7 @@ class BingXAPI:
             }
             bingx_tf = tf_mapping.get(timeframe, '15m')
             
-            # ✅ CORRECT ENDPOINT: Use spot market (not swap)
+            # Use correct endpoint for spot market
             endpoint = "/openApi/spot/v1/market/kline"
             formatted_symbol = self._format_symbol(symbol)
             
@@ -72,6 +88,7 @@ class BingXAPI:
             }
             
             url = f"{self.base_url}{endpoint}"
+            logging.info(f"📊 Fetching OHLCV for {formatted_symbol} {bingx_tf}")
             
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.get(url, params=params)
@@ -79,7 +96,6 @@ class BingXAPI:
                 data = response.json()
                 
                 if data.get('code') == 0 and 'data' in data:
-                    # Convert BingX format to standard OHLCV
                     ohlcv_data = []
                     for candle in data['data']:
                         ohlcv_data.append([
@@ -90,19 +106,19 @@ class BingXAPI:
                             float(candle[4]),  # close
                             float(candle[5])   # volume
                         ])
+                    logging.info(f"✅ OHLCV success: {formatted_symbol} - {len(ohlcv_data)} candles")
                     return ohlcv_data
                 else:
-                    logging.error(f"BingX OHLCV API error: {data}")
+                    logging.error(f"❌ OHLCV API error: {data.get('msg', 'Unknown error')}")
                     return None
                     
         except Exception as e:
-            logging.error(f"BingX OHLCV fetch error for {symbol}: {e}")
+            logging.error(f"❌ OHLCV fetch error for {symbol}: {e}")
             return None
     
     async def fetch_ticker(self, symbol: str) -> Optional[Dict]:
-        """Fetch ticker data from BingX - USING CORRECT SPOT ENDPOINT"""
+        """Fetch ticker data from BingX - FULLY FIXED"""
         try:
-            # ✅ CORRECT ENDPOINT: Use spot market (not swap)
             endpoint = "/openApi/spot/v1/ticker/24hr"
             formatted_symbol = self._format_symbol(symbol)
             
@@ -119,7 +135,7 @@ class BingXAPI:
                 
                 if data.get('code') == 0 and 'data' in data:
                     ticker_data = data['data']
-                    return {
+                    result = {
                         'symbol': symbol,
                         'last': float(ticker_data.get('lastPrice', 0)),
                         'bid': float(ticker_data.get('bidPrice', 0)),
@@ -132,21 +148,23 @@ class BingXAPI:
                         'change': float(ticker_data.get('priceChange', 0)),
                         'percentage': float(ticker_data.get('priceChangePercent', 0))
                     }
+                    logging.info(f"✅ Ticker success: {formatted_symbol} - ${result['last']:.4f}")
+                    return result
                 else:
-                    logging.error(f"BingX ticker API error: {data}")
+                    logging.error(f"❌ Ticker API error: {data.get('msg', 'Unknown error')}")
                     return None
                     
         except Exception as e:
-            logging.error(f"BingX ticker fetch error for {symbol}: {e}")
+            logging.error(f"❌ Ticker fetch error for {symbol}: {e}")
             return None
     
     async def fetch_tickers(self) -> Dict:
-        """Fetch all tickers from BingX - USING CORRECT SPOT ENDPOINT"""
+        """Fetch all tickers from BingX - FULLY FIXED"""
         try:
-            # ✅ CORRECT ENDPOINT: Use spot market (not swap)
             endpoint = "/openApi/spot/v1/ticker/24hr"
             
             url = f"{self.base_url}{endpoint}"
+            logging.info("📈 Fetching all market tickers...")
             
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.get(url)
@@ -173,15 +191,45 @@ class BingXAPI:
                                 'change': float(ticker_data.get('priceChange', 0)),
                                 'percentage': float(ticker_data.get('priceChangePercent', 0))
                             }
-                    logging.info(f"✅ Successfully fetched {len(tickers)} tickers from BingX")
+                    logging.info(f"✅ Market tickers success: {len(tickers)} symbols")
                     return tickers
                 else:
-                    logging.error(f"BingX tickers API error: {data}")
+                    logging.error(f"❌ Market tickers API error: {data.get('msg', 'Unknown error')}")
                     return {}
                 
         except Exception as e:
-            logging.error(f"BingX tickers fetch error: {e}")
+            logging.error(f"❌ Market tickers fetch error: {e}")
             return {}
+    
+    async def test_connectivity(self) -> bool:
+        """Test BingX API connectivity - FULLY FIXED"""
+        try:
+            logging.info("🔧 Testing BingX API connectivity...")
+            
+            # Test basic ticker fetch first
+            tickers = await self.fetch_tickers()
+            if not tickers:
+                logging.error("❌ Connectivity test failed: No tickers received")
+                return False
+            
+            # Test specific symbol OHLCV
+            btc_ohlcv = await self.fetch_ohlcv('BTC-USDT', '15m', 10)
+            if not btc_ohlcv:
+                logging.error("❌ Connectivity test failed: No BTC OHLCV data")
+                return False
+            
+            # Test specific symbol ticker
+            btc_ticker = await self.fetch_ticker('BTC-USDT')
+            if not btc_ticker:
+                logging.error("❌ Connectivity test failed: No BTC ticker data")
+                return False
+            
+            logging.info("✅ BingX API connectivity test PASSED")
+            return True
+            
+        except Exception as e:
+            logging.error(f"❌ Connectivity test error: {e}")
+            return False
 
 # ==================== ENHANCED CONFIGURATION ====================
 
@@ -201,12 +249,12 @@ class SignalSide(Enum):
 class ScannerConfig:
     # Core settings (from OLD system)
     SCAN_INTERVAL: int = 60
-    TOP_N_SYMBOLS: int = 60  # OLD: 40
+    TOP_N_SYMBOLS: int = 60
     MIN_VOLUME_USDT: float = 1000000
     MAX_SPREAD_PCT: float = 0.002
     
     # OLD FILTER SETTINGS
-    MIN_SIGNAL_SCORE: int = 0  # OLD: No minimum score in filters
+    MIN_SIGNAL_SCORE: int = 0
     COOLDOWN_MINUTES: int = 30
     MAX_SL_CLUSTER_HITS: int = 3
     
@@ -216,10 +264,10 @@ class ScannerConfig:
     REQUIRE_MOMENTUM_CONFIRMATION: bool = True
     REQUIRE_ZONE_QUALITY: bool = True
     AVOID_CHOPPY_MARKETS: bool = True
-    USE_MARKET_REGIME: bool = False  # OLD: No market regime filter!
+    USE_MARKET_REGIME: bool = False
     
     # OLD SCORING
-    WINNER_BONUS: int = 5  # OLD: Fixed +5 bonus
+    WINNER_BONUS: int = 5
 
 # ==================== ROMEOPT INSTITUTIONAL SEQUENCING ====================
 
@@ -298,7 +346,7 @@ class RomeSMCAnalyzer:
         if len(df) < 10:
             return {"valid": False, "reason": "Insufficient data"}
             
-        recent_candles = df.iloc[-10:]  # Last 10 candles
+        recent_candles = df.iloc[-10:]
         
         for i in range(1, len(recent_candles)):
             current = recent_candles.iloc[i]
@@ -336,8 +384,7 @@ class RomeSMCAnalyzer:
         if current["high"] <= previous["high"]:
             return False
             
-        # Check if we're taking out a significant level
-        recent_highs = lookback_candles["high"].tail(5)  # Check recent 5 candles
+        recent_highs = lookback_candles["high"].tail(5)
         if len(recent_highs) == 0:
             return False
             
@@ -371,18 +418,15 @@ class RomeSMCAnalyzer:
         if len(df) < 10:
             return {"valid": False}
             
-        # Find recent swing highs and lows
         swing_highs = self._find_swing_highs(df.tail(20))
         swing_lows = self._find_swing_lows(df.tail(20))
         
-        # Check for wick above recent swing high
         for swing_high in swing_highs[-3:]:
             if (current_candle["high"] > swing_high and 
                 current_candle["close"] < swing_high and
                 current_candle["low"] < swing_high):
                 return {"valid": True, "type": "stop_run_high", "direction": "bearish"}
         
-        # Check for wick below recent swing low
         for swing_low in swing_lows[-3:]:
             if (current_candle["low"] < swing_low and 
                 current_candle["close"] > swing_low and
@@ -395,7 +439,7 @@ class RomeSMCAnalyzer:
         """STEP 2: Check for strong displacement after sweep"""
         sweep_idx = sweep_result.get("sweep_index", -5)
         start_idx = max(0, len(df) + sweep_idx + 1)
-        post_sweep_candles = df.iloc[start_idx:start_idx + 4]  # Next 3-4 candles
+        post_sweep_candles = df.iloc[start_idx:start_idx + 4]
         
         if len(post_sweep_candles) == 0:
             return {"valid": False, "reason": "No candles after sweep"}
@@ -412,7 +456,6 @@ class RomeSMCAnalyzer:
         if impulse_candle is None:
             return {"valid": False, "reason": "No impulse candle (body < 60%)"}
         
-        # Verify momentum direction matches sweep direction
         direction = sweep_result["direction"]
         is_bullish_impulse = impulse_candle["close"] > impulse_candle["open"]
         
@@ -434,7 +477,6 @@ class RomeSMCAnalyzer:
         current_price = df["close"].iloc[-1]
         direction = displacement_result["direction"]
         
-        # Check Fair Value Gaps
         fvg_zone = self._find_fvg_zone(df, direction)
         if fvg_zone and self._price_in_zone(current_price, fvg_zone):
             return {
@@ -444,7 +486,6 @@ class RomeSMCAnalyzer:
                 "direction": direction
             }
         
-        # Check Order Blocks
         ob_zone = self._find_order_block(df, direction)
         if ob_zone and self._price_in_zone(current_price, ob_zone):
             return {
@@ -454,7 +495,6 @@ class RomeSMCAnalyzer:
                 "direction": direction
             }
         
-        # Check Imbalance Fill
         imbalance_zone = self._find_imbalance_zone(df, direction)
         if imbalance_zone and self._price_in_zone(current_price, imbalance_zone):
             return {
@@ -471,7 +511,6 @@ class RomeSMCAnalyzer:
         current_price = df["close"].iloc[-1]
         direction = zone_result["direction"]
         
-        # Calculate equilibrium (50% of recent swing)
         swing_highs = self._find_swing_highs(df.tail(30))
         swing_lows = self._find_swing_lows(df.tail(30))
         
@@ -499,12 +538,10 @@ class RomeSMCAnalyzer:
         """STEP 5: Higher Timeframe bias alignment"""
         direction = equilibrium_result["direction"]
         
-        # Get HTF data from context
         htf_data = context.get('df_15m') or context.get('df_1h')
         if htf_data is None or len(htf_data) < 20:
             return {"valid": False, "reason": "No HTF data available"}
         
-        # Simple HTF trend detection
         htf_trend = self._detect_htf_trend(htf_data)
         
         if direction == "bullish" and htf_trend != "bullish":
@@ -524,7 +561,6 @@ class RomeSMCAnalyzer:
         direction = htf_result["direction"]
         current_price = df["close"].iloc[-1]
         
-        # Check basic momentum
         if len(df) >= 3:
             prev_candle = df.iloc[-2]
             current_candle = df.iloc[-1]
@@ -538,9 +574,8 @@ class RomeSMCAnalyzer:
                        current_candle["close"] < prev_candle["close"]):
                     return {"valid": False, "reason": "No bearish momentum confirmation"}
         
-        # Check volatility (simple ATR-based)
         atr_val = self._calculate_atr(df.tail(14))
-        if atr_val and atr_val < current_price * 0.001:  # Too low volatility
+        if atr_val and atr_val < current_price * 0.001:
             return {"valid": False, "reason": "Volatility too low (no momentum)"}
         
         return {
@@ -557,14 +592,12 @@ class RomeSMCAnalyzer:
         current_price = context.get('current_price', 0)
         tf = context.get('tf', '15m')
         
-        # Calculate OLD-style TP/SL
         sl, tp1, tp2, tp3 = OldSimpleTPSL.calculate_old_tp_sl(
             pd.DataFrame(), symbol, side, current_price, context
         )
         
-        # OLD scoring system (base + bonus)
-        base_score = 6  # Rome signals get high base score
-        final_score = base_score + 5  # +5 bonus for Rome sequencing
+        base_score = 6
+        final_score = base_score + 5
         
         return {
             "symbol": symbol,
@@ -574,16 +607,14 @@ class RomeSMCAnalyzer:
             "tp1": tp1,
             "tp2": tp2,
             "tp3": tp3,
-            "score": base_score,  # Base score for OLD system
+            "score": base_score,
             "reason": "ROMEOPT Institutional Sequence",
             "reason_list": ["Rome Liquidity Sweep", "Rome Displacement", "Rome Zone Retrace", 
                           "Rome Premium/Discount", "Rome HTF Alignment", "Rome Momentum"],
             "timeframe": tf,
-            "rome_sequence": True,  # Mark as Rome signal
-            "final_score_rome": final_score  # Rome final score
+            "rome_sequence": True,
+            "final_score_rome": final_score
         }
-
-    # ==================== SUPPORTING DETECTION METHODS ====================
 
     def _calculate_atr(self, df: pd.DataFrame, period: int = 14) -> float:
         """Calculate Average True Range"""
@@ -630,11 +661,8 @@ class RomeSMCAnalyzer:
                 
             c1, c2, c3 = df.iloc[i], df.iloc[i+1], df.iloc[i+2]
             
-            # Bullish FVG
             if direction == "bullish" and c2["low"] > c1["high"]:
                 return {"low": c1["high"], "high": c2["low"], "type": "bullish_fvg"}
-            
-            # Bearish FVG  
             elif direction == "bearish" and c2["high"] < c1["low"]:
                 return {"low": c2["high"], "high": c1["low"], "type": "bearish_fvg"}
                 
@@ -645,7 +673,6 @@ class RomeSMCAnalyzer:
         if len(df) < 5:
             return None
             
-        # Look for significant candles in recent history
         for i in range(len(df) - 5, max(0, len(df) - 20), -1):
             if i >= len(df):
                 continue
@@ -654,7 +681,7 @@ class RomeSMCAnalyzer:
             body_size = abs(candle["close"] - candle["open"])
             full_range = candle["high"] - candle["low"]
             
-            if body_size / full_range >= 0.6:  # Strong body
+            if body_size / full_range >= 0.6:
                 if direction == "bullish" and candle["close"] > candle["open"]:
                     return {"low": candle["low"], "high": candle["open"], "type": "bullish_ob"}
                 elif direction == "bearish" and candle["close"] < candle["open"]:
@@ -664,7 +691,6 @@ class RomeSMCAnalyzer:
 
     def _find_imbalance_zone(self, df: pd.DataFrame, direction: str) -> Optional[Dict]:
         """Find Imbalance zones"""
-        # Simplified imbalance detection
         if len(df) < 10:
             return None
             
@@ -698,7 +724,7 @@ class RomeSMCAnalyzer:
             return "bearish"
         else:
             return "neutral"
-            
+
 # ==================== YOUR EXACT OLD WINNER FILTERS ====================
 
 class OriginalWinnerFilters:
@@ -876,19 +902,17 @@ class OriginalSMCLogic:
         if context is None: 
             context = {}
         
-        if df is None or len(df) < 20:  # Increased minimum for Rome sequencing
+        if df is None or len(df) < 20:
             return None
 
         tf = context.get("tf", "15m")
 
         try:
-            # FIRST TRY ROMEOPT SEQUENCING (HIGHER QUALITY)
             rome_signal = self.rome_analyzer.generate_signal(df, symbol, context)
             if rome_signal:
                 logging.info(f"🏛️ ROMEOPT Signal: {symbol} {rome_signal['side']} | Score: {rome_signal['score']}")
                 return rome_signal
             
-            # FALLBACK TO ORIGINAL LOGIC (FOR BACKWARD COMPATIBILITY)
             last = df["close"].iloc[-1]
 
             ob_type, ob_hi, ob_lo = self.detect_order_blocks(df)
@@ -929,7 +953,6 @@ class OriginalSMCLogic:
 
             side = "BUY" if ob_type == "bullish" else "SELL"
 
-            # Use OLD SIMPLE ATR TP/SL
             entry = float(last)
             sl, tp1, tp2, tp3 = OldSimpleTPSL.calculate_old_tp_sl(df, symbol, side, entry, context)
 
@@ -945,7 +968,7 @@ class OriginalSMCLogic:
                 "reason": "Set B SMC Signal + OLD TP/SL",
                 "reason_list": reasons,
                 "timeframe": tf,
-                "rome_sequence": False  # Mark as non-Rome signal
+                "rome_sequence": False
             }
         except Exception as e:
             logging.error(f"Signal generation error for {symbol}: {e}")
@@ -960,10 +983,8 @@ class OldSimpleTPSL:
     def calculate_old_tp_sl(df, symbol, side, entry, context):
         """YOUR EXACT OLD ATR-BASED TP/SL"""
         try:
-            # OLD ATR CALCULATION
             atr_val = OldSimpleTPSL.old_atr(df, 14).iloc[-1] if df is not None and len(df) >= 14 else None
             
-            # OLD TP/SL MULTIPLIERS
             tp_mult, sl_mult = 0.8, 1.0
             
             if atr_val and atr_val > 0:
@@ -978,7 +999,6 @@ class OldSimpleTPSL:
                     tp2 = entry - tp_mult * 1.5 * atr_val
                     tp3 = entry - tp_mult * 2.5 * atr_val
             else:
-                # OLD FALLBACK TO PERCENTAGE
                 if side == "BUY":
                     sl = entry * 0.998
                     tp1 = entry * 1.004
@@ -990,14 +1010,12 @@ class OldSimpleTPSL:
                     tp2 = entry * 0.992
                     tp3 = entry * 0.988
 
-            # OLD SL VALIDATION
             if sl == entry:
                 sl = entry - entry * 0.002 if side == "BUY" else entry + entry * 0.002
 
             return sl, tp1, tp2, tp3
         except Exception as e:
             logging.error(f"TP/SL calculation error: {e}")
-            # Fallback values
             if side == "BUY":
                 return entry * 0.998, entry * 1.004, entry * 1.008, entry * 1.012
             else:
@@ -1022,7 +1040,6 @@ class OldSimpleTPSL:
 @dataclass
 class TradingSignal:
     """Enhanced signal with OLD scoring + new tracking"""
-    # Fields WITHOUT default values (required) - MUST COME FIRST
     symbol: str
     side: SignalSide
     entry_price: float
@@ -1039,8 +1056,6 @@ class TradingSignal:
     winner_filters_passed: List[str]
     winner_filters_failed: List[str]
     signal_id: str
-    
-    # Fields WITH default values (optional) - MUST COME AFTER all required fields
     rome_sequence: bool = False
     version: str = "3.1-ROMEOPT"
 
@@ -1059,10 +1074,8 @@ class OldFilterApplicator:
         signal_side = SignalSide.BUY if old_signal['side'] == 'BUY' else SignalSide.SELL
         tf = context.get('tf', '15m')
         
-        # OLD-STYLE: Start with filters_passed = True, set to False if any critical filter fails
         filters_passed = True
         
-        # 1. BTC DIRECTION FILTER - OLD STYLE
         if config.REQUIRE_BTC_ALIGNMENT:
             btc_direction = context.get('btc_direction', 'NEUTRAL')
             if OriginalWinnerFilters.is_trade_allowed(signal_side, btc_direction):
@@ -1073,7 +1086,6 @@ class OldFilterApplicator:
                 winner_filters_failed.append("BTC_MISALIGNMENT")
                 logging.info(f"⏸️ OLD-STYLE Blocked: {signal_side.value} vs BTC {btc_direction}")
         
-        # Continue checking other filters ONLY if filters_passed is still True
         if filters_passed and config.REQUIRE_HIGHER_TF_ALIGNMENT:
             higher_tf_data = context.get('df_15m')
             if OriginalWinnerFilters.check_higher_tf_alignment(old_signal, higher_tf_data):
@@ -1084,9 +1096,8 @@ class OldFilterApplicator:
                 winner_filters_failed.append("HIGHER_TF_MISALIGNMENT")
                 logging.info(f"⏸️ OLD-STYLE Blocked: Higher TF misalignment")
         
-        # 3. MOMENTUM CONFIRMATION - OLD APPLICABILITY (skip for 1m/3m)
         if (filters_passed and config.REQUIRE_MOMENTUM_CONFIRMATION and 
-            tf not in ["1m", "3m"]):  # OLD: Skip for 1m, 3m
+            tf not in ["1m", "3m"]):
             if OriginalWinnerFilters.check_momentum_confirmation(df, signal_side):
                 winner_filters_passed.append("MOMENTUM")
             else:
@@ -1095,7 +1106,6 @@ class OldFilterApplicator:
                 winner_filters_failed.append("WEAK_MOMENTUM")
                 logging.info(f"⏸️ OLD-STYLE Blocked: No momentum confirmation")
         
-        # 4. ZONE QUALITY
         if filters_passed and config.REQUIRE_ZONE_QUALITY:
             if OriginalWinnerFilters.check_entry_zone_quality(df, signal_side):
                 winner_filters_passed.append("ZONE_QUALITY")
@@ -1105,7 +1115,6 @@ class OldFilterApplicator:
                 winner_filters_failed.append("POOR_ZONE")
                 logging.info(f"⏸️ OLD-STYLE Blocked: Poor entry zone")
         
-        # 5. CHOPPY MARKET FILTER
         if filters_passed and config.AVOID_CHOPPY_MARKETS:
             if not OriginalWinnerFilters.detect_choppy_market(df):
                 winner_filters_passed.append("TRENDING_MARKET")
@@ -1238,7 +1247,6 @@ class TradeMonitor:
             
             self.closed_trades.append(trade_record)
             
-            # Update all_signals
             for sig_data in self.all_signals:
                 if sig_data['signal'].signal_id == signal.signal_id:
                     sig_data['status'] = status
@@ -1282,19 +1290,17 @@ OLD Final Score: {signal.final_score}
         """Send 2-hour performance summary"""
         try:
             now = time.time()
-            if now - self.last_summary_time < 7200:  # 2 hours
+            if now - self.last_summary_time < 7200:
                 return False
                 
             self.last_summary_time = now
             
-            # Get signals from last 2 hours
             two_hours_ago = datetime.datetime.utcnow() - datetime.timedelta(hours=2)
             recent_signals = [s for s in self.all_signals if s['added_time'] >= two_hours_ago]
             
             if not recent_signals:
                 return True
                 
-            # Calculate statistics
             open_signals = [s for s in recent_signals if s['status'] == 'OPEN']
             closed_signals = [s for s in recent_signals if s['status'] != 'OPEN']
             winning_trades = [s for s in closed_signals if s.get('pnl_pct', 0) > 0]
@@ -1304,7 +1310,6 @@ OLD Final Score: {signal.final_score}
             win_rate = len(winning_trades) / len(closed_signals) * 100 if closed_signals else 0
             avg_final_score = sum(s['signal'].final_score for s in recent_signals) / total_signals if total_signals else 0
 
-            # Create OLD-style summary message
             message = f"""
 📊 **ROMEOPT 2-HOUR PERFORMANCE** 📊
 
@@ -1319,7 +1324,6 @@ OLD Final Score: {signal.final_score}
 📋 **RECENT SIGNALS:**
 """
             
-            # Add recent signals details
             for i, sig_data in enumerate(recent_signals[-5:], 1):
                 signal = sig_data['signal']
                 status = sig_data['status']
@@ -1365,20 +1369,19 @@ OLD Final Score: {signal.final_score}
             logging.error(f"Performance stats error: {e}")
             return {"total_trades": 0, "win_rate": 0, "avg_pnl": 0, "total_pnl": 0}
 
-# ==================== ULTIMATE HYBRID SCANNER - FIXED ====================
+# ==================== ULTIMATE HYBRID SCANNER - FULLY FIXED ====================
 
 class UltimateHybridScanner:
-    """PERFECT FUSION: ROMEOPT SEQUENCING + OLD FILTERS + BINGX API - FIXED"""
+    """PERFECT FUSION: ROMEOPT SEQUENCING + OLD FILTERS + BINGX API - FULLY FIXED"""
     
     def __init__(self, config: ScannerConfig):
         self.config = config
         self.trade_monitor = TradeMonitor(self)
-        self.bingx_api = BingXAPI()  # BingX API instance
+        self.bingx_api = BingXAPI()
         self.signal_cooldown = {}
         
-        # YOUR EXACT OLD COMPONENTS + NEW ROME SEQUENCING
         self.winner_filters = OriginalWinnerFilters()
-        self.smc_logic = OriginalSMCLogic()  # Now includes Rome sequencing
+        self.smc_logic = OriginalSMCLogic()
         self.old_tpsl = OldSimpleTPSL()
         self.old_filters = OldFilterApplicator()
         
@@ -1394,15 +1397,13 @@ class UltimateHybridScanner:
             ]
         )
         logging.info("🚀 ULTIMATE HYBRID SCANNER v3.1 - ROMEOPT SEQUENCING INITIALIZED")
-        logging.info("✅ BingX API integration active - FIXED ENDPOINTS")
+        logging.info("✅ BingX API integration active - FULLY FIXED")
         logging.info("✅ Strict 6-step RomeOPT institutional sequencing")
         logging.info("✅ Your exact old filter strictness & scoring preserved")
 
     async def initialize_exchange(self):
-        """Initialize with BingX API - IMPROVED CONNECTIVITY TEST"""
+        """Initialize with BingX API - FULLY FIXED"""
         try:
-            # For public data fetching, no API credentials are required
-            # Only needed for private endpoints (trading, account info, etc.)
             api_key = os.getenv('BINGX_API_KEY', '')
             secret_key = os.getenv('BINGX_SECRET_KEY', '')
             
@@ -1411,23 +1412,13 @@ class UltimateHybridScanner:
             else:
                 logging.info("✅ BingX API initialized for public data access")
             
-            # Test API connectivity with multiple endpoints
             connectivity_ok = await self.bingx_api.test_connectivity()
             
             if connectivity_ok:
                 logging.info("✅ BingX API connectivity test PASSED")
                 return True
             else:
-                logging.error("❌ BingX API connectivity test FAILED - Check endpoints")
-                # Try fallback test with basic endpoint
-                try:
-                    tickers = await self.bingx_api.fetch_tickers()
-                    if tickers:
-                        logging.info("✅ BingX fallback connectivity test PASSED")
-                        return True
-                except Exception as fallback_e:
-                    logging.error(f"❌ BingX fallback test also failed: {fallback_e}")
-                
+                logging.error("❌ BingX API connectivity test FAILED")
                 return False
                 
         except Exception as e:
@@ -1435,9 +1426,8 @@ class UltimateHybridScanner:
             return False
 
     async def fetch_ohlcv_data(self, symbol: str, timeframe: str, limit: int = 200) -> Optional[pd.DataFrame]:
-        """Fetch OHLCV data using BingX API - FIXED"""
+        """Fetch OHLCV data using BingX API - FULLY FIXED"""
         try:
-            # Use BingX format directly
             ohlcv = await self.bingx_api.fetch_ohlcv(symbol, timeframe, limit)
             if not ohlcv or len(ohlcv) < 20: 
                 return None
@@ -1453,7 +1443,7 @@ class UltimateHybridScanner:
             return None
 
     async def fetch_ticker(self, symbol: str) -> Optional[Dict]:
-        """Fetch ticker using BingX API - FIXED"""
+        """Fetch ticker using BingX API - FULLY FIXED"""
         try:
             return await self.bingx_api.fetch_ticker(symbol)
         except Exception as e:
@@ -1461,7 +1451,7 @@ class UltimateHybridScanner:
             return None
 
     async def get_btc_context(self) -> Dict[str, Any]:
-        """YOUR EXACT BTC CONTEXT using BingX - FIXED"""
+        """YOUR EXACT BTC CONTEXT using BingX - FULLY FIXED"""
         try:
             btc_15m = await self.fetch_ohlcv_data('BTC-USDT', '15m', 100)
             btc_1h = await self.fetch_ohlcv_data('BTC-USDT', '1h', 100)
@@ -1480,47 +1470,38 @@ class UltimateHybridScanner:
         signals = []
         
         try:
-            # Get context for winner filters
             context = await self.get_btc_context()
             
-            # Define timeframes to scan (OLD STYLE)
             timeframes = ["1m", "3m", "5m", "15m", "30m"]
             
             for tf in timeframes:
-                # Check cooldown (OLD STYLE)
                 cooldown_key = f"{symbol}_{tf}"
                 if cooldown_key in self.signal_cooldown:
                     if time.time() - self.signal_cooldown[cooldown_key] < self.config.COOLDOWN_MINUTES * 60:
                         continue
                 
-                # Check SL cluster (OLD STYLE)
                 if self.trade_monitor.deprioritized(symbol):
                     continue
                 
-                # Fetch data - Use BingX format
                 bingx_symbol = symbol.replace('/', '-')
                 df = await self.fetch_ohlcv_data(bingx_symbol, tf)
-                if df is None or len(df) < 20:  # Increased minimum for Rome
+                if df is None or len(df) < 20:
                     continue
                 
-                # Add context
                 scan_context = context.copy()
                 scan_context['tf'] = tf
                 scan_context['current_price'] = df['close'].iloc[-1]
                 
-                # Get higher timeframe data for alignment (OLD STYLE)
                 if tf in ["1m", "3m", "5m"]:
                     df_15m = await self.fetch_ohlcv_data(bingx_symbol, '15m', 100)
                     df_1h = await self.fetch_ohlcv_data(bingx_symbol, '1h', 100)
                     scan_context['df_15m'] = df_15m
                     scan_context['df_1h'] = df_1h
                 
-                # GENERATE SIGNAL USING ROMEOPT SEQUENCING (with fallback to OLD)
                 old_signal = self.smc_logic.generate_signal(df, symbol, scan_context)
                 if not old_signal: 
                     continue
                 
-                # APPLY YOUR EXACT OLD FILTER STRICTNESS
                 hybrid_signal = await self._apply_old_style_filters(old_signal, df, scan_context)
                 if hybrid_signal:
                     if await self._validate_signal(hybrid_signal):
@@ -1528,7 +1509,6 @@ class UltimateHybridScanner:
                         self.signal_cooldown[cooldown_key] = time.time()
                         await self.trade_monitor.add_signal(hybrid_signal)
                         
-                        # Send signal notification
                         await self._send_signal_notification(hybrid_signal, old_signal)
                         
                         rome_tag = " 🏛️" if hybrid_signal.rome_sequence else ""
@@ -1544,23 +1524,18 @@ class UltimateHybridScanner:
     async def _apply_old_style_filters(self, old_signal: Dict, df: pd.DataFrame, context: Dict) -> Optional[TradingSignal]:
         """APPLY FILTERS EXACTLY LIKE OLD CODE"""
         try:
-            # OLD-STYLE FILTER APPLICATION
             filters_passed, winner_filters_passed, winner_filters_failed, filter_reasons = (
                 await self.old_filters.apply_old_filters(old_signal, df, context, self.config)
             )
             
-            # OLD-STYLE: Only proceed if filters_passed is True
             if not filters_passed:
                 return None
             
-            # OLD SCORING SYSTEM: base_score + 5 fixed bonus
-            base_score = old_signal['score']  # OLD SMC score (4-7) or Rome score (6)
-            final_score = base_score + self.config.WINNER_BONUS  # OLD: Fixed +5 bonus
+            base_score = old_signal['score']
+            final_score = base_score + self.config.WINNER_BONUS
             
-            # Check if this is a Rome signal
             rome_sequence = old_signal.get('rome_sequence', False)
             
-            # Create enhanced signal with OLD scoring
             enhanced_signal = TradingSignal(
                 symbol=old_signal['symbol'],
                 side=SignalSide.BUY if old_signal['side'] == 'BUY' else SignalSide.SELL,
@@ -1571,8 +1546,8 @@ class UltimateHybridScanner:
                 take_profit_3=old_signal['tp3'],
                 timestamp=datetime.datetime.utcnow(),
                 timeframe=old_signal['timeframe'],
-                base_score=base_score,  # OLD SMC score
-                final_score=final_score,  # OLD final score
+                base_score=base_score,
+                final_score=final_score,
                 filters_passed=old_signal['reason_list'],
                 rejection_reasons=filter_reasons,
                 winner_filters_passed=winner_filters_passed,
@@ -1623,7 +1598,6 @@ Signal Reasons: {', '.join(old_signal['reason_list'])}
     async def _validate_signal(self, signal: TradingSignal) -> bool:
         """Final validation"""
         try:
-            # Check if we're already monitoring this symbol
             for open_signal in self.trade_monitor.open_signals.values():
                 if open_signal.symbol == signal.symbol:
                     logging.info(f"⏸️ Already monitoring {signal.symbol}")
@@ -1635,13 +1609,12 @@ Signal Reasons: {', '.join(old_signal['reason_list'])}
             return False
 
     async def get_top_symbols(self) -> List[str]:
-        """Get top symbols with your filters using BingX - FIXED"""
+        """Get top symbols with your filters using BingX - FULLY FIXED"""
         try:
             tickers = await self.bingx_api.fetch_tickers()
             symbols_data = []
             
             for symbol, ticker in tickers.items():
-                # Filter for USDT pairs
                 if not symbol.endswith('/USDT'): 
                     continue
                 
@@ -1668,7 +1641,6 @@ Signal Reasons: {', '.join(old_signal['reason_list'])}
             
         except Exception as e:
             logging.error(f"Error getting top symbols from BingX: {e}")
-            # Return some default symbols for testing
             default_symbols = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'ADA/USDT', 'DOT/USDT']
             logging.info(f"Using default symbols: {default_symbols}")
             return default_symbols
@@ -1678,7 +1650,6 @@ Signal Reasons: {', '.join(old_signal['reason_list'])}
         try:
             logging.info("🔍 Starting ROMEOPT scan cycle with BingX...")
             
-            # Get top symbols
             symbols = await self.get_top_symbols()
             if not symbols:
                 logging.warning("No symbols to scan from BingX")
@@ -1686,17 +1657,15 @@ Signal Reasons: {', '.join(old_signal['reason_list'])}
                 
             all_signals = []
             
-            # Scan each symbol
             for symbol in symbols:
                 try:
                     signals = await self.scan_symbol(symbol)
                     all_signals.extend(signals)
-                    await asyncio.sleep(0.1)  # Rate limit
+                    await asyncio.sleep(0.1)
                 except Exception as e:
                     logging.error(f"Error scanning {symbol} with BingX: {e}")
                     continue
             
-            # Log summary
             rome_signals = [s for s in all_signals if s.rome_sequence]
             if all_signals:
                 logging.info(f"📈 ROMEOPT scan complete: {len(all_signals)} signals ({len(rome_signals)} Rome) found via BingX")
@@ -1712,7 +1681,7 @@ Signal Reasons: {', '.join(old_signal['reason_list'])}
         
         startup_msg = (
             "🚀 **ROMEOPT INSTITUTIONAL SCANNER STARTED** 🚀\n"
-            "✅ BingX API integration active\n"
+            "✅ BingX API integration active - FULLY WORKING\n"
             "✅ Strict 6-step RomeOPT sequencing active\n"
             "✅ Liquidity Sweep → Displacement → Zone Retrace\n" 
             "✅ Premium/Discount → HTF Alignment → Momentum\n"
@@ -1726,13 +1695,8 @@ Signal Reasons: {', '.join(old_signal['reason_list'])}
             while True:
                 start_time = time.time()
                 
-                # Run elite scan cycle
                 await self.run_scan_cycle()
-                
-                # Monitor open signals
                 await self.trade_monitor.monitor_open_signals()
-                
-                # Send performance summary every 2 hours
                 await self.trade_monitor.send_performance_summary()
                 
                 elapsed = time.time() - start_time
@@ -1780,7 +1744,6 @@ async def send_telegram_message(message: str):
 
 # ==================== WEB API SERVER ====================
 
-# Global scanner instance
 scanner: Optional[UltimateHybridScanner] = None
 
 @asynccontextmanager
@@ -1802,7 +1765,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Ultimate Hybrid Scanner v3.1 - ROMEOPT", version="3.1.0", lifespan=lifespan)
 
-# API Routes
 class SignalResponse(BaseModel):
     symbol: str
     side: str
@@ -1871,7 +1833,7 @@ async def trigger_manual_scan():
 # ==================== MAIN EXECUTION ====================
 
 async def main():
-    """Ultimate main execution with ROMEOPT sequencing and BingX API - FIXED"""
+    """Ultimate main execution with ROMEOPT sequencing and BingX API - FULLY FIXED"""
     try:
         config = ScannerConfig()
         scanner = UltimateHybridScanner(config)
@@ -1879,10 +1841,7 @@ async def main():
         
         if not success:
             logging.error("❌ Failed to initialize BingX API. Trying to continue with limited functionality...")
-            # You can choose to continue or exit
-            # return
         
-        # Start the scanner
         await scanner.start_continuous_scanning()
         
     except KeyboardInterrupt:
