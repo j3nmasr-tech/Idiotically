@@ -1247,9 +1247,29 @@ class UltimateHybridScanner:
     async def initialize_exchange(self):
         """Initialize with your exchange settings"""
         try:
-            self.exchange = ccxt.okx({
+            # Get API credentials from environment variables with proper None handling
+            api_key = os.getenv('OKX_API_KEY', '')
+            secret = os.getenv('OKX_SECRET', '')
+            password = os.getenv('OKX_PASSWORD', '')  # OKX often requires password
+            
+            # If no credentials provided, use sandbox mode with empty strings
+            if not api_key or not secret:
+                logging.warning("⚠️ No OKX API credentials found. Using sandbox mode with public data access.")
+                api_key = ''
+                secret = ''
+            
+            exchange_config = {
+                "apiKey": api_key,
+                "secret": secret,
+                "password": password if password else None,
                 "enableRateLimit": True,
-            })
+                "sandbox": True,  # Use sandbox for testing
+            }
+            
+            # Remove None values to avoid issues
+            exchange_config = {k: v for k, v in exchange_config.items() if v is not None}
+            
+            self.exchange = ccxt.okx(exchange_config)
             await self.exchange.load_markets()
             logging.info("✅ OKX exchange initialized successfully")
             return True
