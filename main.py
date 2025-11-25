@@ -35,7 +35,7 @@ import urllib.parse
 # ==================== BINGX API CONFIGURATION - FULLY FIXED & WORKING ====================
 
 class BingXAPI:
-    """BingX API integration for data fetching - TIMESTAMP FIXED"""
+    """BingX API integration for data fetching - COMPLETELY FIXED"""
     
     def __init__(self, api_key: str = None, secret_key: str = None):
         self.api_key = api_key or os.getenv('BINGX_API_KEY', '')
@@ -52,8 +52,19 @@ class BingXAPI:
             return symbol.replace('/', '-')
         return symbol
     
+    def _safe_float_convert(self, value) -> float:
+        """Safely convert string to float, handling percentage signs"""
+        try:
+            if isinstance(value, str):
+                # Remove percentage signs and any other non-numeric characters except decimal point and minus
+                cleaned = value.replace('%', '').replace(',', '').strip()
+                return float(cleaned)
+            return float(value)
+        except (ValueError, TypeError):
+            return 0.0
+    
     async def fetch_ohlcv(self, symbol: str, timeframe: str = '15m', limit: int = 200) -> Optional[List]:
-        """Fetch OHLCV data from BingX API - FIXED"""
+        """Fetch OHLCV data from BingX API"""
         try:
             tf_mapping = {
                 '1m': '1m', '3m': '3m', '5m': '5m', 
@@ -69,7 +80,7 @@ class BingXAPI:
                 'symbol': formatted_symbol,
                 'interval': bingx_tf,
                 'limit': limit,
-                'timestamp': self._get_timestamp()  # ✅ ADDED TIMESTAMP
+                'timestamp': self._get_timestamp()
             }
             
             url = f"{self.base_url}{endpoint}"
@@ -84,11 +95,11 @@ class BingXAPI:
                     for candle in data['data']:
                         ohlcv_data.append([
                             candle[0],  # timestamp
-                            float(candle[1]),  # open
-                            float(candle[2]),  # high
-                            float(candle[3]),  # low
-                            float(candle[4]),  # close
-                            float(candle[5])   # volume
+                            self._safe_float_convert(candle[1]),  # open
+                            self._safe_float_convert(candle[2]),  # high
+                            self._safe_float_convert(candle[3]),  # low
+                            self._safe_float_convert(candle[4]),  # close
+                            self._safe_float_convert(candle[5])   # volume
                         ])
                     return ohlcv_data
                 else:
@@ -100,14 +111,14 @@ class BingXAPI:
             return None
     
     async def fetch_ticker(self, symbol: str) -> Optional[Dict]:
-        """Fetch ticker data from BingX - FIXED"""
+        """Fetch ticker data from BingX"""
         try:
             endpoint = "/openApi/spot/v1/ticker/24hr"
             formatted_symbol = self._format_symbol(symbol)
             
             params = {
                 'symbol': formatted_symbol,
-                'timestamp': self._get_timestamp()  # ✅ ADDED TIMESTAMP
+                'timestamp': self._get_timestamp()
             }
             
             url = f"{self.base_url}{endpoint}"
@@ -121,16 +132,16 @@ class BingXAPI:
                     ticker_data = data['data']
                     return {
                         'symbol': symbol,
-                        'last': float(ticker_data.get('lastPrice', 0)),
-                        'bid': float(ticker_data.get('bidPrice', 0)),
-                        'ask': float(ticker_data.get('askPrice', 0)),
-                        'high': float(ticker_data.get('highPrice', 0)),
-                        'low': float(ticker_data.get('lowPrice', 0)),
-                        'volume': float(ticker_data.get('volume', 0)),
-                        'baseVolume': float(ticker_data.get('volume', 0)),
-                        'quoteVolume': float(ticker_data.get('quoteVolume', 0)),
-                        'change': float(ticker_data.get('priceChange', 0)),
-                        'percentage': float(ticker_data.get('priceChangePercent', 0))
+                        'last': self._safe_float_convert(ticker_data.get('lastPrice', 0)),
+                        'bid': self._safe_float_convert(ticker_data.get('bidPrice', 0)),
+                        'ask': self._safe_float_convert(ticker_data.get('askPrice', 0)),
+                        'high': self._safe_float_convert(ticker_data.get('highPrice', 0)),
+                        'low': self._safe_float_convert(ticker_data.get('lowPrice', 0)),
+                        'volume': self._safe_float_convert(ticker_data.get('volume', 0)),
+                        'baseVolume': self._safe_float_convert(ticker_data.get('volume', 0)),
+                        'quoteVolume': self._safe_float_convert(ticker_data.get('quoteVolume', 0)),
+                        'change': self._safe_float_convert(ticker_data.get('priceChange', 0)),
+                        'percentage': self._safe_float_convert(ticker_data.get('priceChangePercent', 0))
                     }
                 else:
                     logging.error(f"BingX ticker API error: {data}")
@@ -141,18 +152,18 @@ class BingXAPI:
             return None
     
     async def fetch_tickers(self) -> Dict:
-        """Fetch all tickers from BingX - FIXED"""
+        """Fetch all tickers from BingX"""
         try:
             endpoint = "/openApi/spot/v1/ticker/24hr"
             
             params = {
-                'timestamp': self._get_timestamp()  # ✅ ADDED TIMESTAMP
+                'timestamp': self._get_timestamp()
             }
             
             url = f"{self.base_url}{endpoint}"
             
             async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(url, params=params)  # ✅ ADDED PARAMS
+                response = await client.get(url, params=params)
                 response.raise_for_status()
                 data = response.json()
                 
@@ -164,16 +175,16 @@ class BingXAPI:
                             standard_symbol = symbol_str.replace('-', '/')
                             tickers[standard_symbol] = {
                                 'symbol': standard_symbol,
-                                'last': float(ticker_data.get('lastPrice', 0)),
-                                'bid': float(ticker_data.get('bidPrice', 0)),
-                                'ask': float(ticker_data.get('askPrice', 0)),
-                                'high': float(ticker_data.get('highPrice', 0)),
-                                'low': float(ticker_data.get('lowPrice', 0)),
-                                'volume': float(ticker_data.get('volume', 0)),
-                                'baseVolume': float(ticker_data.get('volume', 0)),
-                                'quoteVolume': float(ticker_data.get('quoteVolume', 0)),
-                                'change': float(ticker_data.get('priceChange', 0)),
-                                'percentage': float(ticker_data.get('priceChangePercent', 0))
+                                'last': self._safe_float_convert(ticker_data.get('lastPrice', 0)),
+                                'bid': self._safe_float_convert(ticker_data.get('bidPrice', 0)),
+                                'ask': self._safe_float_convert(ticker_data.get('askPrice', 0)),
+                                'high': self._safe_float_convert(ticker_data.get('highPrice', 0)),
+                                'low': self._safe_float_convert(ticker_data.get('lowPrice', 0)),
+                                'volume': self._safe_float_convert(ticker_data.get('volume', 0)),
+                                'baseVolume': self._safe_float_convert(ticker_data.get('volume', 0)),
+                                'quoteVolume': self._safe_float_convert(ticker_data.get('quoteVolume', 0)),
+                                'change': self._safe_float_convert(ticker_data.get('priceChange', 0)),
+                                'percentage': self._safe_float_convert(ticker_data.get('priceChangePercent', 0))
                             }
                     logging.info(f"✅ Successfully fetched {len(tickers)} tickers from BingX")
                     return tickers
@@ -184,6 +195,24 @@ class BingXAPI:
         except Exception as e:
             logging.error(f"BingX tickers fetch error: {e}")
             return {}
+    
+    async def test_connectivity(self) -> bool:
+        """Test BingX API connectivity - ADDED THIS METHOD"""
+        try:
+            logging.info("🔧 Testing BingX API connectivity...")
+            
+            # Test basic ticker fetch
+            tickers = await self.fetch_tickers()
+            if tickers and len(tickers) > 0:
+                logging.info(f"✅ Connectivity test passed: {len(tickers)} tickers received")
+                return True
+            else:
+                logging.error("❌ Connectivity test failed: No tickers received")
+                return False
+            
+        except Exception as e:
+            logging.error(f"❌ Connectivity test error: {e}")
+            return False
 
 # ==================== ENHANCED CONFIGURATION ====================
 
