@@ -7,6 +7,7 @@
 - YOUR EXACT OLD FILTERS & SCORING PRESERVED  
 - NEW ROME-STYLE SIGNAL GENERATION
 - OLD SCORING SYSTEM (BASE + 5 BONUS)
+- BINGX API INTEGRATION
 """
 
 import os
@@ -28,6 +29,150 @@ import uvicorn
 from collections import defaultdict, deque
 import json
 from contextlib import asynccontextmanager
+import hmac
+import hashlib
+
+# ==================== BINGX API CONFIGURATION ====================
+
+class BingXAPI:
+    """BingX API integration for data fetching"""
+    
+    def __init__(self, api_key: str = None, secret_key: str = None):
+        self.api_key = api_key or os.getenv('BINGX_API_KEY', '')
+        self.secret_key = secret_key or os.getenv('BINGX_SECRET_KEY', '')
+        self.base_url = "https://open-api.bingx.com"
+        
+    def _generate_signature(self, params: Dict) -> str:
+        """Generate HMAC SHA256 signature for BingX API"""
+        query_string = '&'.join([f"{key}={params[key]}" for key in sorted(params.keys())])
+        return hmac.new(
+            self.secret_key.encode('utf-8'),
+            query_string.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+    
+    def _get_headers(self) -> Dict:
+        """Get BingX API headers"""
+        return {
+            'X-BX-APIKEY': self.api_key,
+            'Content-Type': 'application/json'
+        }
+    
+    async def fetch_ohlcv(self, symbol: str, timeframe: str = '15m', limit: int = 200) -> Optional[List]:
+        """Fetch OHLCV data from BingX API"""
+        try:
+            # Map standard timeframe to BingX format
+            tf_mapping = {
+                '1m': '1m', '3m': '3m', '5m': '5m', 
+                '15m': '15m', '30m': '30m', '1h': '1h',
+                '4h': '4h', '1d': '1d'
+            }
+            bingx_tf = tf_mapping.get(timeframe, '15m')
+            
+            endpoint = "/openApi/swap/v3/quote/klines"
+            params = {
+                'symbol': symbol.replace('/', '-').replace('USDT', '-USDT'),
+                'interval': bingx_tf,
+                'limit': limit
+            }
+            
+            url = f"{self.base_url}{endpoint}"
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, params=params)
+                response.raise_for_status()
+                data = response.json()
+                
+                if data.get('code') == 0 and 'data' in data:
+                    # Convert BingX format to standard OHLCV
+                    ohlcv_data = []
+                    for candle in data['data']:
+                        ohlcv_data.append([
+                            candle[0],  # timestamp
+                            float(candle[1]),  # open
+                            float(candle[2]),  # high
+                            float(candle[3]),  # low
+                            float(candle[4]),  # close
+                            float(candle[5])   # volume
+                        ])
+                    return ohlcv_data
+                else:
+                    logging.error(f"BingX API error: {data}")
+                    return None
+                    
+        except Exception as e:
+            logging.error(f"BingX OHLCV fetch error for {symbol}: {e}")
+            return None
+    
+    async def fetch_ticker(self, symbol: str) -> Optional[Dict]:
+        """Fetch ticker data from BingX"""
+        try:
+            endpoint = "/openApi/swap/v3/quote/ticker/24hr"
+            params = {
+                'symbol': symbol.replace('/', '-').replace('USDT', '-USDT')
+            }
+            
+            url = f"{self.base_url}{endpoint}"
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, params=params)
+                response.raise_for_status()
+                data = response.json()
+                
+                if data.get('code') == 0 and 'data' in data:
+                    ticker_data = data['data'][0] if isinstance(data['data'], list) else data['data']
+                    return {
+                        'symbol': symbol,
+                        'last': float(ticker_data.get('lastPrice', 0)),
+                        'bid': float(ticker_data.get('bidPrice', 0)),
+                        'ask': float(ticker_data.get('askPrice', 0)),
+                        'high': float(ticker_data.get('highPrice', 0)),
+                        'low': float(ticker_data.get('lowPrice', 0)),
+                        'volume': float(ticker_data.get('volume', 0)),
+                        'baseVolume': float(ticker_data.get('volume', 0)),
+                        'quoteVolume': float(ticker_data.get('quoteVolume', 0)),
+                        'change': float(ticker_data.get('priceChange', 0)),
+                        'percentage': float(ticker_data.get('priceChangePercent', 0))
+                    }
+                else:
+                    logging.error(f"BingX ticker error: {data}")
+                    return None
+                    
+        except Exception as e:
+            logging.error(f"BingX ticker fetch error for {symbol}: {e}")
+            return None
+    
+    async def fetch_tickers(self) -> Dict:
+        """Fetch all tickers from BingX"""
+        try:
+            endpoint = "/openApi/swap/v3/quote/tickers"
+            
+            url = f"{self.base_url}{endpoint}"
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                data = response.json()
+                
+                tickers = {}
+                if data.get('code') == 0 and 'data' in data:
+                    for ticker_data in data['data']:
+                        symbol = ticker_data.get('symbol', '').replace('-', '/')
+                        tickers[symbol] = {
+                            'symbol': symbol,
+                            'last': float(ticker_data.get('lastPrice', 0)),
+                            'bid': float(ticker_data.get('bidPrice', 0)),
+                            'ask': float(ticker_data.get('askPrice', 0)),
+                            'high': float(ticker_data.get('highPrice', 0)),
+                            'low': float(ticker_data.get('lowPrice', 0)),
+                            'volume': float(ticker_data.get('volume', 0)),
+                            'baseVolume': float(ticker_data.get('volume', 0)),
+                            'quoteVolume': float(ticker_data.get('quoteVolume', 0)),
+                            'change': float(ticker_data.get('priceChange', 0)),
+                            'percentage': float(ticker_data.get('priceChangePercent', 0))
+                        }
+                return tickers
+                
+        except Exception as e:
+            logging.error(f"BingX tickers fetch error: {e}")
+            return {}
 
 # ==================== ENHANCED CONFIGURATION ====================
 
@@ -47,7 +192,7 @@ class SignalSide(Enum):
 class ScannerConfig:
     # Core settings (from OLD system)
     SCAN_INTERVAL: int = 60
-    TOP_N_SYMBOLS: int = 80  # OLD: 40
+    TOP_N_SYMBOLS: int = 60  # OLD: 40
     MIN_VOLUME_USDT: float = 1000000
     MAX_SPREAD_PCT: float = 0.002
     
@@ -1014,7 +1159,7 @@ class TradeMonitor:
         
         for signal_id, signal in self.open_signals.items():
             try:
-                ticker = await self.scanner.exchange.fetch_ticker(signal.symbol)
+                ticker = await self.scanner.fetch_ticker(signal.symbol)
                 current_price = ticker['last']
                 
                 status = await self.check_signal_status(signal, current_price)
@@ -1214,12 +1359,13 @@ OLD Final Score: {signal.final_score}
 # ==================== ULTIMATE HYBRID SCANNER ====================
 
 class UltimateHybridScanner:
-    """PERFECT FUSION: ROMEOPT SEQUENCING + OLD FILTERS"""
+    """PERFECT FUSION: ROMEOPT SEQUENCING + OLD FILTERS + BINGX API"""
     
     def __init__(self, config: ScannerConfig):
         self.config = config
         self.trade_monitor = TradeMonitor(self)
         self.exchange = None
+        self.bingx_api = BingXAPI()  # BingX API instance
         self.signal_cooldown = {}
         
         # YOUR EXACT OLD COMPONENTS + NEW ROME SEQUENCING
@@ -1240,43 +1386,70 @@ class UltimateHybridScanner:
             ]
         )
         logging.info("🚀 ULTIMATE HYBRID SCANNER v3.1 - ROMEOPT SEQUENCING INITIALIZED")
+        logging.info("✅ BingX API integration active")
         logging.info("✅ Strict 6-step RomeOPT institutional sequencing")
         logging.info("✅ Your exact old filter strictness & scoring preserved")
-        logging.info("✅ Rome signals get priority + higher base scores")
 
     async def initialize_exchange(self):
-        """Initialize with your exchange settings"""
+        """Initialize with BingX API - No credentials needed for public data"""
         try:
-            self.exchange = ccxt.okx({
-                "enableRateLimit": True,
-            })
-            await self.exchange.load_markets()
-            logging.info("✅ OKX exchange initialized successfully")
-            return True
+            # For public data fetching, no API credentials are required
+            # Only needed for private endpoints (trading, account info, etc.)
+            api_key = os.getenv('BINGX_API_KEY', '')
+            secret_key = os.getenv('BINGX_SECRET_KEY', '')
+            
+            if api_key and secret_key:
+                logging.info("✅ BingX API credentials loaded for enhanced access")
+            else:
+                logging.info("✅ BingX API initialized for public data access")
+            
+            # Test API connectivity
+            test_data = await self.bingx_api.fetch_ticker('BTC-USDT')
+            if test_data:
+                logging.info("✅ BingX API connectivity test passed")
+                return True
+            else:
+                logging.error("❌ BingX API connectivity test failed")
+                return False
+                
         except Exception as e:
-            logging.error(f"❌ Exchange initialization failed: {e}")
+            logging.error(f"❌ BingX API initialization failed: {e}")
             return False
 
     async def fetch_ohlcv_data(self, symbol: str, timeframe: str, limit: int = 200) -> Optional[pd.DataFrame]:
-        """YOUR EXACT OHLCV FETCHING"""
+        """Fetch OHLCV data using BingX API"""
         try:
-            ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+            # Convert symbol format if needed
+            bingx_symbol = symbol.replace('/', '-')
+            
+            ohlcv = await self.bingx_api.fetch_ohlcv(bingx_symbol, timeframe, limit)
             if not ohlcv or len(ohlcv) < 20: 
                 return None
+                
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             return df
+            
         except Exception as e:
-            logging.debug(f"Could not fetch {symbol} {timeframe}: {e}")
+            logging.debug(f"Could not fetch {symbol} {timeframe} from BingX: {e}")
+            return None
+
+    async def fetch_ticker(self, symbol: str) -> Optional[Dict]:
+        """Fetch ticker using BingX API"""
+        try:
+            bingx_symbol = symbol.replace('/', '-')
+            return await self.bingx_api.fetch_ticker(bingx_symbol)
+        except Exception as e:
+            logging.error(f"BingX ticker fetch error for {symbol}: {e}")
             return None
 
     async def get_btc_context(self) -> Dict[str, Any]:
-        """YOUR EXACT BTC CONTEXT"""
+        """YOUR EXACT BTC CONTEXT using BingX"""
         try:
-            btc_15m = await self.fetch_ohlcv_data('BTC/USDT', '15m', 100)
-            btc_1h = await self.fetch_ohlcv_data('BTC/USDT', '1h', 100)
+            btc_15m = await self.fetch_ohlcv_data('BTC-USDT', '15m', 100)
+            btc_1h = await self.fetch_ohlcv_data('BTC-USDT', '1h', 100)
             btc_direction = self.winner_filters.get_btc_direction(btc_15m, btc_1h)
             return {
                 'btc_direction': btc_direction,
@@ -1284,7 +1457,7 @@ class UltimateHybridScanner:
                 'df_1h': btc_1h
             }
         except Exception as e:
-            logging.error(f"Error getting BTC context: {e}")
+            logging.error(f"Error getting BTC context from BingX: {e}")
             return {'btc_direction': 'NEUTRAL'}
 
     async def scan_symbol(self, symbol: str) -> List[TradingSignal]:
@@ -1446,15 +1619,18 @@ Signal Reasons: {', '.join(old_signal['reason_list'])}
             return False
 
     async def get_top_symbols(self) -> List[str]:
-        """Get top symbols with your filters"""
+        """Get top symbols with your filters using BingX"""
         try:
-            tickers = await self.exchange.fetch_tickers()
+            tickers = await self.bingx_api.fetch_tickers()
             symbols_data = []
             
             for symbol, ticker in tickers.items():
-                if not symbol.endswith('/USDT'): 
+                # Filter for USDT pairs
+                if not symbol.endswith('/USDT') and not symbol.endswith('-USDT'): 
                     continue
                 
+                # Convert symbol format if needed
+                standard_symbol = symbol.replace('-', '/')
                 volume_usdt = ticker.get('baseVolume', 0) * ticker.get('last', 0)
                 if volume_usdt < self.config.MIN_VOLUME_USDT: 
                     continue
@@ -1468,27 +1644,27 @@ Signal Reasons: {', '.join(old_signal['reason_list'])}
                 if spread_pct > self.config.MAX_SPREAD_PCT: 
                     continue
                 
-                symbols_data.append({'symbol': symbol, 'volume': volume_usdt})
+                symbols_data.append({'symbol': standard_symbol, 'volume': volume_usdt})
                     
             symbols_data.sort(key=lambda x: x['volume'], reverse=True)
             top_symbols = [s['symbol'] for s in symbols_data[:self.config.TOP_N_SYMBOLS]]
             
-            logging.info(f"📊 Selected {len(top_symbols)} elite symbols")
+            logging.info(f"📊 Selected {len(top_symbols)} elite symbols from BingX")
             return top_symbols
             
         except Exception as e:
-            logging.error(f"Error getting top symbols: {e}")
+            logging.error(f"Error getting top symbols from BingX: {e}")
             return []
 
     async def run_scan_cycle(self):
         """Enhanced scanning with performance tracking"""
         try:
-            logging.info("🔍 Starting ROMEOPT scan cycle...")
+            logging.info("🔍 Starting ROMEOPT scan cycle with BingX...")
             
             # Get top symbols
             symbols = await self.get_top_symbols()
             if not symbols:
-                logging.warning("No symbols to scan")
+                logging.warning("No symbols to scan from BingX")
                 return
                 
             all_signals = []
@@ -1500,32 +1676,32 @@ Signal Reasons: {', '.join(old_signal['reason_list'])}
                     all_signals.extend(signals)
                     await asyncio.sleep(0.1)  # Rate limit
                 except Exception as e:
-                    logging.error(f"Error scanning {symbol}: {e}")
+                    logging.error(f"Error scanning {symbol} with BingX: {e}")
                     continue
             
             # Log summary
             rome_signals = [s for s in all_signals if s.rome_sequence]
             if all_signals:
-                logging.info(f"📈 ROMEOPT scan complete: {len(all_signals)} signals ({len(rome_signals)} Rome) found")
+                logging.info(f"📈 ROMEOPT scan complete: {len(all_signals)} signals ({len(rome_signals)} Rome) found via BingX")
             else:
-                logging.info("📈 ROMEOPT scan complete: No signals found")
+                logging.info("📈 ROMEOPT scan complete: No signals found via BingX")
                 
         except Exception as e:
-            logging.error(f"ROMEOPT scan cycle error: {e}")
+            logging.error(f"ROMEOPT scan cycle error with BingX: {e}")
 
     async def start_continuous_scanning(self):
-        """Ultimate continuous scanning"""
-        logging.info("🔄 Starting ROMEOPT continuous scanning...")
+        """Ultimate continuous scanning with BingX"""
+        logging.info("🔄 Starting ROMEOPT continuous scanning with BingX API...")
         
         startup_msg = (
             "🚀 **ROMEOPT INSTITUTIONAL SCANNER STARTED** 🚀\n"
+            "✅ BingX API integration active\n"
             "✅ Strict 6-step RomeOPT sequencing active\n"
             "✅ Liquidity Sweep → Displacement → Zone Retrace\n" 
             "✅ Premium/Discount → HTF Alignment → Momentum\n"
             "✅ Your exact old filters & scoring preserved\n"
             "✅ Rome signals get priority + higher base scores\n"
-            "✅ Advanced monitoring & performance tracking\n"
-            "🎯 Target: INSTITUTIONAL-GRADE SIGNALS"
+            "🎯 Target: INSTITUTIONAL-GRADE SIGNALS via BingX"
         )
         await send_telegram_message(startup_msg)
         
@@ -1547,14 +1723,12 @@ Signal Reasons: {', '.join(old_signal['reason_list'])}
                 await asyncio.sleep(sleep_time)
                 
         except Exception as e:
-            logging.error(f"ROMEOPT scanning error: {e}")
+            logging.error(f"ROMEOPT scanning error with BingX: {e}")
             await asyncio.sleep(60)
 
     async def cleanup(self):
         """Cleanup resources"""
         try:
-            if self.exchange:
-                await self.exchange.close()
             logging.info("🧹 ROMEOPT scanner cleanup completed")
         except Exception as e:
             logging.error(f"Cleanup error: {e}")
@@ -1680,14 +1854,14 @@ async def trigger_manual_scan():
 # ==================== MAIN EXECUTION ====================
 
 async def main():
-    """Ultimate main execution with ROMEOPT sequencing"""
+    """Ultimate main execution with ROMEOPT sequencing and BingX API"""
     try:
         config = ScannerConfig()
         scanner = UltimateHybridScanner(config)
         success = await scanner.initialize_exchange()
         
         if not success:
-            logging.error("❌ Failed to initialize exchange. Exiting.")
+            logging.error("❌ Failed to initialize BingX API. Exiting.")
             return
         
         # Start the scanner
