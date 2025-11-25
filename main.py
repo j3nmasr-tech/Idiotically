@@ -367,6 +367,61 @@ class PureRomeAnalyzer:
             "displacement_recency": sweep_recency + i + 1
         }
 
+    def _check_current_retracement(self, df: pd.DataFrame, displacement_result: Dict, context: Dict) -> Dict:
+        """STEP 3: Check CURRENT retracement into zone - MISSING METHOD ADDED"""
+        current_price = df["close"].iloc[-1]
+        direction = displacement_result["direction"]
+        
+        # Look for zones that are CURRENTLY being touched
+        fvg_zone = self._find_fvg_zone(df, direction)
+        if fvg_zone and self._price_in_zone(current_price, fvg_zone):
+            if self._is_recent_zone(df, fvg_zone):
+                return {
+                    "valid": True, 
+                    "zone_type": "fvg", 
+                    "zone": fvg_zone,
+                    "direction": direction
+                }
+        
+        ob_zone = self._find_order_block(df, direction)
+        if ob_zone and self._price_in_zone(current_price, ob_zone):
+            if self._is_recent_zone(df, ob_zone):
+                return {
+                    "valid": True, 
+                    "zone_type": "order_block", 
+                    "zone": ob_zone,
+                    "direction": direction
+                }
+        
+        return {"valid": False, "reason": "No CURRENT mitigation zone touched"}
+
+    def _check_current_momentum(self, df: pd.DataFrame, htf_result: Dict, context: Dict) -> Dict:
+        """STEP 6: Check CURRENT momentum only"""
+        direction = htf_result["direction"]
+        current_price = df["close"].iloc[-1]
+        
+        # 🚨 STRICT: Only use CURRENT candle for momentum
+        current_candle = df.iloc[-1]
+        
+        if direction == "bullish":
+            if not (current_candle["close"] > current_candle["open"]):
+                return {"valid": False, "reason": "No CURRENT bullish momentum"}
+        else:
+            if not (current_candle["close"] < current_candle["open"]):
+                return {"valid": False, "reason": "No CURRENT bearish momentum"}
+        
+        # Additional volatility check
+        atr_val = self._calculate_atr(df.tail(14))
+        if atr_val and atr_val < current_price * 0.001:
+            return {"valid": False, "reason": "Volatility too low"}
+        
+        return {
+            "valid": True,
+            "momentum_confirmed": True,
+            "volatility_acceptable": True,
+            "direction": direction
+        }
+
     def _is_recent_zone(self, df: pd.DataFrame, zone: Dict) -> bool:
         """Check if a zone was formed recently"""
         # 🚨 FIXED: Increased from 10 to 15 candles for zone validity
@@ -394,8 +449,6 @@ class PureRomeAnalyzer:
                     return True
                     
         return False
-
-    # ... ALL OTHER METHODS REMAIN EXACTLY THE SAME ...
 
     def _get_signal_age(self, sweep_result: Dict, displacement_result: Dict) -> int:
         """Calculate how old the signal pattern is in candles"""
