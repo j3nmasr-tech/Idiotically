@@ -246,7 +246,7 @@ class PureRomeAnalyzer:
         self.rejection_reason = ""
         
     def generate_signal(self, df: pd.DataFrame, symbol: str, context=None) -> Optional[Dict]:
-        """PURE ROMEOPT 6-STEP INSTITUTIONAL SEQUENCE - FIXED PRICE"""
+        """PURE ROMEOPT 6-STEP INSTITUTIONAL SEQUENCE - RESTORED WORKING VERSION"""
         if context is None:
             context = {}
             
@@ -257,9 +257,12 @@ class PureRomeAnalyzer:
             return None
 
         try:
-            # 🚨 CRITICAL FIX: Get CURRENT price ONCE and use it consistently
-            current_price = df["close"].iloc[-1]
-            context['current_price'] = current_price  # Update context with FRESH price
+            # 🚨 RESTORED: Use context price directly like your working old code
+            # The context should already have the correct current_price from scan_symbol
+            current_price = context.get('current_price', 0)
+            
+            # 🚨 DEBUG: Verify the price at analysis start
+            logging.info(f"🔍 ROME ANALYSIS START: {symbol} | Context Price: {current_price} | DF Price: {df['close'].iloc[-1]}")
             
             # 🔥 STEP 1: Liquidity Sweep Condition
             sweep_result = self._check_liquidity_sweep(df)
@@ -305,12 +308,57 @@ class PureRomeAnalyzer:
             
             # ✅ ALL ROME CONDITIONS MET - GENERATE SIGNAL
             self.sequence_complete = True
-            return self._format_pure_rome_signal(momentum_result, symbol, context)
+            signal = self._format_pure_rome_signal(momentum_result, symbol, context)
+            
+            # 🚨 DEBUG: Final verification
+            if signal:
+                logging.info(f"🔍 ROME SIGNAL GENERATED: {symbol} | Entry Price: {signal['entry']} | Should match current market")
+            
+            return signal
             
         except Exception as e:
             logging.error(f"Rome sequencing error for {symbol}: {e}")
             return None
 
+    def _format_pure_rome_signal(self, final_result: Dict, symbol: str, context: Dict) -> Dict:
+        """RESTORED WORKING VERSION - Use context price exactly like old code"""
+        direction = final_result["direction"]
+        side = "BUY" if direction == "bullish" else "SELL"
+        
+        # 🎯 RESTORED: Use context price directly - this was working in your old code
+        current_price = context.get('current_price', 0)
+        tf = context.get('tf', '15m')
+        
+        # 🚨 DEBUG: Verify the price in signal formatting
+        logging.info(f"🔍 SIGNAL FORMATTING: {symbol} | Context Price: {current_price}")
+        
+        sl, tp1, tp2, tp3 = self._calculate_institutional_tpsl(current_price, side, tf)
+        
+        return {
+            "symbol": symbol,
+            "side": side,
+            "entry": current_price,  # This should now match current market price
+            "sl": sl,
+            "tp1": tp1,
+            "tp2": tp2,
+            "tp3": tp3,
+            "score": 11,
+            "reason": "PURE ROMEOPT INSTITUTIONAL SEQUENCE",
+            "reason_list": [
+                "✅ Liquidity Sweep", 
+                "✅ Strong Displacement", 
+                "✅ Zone Retracement",
+                "✅ Premium/Discount", 
+                "✅ HTF Alignment", 
+                "✅ Momentum Confirmation"
+            ],
+            "timeframe": tf,
+            "rome_sequence": True,
+            "sequence_steps_passed": 6
+        }
+
+    # ==================== KEEP ALL YOUR EXISTING METHODS EXACTLY AS THEY ARE ====================
+    
     def _check_liquidity_sweep(self, df: pd.DataFrame) -> Dict:
         """STEP 1: Check for valid liquidity sweep/stop-run"""
         if len(df) < 10:
@@ -571,46 +619,6 @@ class PureRomeAnalyzer:
             "direction": direction
         }
 
-    def _format_pure_rome_signal(self, final_result: Dict, symbol: str, context: Dict) -> Dict:
-        """Format pure RomeOPT signal - USING CONSISTENT PRICE"""
-        direction = final_result["direction"]
-        side = "BUY" if direction == "bullish" else "SELL"
-        
-        # 🚨 CRITICAL FIX: Use the UPDATED context price from generate_signal
-        current_price = context.get('current_price', 0)
-        
-        # 🚨 SAFETY CHECK: If price is still 0, something is wrong
-        if current_price == 0:
-            logging.error(f"🚨 ZERO PRICE ALERT for {symbol} - Check price flow!")
-            return None
-            
-        tf = context.get('tf', '15m')
-        
-        sl, tp1, tp2, tp3 = self._calculate_institutional_tpsl(current_price, side, tf)
-        
-        return {
-            "symbol": symbol,
-            "side": side,
-            "entry": current_price,  # ← This now matches the analysis price exactly
-            "sl": sl,
-            "tp1": tp1,
-            "tp2": tp2,
-            "tp3": tp3,
-            "score": 11,
-            "reason": "PURE ROMEOPT INSTITUTIONAL SEQUENCE",
-            "reason_list": [
-                "✅ Liquidity Sweep", 
-                "✅ Strong Displacement", 
-                "✅ Zone Retracement",
-                "✅ Premium/Discount", 
-                "✅ HTF Alignment", 
-                "✅ Momentum Confirmation"
-            ],
-            "timeframe": tf,
-            "rome_sequence": True,
-            "sequence_steps_passed": 6
-        }
-
     def _calculate_institutional_tpsl(self, entry: float, side: str, timeframe: str) -> tuple:
         """Institutional-grade TP/SL calculation with timeframe adjustments"""
         # Adjust risk based on timeframe
@@ -774,7 +782,9 @@ class RomeTradeMonitor:
             'status': 'OPEN',
             'added_time': datetime.datetime.utcnow()
         })
-        logging.info(f"🏛️ Rome Monitoring: {signal.symbol} {signal.side.value} | TF: {signal.timeframe} | Score: {signal.score}")
+        # 🚨 DEBUG: Log the entry price when signal is added
+        logging.info(f"🏛️ Rome Monitoring ADDED: {signal.symbol} {signal.side.value} | "
+                   f"Entry: {signal.entry_price:.6f} | TF: {signal.timeframe} | Score: {signal.score}")
         
     def record_sl_hit(self, symbol: str, lookback_minutes=30):
         """Track SL hits for deprioritization"""
@@ -809,6 +819,9 @@ class RomeTradeMonitor:
                     
                 current_price = ticker['last']
                 
+                # 🚨 DEBUG: Log current price vs entry price
+                logging.info(f"🔍 MONITORING: {signal.symbol} | Entry: {signal.entry_price:.6f} | Current: {current_price:.6f} | Diff: {((current_price - signal.entry_price) / signal.entry_price * 100):+.2f}%")
+                
                 status = await self.check_signal_status(signal, current_price)
                 
                 # 🚨 CRITICAL FIX: Update the signal status and process if closed
@@ -832,29 +845,29 @@ class RomeTradeMonitor:
         try:
             if signal.side == SignalSide.BUY:
                 if current_price >= signal.take_profit_3:
-                    logging.info(f"🎯 TP3 HIT: {signal.symbol} | Price: {current_price:.6f} >= TP3: {signal.take_profit_3:.6f}")
+                    logging.info(f"🎯 TP3 HIT: {signal.symbol} | Entry: {signal.entry_price:.6f} | Price: {current_price:.6f} >= TP3: {signal.take_profit_3:.6f}")
                     return "TP3_HIT"
                 elif current_price >= signal.take_profit_2:
-                    logging.info(f"🎯 TP2 HIT: {signal.symbol} | Price: {current_price:.6f} >= TP2: {signal.take_profit_2:.6f}")
+                    logging.info(f"🎯 TP2 HIT: {signal.symbol} | Entry: {signal.entry_price:.6f} | Price: {current_price:.6f} >= TP2: {signal.take_profit_2:.6f}")
                     return "TP2_HIT"
                 elif current_price >= signal.take_profit_1:
-                    logging.info(f"🎯 TP1 HIT: {signal.symbol} | Price: {current_price:.6f} >= TP1: {signal.take_profit_1:.6f}")
+                    logging.info(f"🎯 TP1 HIT: {signal.symbol} | Entry: {signal.entry_price:.6f} | Price: {current_price:.6f} >= TP1: {signal.take_profit_1:.6f}")
                     return "TP1_HIT"
                 elif current_price <= signal.stop_loss:
-                    logging.info(f"🛑 SL HIT: {signal.symbol} | Price: {current_price:.6f} <= SL: {signal.stop_loss:.6f}")
+                    logging.info(f"🛑 SL HIT: {signal.symbol} | Entry: {signal.entry_price:.6f} | Price: {current_price:.6f} <= SL: {signal.stop_loss:.6f}")
                     return "SL_HIT"
             else:  # SELL
                 if current_price <= signal.take_profit_3:
-                    logging.info(f"🎯 TP3 HIT: {signal.symbol} | Price: {current_price:.6f} <= TP3: {signal.take_profit_3:.6f}")
+                    logging.info(f"🎯 TP3 HIT: {signal.symbol} | Entry: {signal.entry_price:.6f} | Price: {current_price:.6f} <= TP3: {signal.take_profit_3:.6f}")
                     return "TP3_HIT"
                 elif current_price <= signal.take_profit_2:
-                    logging.info(f"🎯 TP2 HIT: {signal.symbol} | Price: {current_price:.6f} <= TP2: {signal.take_profit_2:.6f}")
+                    logging.info(f"🎯 TP2 HIT: {signal.symbol} | Entry: {signal.entry_price:.6f} | Price: {current_price:.6f} <= TP2: {signal.take_profit_2:.6f}")
                     return "TP2_HIT"
                 elif current_price <= signal.take_profit_1:
-                    logging.info(f"🎯 TP1 HIT: {signal.symbol} | Price: {current_price:.6f} <= TP1: {signal.take_profit_1:.6f}")
+                    logging.info(f"🎯 TP1 HIT: {signal.symbol} | Entry: {signal.entry_price:.6f} | Price: {current_price:.6f} <= TP1: {signal.take_profit_1:.6f}")
                     return "TP1_HIT"
                 elif current_price >= signal.stop_loss:
-                    logging.info(f"🛑 SL HIT: {signal.symbol} | Price: {current_price:.6f} >= SL: {signal.stop_loss:.6f}")
+                    logging.info(f"🛑 SL HIT: {signal.symbol} | Entry: {signal.entry_price:.6f} | Price: {current_price:.6f} >= SL: {signal.stop_loss:.6f}")
                     return "SL_HIT"
             
             return "OPEN"
@@ -909,6 +922,7 @@ class RomeTradeMonitor:
             
             await self._send_trade_update(signal, status, close_price, pnl_pct, duration)
             logging.info(f"🎯 Rome Trade CLOSED: {signal.symbol} {signal.timeframe} {status} | "
+                        f"Entry: {signal.entry_price:.6f} | Exit: {close_price:.6f} | "
                         f"P&L: {pnl_pct:+.2f}% | Score: {signal.score} | Duration: {duration:.1f}m")
             
         except Exception as e:
@@ -920,6 +934,10 @@ class RomeTradeMonitor:
             emoji = "🟢" if "TP" in status else "🔴"
             pnl_emoji = "📈" if pnl_pct > 0 else "📉"
             
+            # 🚨 ADDED: Entry vs Exit comparison
+            price_diff = close_price - signal.entry_price
+            price_diff_pct = (price_diff / signal.entry_price) * 100
+            
             message = f"""
 {emoji} **🏛️ ROMEOPT TRADE CLOSED** {emoji}
 
@@ -930,6 +948,7 @@ Status: {status}
 
 Entry: {signal.entry_price:.6f}
 Exit: {close_price:.6f}
+Price Change: {price_diff:+.6f} ({price_diff_pct:+.2f}%)
 Duration: {duration:.1f} minutes
 
 {pnl_emoji} P&L: {pnl_pct:+.2f}%
@@ -953,8 +972,18 @@ Sequence Steps: {signal.sequence_steps_passed}/6
             if self.open_signals:
                 logging.info(f"📊 Currently monitoring {len(self.open_signals)} open signals:")
                 for signal_id, signal in list(self.open_signals.items())[:5]:  # Show first 5
-                    logging.info(f"   - {signal.symbol} {signal.timeframe} {signal.side.value} | "
-                               f"Entry: {signal.entry_price:.6f} | Status: {signal.status}")
+                    # Get current price for comparison
+                    try:
+                        ticker = await self.scanner.fetch_ticker(signal.symbol)
+                        current_price = ticker['last'] if ticker else 0
+                        price_diff_pct = ((current_price - signal.entry_price) / signal.entry_price * 100) if current_price else 0
+                        
+                        logging.info(f"   - {signal.symbol} {signal.timeframe} {signal.side.value} | "
+                                   f"Entry: {signal.entry_price:.6f} | Current: {current_price:.6f} | "
+                                   f"Diff: {price_diff_pct:+.2f}% | Status: {signal.status}")
+                    except:
+                        logging.info(f"   - {signal.symbol} {signal.timeframe} {signal.side.value} | "
+                                   f"Entry: {signal.entry_price:.6f} | Status: {signal.status}")
             else:
                 logging.info("📊 No open signals currently being monitored")
                 
@@ -1021,7 +1050,7 @@ Sequence Steps: {signal.sequence_steps_passed}/6
                 status_emoji = "🟢" if "TP" in status else "🔴" if status == "SL_HIT" else "🟡"
                 pnl_str = f"{pnl:+.2f}%" if status != "OPEN" else "OPEN"
                 
-                message += f"\n{i}. {status_emoji} {signal.symbol} {signal.timeframe} {signal.side.value} | Score: {signal.score} | {pnl_str}"
+                message += f"\n{i}. {status_emoji} {signal.symbol} {signal.timeframe} {signal.side.value} | Entry: {signal.entry_price:.6f} | Score: {signal.score} | {pnl_str}"
             
             await send_telegram_message(message)
             logging.info("📊 RomeOPT 2-hour performance summary sent")
@@ -1063,7 +1092,6 @@ Sequence Steps: {signal.sequence_steps_passed}/6
         except Exception as e:
             logging.error(f"Performance stats error: {e}")
             return {"total_trades": 0, "win_rate": 0, "avg_pnl": 0, "total_pnl": 0}
-
 # ==================== FIXED PURE ROMEOPT SCANNER ====================
 
 class PureRomeScanner:
