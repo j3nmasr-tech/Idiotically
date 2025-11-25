@@ -1140,26 +1140,38 @@ Institutional Sequence:
             return False
 
     async def get_top_symbols(self) -> List[str]:
-        """Get top symbols with volume filter"""
+        """Get top symbols with volume filter - FIXED VERSION"""
         try:
             tickers = await self.bingx_api.fetch_tickers()
             symbols_data = []
+            filtered_count = 0
+            total_symbols = 0
             
             for symbol, ticker in tickers.items():
+                total_symbols += 1
                 if not symbol.endswith('/USDT'): 
                     continue
                 
-                volume_usdt = ticker.get('baseVolume', 0) * ticker.get('last', 0)
+                # 🚨 CRITICAL FIX: Change 'baseVolume' to 'volume'
+                volume = ticker.get('volume', 0)
+                last_price = ticker.get('last', 1)
+                volume_usdt = volume * last_price
+                
+                # Volume filter
                 if volume_usdt < self.config.MIN_VOLUME_USDT: 
+                    filtered_count += 1
                     continue
                 
                 bid = ticker.get('bid', 0)
                 ask = ticker.get('ask', 0)
                 if bid == 0 or ask == 0: 
+                    filtered_count += 1
                     continue
                 
-                spread_pct = (ask - bid) / bid
+                # 🚨 CRITICAL FIX: Prevent division by zero
+                spread_pct = (ask - bid) / bid if bid > 0 else 999
                 if spread_pct > self.config.MAX_SPREAD_PCT: 
+                    filtered_count += 1
                     continue
                 
                 symbols_data.append({'symbol': symbol, 'volume': volume_usdt})
@@ -1167,12 +1179,29 @@ Institutional Sequence:
             symbols_data.sort(key=lambda x: x['volume'], reverse=True)
             top_symbols = [s['symbol'] for s in symbols_data[:self.config.TOP_N_SYMBOLS]]
             
-            logging.info(f"📊 Selected {len(top_symbols)} elite symbols from BingX")
+            # Detailed logging to verify fix
+            logging.info(f"📊 Symbol Selection: {len(top_symbols)}/{total_symbols} "
+                        f"(Filtered: {filtered_count}, Min Volume: ${self.config.MIN_VOLUME_USDT:,.0f})")
+            
+            if top_symbols:
+                logging.info(f"🏆 Top 3 by volume: {[s['symbol'] for s in symbols_data[:3]]}")
+            else:
+                logging.warning("⚠️ No symbols passed filters, using fallback")
+                return self._get_fallback_symbols()
+                
             return top_symbols
             
         except Exception as e:
             logging.error(f"Error getting top symbols from BingX: {e}")
-            return ['BTC/USDT', 'ETH/USDT', 'BNB/USDT']
+            return self._get_fallback_symbols()
+
+    def _get_fallback_symbols(self) -> List[str]:
+        """Safe fallback symbols when API fails"""
+        return [
+            'BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'ADA/USDT', 'DOT/USDT',
+            'LINK/USDT', 'LTC/USDT', 'BCH/USDT', 'XLM/USDT', 'ETC/USDT',
+            'XRP/USDT', 'DOGE/USDT', 'SOL/USDT', 'MATIC/USDT', 'AVAX/USDT'
+        ]
 
     async def run_scan_cycle(self):
         """Pure RomeOPT scanning cycle"""
@@ -1181,6 +1210,7 @@ Institutional Sequence:
             
             symbols = await self.get_top_symbols()
             if not symbols:
+                logging.warning("⚠️ No symbols available for scanning")
                 return
                 
             all_signals = []
