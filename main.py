@@ -35,41 +35,26 @@ import urllib.parse
 # ==================== BINGX API CONFIGURATION - FULLY FIXED & WORKING ====================
 
 class BingXAPI:
-    """BingX API integration for data fetching - FULLY FIXED & WORKING"""
+    """BingX API integration for data fetching - TIMESTAMP FIXED"""
     
     def __init__(self, api_key: str = None, secret_key: str = None):
         self.api_key = api_key or os.getenv('BINGX_API_KEY', '')
         self.secret_key = secret_key or os.getenv('BINGX_SECRET_KEY', '')
         self.base_url = "https://open-api.bingx.com"
-        
-    def _generate_signature(self, params: Dict) -> str:
-        """Generate HMAC SHA256 signature for BingX API - FIXED"""
-        query_string = '&'.join([f"{key}={params[key]}" for key in sorted(params.keys())])
-        signature = hmac.new(
-            self.secret_key.encode('utf-8'),
-            query_string.encode('utf-8'),
-            hashlib.sha256
-        ).hexdigest()
-        return signature
     
-    def _get_headers(self) -> Dict:
-        """Get BingX API headers"""
-        return {
-            'X-BX-APIKEY': self.api_key,
-            'Content-Type': 'application/json'
-        }
+    def _get_timestamp(self) -> int:
+        """Get current timestamp in milliseconds"""
+        return int(time.time() * 1000)
     
     def _format_symbol(self, symbol: str) -> str:
-        """Format symbol for BingX API - PROPERLY FIXED"""
-        # Handle both formats: BTC/USDT and BTC-USDT
+        """Format symbol for BingX API"""
         if '/' in symbol:
             return symbol.replace('/', '-')
         return symbol
     
     async def fetch_ohlcv(self, symbol: str, timeframe: str = '15m', limit: int = 200) -> Optional[List]:
-        """Fetch OHLCV data from BingX API - FULLY FIXED"""
+        """Fetch OHLCV data from BingX API - FIXED"""
         try:
-            # Map standard timeframe to BingX format
             tf_mapping = {
                 '1m': '1m', '3m': '3m', '5m': '5m', 
                 '15m': '15m', '30m': '30m', '1h': '1h',
@@ -77,18 +62,17 @@ class BingXAPI:
             }
             bingx_tf = tf_mapping.get(timeframe, '15m')
             
-            # Use correct endpoint for spot market
             endpoint = "/openApi/spot/v1/market/kline"
             formatted_symbol = self._format_symbol(symbol)
             
             params = {
                 'symbol': formatted_symbol,
                 'interval': bingx_tf,
-                'limit': limit
+                'limit': limit,
+                'timestamp': self._get_timestamp()  # ✅ ADDED TIMESTAMP
             }
             
             url = f"{self.base_url}{endpoint}"
-            logging.info(f"📊 Fetching OHLCV for {formatted_symbol} {bingx_tf}")
             
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.get(url, params=params)
@@ -106,24 +90,24 @@ class BingXAPI:
                             float(candle[4]),  # close
                             float(candle[5])   # volume
                         ])
-                    logging.info(f"✅ OHLCV success: {formatted_symbol} - {len(ohlcv_data)} candles")
                     return ohlcv_data
                 else:
-                    logging.error(f"❌ OHLCV API error: {data.get('msg', 'Unknown error')}")
+                    logging.error(f"BingX OHLCV API error: {data}")
                     return None
                     
         except Exception as e:
-            logging.error(f"❌ OHLCV fetch error for {symbol}: {e}")
+            logging.error(f"BingX OHLCV fetch error for {symbol}: {e}")
             return None
     
     async def fetch_ticker(self, symbol: str) -> Optional[Dict]:
-        """Fetch ticker data from BingX - FULLY FIXED"""
+        """Fetch ticker data from BingX - FIXED"""
         try:
             endpoint = "/openApi/spot/v1/ticker/24hr"
             formatted_symbol = self._format_symbol(symbol)
             
             params = {
-                'symbol': formatted_symbol
+                'symbol': formatted_symbol,
+                'timestamp': self._get_timestamp()  # ✅ ADDED TIMESTAMP
             }
             
             url = f"{self.base_url}{endpoint}"
@@ -135,7 +119,7 @@ class BingXAPI:
                 
                 if data.get('code') == 0 and 'data' in data:
                     ticker_data = data['data']
-                    result = {
+                    return {
                         'symbol': symbol,
                         'last': float(ticker_data.get('lastPrice', 0)),
                         'bid': float(ticker_data.get('bidPrice', 0)),
@@ -148,26 +132,27 @@ class BingXAPI:
                         'change': float(ticker_data.get('priceChange', 0)),
                         'percentage': float(ticker_data.get('priceChangePercent', 0))
                     }
-                    logging.info(f"✅ Ticker success: {formatted_symbol} - ${result['last']:.4f}")
-                    return result
                 else:
-                    logging.error(f"❌ Ticker API error: {data.get('msg', 'Unknown error')}")
+                    logging.error(f"BingX ticker API error: {data}")
                     return None
                     
         except Exception as e:
-            logging.error(f"❌ Ticker fetch error for {symbol}: {e}")
+            logging.error(f"BingX ticker fetch error for {symbol}: {e}")
             return None
     
     async def fetch_tickers(self) -> Dict:
-        """Fetch all tickers from BingX - FULLY FIXED"""
+        """Fetch all tickers from BingX - FIXED"""
         try:
             endpoint = "/openApi/spot/v1/ticker/24hr"
             
+            params = {
+                'timestamp': self._get_timestamp()  # ✅ ADDED TIMESTAMP
+            }
+            
             url = f"{self.base_url}{endpoint}"
-            logging.info("📈 Fetching all market tickers...")
             
             async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(url)
+                response = await client.get(url, params=params)  # ✅ ADDED PARAMS
                 response.raise_for_status()
                 data = response.json()
                 
@@ -175,7 +160,6 @@ class BingXAPI:
                 if data.get('code') == 0 and 'data' in data:
                     for ticker_data in data['data']:
                         symbol_str = ticker_data.get('symbol', '')
-                        # Convert BTC-USDT to BTC/USDT format
                         if '-' in symbol_str:
                             standard_symbol = symbol_str.replace('-', '/')
                             tickers[standard_symbol] = {
@@ -191,45 +175,15 @@ class BingXAPI:
                                 'change': float(ticker_data.get('priceChange', 0)),
                                 'percentage': float(ticker_data.get('priceChangePercent', 0))
                             }
-                    logging.info(f"✅ Market tickers success: {len(tickers)} symbols")
+                    logging.info(f"✅ Successfully fetched {len(tickers)} tickers from BingX")
                     return tickers
                 else:
-                    logging.error(f"❌ Market tickers API error: {data.get('msg', 'Unknown error')}")
+                    logging.error(f"BingX tickers API error: {data}")
                     return {}
                 
         except Exception as e:
-            logging.error(f"❌ Market tickers fetch error: {e}")
+            logging.error(f"BingX tickers fetch error: {e}")
             return {}
-    
-    async def test_connectivity(self) -> bool:
-        """Test BingX API connectivity - FULLY FIXED"""
-        try:
-            logging.info("🔧 Testing BingX API connectivity...")
-            
-            # Test basic ticker fetch first
-            tickers = await self.fetch_tickers()
-            if not tickers:
-                logging.error("❌ Connectivity test failed: No tickers received")
-                return False
-            
-            # Test specific symbol OHLCV
-            btc_ohlcv = await self.fetch_ohlcv('BTC-USDT', '15m', 10)
-            if not btc_ohlcv:
-                logging.error("❌ Connectivity test failed: No BTC OHLCV data")
-                return False
-            
-            # Test specific symbol ticker
-            btc_ticker = await self.fetch_ticker('BTC-USDT')
-            if not btc_ticker:
-                logging.error("❌ Connectivity test failed: No BTC ticker data")
-                return False
-            
-            logging.info("✅ BingX API connectivity test PASSED")
-            return True
-            
-        except Exception as e:
-            logging.error(f"❌ Connectivity test error: {e}")
-            return False
 
 # ==================== ENHANCED CONFIGURATION ====================
 
