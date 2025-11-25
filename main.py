@@ -6,7 +6,7 @@
 - STRICT 6-STEP ROMEOPT SEQUENCE
 - YOUR EXACT OLD FILTERS & SCORING PRESERVED  
 - NEW ROME-STYLE SIGNAL GENERATION
-- UNIFIED SMART TP/SL SYSTEM
+- OLD SCORING SYSTEM (BASE + 5 BONUS)
 """
 
 import os
@@ -47,271 +47,25 @@ class SignalSide(Enum):
 class ScannerConfig:
     # Core settings (from OLD system)
     SCAN_INTERVAL: int = 60
-    TOP_N_SYMBOLS: int = 80
+    TOP_N_SYMBOLS: int = 80  # OLD: 40
     MIN_VOLUME_USDT: float = 1000000
     MAX_SPREAD_PCT: float = 0.002
     
     # OLD FILTER SETTINGS
-    MIN_SIGNAL_SCORE: int = 0
+    MIN_SIGNAL_SCORE: int = 0  # OLD: No minimum score in filters
     COOLDOWN_MINUTES: int = 30
     MAX_SL_CLUSTER_HITS: int = 3
     
     # OLD WINNER FILTER SETTINGS (EXACT OLD BEHAVIOR)
-    REQUIRE_BTC_ALIGNMENT: bool = False  # 🛠️ CHANGE THIS TO FALSE
+    REQUIRE_BTC_ALIGNMENT: bool = True
     REQUIRE_HIGHER_TF_ALIGNMENT: bool = True
     REQUIRE_MOMENTUM_CONFIRMATION: bool = True
     REQUIRE_ZONE_QUALITY: bool = True
     AVOID_CHOPPY_MARKETS: bool = True
-    USE_MARKET_REGIME: bool = False
+    USE_MARKET_REGIME: bool = False  # OLD: No market regime filter!
     
     # OLD SCORING
-    WINNER_BONUS: int = 5
-
-# ==================== ROMEOPT TP/SL SYSTEM ====================
-
-class RomeOptTPSL:
-    """UNIFIED SMART PROFIT SYSTEM FOR ALL SIGNALS - ENHANCED WITH TIMEFRAME AWARENESS"""
-    
-    @staticmethod
-    def calculate_rome_tp_sl(df: pd.DataFrame, symbol: str, side: str, entry: float, context: Dict) -> Tuple[float, float, float, float]:
-        """ENHANCED: TIMEFRAME-AWARE SMART TP/SL - PRESERVES ALL EXISTING LOGIC"""
-        try:
-            current_price = entry
-            tf = context.get('tf', '15m')
-            
-            # Get ATR with enhanced fallback
-            atr_val = RomeOptTPSL.rome_atr(df, 14) 
-            if atr_val == 0 or df is None or len(df) < 14:
-                # Smart fallback based on timeframe
-                if tf in ['1m', '3m']:
-                    atr_val = current_price * 0.004  # 0.4% for scalping
-                elif tf in ['5m', '15m']:
-                    atr_val = current_price * 0.008  # 0.8% for short-term
-                else:  # 30m, 1h+
-                    atr_val = current_price * 0.012  # 1.2% for longer-term
-            
-            # 🎯 ENHANCED TIMEFRAME-SPECIFIC PROTECTION
-            if tf in ['1m', '3m']:
-                min_atr = current_price * 0.003  # 0.3% minimum for scalping
-                atr_multiplier = 1.2  # Tighter but safe
-            elif tf in ['5m', '15m']:
-                min_atr = current_price * 0.006  # 0.6% minimum
-                atr_multiplier = 1.5
-            else:  # 30m, 1h+
-                min_atr = current_price * 0.009  # 0.9% minimum  
-                atr_multiplier = 2.0
-                
-            atr_val = max(atr_val, min_atr)
-            
-            if side == "BUY":
-                return RomeOptTPSL._calculate_bullish_targets_enhanced(df, current_price, atr_val, atr_multiplier, tf)
-            else:
-                return RomeOptTPSL._calculate_bearish_targets_enhanced(df, current_price, atr_val, atr_multiplier, tf)
-                
-        except Exception as e:
-            logging.error(f"Rome TP/SL error: {e}")
-            # 🛡️ ENHANCED TIMEFRAME-AWARE FALLBACK
-            tf = context.get('tf', '15m')
-            if tf in ['1m', '3m']:
-                if side == "BUY":
-                    return entry * 0.994, entry * 1.006, entry * 1.012, entry * 1.020  # 0.6% stop → 0.6%/1.2%/2.0%
-                else:
-                    return entry * 1.006, entry * 0.994, entry * 0.988, entry * 0.980  # 0.6% stop → 0.6%/1.2%/2.0%
-            elif tf in ['5m', '15m']:
-                if side == "BUY":
-                    return entry * 0.990, entry * 1.010, entry * 1.020, entry * 1.030  # 1.0% stop → 1.0%/2.0%/3.0%
-                else:
-                    return entry * 1.010, entry * 0.990, entry * 0.980, entry * 0.970  # 1.0% stop → 1.0%/2.0%/3.0%
-            else:  # 30m+
-                if side == "BUY":
-                    return entry * 0.985, entry * 1.015, entry * 1.025, entry * 1.035  # 1.5% stop → 1.5%/2.5%/3.5%
-                else:
-                    return entry * 1.015, entry * 0.985, entry * 0.975, entry * 0.965  # 1.5% stop → 1.5%/2.5%/3.5%
-
-    @staticmethod
-    def _calculate_bullish_targets_enhanced(df: pd.DataFrame, entry: float, atr: float, atr_multiplier: float, tf: str) -> Tuple[float, float, float, float]:
-        """BULLISH: ENHANCED with timeframe-aware parameters"""
-        # 🛡️ IMPROVED SWING LOW DETECTION (your existing logic preserved)
-        swing_lows = RomeOptTPSL._find_significant_swing_lows(df.tail(50))
-        if not swing_lows:
-            # Enhanced fallback with timeframe consideration
-            recent_low = df["low"].tail(15).min()
-            sl = recent_low - (atr * atr_multiplier * 0.8)  # Use multiplier
-        else:
-            # Use the most recent significant swing low
-            recent_swing_low = min(swing_lows[-2:])
-            sl = recent_swing_low - (atr * atr_multiplier * 0.5)  # Use multiplier
-            
-        # 🛡️ ENHANCED MINIMUM STOP DISTANCE (timeframe-aware)
-        if tf in ['1m', '3m']:
-            min_stop_distance = entry * 0.005  # 0.5% minimum for scalping
-        elif tf in ['5m', '15m']:
-            min_stop_distance = entry * 0.008  # 0.8% minimum
-        else:
-            min_stop_distance = entry * 0.012  # 1.2% minimum
-            
-        current_stop_distance = entry - sl
-        if current_stop_distance < min_stop_distance:
-            sl = entry - min_stop_distance
-
-        # TAKE PROFIT TARGETS (your existing logic preserved)
-        swing_highs = RomeOptTPSL._find_significant_swing_highs(df.tail(30))
-        recent_swing_high = max(swing_highs[-3:]) if swing_highs else entry * 1.015
-        tp1 = recent_swing_high
-        
-        equal_highs = RomeOptTPSL._find_equal_highs(df.tail(30))
-        if equal_highs:
-            potential_tp2 = max(equal_highs[-2:])
-            tp2 = max(potential_tp2, tp1 * 1.008)
-        else:
-            tp2 = max(entry + (atr * 2.2), tp1 * 1.008)
-            
-        tp3 = max(tp2 + (atr * 1.8), tp2 * 1.006)
-        
-        return sl, tp1, tp2, tp3
-
-    @staticmethod
-    def _calculate_bearish_targets_enhanced(df: pd.DataFrame, entry: float, atr: float, atr_multiplier: float, tf: str) -> Tuple[float, float, float, float]:
-        """BEARISH: ENHANCED with timeframe-aware parameters"""
-        swing_highs = RomeOptTPSL._find_significant_swing_highs(df.tail(50))
-        if not swing_highs:
-            recent_high = df["high"].tail(15).max()
-            sl = recent_high + (atr * atr_multiplier * 0.8)  # Use multiplier
-        else:
-            recent_swing_high = max(swing_highs[-2:])
-            sl = recent_swing_high + (atr * atr_multiplier * 0.5)  # Use multiplier
-            
-        # 🛡️ ENHANCED MINIMUM STOP DISTANCE (timeframe-aware)
-        if tf in ['1m', '3m']:
-            min_stop_distance = entry * 0.005  # 0.5% minimum for scalping
-        elif tf in ['5m', '15m']:
-            min_stop_distance = entry * 0.008  # 0.8% minimum
-        else:
-            min_stop_distance = entry * 0.012  # 1.2% minimum
-            
-        current_stop_distance = sl - entry
-        if current_stop_distance < min_stop_distance:
-            sl = entry + min_stop_distance
-
-        swing_lows = RomeOptTPSL._find_significant_swing_lows(df.tail(30))
-        recent_swing_low = min(swing_lows[-3:]) if swing_lows else entry * 0.985
-        tp1 = recent_swing_low
-        
-        equal_lows = RomeOptTPSL._find_equal_lows(df.tail(30))
-        if equal_lows:
-            potential_tp2 = min(equal_lows[-2:])
-            tp2 = min(potential_tp2, tp1 * 0.992)
-        else:
-            tp2 = min(entry - (atr * 2.2), tp1 * 0.992)
-            
-        tp3 = min(tp2 - (atr * 1.8), tp2 * 0.994)
-        
-        return sl, tp1, tp2, tp3
-
-    # ✅ ALL YOUR EXISTING METHODS PRESERVED EXACTLY AS IS:
-    @staticmethod
-    def _find_significant_swing_lows(df: pd.DataFrame, lookback: int = 5, min_change: float = 0.003) -> List[float]:
-        """Find ONLY significant swing lows (filters noise) - PRESERVED"""
-        if len(df) < lookback * 2 + 1:
-            return []
-            
-        significant_lows = []
-        for i in range(lookback, len(df) - lookback):
-            current_low = df["low"].iloc[i]
-            
-            # Check if it's a local minimum
-            is_local_min = (current_low == df["low"].iloc[i-lookback:i+lookback+1].min())
-            
-            if is_local_min:
-                # Check if this swing is significant (not just noise)
-                left_avg = df["low"].iloc[i-lookback:i].mean()
-                right_avg = df["low"].iloc[i+1:i+lookback+1].mean()
-                avg_around = (left_avg + right_avg) / 2
-                
-                price_change = abs(avg_around - current_low) / current_low
-                if price_change >= min_change:  # At least 0.3% change
-                    significant_lows.append(current_low)
-                    
-        return significant_lows if significant_lows else [df["low"].min()]
-
-    @staticmethod
-    def _find_significant_swing_highs(df: pd.DataFrame, lookback: int = 5, min_change: float = 0.003) -> List[float]:
-        """Find ONLY significant swing highs (filters noise) - PRESERVED"""
-        if len(df) < lookback * 2 + 1:
-            return []
-            
-        significant_highs = []
-        for i in range(lookback, len(df) - lookback):
-            current_high = df["high"].iloc[i]
-            
-            is_local_max = (current_high == df["high"].iloc[i-lookback:i+lookback+1].max())
-            
-            if is_local_max:
-                left_avg = df["high"].iloc[i-lookback:i].mean()
-                right_avg = df["high"].iloc[i+1:i+lookback+1].mean()
-                avg_around = (left_avg + right_avg) / 2
-                
-                price_change = abs(avg_around - current_high) / current_high
-                if price_change >= min_change:
-                    significant_highs.append(current_high)
-                    
-        return significant_highs if significant_highs else [df["high"].max()]
-
-    # 🔄 KEEP ALL YOUR EXISTING METHODS EXACTLY THE SAME:
-    @staticmethod
-    def _find_swing_lows(df: pd.DataFrame, lookback: int = 3) -> List[float]:
-        """Use significant swing detection - PRESERVED"""
-        return RomeOptTPSL._find_significant_swing_lows(df, lookback)
-
-    @staticmethod
-    def _find_swing_highs(df: pd.DataFrame, lookback: int = 3) -> List[float]:
-        """Use significant swing detection - PRESERVED"""
-        return RomeOptTPSL._find_significant_swing_highs(df, lookback)
-
-    @staticmethod
-    def _find_equal_highs(df: pd.DataFrame) -> List[float]:
-        """Find recent equal highs (liquidity levels) - PRESERVED"""
-        if len(df) < 10:
-            return []
-            
-        recent_highs = df["high"].tail(10).values
-        equal_highs = []
-        
-        for i in range(len(recent_highs)):
-            for j in range(i+1, len(recent_highs)):
-                if abs(recent_highs[i] - recent_highs[j]) < np.mean(recent_highs) * 0.002:
-                    equal_highs.append(max(recent_highs[i], recent_highs[j]))
-                    
-        return list(set(equal_highs))
-
-    @staticmethod
-    def _find_equal_lows(df: pd.DataFrame) -> List[float]:
-        """Find recent equal lows (liquidity levels) - PRESERVED"""
-        if len(df) < 10:
-            return []
-            
-        recent_lows = df["low"].tail(10).values
-        equal_lows = []
-        
-        for i in range(len(recent_lows)):
-            for j in range(i+1, len(recent_lows)):
-                if abs(recent_lows[i] - recent_lows[j]) < np.mean(recent_lows) * 0.002:
-                    equal_lows.append(min(recent_lows[i], recent_lows[j]))
-                    
-        return list(set(equal_lows))
-
-    @staticmethod
-    def rome_atr(df: pd.DataFrame, period: int = 14) -> float:
-        """RomeOPT ATR calculation - PRESERVED"""
-        if df is None or len(df) < period:
-            return 0.0
-            
-        high, low, close = df["high"], df["low"], df["close"]
-        tr1 = high - low
-        tr2 = (high - close.shift(1)).abs()
-        tr3 = (low - close.shift(1)).abs()
-        true_range = pd.DataFrame({'tr1': tr1, 'tr2': tr2, 'tr3': tr3}).max(axis=1)
-        return true_range.rolling(period).mean().iloc[-1]
+    WINNER_BONUS: int = 5  # OLD: Fixed +5 bonus
 
 # ==================== ROMEOPT INSTITUTIONAL SEQUENCING ====================
 
@@ -379,7 +133,7 @@ class RomeSMCAnalyzer:
             
             # ✅ ALL ROME CONDITIONS MET - GENERATE SIGNAL
             self.sequence_complete = True
-            return self._format_rome_signal(momentum_result, symbol, context, df)
+            return self._format_rome_signal(momentum_result, symbol, context)
             
         except Exception as e:
             logging.error(f"Rome sequencing error for {symbol}: {e}")
@@ -390,7 +144,7 @@ class RomeSMCAnalyzer:
         if len(df) < 10:
             return {"valid": False, "reason": "Insufficient data"}
             
-        recent_candles = df.iloc[-10:]
+        recent_candles = df.iloc[-10:]  # Last 10 candles
         
         for i in range(1, len(recent_candles)):
             current = recent_candles.iloc[i]
@@ -428,7 +182,8 @@ class RomeSMCAnalyzer:
         if current["high"] <= previous["high"]:
             return False
             
-        recent_highs = lookback_candles["high"].tail(5)
+        # Check if we're taking out a significant level
+        recent_highs = lookback_candles["high"].tail(5)  # Check recent 5 candles
         if len(recent_highs) == 0:
             return False
             
@@ -462,15 +217,18 @@ class RomeSMCAnalyzer:
         if len(df) < 10:
             return {"valid": False}
             
+        # Find recent swing highs and lows
         swing_highs = self._find_swing_highs(df.tail(20))
         swing_lows = self._find_swing_lows(df.tail(20))
         
+        # Check for wick above recent swing high
         for swing_high in swing_highs[-3:]:
             if (current_candle["high"] > swing_high and 
                 current_candle["close"] < swing_high and
                 current_candle["low"] < swing_high):
                 return {"valid": True, "type": "stop_run_high", "direction": "bearish"}
         
+        # Check for wick below recent swing low
         for swing_low in swing_lows[-3:]:
             if (current_candle["low"] < swing_low and 
                 current_candle["close"] > swing_low and
@@ -483,7 +241,7 @@ class RomeSMCAnalyzer:
         """STEP 2: Check for strong displacement after sweep"""
         sweep_idx = sweep_result.get("sweep_index", -5)
         start_idx = max(0, len(df) + sweep_idx + 1)
-        post_sweep_candles = df.iloc[start_idx:start_idx + 4]
+        post_sweep_candles = df.iloc[start_idx:start_idx + 4]  # Next 3-4 candles
         
         if len(post_sweep_candles) == 0:
             return {"valid": False, "reason": "No candles after sweep"}
@@ -500,6 +258,7 @@ class RomeSMCAnalyzer:
         if impulse_candle is None:
             return {"valid": False, "reason": "No impulse candle (body < 60%)"}
         
+        # Verify momentum direction matches sweep direction
         direction = sweep_result["direction"]
         is_bullish_impulse = impulse_candle["close"] > impulse_candle["open"]
         
@@ -521,6 +280,7 @@ class RomeSMCAnalyzer:
         current_price = df["close"].iloc[-1]
         direction = displacement_result["direction"]
         
+        # Check Fair Value Gaps
         fvg_zone = self._find_fvg_zone(df, direction)
         if fvg_zone and self._price_in_zone(current_price, fvg_zone):
             return {
@@ -530,6 +290,7 @@ class RomeSMCAnalyzer:
                 "direction": direction
             }
         
+        # Check Order Blocks
         ob_zone = self._find_order_block(df, direction)
         if ob_zone and self._price_in_zone(current_price, ob_zone):
             return {
@@ -539,6 +300,7 @@ class RomeSMCAnalyzer:
                 "direction": direction
             }
         
+        # Check Imbalance Fill
         imbalance_zone = self._find_imbalance_zone(df, direction)
         if imbalance_zone and self._price_in_zone(current_price, imbalance_zone):
             return {
@@ -555,6 +317,7 @@ class RomeSMCAnalyzer:
         current_price = df["close"].iloc[-1]
         direction = zone_result["direction"]
         
+        # Calculate equilibrium (50% of recent swing)
         swing_highs = self._find_swing_highs(df.tail(30))
         swing_lows = self._find_swing_lows(df.tail(30))
         
@@ -582,10 +345,12 @@ class RomeSMCAnalyzer:
         """STEP 5: Higher Timeframe bias alignment"""
         direction = equilibrium_result["direction"]
         
+        # Get HTF data from context
         htf_data = context.get('df_15m') or context.get('df_1h')
         if htf_data is None or len(htf_data) < 20:
             return {"valid": False, "reason": "No HTF data available"}
         
+        # Simple HTF trend detection
         htf_trend = self._detect_htf_trend(htf_data)
         
         if direction == "bullish" and htf_trend != "bullish":
@@ -605,6 +370,7 @@ class RomeSMCAnalyzer:
         direction = htf_result["direction"]
         current_price = df["close"].iloc[-1]
         
+        # Check basic momentum
         if len(df) >= 3:
             prev_candle = df.iloc[-2]
             current_candle = df.iloc[-1]
@@ -618,8 +384,9 @@ class RomeSMCAnalyzer:
                        current_candle["close"] < prev_candle["close"]):
                     return {"valid": False, "reason": "No bearish momentum confirmation"}
         
+        # Check volatility (simple ATR-based)
         atr_val = self._calculate_atr(df.tail(14))
-        if atr_val and atr_val < current_price * 0.001:
+        if atr_val and atr_val < current_price * 0.001:  # Too low volatility
             return {"valid": False, "reason": "Volatility too low (no momentum)"}
         
         return {
@@ -629,20 +396,21 @@ class RomeSMCAnalyzer:
             "direction": direction
         }
 
-    def _format_rome_signal(self, final_result: Dict, symbol: str, context: Dict, df: pd.DataFrame) -> Dict:
+    def _format_rome_signal(self, final_result: Dict, symbol: str, context: Dict) -> Dict:
         """Format valid Rome signal with OLD scoring"""
         direction = final_result["direction"]
         side = "BUY" if direction == "bullish" else "SELL"
         current_price = context.get('current_price', 0)
         tf = context.get('tf', '15m')
         
-        # 🚀 UNIFIED SMART TP/SL SYSTEM
-        sl, tp1, tp2, tp3 = RomeOptTPSL.calculate_rome_tp_sl(
-            df, symbol, side, current_price, context
+        # Calculate OLD-style TP/SL
+        sl, tp1, tp2, tp3 = OldSimpleTPSL.calculate_old_tp_sl(
+            pd.DataFrame(), symbol, side, current_price, context
         )
         
-        base_score = 6
-        final_score = base_score + 5
+        # OLD scoring system (base + bonus)
+        base_score = 6  # Rome signals get high base score
+        final_score = base_score + 5  # +5 bonus for Rome sequencing
         
         return {
             "symbol": symbol,
@@ -652,13 +420,13 @@ class RomeSMCAnalyzer:
             "tp1": tp1,
             "tp2": tp2,
             "tp3": tp3,
-            "score": base_score,
+            "score": base_score,  # Base score for OLD system
             "reason": "ROMEOPT Institutional Sequence",
             "reason_list": ["Rome Liquidity Sweep", "Rome Displacement", "Rome Zone Retrace", 
                           "Rome Premium/Discount", "Rome HTF Alignment", "Rome Momentum"],
             "timeframe": tf,
-            "rome_sequence": True,
-            "final_score_rome": final_score
+            "rome_sequence": True,  # Mark as Rome signal
+            "final_score_rome": final_score  # Rome final score
         }
 
     # ==================== SUPPORTING DETECTION METHODS ====================
@@ -708,8 +476,11 @@ class RomeSMCAnalyzer:
                 
             c1, c2, c3 = df.iloc[i], df.iloc[i+1], df.iloc[i+2]
             
+            # Bullish FVG
             if direction == "bullish" and c2["low"] > c1["high"]:
                 return {"low": c1["high"], "high": c2["low"], "type": "bullish_fvg"}
+            
+            # Bearish FVG  
             elif direction == "bearish" and c2["high"] < c1["low"]:
                 return {"low": c2["high"], "high": c1["low"], "type": "bearish_fvg"}
                 
@@ -720,6 +491,7 @@ class RomeSMCAnalyzer:
         if len(df) < 5:
             return None
             
+        # Look for significant candles in recent history
         for i in range(len(df) - 5, max(0, len(df) - 20), -1):
             if i >= len(df):
                 continue
@@ -728,7 +500,7 @@ class RomeSMCAnalyzer:
             body_size = abs(candle["close"] - candle["open"])
             full_range = candle["high"] - candle["low"]
             
-            if body_size / full_range >= 0.6:
+            if body_size / full_range >= 0.6:  # Strong body
                 if direction == "bullish" and candle["close"] > candle["open"]:
                     return {"low": candle["low"], "high": candle["open"], "type": "bullish_ob"}
                 elif direction == "bearish" and candle["close"] < candle["open"]:
@@ -738,6 +510,7 @@ class RomeSMCAnalyzer:
 
     def _find_imbalance_zone(self, df: pd.DataFrame, direction: str) -> Optional[Dict]:
         """Find Imbalance zones"""
+        # Simplified imbalance detection
         if len(df) < 10:
             return None
             
@@ -893,7 +666,7 @@ class OriginalWinnerFilters:
 # ==================== YOUR EXACT OLD SMC CORE LOGIC ====================
 
 class OriginalSMCLogic:
-    """YOUR EXACT ORIGINAL SMC LOGIC - NOW WITH UNIFIED TP/SL"""
+    """YOUR EXACT ORIGINAL SMC LOGIC - NOW WITH ROME SEQUENCING"""
     
     def __init__(self):
         self.rome_analyzer = RomeSMCAnalyzer()
@@ -945,11 +718,11 @@ class OriginalSMCLogic:
         return "bearish", candle["high"], candle["open"]
 
     def generate_signal(self, df: pd.DataFrame, symbol: str, context=None):
-        """UPDATED: USES UNIFIED ROMEOPT TP/SL FOR ALL SIGNALS"""
+        """UPDATED: NOW USES ROMEOPT INSTITUTIONAL SEQUENCING"""
         if context is None: 
             context = {}
         
-        if df is None or len(df) < 20:
+        if df is None or len(df) < 20:  # Increased minimum for Rome sequencing
             return None
 
         tf = context.get("tf", "15m")
@@ -961,7 +734,7 @@ class OriginalSMCLogic:
                 logging.info(f"🏛️ ROMEOPT Signal: {symbol} {rome_signal['side']} | Score: {rome_signal['score']}")
                 return rome_signal
             
-            # FALLBACK TO ORIGINAL LOGIC
+            # FALLBACK TO ORIGINAL LOGIC (FOR BACKWARD COMPATIBILITY)
             last = df["close"].iloc[-1]
 
             ob_type, ob_hi, ob_lo = self.detect_order_blocks(df)
@@ -1002,11 +775,9 @@ class OriginalSMCLogic:
 
             side = "BUY" if ob_type == "bullish" else "SELL"
 
-            # 🚀 UNIFIED SMART TP/SL SYSTEM FOR ALL SIGNALS
+            # Use OLD SIMPLE ATR TP/SL
             entry = float(last)
-            sl, tp1, tp2, tp3 = RomeOptTPSL.calculate_rome_tp_sl(
-                df, symbol, side, entry, context
-            )
+            sl, tp1, tp2, tp3 = OldSimpleTPSL.calculate_old_tp_sl(df, symbol, side, entry, context)
 
             return {
                 "symbol": symbol,
@@ -1017,20 +788,87 @@ class OriginalSMCLogic:
                 "tp2": tp2,
                 "tp3": tp3,
                 "score": score,
-                "reason": "Set B SMC Signal + SMART TP/SL",
+                "reason": "Set B SMC Signal + OLD TP/SL",
                 "reason_list": reasons,
                 "timeframe": tf,
-                "rome_sequence": False
+                "rome_sequence": False  # Mark as non-Rome signal
             }
         except Exception as e:
             logging.error(f"Signal generation error for {symbol}: {e}")
             return None
+
+# ==================== OLD SIMPLE ATR TP/SL SYSTEM ====================
+
+class OldSimpleTPSL:
+    """YOUR EXACT OLD SIMPLE ATR TP/SL SYSTEM"""
+    
+    @staticmethod
+    def calculate_old_tp_sl(df, symbol, side, entry, context):
+        """YOUR EXACT OLD ATR-BASED TP/SL"""
+        try:
+            # OLD ATR CALCULATION
+            atr_val = OldSimpleTPSL.old_atr(df, 14).iloc[-1] if df is not None and len(df) >= 14 else None
+            
+            # OLD TP/SL MULTIPLIERS
+            tp_mult, sl_mult = 0.8, 1.0
+            
+            if atr_val and atr_val > 0:
+                if side == "BUY":
+                    sl = entry - sl_mult * atr_val
+                    tp1 = entry + tp_mult * atr_val
+                    tp2 = entry + tp_mult * 1.5 * atr_val
+                    tp3 = entry + tp_mult * 2.5 * atr_val
+                else:
+                    sl = entry + sl_mult * atr_val
+                    tp1 = entry - tp_mult * atr_val
+                    tp2 = entry - tp_mult * 1.5 * atr_val
+                    tp3 = entry - tp_mult * 2.5 * atr_val
+            else:
+                # OLD FALLBACK TO PERCENTAGE
+                if side == "BUY":
+                    sl = entry * 0.998
+                    tp1 = entry * 1.004
+                    tp2 = entry * 1.008  
+                    tp3 = entry * 1.012
+                else:
+                    sl = entry * 1.002
+                    tp1 = entry * 0.996
+                    tp2 = entry * 0.992
+                    tp3 = entry * 0.988
+
+            # OLD SL VALIDATION
+            if sl == entry:
+                sl = entry - entry * 0.002 if side == "BUY" else entry + entry * 0.002
+
+            return sl, tp1, tp2, tp3
+        except Exception as e:
+            logging.error(f"TP/SL calculation error: {e}")
+            # Fallback values
+            if side == "BUY":
+                return entry * 0.998, entry * 1.004, entry * 1.008, entry * 1.012
+            else:
+                return entry * 1.002, entry * 0.996, entry * 0.992, entry * 0.988
+
+    @staticmethod
+    def old_atr(df: pd.DataFrame, period=14):
+        """YOUR EXACT OLD ATR CALCULATION"""
+        if df is None or len(df) < period:
+            return pd.Series([0] * len(df) if df is not None else [0])
+        
+        high, low, close = df["high"], df["low"], df["close"]
+        tr = pd.DataFrame({
+            "h-l": high - low,
+            "h-pc": (high - close.shift(1)).abs(),
+            "l-pc": (low - close.shift(1)).abs()
+        }).max(axis=1)
+        return tr.rolling(period, min_periods=1).mean()
 
 # ==================== ENHANCED DATA MODELS ====================
 
 @dataclass
 class TradingSignal:
     """Enhanced signal with OLD scoring + new tracking"""
+    # Fields WITHOUT default values (required) - MUST COME FIRST
     symbol: str
     side: SignalSide
     entry_price: float
@@ -1047,8 +885,10 @@ class TradingSignal:
     winner_filters_passed: List[str]
     winner_filters_failed: List[str]
     signal_id: str
+    
+    # Fields WITH default values (optional) - MUST COME AFTER all required fields
     rome_sequence: bool = False
-    version: str = "3.1-ROMEOPT-UNIFIED"
+    version: str = "3.1-ROMEOPT"
 
 # ==================== OLD-STYLE FILTER APPLICATION ====================
 
@@ -1065,8 +905,10 @@ class OldFilterApplicator:
         signal_side = SignalSide.BUY if old_signal['side'] == 'BUY' else SignalSide.SELL
         tf = context.get('tf', '15m')
         
+        # OLD-STYLE: Start with filters_passed = True, set to False if any critical filter fails
         filters_passed = True
         
+        # 1. BTC DIRECTION FILTER - OLD STYLE
         if config.REQUIRE_BTC_ALIGNMENT:
             btc_direction = context.get('btc_direction', 'NEUTRAL')
             if OriginalWinnerFilters.is_trade_allowed(signal_side, btc_direction):
@@ -1077,6 +919,7 @@ class OldFilterApplicator:
                 winner_filters_failed.append("BTC_MISALIGNMENT")
                 logging.info(f"⏸️ OLD-STYLE Blocked: {signal_side.value} vs BTC {btc_direction}")
         
+        # Continue checking other filters ONLY if filters_passed is still True
         if filters_passed and config.REQUIRE_HIGHER_TF_ALIGNMENT:
             higher_tf_data = context.get('df_15m')
             if OriginalWinnerFilters.check_higher_tf_alignment(old_signal, higher_tf_data):
@@ -1087,8 +930,9 @@ class OldFilterApplicator:
                 winner_filters_failed.append("HIGHER_TF_MISALIGNMENT")
                 logging.info(f"⏸️ OLD-STYLE Blocked: Higher TF misalignment")
         
+        # 3. MOMENTUM CONFIRMATION - OLD APPLICABILITY (skip for 1m/3m)
         if (filters_passed and config.REQUIRE_MOMENTUM_CONFIRMATION and 
-            tf not in ["1m", "3m"]):
+            tf not in ["1m", "3m"]):  # OLD: Skip for 1m, 3m
             if OriginalWinnerFilters.check_momentum_confirmation(df, signal_side):
                 winner_filters_passed.append("MOMENTUM")
             else:
@@ -1097,6 +941,7 @@ class OldFilterApplicator:
                 winner_filters_failed.append("WEAK_MOMENTUM")
                 logging.info(f"⏸️ OLD-STYLE Blocked: No momentum confirmation")
         
+        # 4. ZONE QUALITY
         if filters_passed and config.REQUIRE_ZONE_QUALITY:
             if OriginalWinnerFilters.check_entry_zone_quality(df, signal_side):
                 winner_filters_passed.append("ZONE_QUALITY")
@@ -1106,6 +951,7 @@ class OldFilterApplicator:
                 winner_filters_failed.append("POOR_ZONE")
                 logging.info(f"⏸️ OLD-STYLE Blocked: Poor entry zone")
         
+        # 5. CHOPPY MARKET FILTER
         if filters_passed and config.AVOID_CHOPPY_MARKETS:
             if not OriginalWinnerFilters.detect_choppy_market(df):
                 winner_filters_passed.append("TRENDING_MARKET")
@@ -1238,6 +1084,7 @@ class TradeMonitor:
             
             self.closed_trades.append(trade_record)
             
+            # Update all_signals
             for sig_data in self.all_signals:
                 if sig_data['signal'].signal_id == signal.signal_id:
                     sig_data['status'] = status
@@ -1281,17 +1128,19 @@ OLD Final Score: {signal.final_score}
         """Send 2-hour performance summary"""
         try:
             now = time.time()
-            if now - self.last_summary_time < 7200:
+            if now - self.last_summary_time < 7200:  # 2 hours
                 return False
                 
             self.last_summary_time = now
             
+            # Get signals from last 2 hours
             two_hours_ago = datetime.datetime.utcnow() - datetime.timedelta(hours=2)
             recent_signals = [s for s in self.all_signals if s['added_time'] >= two_hours_ago]
             
             if not recent_signals:
                 return True
                 
+            # Calculate statistics
             open_signals = [s for s in recent_signals if s['status'] == 'OPEN']
             closed_signals = [s for s in recent_signals if s['status'] != 'OPEN']
             winning_trades = [s for s in closed_signals if s.get('pnl_pct', 0) > 0]
@@ -1301,6 +1150,7 @@ OLD Final Score: {signal.final_score}
             win_rate = len(winning_trades) / len(closed_signals) * 100 if closed_signals else 0
             avg_final_score = sum(s['signal'].final_score for s in recent_signals) / total_signals if total_signals else 0
 
+            # Create OLD-style summary message
             message = f"""
 📊 **ROMEOPT 2-HOUR PERFORMANCE** 📊
 
@@ -1315,6 +1165,7 @@ OLD Final Score: {signal.final_score}
 📋 **RECENT SIGNALS:**
 """
             
+            # Add recent signals details
             for i, sig_data in enumerate(recent_signals[-5:], 1):
                 signal = sig_data['signal']
                 status = sig_data['status']
@@ -1363,7 +1214,7 @@ OLD Final Score: {signal.final_score}
 # ==================== ULTIMATE HYBRID SCANNER ====================
 
 class UltimateHybridScanner:
-    """PERFECT FUSION: ROMEOPT SEQUENCING + OLD FILTERS + UNIFIED TP/SL"""
+    """PERFECT FUSION: ROMEOPT SEQUENCING + OLD FILTERS"""
     
     def __init__(self, config: ScannerConfig):
         self.config = config
@@ -1371,8 +1222,10 @@ class UltimateHybridScanner:
         self.exchange = None
         self.signal_cooldown = {}
         
+        # YOUR EXACT OLD COMPONENTS + NEW ROME SEQUENCING
         self.winner_filters = OriginalWinnerFilters()
-        self.smc_logic = OriginalSMCLogic()
+        self.smc_logic = OriginalSMCLogic()  # Now includes Rome sequencing
+        self.old_tpsl = OldSimpleTPSL()
         self.old_filters = OldFilterApplicator()
         
         self._setup_logging()
@@ -1386,10 +1239,10 @@ class UltimateHybridScanner:
                 logging.StreamHandler()
             ]
         )
-        logging.info("🚀 ULTIMATE HYBRID SCANNER v3.1 - UNIFIED SMART TP/SL INITIALIZED")
+        logging.info("🚀 ULTIMATE HYBRID SCANNER v3.1 - ROMEOPT SEQUENCING INITIALIZED")
         logging.info("✅ Strict 6-step RomeOPT institutional sequencing")
         logging.info("✅ Your exact old filter strictness & scoring preserved")
-        logging.info("✅ UNIFIED SMART TP/SL for ALL signals")
+        logging.info("✅ Rome signals get priority + higher base scores")
 
     async def initialize_exchange(self):
         """Initialize with your exchange settings"""
@@ -1439,37 +1292,46 @@ class UltimateHybridScanner:
         signals = []
         
         try:
+            # Get context for winner filters
             context = await self.get_btc_context()
             
+            # Define timeframes to scan (OLD STYLE)
             timeframes = ["1m", "3m", "5m", "15m", "30m"]
             
             for tf in timeframes:
+                # Check cooldown (OLD STYLE)
                 cooldown_key = f"{symbol}_{tf}"
                 if cooldown_key in self.signal_cooldown:
                     if time.time() - self.signal_cooldown[cooldown_key] < self.config.COOLDOWN_MINUTES * 60:
                         continue
                 
+                # Check SL cluster (OLD STYLE)
                 if self.trade_monitor.deprioritized(symbol):
                     continue
                 
+                # Fetch data
                 df = await self.fetch_ohlcv_data(symbol, tf)
-                if df is None or len(df) < 20:
+                if df is None or len(df) < 20:  # Increased minimum for Rome
                     continue
                 
+                # Add context
                 scan_context = context.copy()
                 scan_context['tf'] = tf
                 scan_context['current_price'] = df['close'].iloc[-1]
                 
+                # Get higher timeframe data for alignment (OLD STYLE)
                 if tf in ["1m", "3m", "5m"]:
                     df_15m = await self.fetch_ohlcv_data(symbol, '15m', 100)
                     df_1h = await self.fetch_ohlcv_data(symbol, '1h', 100)
                     scan_context['df_15m'] = df_15m
                     scan_context['df_1h'] = df_1h
                 
+                # GENERATE SIGNAL USING ROMEOPT SEQUENCING (with fallback to OLD)
                 old_signal = self.smc_logic.generate_signal(df, symbol, scan_context)
                 if not old_signal: 
                     continue
                 
+                # APPLY YOUR EXACT OLD FILTER STRICTNESS
                 hybrid_signal = await self._apply_old_style_filters(old_signal, df, scan_context)
                 if hybrid_signal:
                     if await self._validate_signal(hybrid_signal):
@@ -1477,10 +1339,11 @@ class UltimateHybridScanner:
                         self.signal_cooldown[cooldown_key] = time.time()
                         await self.trade_monitor.add_signal(hybrid_signal)
                         
+                        # Send signal notification
                         await self._send_signal_notification(hybrid_signal, old_signal)
                         
                         rome_tag = " 🏛️" if hybrid_signal.rome_sequence else ""
-                        logging.info(f"🏆 UNIFIED SIGNAL: {symbol} {hybrid_signal.side.value} "
+                        logging.info(f"🏆 ROMEOPT SIGNAL: {symbol} {hybrid_signal.side.value} "
                                    f"| Base: {hybrid_signal.base_score} "
                                    f"| Final: {hybrid_signal.final_score}{rome_tag}")
         
@@ -1492,18 +1355,23 @@ class UltimateHybridScanner:
     async def _apply_old_style_filters(self, old_signal: Dict, df: pd.DataFrame, context: Dict) -> Optional[TradingSignal]:
         """APPLY FILTERS EXACTLY LIKE OLD CODE"""
         try:
+            # OLD-STYLE FILTER APPLICATION
             filters_passed, winner_filters_passed, winner_filters_failed, filter_reasons = (
                 await self.old_filters.apply_old_filters(old_signal, df, context, self.config)
             )
             
+            # OLD-STYLE: Only proceed if filters_passed is True
             if not filters_passed:
                 return None
             
-            base_score = old_signal['score']
-            final_score = base_score + self.config.WINNER_BONUS
+            # OLD SCORING SYSTEM: base_score + 5 fixed bonus
+            base_score = old_signal['score']  # OLD SMC score (4-7) or Rome score (6)
+            final_score = base_score + self.config.WINNER_BONUS  # OLD: Fixed +5 bonus
             
+            # Check if this is a Rome signal
             rome_sequence = old_signal.get('rome_sequence', False)
             
+            # Create enhanced signal with OLD scoring
             enhanced_signal = TradingSignal(
                 symbol=old_signal['symbol'],
                 side=SignalSide.BUY if old_signal['side'] == 'BUY' else SignalSide.SELL,
@@ -1514,8 +1382,8 @@ class UltimateHybridScanner:
                 take_profit_3=old_signal['tp3'],
                 timestamp=datetime.datetime.utcnow(),
                 timeframe=old_signal['timeframe'],
-                base_score=base_score,
-                final_score=final_score,
+                base_score=base_score,  # OLD SMC score
+                final_score=final_score,  # OLD final score
                 filters_passed=old_signal['reason_list'],
                 rejection_reasons=filter_reasons,
                 winner_filters_passed=winner_filters_passed,
@@ -1532,7 +1400,7 @@ class UltimateHybridScanner:
             return None
 
     async def _send_signal_notification(self, hybrid_signal: TradingSignal, old_signal: Dict):
-        """Send signal notification"""
+        """Send signal notification in OLD STYLE"""
         try:
             rome_tag = "🏛️ ROMEOPT INSTITUTIONAL" if hybrid_signal.rome_sequence else "OLD-STYLE"
             rome_emoji = "🏛️" if hybrid_signal.rome_sequence else "🔹"
@@ -1557,13 +1425,8 @@ Winner Bonus: +{self.config.WINNER_BONUS}
 FINAL SCORE: {hybrid_signal.final_score}
 
 Filters: {', '.join(hybrid_signal.winner_filters_passed)}
+Signal Reasons: {', '.join(old_signal['reason_list'])}
 """
-            
-            if hybrid_signal.rome_sequence:
-                message += f"Rome Sequence: {', '.join(hybrid_signal.filters_passed)}\n"
-            else:
-                message += f"Signal Reasons: {', '.join(old_signal['reason_list'])}\n"
-        
             await send_telegram_message(message)
         except Exception as e:
             logging.error(f"Send signal notification error: {e}")
@@ -1571,6 +1434,7 @@ Filters: {', '.join(hybrid_signal.winner_filters_passed)}
     async def _validate_signal(self, signal: TradingSignal) -> bool:
         """Final validation"""
         try:
+            # Check if we're already monitoring this symbol
             for open_signal in self.trade_monitor.open_signals.values():
                 if open_signal.symbol == signal.symbol:
                     logging.info(f"⏸️ Already monitoring {signal.symbol}")
@@ -1619,8 +1483,9 @@ Filters: {', '.join(hybrid_signal.winner_filters_passed)}
     async def run_scan_cycle(self):
         """Enhanced scanning with performance tracking"""
         try:
-            logging.info("🔍 Starting UNIFIED scan cycle...")
+            logging.info("🔍 Starting ROMEOPT scan cycle...")
             
+            # Get top symbols
             symbols = await self.get_top_symbols()
             if not symbols:
                 logging.warning("No symbols to scan")
@@ -1628,34 +1493,38 @@ Filters: {', '.join(hybrid_signal.winner_filters_passed)}
                 
             all_signals = []
             
+            # Scan each symbol
             for symbol in symbols:
                 try:
                     signals = await self.scan_symbol(symbol)
                     all_signals.extend(signals)
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.1)  # Rate limit
                 except Exception as e:
                     logging.error(f"Error scanning {symbol}: {e}")
                     continue
             
+            # Log summary
             rome_signals = [s for s in all_signals if s.rome_sequence]
             if all_signals:
-                logging.info(f"📈 UNIFIED scan complete: {len(all_signals)} signals ({len(rome_signals)} Rome) found")
+                logging.info(f"📈 ROMEOPT scan complete: {len(all_signals)} signals ({len(rome_signals)} Rome) found")
             else:
-                logging.info("📈 UNIFIED scan complete: No signals found")
+                logging.info("📈 ROMEOPT scan complete: No signals found")
                 
         except Exception as e:
-            logging.error(f"UNIFIED scan cycle error: {e}")
+            logging.error(f"ROMEOPT scan cycle error: {e}")
 
     async def start_continuous_scanning(self):
         """Ultimate continuous scanning"""
-        logging.info("🔄 Starting UNIFIED continuous scanning...")
+        logging.info("🔄 Starting ROMEOPT continuous scanning...")
         
         startup_msg = (
-            "🚀 **UNIFIED SMART TP/SL SCANNER STARTED** 🚀\n"
-            "✅ Strict 6-step RomeOPT institutional sequencing\n"
+            "🚀 **ROMEOPT INSTITUTIONAL SCANNER STARTED** 🚀\n"
+            "✅ Strict 6-step RomeOPT sequencing active\n"
+            "✅ Liquidity Sweep → Displacement → Zone Retrace\n" 
+            "✅ Premium/Discount → HTF Alignment → Momentum\n"
             "✅ Your exact old filters & scoring preserved\n"
-            "✅ UNIFIED SMART TP/SL for ALL signals\n"
-            "✅ Liquidity-based targets & story-based stops\n"
+            "✅ Rome signals get priority + higher base scores\n"
+            "✅ Advanced monitoring & performance tracking\n"
             "🎯 Target: INSTITUTIONAL-GRADE SIGNALS"
         )
         await send_telegram_message(startup_msg)
@@ -1664,8 +1533,13 @@ Filters: {', '.join(hybrid_signal.winner_filters_passed)}
             while True:
                 start_time = time.time()
                 
+                # Run elite scan cycle
                 await self.run_scan_cycle()
+                
+                # Monitor open signals
                 await self.trade_monitor.monitor_open_signals()
+                
+                # Send performance summary every 2 hours
                 await self.trade_monitor.send_performance_summary()
                 
                 elapsed = time.time() - start_time
@@ -1673,7 +1547,7 @@ Filters: {', '.join(hybrid_signal.winner_filters_passed)}
                 await asyncio.sleep(sleep_time)
                 
         except Exception as e:
-            logging.error(f"UNIFIED scanning error: {e}")
+            logging.error(f"ROMEOPT scanning error: {e}")
             await asyncio.sleep(60)
 
     async def cleanup(self):
@@ -1681,14 +1555,14 @@ Filters: {', '.join(hybrid_signal.winner_filters_passed)}
         try:
             if self.exchange:
                 await self.exchange.close()
-            logging.info("🧹 UNIFIED scanner cleanup completed")
+            logging.info("🧹 ROMEOPT scanner cleanup completed")
         except Exception as e:
             logging.error(f"Cleanup error: {e}")
 
 # ==================== TELEGRAM NOTIFICATIONS ====================
 
 async def send_telegram_message(message: str):
-    """Your exact Telegram function"""
+    """Your exact Telegram function - FIXED"""
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     
@@ -1715,6 +1589,7 @@ async def send_telegram_message(message: str):
 
 # ==================== WEB API SERVER ====================
 
+# Global scanner instance
 scanner: Optional[UltimateHybridScanner] = None
 
 @asynccontextmanager
@@ -1734,8 +1609,9 @@ async def lifespan(app: FastAPI):
     if scanner:
         await scanner.cleanup()
 
-app = FastAPI(title="Ultimate Hybrid Scanner v3.1 - UNIFIED", version="3.1.0", lifespan=lifespan)
+app = FastAPI(title="Ultimate Hybrid Scanner v3.1 - ROMEOPT", version="3.1.0", lifespan=lifespan)
 
+# API Routes
 class SignalResponse(BaseModel):
     symbol: str
     side: str
@@ -1757,7 +1633,7 @@ class PerformanceStats(BaseModel):
 
 @app.get("/")
 async def root():
-    return {"status": "ULTIMATE HYBRID SCANNER v3.1 - UNIFIED SMART TP/SL - RUNNING"}
+    return {"status": "ULTIMATE HYBRID SCANNER v3.1 - ROMEOPT SEQUENCING - RUNNING"}
 
 @app.get("/signals", response_model=List[SignalResponse])
 async def get_current_signals():
@@ -1794,17 +1670,17 @@ async def get_performance():
 
 @app.post("/scan-now")
 async def trigger_manual_scan():
-    """Trigger manual scan cycle"""
+    """Trigger manual ROMEOPT scan cycle"""
     if not scanner:
         raise HTTPException(status_code=500, detail="Scanner not initialized")
     
     asyncio.create_task(scanner.run_scan_cycle())
-    return {"status": "UNIFIED scan triggered"}
+    return {"status": "ROMEOPT scan triggered"}
 
 # ==================== MAIN EXECUTION ====================
 
 async def main():
-    """Ultimate main execution with unified TP/SL"""
+    """Ultimate main execution with ROMEOPT sequencing"""
     try:
         config = ScannerConfig()
         scanner = UltimateHybridScanner(config)
@@ -1814,12 +1690,13 @@ async def main():
             logging.error("❌ Failed to initialize exchange. Exiting.")
             return
         
+        # Start the scanner
         await scanner.start_continuous_scanning()
         
     except KeyboardInterrupt:
-        logging.info("🛑 UNIFIED scanner stopped by user")
+        logging.info("🛑 ROMEOPT scanner stopped by user")
     except Exception as e:
-        logging.error(f"❌ UNIFIED scanner error: {e}")
+        logging.error(f"❌ ROMEOPT scanner error: {e}")
     finally:
         if 'scanner' in locals():
             await scanner.cleanup()
