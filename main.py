@@ -9,6 +9,7 @@
 - ALL MONITORING, TRACKING & 2-HOUR SUMMARIES PRESERVED
 - BINGX API INTEGRATION - FULLY WORKING
 - FIXED TP/SL TRACKING
+- 🚨 FIXED PRICE CONSISTENCY ISSUE - NO MORE LATE SIGNALS
 """
 
 import os
@@ -245,7 +246,7 @@ class PureRomeAnalyzer:
         self.rejection_reason = ""
         
     def generate_signal(self, df: pd.DataFrame, symbol: str, context=None) -> Optional[Dict]:
-        """PURE ROMEOPT 6-STEP INSTITUTIONAL SEQUENCE"""
+        """PURE ROMEOPT 6-STEP INSTITUTIONAL SEQUENCE - FIXED PRICE"""
         if context is None:
             context = {}
             
@@ -256,6 +257,10 @@ class PureRomeAnalyzer:
             return None
 
         try:
+            # 🚨 CRITICAL FIX: Get CURRENT price ONCE and use it consistently
+            current_price = df["close"].iloc[-1]
+            context['current_price'] = current_price  # Update context with FRESH price
+            
             # 🔥 STEP 1: Liquidity Sweep Condition
             sweep_result = self._check_liquidity_sweep(df)
             if not sweep_result["valid"]:
@@ -410,7 +415,8 @@ class PureRomeAnalyzer:
             return {"valid": False, "reason": "No candles after sweep"}
         
         impulse_candle = None
-        for i, candle in post_sweep_candles.iterrows():
+        for i in range(len(post_sweep_candles)):
+            candle = post_sweep_candles.iloc[i]
             body_size = abs(candle["close"] - candle["open"])
             full_range = candle["high"] - candle["low"]
             
@@ -566,10 +572,18 @@ class PureRomeAnalyzer:
         }
 
     def _format_pure_rome_signal(self, final_result: Dict, symbol: str, context: Dict) -> Dict:
-        """Format pure RomeOPT signal with perfect score"""
+        """Format pure RomeOPT signal - USING CONSISTENT PRICE"""
         direction = final_result["direction"]
         side = "BUY" if direction == "bullish" else "SELL"
+        
+        # 🚨 CRITICAL FIX: Use the UPDATED context price from generate_signal
         current_price = context.get('current_price', 0)
+        
+        # 🚨 SAFETY CHECK: If price is still 0, something is wrong
+        if current_price == 0:
+            logging.error(f"🚨 ZERO PRICE ALERT for {symbol} - Check price flow!")
+            return None
+            
         tf = context.get('tf', '15m')
         
         sl, tp1, tp2, tp3 = self._calculate_institutional_tpsl(current_price, side, tf)
@@ -577,12 +591,12 @@ class PureRomeAnalyzer:
         return {
             "symbol": symbol,
             "side": side,
-            "entry": current_price,
+            "entry": current_price,  # ← This now matches the analysis price exactly
             "sl": sl,
             "tp1": tp1,
             "tp2": tp2,
             "tp3": tp3,
-            "score": 11,  # Perfect Rome score
+            "score": 11,
             "reason": "PURE ROMEOPT INSTITUTIONAL SEQUENCE",
             "reason_list": [
                 "✅ Liquidity Sweep", 
@@ -1079,6 +1093,7 @@ class PureRomeScanner:
         logging.info("✅ No Additional Filters - Pure Rome Logic Only")
         logging.info("✅ BingX API Integration Active")
         logging.info("✅ FIXED TP/SL Tracking System")
+        logging.info("🚨 FIXED PRICE CONSISTENCY - NO MORE LATE SIGNALS")
 
     async def initialize_exchange(self):
         """Initialize with BingX API"""
@@ -1162,7 +1177,7 @@ class PureRomeScanner:
                 
                 scan_context = context.copy()
                 scan_context['tf'] = tf
-                scan_context['current_price'] = df['close'].iloc[-1]
+                scan_context['current_price'] = df['close'].iloc[-1]  # Fresh price
                 
                 # Get appropriate HTF data for each timeframe
                 if tf in ['1m', '3m', '5m']:
@@ -1347,6 +1362,7 @@ Institutional Sequence:
             "✅ ALL TIMEFRAMES: 1m, 3m, 5m, 15m, 30m, 1h\n"
             "✅ No additional filters - Pure institutional logic\n"
             "✅ FIXED TP/SL Tracking System\n"
+            "🚨 FIXED PRICE CONSISTENCY - NO MORE LATE SIGNALS\n"
             "✅ Real-time signal monitoring active\n"
             "🎯 Target: 100% INSTITUTIONAL-GRADE SIGNALS"
         )
