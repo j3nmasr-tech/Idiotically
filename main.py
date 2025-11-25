@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-🏛️ PURE ROMEOPT INSTITUTIONAL SCANNER v4.0 - EARLY SIGNALS RESTORED 🏛️
+🏛️ PURE ROMEOPT INSTITUTIONAL SCANNER v4.1 - FIXED SIGNAL TIMING 🏛️
 - STRICT 6-STEP ROMEOPT SEQUENCING ONLY  
 - BINGX API INTEGRATION 
-- EARLY SIGNAL FIRING LIKE OLD VERSION
-- LIVE CANDLE PROCESSING
+- PROPER SIGNAL AGE VALIDATION
+- LIVE CANDLE PROCESSING WITH CLOSED CANDLES ONLY
 - ALL MONITORING & TRACKING PRESERVED
-- 🚀 GUARANTEED EARLY SIGNALS LIKE BEFORE
+- 🚀 BALANCED EARLY SIGNALS WITH AGE FILTERS
 """
 
 import os
@@ -200,8 +200,9 @@ class PureRomeConfig:
     MIN_VOLUME_USDT: float = 1000000
     MAX_SPREAD_PCT: float = 0.002
     
-    # Pure RomeOPT sequencing only - NO ADDITIONAL FILTERS
+    # Signal age validation - BALANCED SETTINGS
     COOLDOWN_MINUTES: int = 30
+    MAX_SIGNAL_AGE_MINUTES: int = 12  # BALANCED: Not too strict, not too loose
     MAX_SL_CLUSTER_HITS: int = 3
     
     # RomeOPT scoring
@@ -210,78 +211,118 @@ class PureRomeConfig:
 # ==================== PURE ROMEOPT 6-STEP SEQUENCING ====================
 
 class PureRomeAnalyzer:
-    """PURE ROMEOPT 6-STEP INSTITUTIONAL SEQUENCING - EARLY SIGNALS RESTORED"""
+    """PURE ROMEOPT 6-STEP INSTITUTIONAL SEQUENCING - FIXED SIGNAL TIMING"""
     
-    def __init__(self):
+    def __init__(self, config: PureRomeConfig):
+        self.config = config
         self.sequence_complete = False
         self.current_step = 0
         
+    def _get_candle_duration_minutes(self, timeframe: str) -> int:
+        """Get candle duration in minutes for age calculation"""
+        tf_minutes = {
+            '1m': 1, '3m': 3, '5m': 5, 
+            '15m': 15, '30m': 30, '1h': 60
+        }
+        return tf_minutes.get(timeframe, 15)
+
     def generate_signal(self, df: pd.DataFrame, symbol: str, context=None) -> Optional[Dict]:
-        """PURE ROMEOPT 6-STEP INSTITUTIONAL SEQUENCE - EARLY SIGNALS RESTORED"""
+        """PURE ROMEOPT 6-STEP INSTITUTIONAL SEQUENCE - FIXED AGE VALIDATION"""
         if context is None:
             context = {}
             
-        if df is None or len(df) < 15:  # REDUCED FROM 20 to 15 for faster signals
+        # 🚨 CRITICAL FIX: Use only closed candles for analysis
+        if df is None or len(df) < 16:  # Need 15 closed + 1 forming
             return None
 
         try:
-            # 🚨 CRITICAL: Get CURRENT price and ensure data freshness
-            current_price = df["close"].iloc[-1]
+            # Use only CLOSED candles (exclude current forming candle)
+            closed_data = df.iloc[:-1]
+            current_price = closed_data["close"].iloc[-1]  # Last CLOSED price
             context['current_price'] = current_price
+            timeframe = context.get('tf', '15m')
             
+            if len(closed_data) < 15:
+                return None
+
             # 🚨 RESTORED OLD BEHAVIOR: Use shorter lookback for early signals
             max_lookback_candles = 5  # RESTORED FROM 8 to 5 (OLD BEHAVIOR)
             
             # 🔥 STEP 1: Liquidity Sweep Condition - EARLY DETECTION
-            sweep_result = self._check_early_liquidity_sweep(df, max_lookback_candles)
+            sweep_result = self._check_early_liquidity_sweep(closed_data, max_lookback_candles)
             if not sweep_result["valid"]:
                 return None
             
             # 🔥 STEP 2: Displacement Condition - EARLY DETECTION  
-            displacement_result = self._check_early_displacement(df, sweep_result, max_lookback_candles)
+            displacement_result = self._check_early_displacement(closed_data, sweep_result, max_lookback_candles)
             if not displacement_result["valid"]:
                 return None
             
+            # 🚨 NEW: REAL-TIME AGE VALIDATION - BALANCED
+            signal_age_minutes = self._get_signal_timestamp_age(closed_data, sweep_result)
+            if signal_age_minutes > self.config.MAX_SIGNAL_AGE_MINUTES:
+                logging.info(f"⏰ REJECTED OLD SIGNAL: {symbol} - Age: {signal_age_minutes:.1f}m (Max: {self.config.MAX_SIGNAL_AGE_MINUTES}m)")
+                return None
+            
             # 🔥 STEP 3: Retracement Into Zone - EARLY DETECTION
-            zone_result = self._check_early_retracement(df, displacement_result, context)
+            zone_result = self._check_early_retracement(closed_data, displacement_result, context)
             if not zone_result["valid"]:
                 return None
             
             # 🔥 STEP 4: Premium/Discount Filter - RELAXED FOR EARLY SIGNALS
-            equilibrium_result = self._check_relaxed_premium_discount(df, zone_result, context)
+            equilibrium_result = self._check_relaxed_premium_discount(closed_data, zone_result, context)
             if not equilibrium_result["valid"]:
                 return None
             
             # 🔥 STEP 5: HTF Bias Alignment - RELAXED FOR EARLY SIGNALS
-            htf_result = self._check_relaxed_htf_alignment(df, equilibrium_result, context)
+            htf_result = self._check_relaxed_htf_alignment(closed_data, equilibrium_result, context)
             if not htf_result["valid"]:
                 return None
             
             # 🔥 STEP 6: Momentum & Volatility Confirmation - EARLY DETECTION
-            momentum_result = self._check_early_momentum(df, htf_result, context)
+            momentum_result = self._check_early_momentum(closed_data, htf_result, context)
             if not momentum_result["valid"]:
                 return None
             
             # ✅ ALL ROME CONDITIONS MET - GENERATE EARLY SIGNAL
             self.sequence_complete = True
-            
-            # 🚨 RESTORED OLD BEHAVIOR: Less strict signal age checking
-            signal_age = self._get_signal_age(sweep_result, displacement_result)
-            if signal_age > 8:  # RELAXED FROM 12 to 8 (OLD BEHAVIOR)
-                logging.info(f"⏰ REJECTED OLD SIGNAL: {symbol} - Signal age: {signal_age} candles")
-                return None
                 
             signal = self._format_early_rome_signal(momentum_result, symbol, context)
             
             # 🚨 DEBUG: Log early signal timing
             if signal:
-                logging.info(f"🎯 EARLY ROME SIGNAL: {symbol} | Entry: {signal['entry']} | Fresh signal detected")
+                logging.info(f"🎯 EARLY ROME SIGNAL: {symbol} | Entry: {signal['entry']} | Age: {signal_age_minutes:.1f}m - FRESH")
             
             return signal
             
         except Exception as e:
             logging.error(f"Rome sequencing error for {symbol}: {e}")
             return None
+
+    def _get_signal_timestamp_age(self, df: pd.DataFrame, sweep_result: Dict) -> float:
+        """Calculate signal age in minutes based on actual timestamps - BALANCED"""
+        try:
+            sweep_recency = sweep_result.get("sweep_recency", 1)
+            if sweep_recency >= len(df):
+                return 999.0  # Very old
+            
+            # Get timestamp of the sweep candle
+            sweep_idx = -sweep_recency
+            sweep_timestamp = df.iloc[sweep_idx]['timestamp']
+            current_time = datetime.datetime.utcnow()
+            
+            # Convert to datetime if needed
+            if hasattr(sweep_timestamp, 'timestamp'):
+                sweep_time = sweep_timestamp
+            else:
+                sweep_time = pd.to_datetime(sweep_timestamp)
+            
+            age_minutes = (current_time - sweep_time).total_seconds() / 60
+            return max(0.0, age_minutes)
+            
+        except Exception as e:
+            logging.debug(f"Age calculation error: {e}")
+            return 0.0  # Don't reject on age calculation errors
 
     def _check_early_liquidity_sweep(self, df: pd.DataFrame, max_lookback: int) -> Dict:
         """STEP 1: Check for EARLY liquidity sweep detection"""
@@ -302,7 +343,8 @@ class PureRomeAnalyzer:
                     "valid": True, 
                     "type": "equal_high_sweep", 
                     "direction": "bearish",
-                    "sweep_recency": i
+                    "sweep_recency": i,
+                    "sweep_index": -i  # Store index for age calculation
                 }
             
             # EARLY Sweep detection - less strict  
@@ -311,13 +353,15 @@ class PureRomeAnalyzer:
                     "valid": True, 
                     "type": "equal_low_sweep", 
                     "direction": "bullish",
-                    "sweep_recency": i
+                    "sweep_recency": i,
+                    "sweep_index": -i  # Store index for age calculation
                 }
             
             # EARLY Stop-run detection
             stop_run = self._is_early_stop_run_sweep(current, df)
             if stop_run["valid"]:
                 stop_run["sweep_recency"] = i
+                stop_run["sweep_index"] = -i
                 return stop_run
         
         return {"valid": False, "reason": "No EARLY liquidity sweep detected"}
@@ -366,7 +410,8 @@ class PureRomeAnalyzer:
             "valid": True, 
             "impulse_candle": impulse_candle,
             "direction": direction,
-            "displacement_recency": sweep_recency + i + 1
+            "displacement_recency": sweep_recency + i + 1,
+            "displacement_index": start_idx + i
         }
 
     def _check_early_retracement(self, df: pd.DataFrame, displacement_result: Dict, context: Dict) -> Dict:
@@ -402,16 +447,16 @@ class PureRomeAnalyzer:
         direction = htf_result["direction"]
         current_price = df["close"].iloc[-1]
         
-        # 🚨 RESTORED OLD BEHAVIOR: Use CURRENT candle for early momentum
-        current_candle = df.iloc[-1]
+        # 🚨 CRITICAL FIX: Use last CLOSED candle for momentum
+        last_closed_candle = df.iloc[-1]
         
         if direction == "bullish":
             # EARLY momentum: allow partial bullish formation
-            if not (current_candle["close"] >= current_candle["open"]):  # RELAXED CONDITION
+            if not (last_closed_candle["close"] >= last_closed_candle["open"]):  # RELAXED CONDITION
                 return {"valid": False, "reason": "No EARLY bullish momentum"}
         else:
             # EARLY momentum: allow partial bearish formation  
-            if not (current_candle["close"] <= current_candle["open"]):  # RELAXED CONDITION
+            if not (last_closed_candle["close"] <= last_closed_candle["open"]):  # RELAXED CONDITION
                 return {"valid": False, "reason": "No EARLY bearish momentum"}
         
         # Additional volatility check - relaxed
@@ -581,14 +626,6 @@ class PureRomeAnalyzer:
                     return True
                     
         return False
-
-    def _get_signal_age(self, sweep_result: Dict, displacement_result: Dict) -> int:
-        """Calculate how old the signal pattern is in candles"""
-        sweep_recency = sweep_result.get("sweep_recency", 8)
-        displacement_recency = displacement_result.get("displacement_recency", 8)
-        
-        # Total age is the recency of the sweep + displacement
-        return sweep_recency + (displacement_recency - sweep_recency)
 
     def _format_early_rome_signal(self, final_result: Dict, symbol: str, context: Dict) -> Dict:
         """Format early RomeOPT signal"""
@@ -992,14 +1029,15 @@ Sequence Steps: {signal.sequence_steps_passed}/6
 # ==================== PURE ROMEOPT SCANNER ====================
 
 class PureRomeScanner:
-    """PURE ROMEOPT SCANNER - 6-STEP INSTITUTIONAL SEQUENCING ONLY - EARLY SIGNALS"""
+    """PURE ROMEOPT SCANNER - 6-STEP INSTITUTIONAL SEQUENCING ONLY - FIXED TIMING"""
     
     def __init__(self, config: PureRomeConfig):
         self.config = config
         self.trade_monitor = RomeTradeMonitor(self)
         self.bingx_api = BingXAPI()
         self.signal_cooldown = {}
-        self.rome_analyzer = PureRomeAnalyzer()
+        self.pattern_cooldown = {}  # NEW: Track specific patterns
+        self.rome_analyzer = PureRomeAnalyzer(config)
         
         self._setup_logging()
     
@@ -1009,11 +1047,11 @@ class PureRomeScanner:
             format='%(asctime)s | %(levelname)s | %(message)s',
             handlers=[logging.StreamHandler()]
         )
-        logging.info("🏛️ PURE ROMEOPT SCANNER v4.0 - EARLY SIGNALS RESTORED")
+        logging.info("🏛️ PURE ROMEOPT SCANNER v4.1 - FIXED SIGNAL TIMING")
         logging.info("✅ 6-Step Institutional Sequencing Active")
         logging.info("✅ BingX API Integration")
-        logging.info("🚀 EARLY SIGNAL FIRING LIKE OLD VERSION")
-        logging.info("🎯 GUARANTEED EARLY SIGNALS LIKE BEFORE")
+        logging.info("✅ PROPER SIGNAL AGE VALIDATION")
+        logging.info("🎯 BALANCED EARLY SIGNALS WITH AGE FILTERS")
 
     async def initialize_exchange(self):
         try:
@@ -1025,7 +1063,7 @@ class PureRomeScanner:
     async def fetch_ohlcv_data(self, symbol: str, timeframe: str, limit: int = 200) -> Optional[pd.DataFrame]:
         try:
             ohlcv = await self.bingx_api.fetch_ohlcv(symbol, timeframe, limit)
-            if not ohlcv or len(ohlcv) < 15: return None  # REDUCED FROM 20 to 15
+            if not ohlcv or len(ohlcv) < 16: return None  # Need 15 closed + 1 forming
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
@@ -1055,7 +1093,7 @@ class PureRomeScanner:
             return {}
 
     async def scan_symbol(self, symbol: str) -> List[RomeSignal]:
-        """PURE ROMEOPT SCANNING - EARLY SIGNALS"""
+        """PURE ROMEOPT SCANNING - FIXED TIMING"""
         signals = []
         
         try:
@@ -1075,12 +1113,12 @@ class PureRomeScanner:
                 
                 bingx_symbol = symbol.replace('/', '-')
                 df = await self.fetch_ohlcv_data(bingx_symbol, tf)
-                if df is None or len(df) < 15:  # REDUCED FROM 20 to 15
+                if df is None or len(df) < 16:  # Need 15 closed + 1 forming
                     continue
                 
                 scan_context = context.copy()
                 scan_context['tf'] = tf
-                scan_context['current_price'] = df['close'].iloc[-1]
+                scan_context['current_price'] = df['close'].iloc[-2]  # Use last CLOSED price
                 
                 # Get appropriate HTF data for each timeframe
                 if tf in ['1m', '3m', '5m']:
@@ -1096,16 +1134,23 @@ class PureRomeScanner:
                     df_4h = await self.fetch_ohlcv_data(bingx_symbol, '4h', 100)
                     scan_context['df_4h'] = df_4h
                 
-                # 🎯 PURE ROMEOPT SEQUENCING ONLY - EARLY SIGNALS
+                # 🎯 PURE ROMEOPT SEQUENCING ONLY - WITH AGE VALIDATION
                 rome_signal = self.rome_analyzer.generate_signal(df, symbol, scan_context)
                 if not rome_signal: 
                     continue
+                
+                # NEW: Pattern-based cooldown to prevent duplicate signals
+                pattern_id = f"{symbol}_{tf}_s{rome_signal.get('sweep_index', 0)}"
+                if pattern_id in self.pattern_cooldown:
+                    if time.time() - self.pattern_cooldown[pattern_id] < 300:  # 5 min pattern cooldown
+                        continue
                 
                 pure_signal = await self._create_rome_signal(rome_signal)
                 if pure_signal:
                     if await self._validate_signal(pure_signal):
                         signals.append(pure_signal)
                         self.signal_cooldown[cooldown_key] = time.time()
+                        self.pattern_cooldown[pattern_id] = time.time()
                         await self.trade_monitor.add_signal(pure_signal)
                         
                         await self._send_rome_notification(pure_signal, rome_signal)
@@ -1249,9 +1294,9 @@ Institutional Sequence:
         ]
 
     async def run_scan_cycle(self):
-        """Pure RomeOPT scanning cycle - EARLY SIGNALS"""
+        """Pure RomeOPT scanning cycle - FIXED TIMING"""
         try:
-            logging.info("🔍 Starting PURE ROMEOPT scan cycle - EARLY SIGNALS...")
+            logging.info("🔍 Starting PURE ROMEOPT scan cycle - FIXED TIMING...")
             
             symbols = await self.get_top_symbols()
             if not symbols:
@@ -1286,17 +1331,17 @@ Institutional Sequence:
             logging.error(f"ROMEOPT scan cycle error: {e}")
 
     async def start_continuous_scanning(self):
-        """Pure RomeOPT continuous scanning - EARLY SIGNALS"""
-        logging.info("🔄 Starting PURE ROMEOPT continuous scanning - EARLY SIGNALS...")
+        """Pure RomeOPT continuous scanning - FIXED TIMING"""
+        logging.info("🔄 Starting PURE ROMEOPT continuous scanning - FIXED TIMING...")
         
         startup_msg = (
-            "🏛️ **PURE ROMEOPT INSTITUTIONAL SCANNER STARTED** 🏛️\n"
+            "🏛️ **PURE ROMEOPT INSTITUTIONAL SCANNER v4.1 STARTED** 🏛️\n"
             "✅ BingX API integration active\n"
             "✅ Strict 6-step RomeOPT sequencing only\n"
-            "🚀 EARLY SIGNAL FIRING LIKE OLD VERSION\n"
+            "✅ PROPER SIGNAL AGE VALIDATION\n"
             "✅ ALL TIMEFRAMES: 1m, 3m, 5m, 15m, 30m, 1h\n"
-            "🎯 RELAXED CRITERIA FOR EARLY DETECTION\n"
-            "🚀 GUARANTEED EARLY SIGNALS LIKE BEFORE"
+            "🎯 BALANCED AGE FILTERS (Max 12 minutes)\n"
+            "🚀 EARLY SIGNALS WITH FRESH PATTERNS ONLY"
         )
         await send_telegram_message(startup_msg)
         
@@ -1372,7 +1417,7 @@ async def lifespan(app: FastAPI):
     if scanner:
         await scanner.cleanup()
 
-app = FastAPI(title="Pure RomeOPT Institutional Scanner - Early Signals", version="4.0.0", lifespan=lifespan)
+app = FastAPI(title="Pure RomeOPT Institutional Scanner - Fixed Timing", version="4.1.0", lifespan=lifespan)
 
 class SignalResponse(BaseModel):
     symbol: str
@@ -1396,7 +1441,7 @@ class PerformanceStats(BaseModel):
 
 @app.get("/")
 async def root():
-    return {"status": "PURE ROMEOPT INSTITUTIONAL SCANNER v4.0 - EARLY SIGNALS - RUNNING"}
+    return {"status": "PURE ROMEOPT INSTITUTIONAL SCANNER v4.1 - FIXED TIMING - RUNNING"}
 
 @app.get("/signals", response_model=List[SignalResponse])
 async def get_current_signals():
@@ -1439,12 +1484,12 @@ async def trigger_manual_scan():
         raise HTTPException(status_code=500, detail="Scanner not initialized")
     
     asyncio.create_task(scanner.run_scan_cycle())
-    return {"status": "PURE ROMEOPT EARLY SIGNALS scan triggered"}
+    return {"status": "PURE ROMEOPT FIXED TIMING scan triggered"}
 
 # ==================== MAIN EXECUTION ====================
 
 async def main():
-    """Pure RomeOPT main execution - EARLY SIGNALS"""
+    """Pure RomeOPT main execution - FIXED TIMING"""
     try:
         config = PureRomeConfig()
         scanner = PureRomeScanner(config)
