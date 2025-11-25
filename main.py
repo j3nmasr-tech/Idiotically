@@ -8,6 +8,7 @@
 - NO ADDITIONAL FILTERS - PURE INSTITUTIONAL LOGIC
 - ALL MONITORING, TRACKING & 2-HOUR SUMMARIES PRESERVED
 - BINGX API INTEGRATION - FULLY WORKING
+- FIXED TP/SL TRACKING
 """
 
 import os
@@ -222,7 +223,7 @@ class SignalSide(Enum):
 class PureRomeConfig:
     # Core scanning settings
     SCAN_INTERVAL: int = 60
-    TOP_N_SYMBOLS: int = 80
+    TOP_N_SYMBOLS: int = 60
     MIN_VOLUME_USDT: float = 1000000
     MAX_SPREAD_PCT: float = 0.002
     
@@ -738,10 +739,10 @@ class RomeSignal:
     signal_id: str
     status: str = "active"
 
-# ==================== TRADE MONITORING SYSTEM ====================
+# ==================== FIXED TRADE MONITORING SYSTEM ====================
 
 class RomeTradeMonitor:
-    """Advanced monitoring for RomeOPT signals"""
+    """FIXED Advanced monitoring for RomeOPT signals"""
     
     def __init__(self, scanner):
         self.scanner = scanner
@@ -780,7 +781,7 @@ class RomeTradeMonitor:
         return len(dq) >= threshold
 
     async def monitor_open_signals(self):
-        """Monitor Rome signals"""
+        """FIXED: Monitor Rome signals and update their status"""
         if not self.open_signals: 
             return
         
@@ -789,11 +790,16 @@ class RomeTradeMonitor:
         for signal_id, signal in self.open_signals.items():
             try:
                 ticker = await self.scanner.fetch_ticker(signal.symbol)
+                if not ticker:
+                    continue
+                    
                 current_price = ticker['last']
                 
                 status = await self.check_signal_status(signal, current_price)
                 
-                if status != "OPEN":
+                # 🚨 CRITICAL FIX: Update the signal status and process if closed
+                if status != "OPEN" and signal.status == "active":
+                    signal.status = status.lower()  # Update the signal object status
                     await self._process_closed_signal(signal, status, current_price)
                     signals_to_remove.append(signal_id)
                     if "SL" in status:
@@ -802,44 +808,59 @@ class RomeTradeMonitor:
             except Exception as e:
                 logging.error(f"Error monitoring {signal.symbol}: {e}")
         
+        # Remove closed signals from open_signals
         for signal_id in signals_to_remove:
             if signal_id in self.open_signals:
                 del self.open_signals[signal_id]
 
     async def check_signal_status(self, signal: RomeSignal, current_price: float):
-        """Check TP/SL hits for Rome signals"""
+        """FIXED: Check TP/SL hits for Rome signals with detailed logging"""
         try:
             if signal.side == SignalSide.BUY:
-                if current_price >= signal.take_profit_3: 
+                if current_price >= signal.take_profit_3:
+                    logging.info(f"🎯 TP3 HIT: {signal.symbol} | Price: {current_price:.6f} >= TP3: {signal.take_profit_3:.6f}")
                     return "TP3_HIT"
-                elif current_price >= signal.take_profit_2: 
+                elif current_price >= signal.take_profit_2:
+                    logging.info(f"🎯 TP2 HIT: {signal.symbol} | Price: {current_price:.6f} >= TP2: {signal.take_profit_2:.6f}")
                     return "TP2_HIT"
-                elif current_price >= signal.take_profit_1: 
+                elif current_price >= signal.take_profit_1:
+                    logging.info(f"🎯 TP1 HIT: {signal.symbol} | Price: {current_price:.6f} >= TP1: {signal.take_profit_1:.6f}")
                     return "TP1_HIT"
-                elif current_price <= signal.stop_loss: 
+                elif current_price <= signal.stop_loss:
+                    logging.info(f"🛑 SL HIT: {signal.symbol} | Price: {current_price:.6f} <= SL: {signal.stop_loss:.6f}")
                     return "SL_HIT"
-            else:
-                if current_price <= signal.take_profit_3: 
+            else:  # SELL
+                if current_price <= signal.take_profit_3:
+                    logging.info(f"🎯 TP3 HIT: {signal.symbol} | Price: {current_price:.6f} <= TP3: {signal.take_profit_3:.6f}")
                     return "TP3_HIT"
-                elif current_price <= signal.take_profit_2: 
+                elif current_price <= signal.take_profit_2:
+                    logging.info(f"🎯 TP2 HIT: {signal.symbol} | Price: {current_price:.6f} <= TP2: {signal.take_profit_2:.6f}")
                     return "TP2_HIT"
-                elif current_price <= signal.take_profit_1: 
+                elif current_price <= signal.take_profit_1:
+                    logging.info(f"🎯 TP1 HIT: {signal.symbol} | Price: {current_price:.6f} <= TP1: {signal.take_profit_1:.6f}")
                     return "TP1_HIT"
-                elif current_price >= signal.stop_loss: 
+                elif current_price >= signal.stop_loss:
+                    logging.info(f"🛑 SL HIT: {signal.symbol} | Price: {current_price:.6f} >= SL: {signal.stop_loss:.6f}")
                     return "SL_HIT"
+            
             return "OPEN"
         except Exception as e:
             logging.error(f"Signal status check error: {e}")
             return "OPEN"
 
     async def _process_closed_signal(self, signal: RomeSignal, status: str, close_price: float):
-        """Process closed Rome signal"""
+        """FIXED: Process closed Rome signal with enhanced tracking"""
         try:
+            # Calculate P&L
             if signal.side == SignalSide.BUY:
                 pnl_pct = (close_price - signal.entry_price) / signal.entry_price * 100
             else:
                 pnl_pct = (signal.entry_price - close_price) / signal.entry_price * 100
             
+            # Calculate duration
+            duration = (datetime.datetime.utcnow() - signal.timestamp).total_seconds() / 60  # minutes
+            
+            # Create comprehensive trade record
             trade_record = {
                 'signal_id': signal.signal_id,
                 'symbol': signal.symbol,
@@ -850,33 +871,43 @@ class RomeTradeMonitor:
                 'status': status,
                 'entry_time': signal.timestamp,
                 'exit_time': datetime.datetime.utcnow(),
+                'duration_minutes': duration,
                 'timeframe': signal.timeframe,
                 'score': signal.score,
-                'sequence_steps': signal.sequence_steps_passed
+                'sequence_steps': signal.sequence_steps_passed,
+                'stop_loss': signal.stop_loss,
+                'take_profit_1': signal.take_profit_1,
+                'take_profit_2': signal.take_profit_2,
+                'take_profit_3': signal.take_profit_3
             }
             
             self.closed_trades.append(trade_record)
             
+            # Update all_signals record with detailed info
             for sig_data in self.all_signals:
                 if sig_data['signal'].signal_id == signal.signal_id:
                     sig_data['status'] = status
                     sig_data['close_price'] = close_price
                     sig_data['pnl_pct'] = pnl_pct
                     sig_data['exit_time'] = datetime.datetime.utcnow()
+                    sig_data['duration_minutes'] = duration
                     break
             
-            await self._send_trade_update(signal, status, close_price, pnl_pct)
-            logging.info(f"🎯 Rome Trade closed: {signal.symbol} {signal.timeframe} {status} | P&L: {pnl_pct:.2f}% | Score: {signal.score}")
+            await self._send_trade_update(signal, status, close_price, pnl_pct, duration)
+            logging.info(f"🎯 Rome Trade CLOSED: {signal.symbol} {signal.timeframe} {status} | "
+                        f"P&L: {pnl_pct:+.2f}% | Score: {signal.score} | Duration: {duration:.1f}m")
+            
         except Exception as e:
             logging.error(f"Process closed signal error: {e}")
 
-    async def _send_trade_update(self, signal: RomeSignal, status: str, close_price: float, pnl_pct: float):
-        """Send Rome trade update"""
+    async def _send_trade_update(self, signal: RomeSignal, status: str, close_price: float, pnl_pct: float, duration: float):
+        """Send enhanced Rome trade update with all details"""
         try:
             emoji = "🟢" if "TP" in status else "🔴"
+            pnl_emoji = "📈" if pnl_pct > 0 else "📉"
             
             message = f"""
-{emoji} **🏛️ ROMEOPT TRADE UPDATE** {emoji}
+{emoji} **🏛️ ROMEOPT TRADE CLOSED** {emoji}
 
 Symbol: {signal.symbol}
 Timeframe: {signal.timeframe}
@@ -885,7 +916,15 @@ Status: {status}
 
 Entry: {signal.entry_price:.6f}
 Exit: {close_price:.6f}
-P&L: {pnl_pct:+.2f}%
+Duration: {duration:.1f} minutes
+
+{pnl_emoji} P&L: {pnl_pct:+.2f}%
+
+Risk Levels:
+SL: {signal.stop_loss:.6f}
+TP1: {signal.take_profit_1:.6f}
+TP2: {signal.take_profit_2:.6f}  
+TP3: {signal.take_profit_3:.6f}
 
 Rome Score: {signal.score}/11
 Sequence Steps: {signal.sequence_steps_passed}/6
@@ -893,6 +932,20 @@ Sequence Steps: {signal.sequence_steps_passed}/6
             await send_telegram_message(message)
         except Exception as e:
             logging.error(f"Send trade update error: {e}")
+
+    async def log_monitoring_status(self):
+        """Log current monitoring status for debugging"""
+        try:
+            if self.open_signals:
+                logging.info(f"📊 Currently monitoring {len(self.open_signals)} open signals:")
+                for signal_id, signal in list(self.open_signals.items())[:5]:  # Show first 5
+                    logging.info(f"   - {signal.symbol} {signal.timeframe} {signal.side.value} | "
+                               f"Entry: {signal.entry_price:.6f} | Status: {signal.status}")
+            else:
+                logging.info("📊 No open signals currently being monitored")
+                
+        except Exception as e:
+            logging.error(f"Monitoring status log error: {e}")
 
     async def send_performance_summary(self):
         """Send 2-hour performance summary"""
@@ -997,10 +1050,10 @@ Sequence Steps: {signal.sequence_steps_passed}/6
             logging.error(f"Performance stats error: {e}")
             return {"total_trades": 0, "win_rate": 0, "avg_pnl": 0, "total_pnl": 0}
 
-# ==================== PURE ROMEOPT SCANNER ====================
+# ==================== FIXED PURE ROMEOPT SCANNER ====================
 
 class PureRomeScanner:
-    """PURE ROMEOPT SCANNER - 6-STEP INSTITUTIONAL SEQUENCING ONLY"""
+    """FIXED PURE ROMEOPT SCANNER - 6-STEP INSTITUTIONAL SEQUENCING ONLY"""
     
     def __init__(self, config: PureRomeConfig):
         self.config = config
@@ -1025,6 +1078,7 @@ class PureRomeScanner:
         logging.info("✅ All Timeframes: 1m, 3m, 5m, 15m, 30m, 1h")
         logging.info("✅ No Additional Filters - Pure Rome Logic Only")
         logging.info("✅ BingX API Integration Active")
+        logging.info("✅ FIXED TP/SL Tracking System")
 
     async def initialize_exchange(self):
         """Initialize with BingX API"""
@@ -1195,10 +1249,12 @@ Institutional Sequence:
             logging.error(f"Send Rome notification error: {e}")
 
     async def _validate_signal(self, signal: RomeSignal) -> bool:
-        """Final validation"""
+        """FIXED: Final validation - only block if same symbol/timeframe has ACTIVE signal"""
         try:
-            for open_signal in self.trade_monitor.open_signals.values():
-                if open_signal.symbol == signal.symbol and open_signal.timeframe == signal.timeframe:
+            for signal_id, open_signal in self.trade_monitor.open_signals.items():
+                if (open_signal.symbol == signal.symbol and 
+                    open_signal.timeframe == signal.timeframe):
+                    # Only block if there's already an ACTIVE signal for this symbol/timeframe
                     logging.info(f"⏸️ Already monitoring {signal.symbol} on {signal.timeframe}")
                     return False
                     
@@ -1281,7 +1337,7 @@ Institutional Sequence:
             logging.error(f"ROMEOPT scan cycle error with BingX: {e}")
 
     async def start_continuous_scanning(self):
-        """Pure RomeOPT continuous scanning"""
+        """FIXED: Pure RomeOPT continuous scanning with enhanced monitoring"""
         logging.info("🔄 Starting PURE ROMEOPT continuous scanning...")
         
         startup_msg = (
@@ -1290,8 +1346,8 @@ Institutional Sequence:
             "✅ Strict 6-step RomeOPT sequencing only\n"
             "✅ ALL TIMEFRAMES: 1m, 3m, 5m, 15m, 30m, 1h\n"
             "✅ No additional filters - Pure institutional logic\n"
-            "✅ Liquidity Sweep → Displacement → Zone Retrace\n" 
-            "✅ Premium/Discount → HTF Alignment → Momentum\n"
+            "✅ FIXED TP/SL Tracking System\n"
+            "✅ Real-time signal monitoring active\n"
             "🎯 Target: 100% INSTITUTIONAL-GRADE SIGNALS"
         )
         await send_telegram_message(startup_msg)
@@ -1302,6 +1358,7 @@ Institutional Sequence:
                 
                 await self.run_scan_cycle()
                 await self.trade_monitor.monitor_open_signals()
+                await self.trade_monitor.log_monitoring_status()  # ✅ ADDED MONITORING STATUS
                 await self.trade_monitor.send_performance_summary()
                 
                 elapsed = time.time() - start_time
@@ -1378,6 +1435,7 @@ class SignalResponse(BaseModel):
     timeframe: str
     sequence_steps: int
     timestamp: datetime.datetime
+    status: str
 
 class PerformanceStats(BaseModel):
     total_trades: int
@@ -1403,7 +1461,8 @@ async def get_current_signals():
             score=signal.score,
             timeframe=signal.timeframe,
             sequence_steps=signal.sequence_steps_passed,
-            timestamp=signal.timestamp
+            timestamp=signal.timestamp,
+            status=signal.status
         ))
     return signals
 
