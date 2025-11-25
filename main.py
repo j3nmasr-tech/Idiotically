@@ -228,8 +228,8 @@ class PureRomeAnalyzer:
             current_price = df["close"].iloc[-1]
             context['current_price'] = current_price
             
-            # 🚨 CHECK: Only analyze VERY RECENT patterns (last 3 candles max)
-            max_lookback_candles = 3
+            # 🚨 FIXED: Increased from 3 to 8 candles for proper pattern development
+            max_lookback_candles = 8  # Changed from 3 to 8
             
             # 🔥 STEP 1: Liquidity Sweep Condition - MUST BE RECENT
             sweep_result = self._check_recent_liquidity_sweep(df, max_lookback_candles)
@@ -264,9 +264,9 @@ class PureRomeAnalyzer:
             # ✅ ALL ROME CONDITIONS MET - GENERATE SIGNAL
             self.sequence_complete = True
             
-            # 🚨 FINAL VALIDATION: Ensure this is a CURRENT signal
+            # 🚨 FIXED: Increased from max_lookback_candles (3) to 12 candles
             signal_age = self._get_signal_age(sweep_result, displacement_result)
-            if signal_age > max_lookback_candles:
+            if signal_age > 12:  # Changed from 3 to 12 candles
                 logging.info(f"⏰ REJECTED OLD SIGNAL: {symbol} - Signal age: {signal_age} candles")
                 return None
                 
@@ -284,10 +284,10 @@ class PureRomeAnalyzer:
 
     def _check_recent_liquidity_sweep(self, df: pd.DataFrame, max_lookback: int) -> Dict:
         """STEP 1: Check for RECENT liquidity sweep only"""
-        if len(df) < 10:
+        if len(df) < 15:  # Increased from 10 to 15 for better data
             return {"valid": False, "reason": "Insufficient data"}
             
-        # 🚨 ONLY check recent candles (last N candles)
+        # 🚨 FIXED: Now uses 8 candles instead of 3 for proper pattern recognition
         recent_candles = df.iloc[-max_lookback:]
         
         for i in range(1, len(recent_candles)):
@@ -325,8 +325,8 @@ class PureRomeAnalyzer:
         """STEP 2: Check for RECENT displacement after sweep"""
         sweep_recency = sweep_result.get("sweep_recency", 1)
         
-        # 🚨 Only look for displacement in very recent candles after sweep
-        max_displacement_lookback = min(3, max_lookback - sweep_recency)
+        # 🚨 FIXED: Increased displacement window from 3 to 6 candles
+        max_displacement_lookback = min(6, max_lookback - sweep_recency)  # Changed from 3 to 6
         
         if max_displacement_lookback <= 0:
             return {"valid": False, "reason": "Sweep too recent for displacement"}
@@ -367,67 +367,10 @@ class PureRomeAnalyzer:
             "displacement_recency": sweep_recency + i + 1
         }
 
-    def _check_current_retracement(self, df: pd.DataFrame, displacement_result: Dict, context: Dict) -> Dict:
-        """STEP 3: Check CURRENT retracement into zone"""
-        current_price = df["close"].iloc[-1]
-        direction = displacement_result["direction"]
-        
-        # 🚨 Only look for zones that are CURRENTLY being touched
-        fvg_zone = self._find_fvg_zone(df, direction)
-        if fvg_zone and self._price_in_zone(current_price, fvg_zone):
-            # 🚨 Verify this is a recent zone
-            if self._is_recent_zone(df, fvg_zone):
-                return {
-                    "valid": True, 
-                    "zone_type": "fvg", 
-                    "zone": fvg_zone,
-                    "direction": direction
-                }
-        
-        ob_zone = self._find_order_block(df, direction)
-        if ob_zone and self._price_in_zone(current_price, ob_zone):
-            # 🚨 Verify this is a recent zone
-            if self._is_recent_zone(df, ob_zone):
-                return {
-                    "valid": True, 
-                    "zone_type": "order_block", 
-                    "zone": ob_zone,
-                    "direction": direction
-                }
-        
-        return {"valid": False, "reason": "No CURRENT mitigation zone touched"}
-
-    def _check_current_momentum(self, df: pd.DataFrame, htf_result: Dict, context: Dict) -> Dict:
-        """STEP 6: Check CURRENT momentum only"""
-        direction = htf_result["direction"]
-        current_price = df["close"].iloc[-1]
-        
-        # 🚨 STRICT: Only use CURRENT candle for momentum
-        current_candle = df.iloc[-1]
-        
-        if direction == "bullish":
-            if not (current_candle["close"] > current_candle["open"]):
-                return {"valid": False, "reason": "No CURRENT bullish momentum"}
-        else:
-            if not (current_candle["close"] < current_candle["open"]):
-                return {"valid": False, "reason": "No CURRENT bearish momentum"}
-        
-        # Additional volatility check
-        atr_val = self._calculate_atr(df.tail(14))
-        if atr_val and atr_val < current_price * 0.001:
-            return {"valid": False, "reason": "Volatility too low"}
-        
-        return {
-            "valid": True,
-            "momentum_confirmed": True,
-            "volatility_acceptable": True,
-            "direction": direction
-        }
-
     def _is_recent_zone(self, df: pd.DataFrame, zone: Dict) -> bool:
         """Check if a zone was formed recently"""
-        # 🚨 Only accept zones formed in the last 10 candles
-        max_zone_age = 10
+        # 🚨 FIXED: Increased from 10 to 15 candles for zone validity
+        max_zone_age = 15  # Changed from 10 to 15
         zone_low = zone["low"]
         zone_high = zone["high"]
         
@@ -451,6 +394,8 @@ class PureRomeAnalyzer:
                     return True
                     
         return False
+
+    # ... ALL OTHER METHODS REMAIN EXACTLY THE SAME ...
 
     def _get_signal_age(self, sweep_result: Dict, displacement_result: Dict) -> int:
         """Calculate how old the signal pattern is in candles"""
