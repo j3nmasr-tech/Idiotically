@@ -772,7 +772,7 @@ class OriginalWinnerFilters:
 # ==================== YOUR EXACT OLD SMC CORE LOGIC ====================
 
 class OriginalSMCLogic:
-    """YOUR EXACT ORIGINAL SMC LOGIC - NOW WITH ROME SEQUENCING"""
+    """YOUR EXACT ORIGINAL SMC LOGIC - NOW WITH ROME SEQUENCING ONLY"""
     
     def __init__(self):
         self.rome_analyzer = RomeSMCAnalyzer()
@@ -824,83 +824,26 @@ class OriginalSMCLogic:
         return "bearish", candle["high"], candle["open"]
 
     def generate_signal(self, df: pd.DataFrame, symbol: str, context=None):
-        """UPDATED: NOW USES ROMEOPT INSTITUTIONAL SEQUENCING"""
+        """STRICT ROMEOPT INSTITUTIONAL SEQUENCING ONLY - NO FALLBACK"""
         if context is None: 
             context = {}
         
-        if df is None or len(df) < 20:  # Increased minimum for Rome sequencing
+        if df is None or len(df) < 20:  # Rome sequencing requires more data
             return None
 
-        tf = context.get("tf", "15m")
-
         try:
-            # FIRST TRY ROMEOPT SEQUENCING (HIGHER QUALITY)
+            # STRICT ROMEOPT SEQUENCING ONLY - NO FALLBACK TO OLD LOGIC
             rome_signal = self.rome_analyzer.generate_signal(df, symbol, context)
             if rome_signal:
                 logging.info(f"🏛️ ROMEOPT Signal: {symbol} {rome_signal['side']} | Score: {rome_signal['score']}")
                 return rome_signal
             
-            # FALLBACK TO ORIGINAL LOGIC (FOR BACKWARD COMPATIBILITY)
-            last = df["close"].iloc[-1]
-
-            ob_type, ob_hi, ob_lo = self.detect_order_blocks(df)
-            if ob_type is None: 
-                return None
-
-            bull_fvg, bear_fvg = self.detect_fvg(df)
-            sweep_h, sweep_l = self.detect_sweep(df)
-            bos_hh, bos_ll = self.detect_bos_mss(df)
-
-            if not (bos_hh or bos_ll): 
-                return None
-
-            score = 0
-            reasons = []
-
-            if ob_type == "bullish": 
-                score += 2
-                reasons.append("OB Bull +2")
-            else: 
-                score += 2
-                reasons.append("OB Bear +2")
-
-            if bull_fvg: 
-                score += 2
-                reasons.append("FVG Bull +2")
-            elif bear_fvg: 
-                score += 2
-                reasons.append("FVG Bear +2")
-
-            score += 2
-            reasons.append("BOS +2")
-            if sweep_h or sweep_l: 
-                score += 1
-                reasons.append("Sweep +1")
-            else: 
-                reasons.append("No Sweep +0")
-
-            side = "BUY" if ob_type == "bullish" else "SELL"
-
-            # Use OLD SIMPLE ATR TP/SL
-            entry = float(last)
-            sl, tp1, tp2, tp3 = OldSimpleTPSL.calculate_old_tp_sl(df, symbol, side, entry, context)
-
-            return {
-                "symbol": symbol,
-                "side": side,
-                "entry": entry,
-                "sl": sl,
-                "tp1": tp1,
-                "tp2": tp2,
-                "tp3": tp3,
-                "score": score,
-                "reason": "Set B SMC Signal + OLD TP/SL",
-                "reason_list": reasons,
-                "timeframe": tf,
-                "rome_sequence": False  # Mark as non-Rome signal
-            }
+            # NO FALLBACK - RETURN NONE IF ROME SEQUENCE FAILS
+            logging.debug(f"❌ Rome sequence failed for {symbol}: {self.rome_analyzer.rejection_reason}")
+            return None
+            
         except Exception as e:
-            logging.error(f"Signal generation error for {symbol}: {e}")
+            logging.error(f"Rome sequencing error for {symbol}: {e}")
             return None
 
 # ==================== OLD SIMPLE ATR TP/SL SYSTEM ====================
