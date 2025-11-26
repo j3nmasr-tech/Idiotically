@@ -51,7 +51,7 @@ class SignalSide(Enum):
 class ScannerConfig:
     # Core settings (from OLD system)
     SCAN_INTERVAL: int = 60
-    TOP_N_SYMBOLS: int = 80  # OLD: 40
+    TOP_N_SYMBOLS: int = 3  # OLD: 40
     MIN_VOLUME_USDT: float = 1000000
     MAX_SPREAD_PCT: float = 0.002
     
