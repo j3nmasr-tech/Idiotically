@@ -61,11 +61,11 @@ class ScannerConfig:
     MAX_SL_CLUSTER_HITS: int = 3
     
     # OLD WINNER FILTER SETTINGS (EXACT OLD BEHAVIOR)
-    REQUIRE_BTC_ALIGNMENT: bool = True
-    REQUIRE_HIGHER_TF_ALIGNMENT: bool = True
-    REQUIRE_MOMENTUM_CONFIRMATION: bool = True
-    REQUIRE_ZONE_QUALITY: bool = True
-    AVOID_CHOPPY_MARKETS: bool = True
+    REQUIRE_BTC_ALIGNMENT: bool = False
+    REQUIRE_HIGHER_TF_ALIGNMENT: bool = False
+    REQUIRE_MOMENTUM_CONFIRMATION: bool = False
+    REQUIRE_ZONE_QUALITY: bool = False
+    AVOID_CHOPPY_MARKETS: bool = False
     USE_MARKET_REGIME: bool = False  # OLD: No market regime filter!
     
     # OLD SCORING
