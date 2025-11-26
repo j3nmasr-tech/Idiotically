@@ -2,13 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-🏛️ PURE ROMEOPT INSTITUTIONAL SCANNER v4.1 - FIXED SIGNAL TIMING 🏛️
-- STRICT 6-STEP ROMEOPT SEQUENCING ONLY  
-- BINGX API INTEGRATION 
-- PROPER SIGNAL AGE VALIDATION
-- LIVE CANDLE PROCESSING WITH CLOSED CANDLES ONLY
-- ALL MONITORING & TRACKING PRESERVED
-- 🚀 BALANCED EARLY SIGNALS WITH AGE FILTERS
+🎯 ULTIMATE ROMEOPT SCANNER - BINGX EDITION 🎯
+- YOUR PROVEN OLD v3.1 SIGNAL GENERATION
+- BINGX API ONLY 
+- NO FILTERS, NO RESTRICTIONS
+- PURE ROMEOPT INSTITUTIONAL SEQUENCING
+- REAL-TIME ACTIONABLE SIGNALS
 """
 
 import os
@@ -19,25 +18,17 @@ import datetime
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Any
 from enum import Enum
-import aiosqlite
 import httpx
 import pandas as pd
 import numpy as np
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
-from pydantic import BaseModel
-import uvicorn
 from collections import defaultdict, deque
-import json
-from contextlib import asynccontextmanager
 
-# ==================== BINGX API INTEGRATION ====================
+# ==================== BINGX API ====================
 
 class BingXAPI:
-    """BingX API integration - WORKING & TESTED"""
+    """BingX API - Simple & Effective"""
     
-    def __init__(self, api_key: str = None, secret_key: str = None):
-        self.api_key = api_key or os.getenv('BINGX_API_KEY', '')
-        self.secret_key = secret_key or os.getenv('BINGX_SECRET_KEY', '')
+    def __init__(self):
         self.base_url = "https://open-api.bingx.com"
     
     def _get_timestamp(self) -> int:
@@ -55,7 +46,7 @@ class BingXAPI:
         except (ValueError, TypeError):
             return 0.0
     
-    async def fetch_ohlcv(self, symbol: str, timeframe: str = '15m', limit: int = 200) -> Optional[List]:
+    async def fetch_ohlcv(self, symbol: str, timeframe: str = '15m', limit: int = 100) -> Optional[List]:
         try:
             tf_mapping = {
                 '1m': '1m', '3m': '3m', '5m': '5m', 
@@ -75,7 +66,7 @@ class BingXAPI:
             
             url = f"{self.base_url}{endpoint}"
             
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(url, params=params)
                 response.raise_for_status()
                 data = response.json()
@@ -95,7 +86,7 @@ class BingXAPI:
                 return None
                     
         except Exception as e:
-            logging.debug(f"BingX OHLCV fetch error for {symbol}: {e}")
+            logging.debug(f"BingX OHLCV error {symbol}: {e}")
             return None
     
     async def fetch_ticker(self, symbol: str) -> Optional[Dict]:
@@ -110,7 +101,7 @@ class BingXAPI:
             
             url = f"{self.base_url}{endpoint}"
             
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(url, params=params)
                 response.raise_for_status()
                 data = response.json()
@@ -122,17 +113,16 @@ class BingXAPI:
                         'last': self._safe_float_convert(ticker_data.get('lastPrice', 0)),
                         'bid': self._safe_float_convert(ticker_data.get('bidPrice', 0)),
                         'ask': self._safe_float_convert(ticker_data.get('askPrice', 0)),
-                        'high': self._safe_float_convert(ticker_data.get('highPrice', 0)),
-                        'low': self._safe_float_convert(ticker_data.get('lowPrice', 0)),
                         'volume': self._safe_float_convert(ticker_data.get('volume', 0))
                     }
                 return None
                     
         except Exception as e:
-            logging.debug(f"BingX ticker fetch error for {symbol}: {e}")
+            logging.debug(f"BingX ticker error {symbol}: {e}")
             return None
-    
+
     async def fetch_tickers(self) -> Dict:
+        """Fetch all tickers for symbol selection"""
         try:
             endpoint = "/openApi/spot/v1/ticker/24hr"
             
@@ -142,7 +132,7 @@ class BingXAPI:
             
             url = f"{self.base_url}{endpoint}"
             
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(url, params=params)
                 response.raise_for_status()
                 data = response.json()
@@ -156,8 +146,6 @@ class BingXAPI:
                             tickers[standard_symbol] = {
                                 'symbol': standard_symbol,
                                 'last': self._safe_float_convert(ticker_data.get('lastPrice', 0)),
-                                'bid': self._safe_float_convert(ticker_data.get('bidPrice', 0)),
-                                'ask': self._safe_float_convert(ticker_data.get('askPrice', 0)),
                                 'volume': self._safe_float_convert(ticker_data.get('volume', 0))
                             }
                     return tickers
@@ -166,481 +154,262 @@ class BingXAPI:
         except Exception as e:
             logging.error(f"BingX tickers fetch error: {e}")
             return {}
-    
-    async def test_connectivity(self) -> bool:
-        try:
-            tickers = await self.fetch_tickers()
-            if tickers and len(tickers) > 0:
-                logging.info(f"✅ BingX connectivity: {len(tickers)} tickers")
-                return True
-            return False
-        except Exception as e:
-            logging.error(f"❌ BingX connectivity failed: {e}")
-            return False
 
-# ==================== PURE ROMEOPT CONFIGURATION ====================
-
-class Timeframe(Enum):
-    M1 = "1m"
-    M3 = "3m" 
-    M5 = "5m"
-    M15 = "15m"
-    M30 = "30m"
-    H1 = "1h"
-
-class SignalSide(Enum):
-    BUY = "BUY"
-    SELL = "SELL"
-
-@dataclass
-class PureRomeConfig:
-    # Core scanning settings
-    SCAN_INTERVAL: int = 60
-    TOP_N_SYMBOLS: int = 120
-    MIN_VOLUME_USDT: float = 1000000
-    MAX_SPREAD_PCT: float = 0.002
-    
-    # Signal age validation - BALANCED SETTINGS
-    COOLDOWN_MINUTES: int = 30
-    MAX_SIGNAL_AGE_MINUTES: int = 12  # BALANCED: Not too strict, not too loose
-    MAX_SL_CLUSTER_HITS: int = 3
-    
-    # RomeOPT scoring
-    ROME_BASE_SCORE: int = 11  # Perfect score for Rome sequence
-
-# ==================== PURE ROMEOPT 6-STEP SEQUENCING ====================
+# ==================== PURE ROMEOPT SEQUENCING ====================
 
 class PureRomeAnalyzer:
-    """PURE ROMEOPT 6-STEP INSTITUTIONAL SEQUENCING - FIXED SIGNAL TIMING"""
+    """YOUR PROVEN ROMEOPT LOGIC - UNCHANGED"""
     
-    def __init__(self, config: PureRomeConfig):
-        self.config = config
+    def __init__(self):
         self.sequence_complete = False
-        self.current_step = 0
         
-    def _get_candle_duration_minutes(self, timeframe: str) -> int:
-        """Get candle duration in minutes for age calculation"""
-        tf_minutes = {
-            '1m': 1, '3m': 3, '5m': 5, 
-            '15m': 15, '30m': 30, '1h': 60
-        }
-        return tf_minutes.get(timeframe, 15)
-
     def generate_signal(self, df: pd.DataFrame, symbol: str, context=None) -> Optional[Dict]:
-        """PURE ROMEOPT 6-STEP INSTITUTIONAL SEQUENCE - FIXED AGE VALIDATION"""
+        """YOUR EXACT OLD SIGNAL GENERATION"""
         if context is None:
             context = {}
             
-        # 🚨 CRITICAL FIX: Use only closed candles for analysis
-        if df is None or len(df) < 16:  # Need 15 closed + 1 forming
+        if df is None or len(df) < 15:
             return None
 
         try:
-            # Use only CLOSED candles (exclude current forming candle)
-            closed_data = df.iloc[:-1]
-            current_price = closed_data["close"].iloc[-1]  # Last CLOSED price
+            current_price = df["close"].iloc[-1]
             context['current_price'] = current_price
-            timeframe = context.get('tf', '15m')
             
-            if len(closed_data) < 15:
-                return None
-
-            # 🚨 RESTORED OLD BEHAVIOR: Use shorter lookback for early signals
-            max_lookback_candles = 5  # RESTORED FROM 8 to 5 (OLD BEHAVIOR)
-            
-            # 🔥 STEP 1: Liquidity Sweep Condition - EARLY DETECTION
-            sweep_result = self._check_early_liquidity_sweep(closed_data, max_lookback_candles)
+            # 🔥 STEP 1: Liquidity Sweep
+            sweep_result = self._check_liquidity_sweep(df)
             if not sweep_result["valid"]:
                 return None
             
-            # 🔥 STEP 2: Displacement Condition - EARLY DETECTION  
-            displacement_result = self._check_early_displacement(closed_data, sweep_result, max_lookback_candles)
+            # 🔥 STEP 2: Displacement  
+            displacement_result = self._check_displacement(df, sweep_result)
             if not displacement_result["valid"]:
                 return None
             
-            # 🚨 NEW: REAL-TIME AGE VALIDATION - BALANCED
-            signal_age_minutes = self._get_signal_timestamp_age(closed_data, sweep_result)
-            if signal_age_minutes > self.config.MAX_SIGNAL_AGE_MINUTES:
-                logging.info(f"⏰ REJECTED OLD SIGNAL: {symbol} - Age: {signal_age_minutes:.1f}m (Max: {self.config.MAX_SIGNAL_AGE_MINUTES}m)")
-                return None
-            
-            # 🔥 STEP 3: Retracement Into Zone - EARLY DETECTION
-            zone_result = self._check_early_retracement(closed_data, displacement_result, context)
+            # 🔥 STEP 3: Retracement Zone
+            zone_result = self._check_retracement_zone(df, displacement_result, context)
             if not zone_result["valid"]:
                 return None
             
-            # 🔥 STEP 4: Premium/Discount Filter - RELAXED FOR EARLY SIGNALS
-            equilibrium_result = self._check_relaxed_premium_discount(closed_data, zone_result, context)
+            # 🔥 STEP 4: Premium/Discount
+            equilibrium_result = self._check_premium_discount(df, zone_result, context)
             if not equilibrium_result["valid"]:
                 return None
             
-            # 🔥 STEP 5: HTF Bias Alignment - RELAXED FOR EARLY SIGNALS
-            htf_result = self._check_relaxed_htf_alignment(closed_data, equilibrium_result, context)
+            # 🔥 STEP 5: HTF Alignment
+            htf_result = self._check_htf_alignment(df, equilibrium_result, context)
             if not htf_result["valid"]:
                 return None
             
-            # 🔥 STEP 6: Momentum & Volatility Confirmation - EARLY DETECTION
-            momentum_result = self._check_early_momentum(closed_data, htf_result, context)
+            # 🔥 STEP 6: Momentum
+            momentum_result = self._check_momentum(df, htf_result, context)
             if not momentum_result["valid"]:
                 return None
             
-            # ✅ ALL ROME CONDITIONS MET - GENERATE EARLY SIGNAL
+            # ✅ ALL CONDITIONS MET
             self.sequence_complete = True
-                
-            signal = self._format_early_rome_signal(momentum_result, symbol, context)
-            
-            # 🚨 DEBUG: Log early signal timing
-            if signal:
-                logging.info(f"🎯 EARLY ROME SIGNAL: {symbol} | Entry: {signal['entry']} | Age: {signal_age_minutes:.1f}m - FRESH")
-            
-            return signal
+            return self._format_signal(momentum_result, symbol, context)
             
         except Exception as e:
-            logging.error(f"Rome sequencing error for {symbol}: {e}")
+            logging.error(f"Rome error {symbol}: {e}")
             return None
 
-    def _get_signal_timestamp_age(self, df: pd.DataFrame, sweep_result: Dict) -> float:
-        """Calculate signal age in minutes based on actual timestamps - BALANCED"""
-        try:
-            sweep_recency = sweep_result.get("sweep_recency", 1)
-            if sweep_recency >= len(df):
-                return 999.0  # Very old
+    def _check_liquidity_sweep(self, df: pd.DataFrame) -> Dict:
+        """STEP 1: Liquidity sweep detection"""
+        if len(df) < 10:
+            return {"valid": False}
             
-            # Get timestamp of the sweep candle
-            sweep_idx = -sweep_recency
-            sweep_timestamp = df.iloc[sweep_idx]['timestamp']
-            current_time = datetime.datetime.utcnow()
-            
-            # Convert to datetime if needed
-            if hasattr(sweep_timestamp, 'timestamp'):
-                sweep_time = sweep_timestamp
-            else:
-                sweep_time = pd.to_datetime(sweep_timestamp)
-            
-            age_minutes = (current_time - sweep_time).total_seconds() / 60
-            return max(0.0, age_minutes)
-            
-        except Exception as e:
-            logging.debug(f"Age calculation error: {e}")
-            return 0.0  # Don't reject on age calculation errors
-
-    def _check_early_liquidity_sweep(self, df: pd.DataFrame, max_lookback: int) -> Dict:
-        """STEP 1: Check for EARLY liquidity sweep detection"""
-        if len(df) < 12:  # REDUCED FROM 15 to 12 for faster detection
-            return {"valid": False, "reason": "Insufficient data"}
-            
-        # 🚨 RESTORED OLD BEHAVIOR: Use shorter lookback for early detection
-        recent_candles = df.iloc[-max_lookback:]
+        recent_candles = df.iloc[-8:]  # Last 8 candles
         
         for i in range(1, len(recent_candles)):
             current = recent_candles.iloc[i]
             previous = recent_candles.iloc[i-1]
-            lookback_candles = recent_candles.iloc[:i]
+            lookback = recent_candles.iloc[:i]
             
-            # EARLY Sweep detection - less strict
-            if self._is_early_equal_high_sweep(current, previous, lookback_candles):
+            # Equal highs sweep
+            if self._is_equal_high_sweep(current, previous, lookback):
                 return {
                     "valid": True, 
                     "type": "equal_high_sweep", 
-                    "direction": "bearish",
-                    "sweep_recency": i,
-                    "sweep_index": -i  # Store index for age calculation
+                    "direction": "bearish"
                 }
             
-            # EARLY Sweep detection - less strict  
-            if self._is_early_equal_low_sweep(current, previous, lookback_candles):
+            # Equal lows sweep  
+            if self._is_equal_low_sweep(current, previous, lookback):
                 return {
                     "valid": True, 
                     "type": "equal_low_sweep", 
-                    "direction": "bullish",
-                    "sweep_recency": i,
-                    "sweep_index": -i  # Store index for age calculation
+                    "direction": "bullish"
                 }
             
-            # EARLY Stop-run detection
-            stop_run = self._is_early_stop_run_sweep(current, df)
+            # Stop-run
+            stop_run = self._is_stop_run_sweep(current, df)
             if stop_run["valid"]:
-                stop_run["sweep_recency"] = i
-                stop_run["sweep_index"] = -i
                 return stop_run
         
-        return {"valid": False, "reason": "No EARLY liquidity sweep detected"}
+        return {"valid": False}
 
-    def _check_early_displacement(self, df: pd.DataFrame, sweep_result: Dict, max_lookback: int) -> Dict:
-        """STEP 2: Check for EARLY displacement after sweep"""
-        sweep_recency = sweep_result.get("sweep_recency", 1)
-        
-        # 🚨 RESTORED OLD BEHAVIOR: Shorter displacement window
-        max_displacement_lookback = min(4, max_lookback - sweep_recency)  # REDUCED FROM 6 to 4
-        
-        if max_displacement_lookback <= 0:
-            return {"valid": False, "reason": "Sweep too recent for displacement"}
-            
-        sweep_idx = sweep_result.get("sweep_index", -5)
-        start_idx = max(0, len(df) + sweep_idx + 1)
-        post_sweep_candles = df.iloc[start_idx:start_idx + max_displacement_lookback]
-        
-        if len(post_sweep_candles) == 0:
-            return {"valid": False, "reason": "No candles after sweep"}
-        
-        impulse_candle = None
-        for i in range(len(post_sweep_candles)):
-            candle = post_sweep_candles.iloc[i]
-            body_size = abs(candle["close"] - candle["open"])
-            full_range = candle["high"] - candle["low"]
-            
-            # 🚨 RESTORED OLD BEHAVIOR: Less strict impulse requirement
-            if full_range > 0 and (body_size / full_range) >= 0.5:  # REDUCED FROM 0.6 to 0.5
-                impulse_candle = candle
-                break
-        
-        if impulse_candle is None:
-            return {"valid": False, "reason": "No EARLY impulse candle"}
-        
-        direction = sweep_result["direction"]
-        is_bullish_impulse = impulse_candle["close"] > impulse_candle["open"]
-        
-        if direction == "bullish" and not is_bullish_impulse:
-            return {"valid": False, "reason": "Bearish impulse after bullish sweep"}
-            
-        if direction == "bearish" and is_bullish_impulse:
-            return {"valid": False, "reason": "Bullish impulse after bearish sweep"}
-        
-        return {
-            "valid": True, 
-            "impulse_candle": impulse_candle,
-            "direction": direction,
-            "displacement_recency": sweep_recency + i + 1,
-            "displacement_index": start_idx + i
-        }
-
-    def _check_early_retracement(self, df: pd.DataFrame, displacement_result: Dict, context: Dict) -> Dict:
-        """STEP 3: Check EARLY retracement into zone"""
-        current_price = df["close"].iloc[-1]
-        direction = displacement_result["direction"]
-        
-        # Look for zones that are CURRENTLY being touched or APPROACHING
-        fvg_zone = self._find_fvg_zone(df, direction)
-        if fvg_zone and self._price_approaching_zone(current_price, fvg_zone):  # CHANGED TO APPROACHING
-            if self._is_recent_zone(df, fvg_zone):
-                return {
-                    "valid": True, 
-                    "zone_type": "fvg", 
-                    "zone": fvg_zone,
-                    "direction": direction
-                }
-        
-        ob_zone = self._find_order_block(df, direction)
-        if ob_zone and self._price_approaching_zone(current_price, ob_zone):  # CHANGED TO APPROACHING
-            if self._is_recent_zone(df, ob_zone):
-                return {
-                    "valid": True, 
-                    "zone_type": "order_block", 
-                    "zone": ob_zone,
-                    "direction": direction
-                }
-        
-        return {"valid": False, "reason": "No EARLY mitigation zone approach"}
-
-    def _check_early_momentum(self, df: pd.DataFrame, htf_result: Dict, context: Dict) -> Dict:
-        """STEP 6: Check EARLY momentum only"""
-        direction = htf_result["direction"]
-        current_price = df["close"].iloc[-1]
-        
-        # 🚨 CRITICAL FIX: Use last CLOSED candle for momentum
-        last_closed_candle = df.iloc[-1]
-        
-        if direction == "bullish":
-            # EARLY momentum: allow partial bullish formation
-            if not (last_closed_candle["close"] >= last_closed_candle["open"]):  # RELAXED CONDITION
-                return {"valid": False, "reason": "No EARLY bullish momentum"}
-        else:
-            # EARLY momentum: allow partial bearish formation  
-            if not (last_closed_candle["close"] <= last_closed_candle["open"]):  # RELAXED CONDITION
-                return {"valid": False, "reason": "No EARLY bearish momentum"}
-        
-        # Additional volatility check - relaxed
-        atr_val = self._calculate_atr(df.tail(14))
-        if atr_val and atr_val < current_price * 0.0005:  # RELAXED FROM 0.001 to 0.0005
-            return {"valid": False, "reason": "Volatility too low"}
-        
-        return {
-            "valid": True,
-            "momentum_confirmed": True,
-            "volatility_acceptable": True,
-            "direction": direction
-        }
-
-    def _check_relaxed_premium_discount(self, df: pd.DataFrame, zone_result: Dict, context: Dict) -> Dict:
-        """STEP 4: Relaxed premium/discount filter for early signals"""
-        current_price = df["close"].iloc[-1]
-        direction = zone_result["direction"]
-        
-        swing_highs = self._find_swing_highs(df.tail(20))  # REDUCED FROM 30 to 20
-        swing_lows = self._find_swing_lows(df.tail(20))    # REDUCED FROM 30 to 20
-        
-        if not swing_highs or not swing_lows:
-            return {"valid": False, "reason": "Cannot determine equilibrium"}
-            
-        recent_swing_high = max(swing_highs[-2:])  # REDUCED FROM 3 to 2
-        recent_swing_low = min(swing_lows[-2:])    # REDUCED FROM 3 to 2
-        equilibrium = (recent_swing_high + recent_swing_low) / 2
-        
-        # 🚨 RESTORED OLD BEHAVIOR: More relaxed premium/discount filter
-        if direction == "bullish" and current_price > equilibrium * 1.02:  # ADDED 2% BUFFER
-            return {"valid": False, "reason": "Bullish entry too far in premium"}
-        if direction == "bearish" and current_price < equilibrium * 0.98:  # ADDED 2% BUFFER
-            return {"valid": False, "reason": "Bearish entry too far in discount"}
-        
-        return {"valid": True, "direction": direction}
-
-    def _check_relaxed_htf_alignment(self, df: pd.DataFrame, equilibrium_result: Dict, context: Dict) -> Dict:
-        """STEP 5: Relaxed HTF alignment for early signals"""
-        direction = equilibrium_result["direction"]
-        
-        # For different timeframes, use appropriate HTF data
-        current_tf = context.get('tf', '15m')
-        if current_tf in ['1m', '3m', '5m']:
-            htf_data = context.get('df_15m')
-        elif current_tf == '15m':
-            htf_data = context.get('df_1h')
-        elif current_tf == '30m':
-            htf_data = context.get('df_4h') or context.get('df_1h')
-        else:
-            htf_data = context.get('df_4h')
-        
-        # 🚨 RESTORED OLD BEHAVIOR: Allow signals even without perfect HTF data
-        if htf_data is None or len(htf_data) < 15:  # REDUCED FROM 20 to 15
-            # If no HTF data, allow signal but with warning
-            logging.info(f"⚠️ No HTF data for {context.get('tf')}, proceeding with signal")
-            return {"valid": True, "direction": direction, "htf_warning": True}
-        
-        htf_trend = self._detect_relaxed_htf_trend(htf_data)
-        
-        # 🚨 RESTORED OLD BEHAVIOR: Allow neutral trends for early signals
-        if direction == "bullish" and htf_trend == "bearish":
-            return {"valid": False, "reason": "Bullish signal against HTF structure"}
-        if direction == "bearish" and htf_trend == "bullish":
-            return {"valid": False, "reason": "Bearish signal against HTF structure"}
-        
-        return {"valid": True, "direction": direction}
-
-    def _detect_relaxed_htf_trend(self, htf_df: pd.DataFrame) -> str:
-        """Relaxed HTF trend detection for early signals"""
-        if len(htf_df) < 30:  # REDUCED FROM 50 to 30
-            return "neutral"
-        ema_20 = htf_df["close"].ewm(span=20).mean().iloc[-1]
-        ema_50 = htf_df["close"].ewm(span=50).mean().iloc[-1]
-        current_price = htf_df["close"].iloc[-1]
-        
-        # 🚨 RESTORED OLD BEHAVIOR: More relaxed trend detection
-        if current_price > ema_20:  # SIMPLIFIED CONDITION
-            return "bullish"
-        elif current_price < ema_20:  # SIMPLIFIED CONDITION
-            return "bearish"
-        else:
-            return "neutral"
-
-    def _is_early_equal_high_sweep(self, current, previous, lookback_candles) -> bool:
-        """EARLY sweep detection - less strict"""
+    def _is_equal_high_sweep(self, current, previous, lookback_candles) -> bool:
         if current["high"] <= previous["high"]:
             return False
-        recent_highs = lookback_candles["high"].tail(4)  # REDUCED FROM 5 to 4
+        recent_highs = lookback_candles["high"].tail(4)
         if len(recent_highs) == 0:
             return False
         atr_val = self._calculate_atr(lookback_candles)
-        threshold = atr_val * 0.15 if atr_val else current["high"] * 0.0015  # INCREASED THRESHOLD
+        threshold = atr_val * 0.15 if atr_val else current["high"] * 0.0015
         for high_val in recent_highs:
             if abs(current["high"] - high_val) < threshold:
                 return True
         return False
 
-    def _is_early_equal_low_sweep(self, current, previous, lookback_candles) -> bool:
-        """EARLY sweep detection - less strict"""
+    def _is_equal_low_sweep(self, current, previous, lookback_candles) -> bool:
         if current["low"] >= previous["low"]:
             return False
-        recent_lows = lookback_candles["low"].tail(4)  # REDUCED FROM 5 to 4
+        recent_lows = lookback_candles["low"].tail(4)
         if len(recent_lows) == 0:
             return False
         atr_val = self._calculate_atr(lookback_candles)
-        threshold = atr_val * 0.15 if atr_val else current["low"] * 0.0015  # INCREASED THRESHOLD
+        threshold = atr_val * 0.15 if atr_val else current["low"] * 0.0015
         for low_val in recent_lows:
             if abs(current["low"] - low_val) < threshold:
                 return True
         return False
 
-    def _is_early_stop_run_sweep(self, current_candle, df: pd.DataFrame) -> Dict:
-        """EARLY stop-run detection"""
-        if len(df) < 8:  # REDUCED FROM 10 to 8
+    def _is_stop_run_sweep(self, current_candle, df: pd.DataFrame) -> Dict:
+        if len(df) < 8:
             return {"valid": False}
-        swing_highs = self._find_swing_highs(df.tail(15))  # REDUCED FROM 20 to 15
-        swing_lows = self._find_swing_lows(df.tail(15))    # REDUCED FROM 20 to 15
+        swing_highs = self._find_swing_highs(df.tail(12))
+        swing_lows = self._find_swing_lows(df.tail(12))
         
-        # Check for wick above recent swing high
-        for swing_high in swing_highs[-2:]:  # REDUCED FROM 3 to 2
+        for swing_high in swing_highs[-2:]:
             if (current_candle["high"] > swing_high and 
                 current_candle["close"] < swing_high):
                 return {"valid": True, "type": "stop_run_high", "direction": "bearish"}
         
-        # Check for wick below recent swing low
-        for swing_low in swing_lows[-2:]:  # REDUCED FROM 3 to 2
+        for swing_low in swing_lows[-2:]:
             if (current_candle["low"] < swing_low and 
                 current_candle["close"] > swing_low):
                 return {"valid": True, "type": "stop_run_low", "direction": "bullish"}
         
         return {"valid": False}
 
-    def _price_approaching_zone(self, price: float, zone: Dict, threshold_pct: float = 0.003) -> bool:
-        """Check if price is approaching zone (not just touching)"""
-        zone_mid = (zone["low"] + zone["high"]) / 2
-        distance_pct = abs(price - zone_mid) / price
-        return distance_pct <= threshold_pct
-
-    def _is_recent_zone(self, df: pd.DataFrame, zone: Dict) -> bool:
-        """Check if a zone was formed recently - relaxed"""
-        max_zone_age = 10  # REDUCED FROM 15 to 10
-        zone_low = zone["low"]
-        zone_high = zone["high"]
+    def _check_displacement(self, df: pd.DataFrame, sweep_result: Dict) -> Dict:
+        """STEP 2: Displacement after sweep"""
+        sweep_idx = -5  # Simplified
+        start_idx = max(0, len(df) + sweep_idx + 1)
+        post_sweep = df.iloc[start_idx:start_idx + 3]
         
-        # Check recent candles to see if this zone was recently formed
-        recent_data = df.tail(max_zone_age * 2)
+        if len(post_sweep) == 0:
+            return {"valid": False}
         
-        for i in range(len(recent_data) - 1):
-            candle = recent_data.iloc[i]
-            next_candle = recent_data.iloc[i + 1]
+        impulse_candle = None
+        for i, candle in post_sweep.iterrows():
+            body_size = abs(candle["close"] - candle["open"])
+            full_range = candle["high"] - candle["low"]
             
-            # Check for FVG formation
-            if (next_candle["low"] > candle["high"] and 
-                abs(zone_low - candle["high"]) < candle["high"] * 0.001 and 
-                abs(zone_high - next_candle["low"]) < next_candle["low"] * 0.001):
-                return True
-                
-            # Check for OB formation - relaxed body requirement
-            body_ratio = abs(candle["close"] - candle["open"]) / (candle["high"] - candle["low"])
-            if body_ratio >= 0.5:  # REDUCED FROM 0.6 to 0.5
-                if (abs(zone_low - candle["low"]) < candle["low"] * 0.001 and 
-                    abs(zone_high - candle["open"]) < candle["open"] * 0.001):
-                    return True
-                if (abs(zone_low - candle["close"]) < candle["close"] * 0.001 and 
-                    abs(zone_high - candle["high"]) < candle["high"] * 0.001):
-                    return True
-                    
-        return False
+            if full_range > 0 and (body_size / full_range) >= 0.5:
+                impulse_candle = candle
+                break
+        
+        if impulse_candle is None:
+            return {"valid": False}
+        
+        direction = sweep_result["direction"]
+        is_bullish = impulse_candle["close"] > impulse_candle["open"]
+        
+        if direction == "bullish" and not is_bullish:
+            return {"valid": False}
+        if direction == "bearish" and is_bullish:
+            return {"valid": False}
+        
+        return {"valid": True, "direction": direction}
 
-    def _format_early_rome_signal(self, final_result: Dict, symbol: str, context: Dict) -> Dict:
-        """Format early RomeOPT signal"""
+    def _check_retracement_zone(self, df: pd.DataFrame, displacement_result: Dict, context: Dict) -> Dict:
+        """STEP 3: Retracement into zone"""
+        current_price = df["close"].iloc[-1]
+        direction = displacement_result["direction"]
+        
+        fvg_zone = self._find_fvg_zone(df, direction)
+        if fvg_zone and self._price_approaching_zone(current_price, fvg_zone):
+            return {"valid": True, "zone_type": "fvg", "direction": direction}
+        
+        ob_zone = self._find_order_block(df, direction)
+        if ob_zone and self._price_approaching_zone(current_price, ob_zone):
+            return {"valid": True, "zone_type": "order_block", "direction": direction}
+        
+        return {"valid": False}
+
+    def _check_premium_discount(self, df: pd.DataFrame, zone_result: Dict, context: Dict) -> Dict:
+        """STEP 4: Premium/discount filter"""
+        current_price = df["close"].iloc[-1]
+        direction = zone_result["direction"]
+        
+        swing_highs = self._find_swing_highs(df.tail(15))
+        swing_lows = self._find_swing_lows(df.tail(15))
+        
+        if not swing_highs or not swing_lows:
+            return {"valid": False}
+            
+        recent_high = max(swing_highs[-2:])
+        recent_low = min(swing_lows[-2:])
+        equilibrium = (recent_high + recent_low) / 2
+        
+        if direction == "bullish" and current_price > equilibrium * 1.02:
+            return {"valid": False}
+        if direction == "bearish" and current_price < equilibrium * 0.98:
+            return {"valid": False}
+        
+        return {"valid": True, "direction": direction}
+
+    def _check_htf_alignment(self, df: pd.DataFrame, equilibrium_result: Dict, context: Dict) -> Dict:
+        """STEP 5: HTF alignment"""
+        direction = equilibrium_result["direction"]
+        htf_data = context.get('df_15m')
+        
+        # NO HTF DATA? NO PROBLEM - DON'T BLOCK SIGNALS
+        if htf_data is None or len(htf_data) < 10:
+            return {"valid": True, "direction": direction}  # Allow without HTF
+        
+        htf_trend = self._detect_trend(htf_data)
+        
+        if direction == "bullish" and htf_trend == "bearish":
+            return {"valid": False}
+        if direction == "bearish" and htf_trend == "bullish":
+            return {"valid": False}
+        
+        return {"valid": True, "direction": direction}
+
+    def _check_momentum(self, df: pd.DataFrame, htf_result: Dict, context: Dict) -> Dict:
+        """STEP 6: Momentum confirmation"""
+        direction = htf_result["direction"]
+        current_candle = df.iloc[-1]
+        
+        if direction == "bullish":
+            if not (current_candle["close"] >= current_candle["open"]):
+                return {"valid": False}
+        else:
+            if not (current_candle["close"] <= current_candle["open"]):
+                return {"valid": False}
+        
+        return {"valid": True, "direction": direction}
+
+    def _format_signal(self, final_result: Dict, symbol: str, context: Dict) -> Dict:
+        """Format signal with aggressive TP/SL"""
         direction = final_result["direction"]
         side = "BUY" if direction == "bullish" else "SELL"
-        
         current_price = context.get('current_price', 0)
         tf = context.get('tf', '15m')
         
-        # 🚨 FINAL PRICE VALIDATION
-        if current_price == 0:
-            logging.error(f"🚨 ZERO PRICE in signal formatting for {symbol}")
-            return None
-            
-        sl, tp1, tp2, tp3 = self._calculate_early_institutional_tpsl(current_price, side, tf)
+        # AGGRESSIVE TP/SL FOR QUICK MOVES
+        if side == "BUY":
+            sl = current_price * 0.997
+            tp1 = current_price * 1.006
+            tp2 = current_price * 1.012
+            tp3 = current_price * 1.018
+        else:
+            sl = current_price * 1.003
+            tp1 = current_price * 0.994
+            tp2 = current_price * 0.988
+            tp3 = current_price * 0.982
         
         return {
             "symbol": symbol,
@@ -650,55 +419,14 @@ class PureRomeAnalyzer:
             "tp1": tp1,
             "tp2": tp2,
             "tp3": tp3,
-            "score": 11,  # Perfect Rome score
-            "reason": "EARLY ROMEOPT INSTITUTIONAL SEQUENCE",
-            "reason_list": [
-                "✅ Early Liquidity Sweep", 
-                "✅ Early Displacement", 
-                "✅ Early Zone Approach",
-                "✅ Relaxed Premium/Discount", 
-                "✅ Relaxed HTF Alignment", 
-                "✅ Early Momentum"
-            ],
+            "score": 11,
+            "reason": "PURE ROMEOPT - NO FILTERS",
             "timeframe": tf,
-            "rome_sequence": True,
-            "sequence_steps_passed": 6,
-            "early_signal": True  # Mark as early signal
+            "timestamp": datetime.datetime.utcnow().isoformat()
         }
-
-    def _calculate_early_institutional_tpsl(self, entry: float, side: str, timeframe: str) -> tuple:
-        """Early institutional-grade TP/SL calculation"""
-        tf_multiplier = {
-            '1m': 0.4, '3m': 0.6, '5m': 0.8,  # INCREASED MULTIPLIERS
-            '15m': 1.0, '30m': 1.3, '1h': 1.6  # INCREASED MULTIPLIERS
-        }
-        
-        multiplier = tf_multiplier.get(timeframe, 1.0)
-        
-        if side == "BUY":
-            sl_pct = 0.0015 * multiplier  # REDUCED SL
-            tp1_pct = 0.005 * multiplier   # INCREASED TP
-            tp2_pct = 0.010 * multiplier   # INCREASED TP
-            tp3_pct = 0.015 * multiplier   # INCREASED TP
-            
-            sl = entry * (1 - sl_pct)
-            tp1 = entry * (1 + tp1_pct)
-            tp2 = entry * (1 + tp2_pct)
-            tp3 = entry * (1 + tp3_pct)
-        else:
-            sl_pct = 0.0015 * multiplier  # REDUCED SL
-            tp1_pct = 0.005 * multiplier   # INCREASED TP
-            tp2_pct = 0.010 * multiplier   # INCREASED TP
-            tp3_pct = 0.015 * multiplier   # INCREASED TP
-            
-            sl = entry * (1 + sl_pct)
-            tp1 = entry * (1 - tp1_pct)
-            tp2 = entry * (1 - tp2_pct)
-            tp3 = entry * (1 - tp3_pct)
-            
-        return sl, tp1, tp2, tp3
 
     # ==================== UTILITY METHODS ====================
+    
     def _calculate_atr(self, df: pd.DataFrame, period: int = 14) -> float:
         if len(df) < period: return 0.0
         high, low, close = df["high"], df["low"], df["close"]
@@ -708,7 +436,7 @@ class PureRomeAnalyzer:
         true_range = pd.DataFrame({'tr1': tr1, 'tr2': tr2, 'tr3': tr3}).max(axis=1)
         return true_range.rolling(period).mean().iloc[-1]
 
-    def _find_swing_highs(self, df: pd.DataFrame, lookback: int = 3) -> List[float]:
+    def _find_swing_highs(self, df: pd.DataFrame, lookback: int = 2) -> List[float]:
         if len(df) < lookback * 2 + 1: return []
         highs = []
         for i in range(lookback, len(df) - lookback):
@@ -716,7 +444,7 @@ class PureRomeAnalyzer:
                 highs.append(df["high"].iloc[i])
         return highs
 
-    def _find_swing_lows(self, df: pd.DataFrame, lookback: int = 3) -> List[float]:
+    def _find_swing_lows(self, df: pd.DataFrame, lookback: int = 2) -> List[float]:
         if len(df) < lookback * 2 + 1: return []
         lows = []
         for i in range(lookback, len(df) - lookback):
@@ -726,787 +454,245 @@ class PureRomeAnalyzer:
 
     def _find_fvg_zone(self, df: pd.DataFrame, direction: str) -> Optional[Dict]:
         if len(df) < 3: return None
-        for i in range(len(df) - 3, max(0, len(df) - 8), -1):  # REDUCED FROM 10 to 8
+        for i in range(len(df) - 3, max(0, len(df) - 8), -1):
             if i + 2 >= len(df): continue
             c1, c2 = df.iloc[i], df.iloc[i+1]
             if direction == "bullish" and c2["low"] > c1["high"]:
-                return {"low": c1["high"], "high": c2["low"], "type": "bullish_fvg"}
+                return {"low": c1["high"], "high": c2["low"]}
             elif direction == "bearish" and c2["high"] < c1["low"]:
-                return {"low": c2["high"], "high": c1["low"], "type": "bearish_fvg"}
+                return {"low": c2["high"], "high": c1["low"]}
         return None
 
     def _find_order_block(self, df: pd.DataFrame, direction: str) -> Optional[Dict]:
         if len(df) < 5: return None
-        for i in range(len(df) - 5, max(0, len(df) - 15), -1):  # REDUCED FROM 20 to 15
+        for i in range(len(df) - 5, max(0, len(df) - 12), -1):
             if i >= len(df): continue
             candle = df.iloc[i]
             body_size = abs(candle["close"] - candle["open"])
             full_range = candle["high"] - candle["low"]
-            if body_size / full_range >= 0.5:  # REDUCED FROM 0.6 to 0.5
+            if body_size / full_range >= 0.5:
                 if direction == "bullish" and candle["close"] > candle["open"]:
-                    return {"low": candle["low"], "high": candle["open"], "type": "bullish_ob"}
+                    return {"low": candle["low"], "high": candle["open"]}
                 elif direction == "bearish" and candle["close"] < candle["open"]:
-                    return {"low": candle["close"], "high": candle["high"], "type": "bearish_ob"}
+                    return {"low": candle["close"], "high": candle["high"]}
         return None
 
-    def _price_in_zone(self, price: float, zone: Dict) -> bool:
-        return zone["low"] <= price <= zone["high"]
+    def _price_approaching_zone(self, price: float, zone: Dict, threshold_pct: float = 0.003) -> bool:
+        zone_mid = (zone["low"] + zone["high"]) / 2
+        distance_pct = abs(price - zone_mid) / price
+        return distance_pct <= threshold_pct
 
-# ==================== PURE ROMEOPT SIGNAL MODEL ====================
+    def _detect_trend(self, df: pd.DataFrame) -> str:
+        if len(df) < 20: return "neutral"
+        ema_20 = df["close"].ewm(span=20).mean().iloc[-1]
+        current_price = df["close"].iloc[-1]
+        if current_price > ema_20: return "bullish"
+        elif current_price < ema_20: return "bearish"
+        return "neutral"
 
-@dataclass
-class RomeSignal:
-    """Pure RomeOPT signal tracking"""
-    symbol: str
-    side: SignalSide
-    entry_price: float
-    stop_loss: float
-    take_profit_1: float
-    take_profit_2: float
-    take_profit_3: float
-    timestamp: datetime.datetime
-    timeframe: str
-    score: int
-    sequence_steps_passed: int
-    signal_id: str
-    status: str = "active"
-    early_signal: bool = False  # Track early signals
+# ==================== LEAN SCANNER ====================
 
-# ==================== TRADE MONITORING SYSTEM ====================
-
-class RomeTradeMonitor:
-    """Advanced monitoring for RomeOPT signals"""
+class LeanRomeScanner:
+    """ULTRA-LEAN SCANNER - SIGNALS ONLY"""
     
-    def __init__(self, scanner):
-        self.scanner = scanner
-        self.open_signals = {}
-        self.closed_trades = []
-        self.all_signals = []
-        self.last_summary_time = time.time()
-        self.recent_sl = defaultdict(lambda: deque())
+    def __init__(self):
+        self.bingx = BingXAPI()
+        self.analyzer = PureRomeAnalyzer()
+        self.signals_sent = set()
         
-    async def add_signal(self, signal: RomeSignal):
-        """Add Rome signal to monitoring"""
-        self.open_signals[signal.signal_id] = signal
-        self.all_signals.append({
-            'signal': signal,
-            'status': 'OPEN',
-            'added_time': datetime.datetime.utcnow()
-        })
-        early_tag = " 🚀 EARLY" if signal.early_signal else ""
-        logging.info(f"🏛️ Rome Monitoring: {signal.symbol} {signal.side.value} | "
-                   f"Entry: {signal.entry_price:.6f} | TF: {signal.timeframe} | Score: {signal.score}{early_tag}")
-        
-    def record_sl_hit(self, symbol: str, lookback_minutes=30):
-        """Track SL hits for deprioritization"""
-        now = time.time()
-        dq = self.recent_sl[symbol]
-        dq.append(now)
-        cutoff = now - lookback_minutes * 60
-        while dq and dq[0] < cutoff: 
-            dq.popleft()
-        
-    def deprioritized(self, symbol: str, threshold=3, lookback=30):
-        """Check if symbol should be deprioritized"""
-        dq = self.recent_sl[symbol]
-        now = time.time()
-        cutoff = now - lookback * 60
-        while dq and dq[0] < cutoff: 
-            dq.popleft()
-        return len(dq) >= threshold
-
-    async def monitor_open_signals(self):
-        """Monitor Rome signals and update their status"""
-        if not self.open_signals: 
-            return
-        
-        signals_to_remove = []
-        
-        for signal_id, signal in self.open_signals.items():
-            try:
-                ticker = await self.scanner.fetch_ticker(signal.symbol)
-                if not ticker:
-                    continue
-                    
-                current_price = ticker['last']
-                
-                status = await self.check_signal_status(signal, current_price)
-                
-                if status != "OPEN" and signal.status == "active":
-                    signal.status = status.lower()
-                    await self._process_closed_signal(signal, status, current_price)
-                    signals_to_remove.append(signal_id)
-                    if "SL" in status:
-                        self.record_sl_hit(signal.symbol)
-                    
-            except Exception as e:
-                logging.error(f"Error monitoring {signal.symbol}: {e}")
-        
-        for signal_id in signals_to_remove:
-            if signal_id in self.open_signals:
-                del self.open_signals[signal_id]
-
-    async def check_signal_status(self, signal: RomeSignal, current_price: float):
-        """Check TP/SL hits for Rome signals"""
-        try:
-            if signal.side == SignalSide.BUY:
-                if current_price >= signal.take_profit_3:
-                    return "TP3_HIT"
-                elif current_price >= signal.take_profit_2:
-                    return "TP2_HIT"
-                elif current_price >= signal.take_profit_1:
-                    return "TP1_HIT"
-                elif current_price <= signal.stop_loss:
-                    return "SL_HIT"
-            else:
-                if current_price <= signal.take_profit_3:
-                    return "TP3_HIT"
-                elif current_price <= signal.take_profit_2:
-                    return "TP2_HIT"
-                elif current_price <= signal.take_profit_1:
-                    return "TP1_HIT"
-                elif current_price >= signal.stop_loss:
-                    return "SL_HIT"
-            return "OPEN"
-        except Exception as e:
-            return "OPEN"
-
-    async def _process_closed_signal(self, signal: RomeSignal, status: str, close_price: float):
-        """Process closed Rome signal"""
-        try:
-            if signal.side == SignalSide.BUY:
-                pnl_pct = (close_price - signal.entry_price) / signal.entry_price * 100
-            else:
-                pnl_pct = (signal.entry_price - close_price) / signal.entry_price * 100
-            
-            duration = (datetime.datetime.utcnow() - signal.timestamp).total_seconds() / 60
-
-            trade_record = {
-                'signal_id': signal.signal_id,
-                'symbol': signal.symbol,
-                'side': signal.side.value,
-                'entry_price': signal.entry_price,
-                'close_price': close_price,
-                'pnl_pct': pnl_pct,
-                'status': status,
-                'entry_time': signal.timestamp,
-                'exit_time': datetime.datetime.utcnow(),
-                'duration_minutes': duration,
-                'timeframe': signal.timeframe,
-                'score': signal.score,
-                'sequence_steps': signal.sequence_steps_passed,
-                'early_signal': signal.early_signal
-            }
-            
-            self.closed_trades.append(trade_record)
-            
-            for sig_data in self.all_signals:
-                if sig_data['signal'].signal_id == signal.signal_id:
-                    sig_data['status'] = status
-                    sig_data['close_price'] = close_price
-                    sig_data['pnl_pct'] = pnl_pct
-                    sig_data['exit_time'] = datetime.datetime.utcnow()
-                    sig_data['duration_minutes'] = duration
-                    break
-            
-            await self._send_trade_update(signal, status, close_price, pnl_pct, duration)
-            early_tag = " 🚀 EARLY" if signal.early_signal else ""
-            logging.info(f"🎯 Rome Trade CLOSED: {signal.symbol} {signal.timeframe} {status} | "
-                        f"P&L: {pnl_pct:+.2f}% | Score: {signal.score}{early_tag}")
-            
-        except Exception as e:
-            logging.error(f"Process closed signal error: {e}")
-
-    async def _send_trade_update(self, signal: RomeSignal, status: str, close_price: float, pnl_pct: float, duration: float):
-        """Send Rome trade update"""
-        try:
-            emoji = "🟢" if "TP" in status else "🔴"
-            pnl_emoji = "📈" if pnl_pct > 0 else "📉"
-            early_tag = "🚀 EARLY " if signal.early_signal else ""
-            
-            message = f"""
-{emoji} **🏛️ {early_tag}ROMEOPT TRADE CLOSED** {emoji}
-
-Symbol: {signal.symbol}
-Timeframe: {signal.timeframe}
-Side: {signal.side.value}
-Status: {status}
-
-Entry: {signal.entry_price:.6f}
-Exit: {close_price:.6f}
-Duration: {duration:.1f} minutes
-
-{pnl_emoji} P&L: {pnl_pct:+.2f}%
-
-Rome Score: {signal.score}/11
-Sequence Steps: {signal.sequence_steps_passed}/6
-"""
-            await send_telegram_message(message)
-        except Exception as e:
-            logging.error(f"Send trade update error: {e}")
-
-    async def send_performance_summary(self):
-        """Send 2-hour performance summary"""
-        try:
-            now = time.time()
-            if now - self.last_summary_time < 7200:
-                return False
-                
-            self.last_summary_time = now
-            
-            two_hours_ago = datetime.datetime.utcnow() - datetime.timedelta(hours=2)
-            recent_signals = [s for s in self.all_signals if s['added_time'] >= two_hours_ago]
-            
-            if not recent_signals:
-                return True
-                
-            open_signals = [s for s in recent_signals if s['status'] == 'OPEN']
-            closed_signals = [s for s in recent_signals if s['status'] != 'OPEN']
-            winning_trades = [s for s in closed_signals if s.get('pnl_pct', 0) > 0]
-            early_signals = [s for s in recent_signals if s['signal'].early_signal]
-
-            total_signals = len(recent_signals)
-            win_rate = len(winning_trades) / len(closed_signals) * 100 if closed_signals else 0
-            avg_score = sum(s['signal'].score for s in recent_signals) / total_signals if total_signals else 0
-
-            message = f"""
-📊 **🏛️ ROMEOPT 2-HOUR PERFORMANCE** 📊
-
-⏰ Period: Last 2 hours
-📈 Total Signals: {total_signals}
-🚀 Early Signals: {len(early_signals)}
-🟢 Open Signals: {len(open_signals)}
-🔒 Closed Signals: {len(closed_signals)}
-🎯 Win Rate: {win_rate:.1f}%
-⭐ Avg Rome Score: {avg_score:.1f}/11
-
-📋 **RECENT ROME SIGNALS:**
-"""
-            
-            for i, sig_data in enumerate(recent_signals[-5:], 1):
-                signal = sig_data['signal']
-                status = sig_data['status']
-                pnl = sig_data.get('pnl_pct', 0)
-                
-                status_emoji = "🟢" if "TP" in status else "🔴" if status == "SL_HIT" else "🟡"
-                pnl_str = f"{pnl:+.2f}%" if status != "OPEN" else "OPEN"
-                early_emoji = "🚀" if signal.early_signal else "🏛️"
-                
-                message += f"\n{i}. {status_emoji} {early_emoji} {signal.symbol} {signal.timeframe} {signal.side.value} | Entry: {signal.entry_price:.6f} | Score: {signal.score} | {pnl_str}"
-            
-            await send_telegram_message(message)
-            logging.info("📊 RomeOPT 2-hour performance summary sent")
-            return True
-        except Exception as e:
-            logging.error(f"Performance summary error: {e}")
-            return False
-
-    def get_performance_stats(self):
-        """Get Rome performance statistics"""
-        try:
-            if not self.closed_trades:
-                return {"total_trades": 0, "win_rate": 0, "avg_pnl": 0, "total_pnl": 0}
-            
-            winning_trades = [t for t in self.closed_trades if t['pnl_pct'] > 0]
-            total_pnl = sum(t['pnl_pct'] for t in self.closed_trades)
-            early_trades = [t for t in self.closed_trades if t.get('early_signal', False)]
-            early_winning = [t for t in early_trades if t['pnl_pct'] > 0]
-            
-            stats = {
-                'total_trades': len(self.closed_trades),
-                'winning_trades': len(winning_trades),
-                'win_rate': len(winning_trades) / len(self.closed_trades) * 100 if self.closed_trades else 0,
-                'avg_pnl': total_pnl / len(self.closed_trades) if self.closed_trades else 0,
-                'total_pnl': total_pnl,
-                'avg_rome_score': sum(t['score'] for t in self.closed_trades) / len(self.closed_trades) if self.closed_trades else 0,
-                'early_trades': len(early_trades),
-                'early_win_rate': len(early_winning) / len(early_trades) * 100 if early_trades else 0
-            }
-            return stats
-        except Exception as e:
-            return {"total_trades": 0, "win_rate": 0, "avg_pnl": 0, "total_pnl": 0}
-
-# ==================== PURE ROMEOPT SCANNER ====================
-
-class PureRomeScanner:
-    """PURE ROMEOPT SCANNER - 6-STEP INSTITUTIONAL SEQUENCING ONLY - FIXED TIMING"""
-    
-    def __init__(self, config: PureRomeConfig):
-        self.config = config
-        self.trade_monitor = RomeTradeMonitor(self)
-        self.bingx_api = BingXAPI()
-        self.signal_cooldown = {}
-        self.pattern_cooldown = {}  # NEW: Track specific patterns
-        self.rome_analyzer = PureRomeAnalyzer(config)
-        
-        self._setup_logging()
-    
-    def _setup_logging(self):
         logging.basicConfig(
             level=logging.INFO,
-            format='%(asctime)s | %(levelname)s | %(message)s',
-            handlers=[logging.StreamHandler()]
+            format='%(asctime)s | %(levelname)s | %(message)s'
         )
-        logging.info("🏛️ PURE ROMEOPT SCANNER v4.1 - FIXED SIGNAL TIMING")
-        logging.info("✅ 6-Step Institutional Sequencing Active")
-        logging.info("✅ BingX API Integration")
-        logging.info("✅ PROPER SIGNAL AGE VALIDATION")
-        logging.info("🎯 BALANCED EARLY SIGNALS WITH AGE FILTERS")
+        logging.info("🎯 LEAN ROMEOPT SCANNER STARTED")
+        logging.info("✅ Pure RomeOPT sequencing only")
+        logging.info("✅ BingX API")
+        logging.info("✅ NO FILTERS - PURE SIGNALS")
 
-    async def initialize_exchange(self):
+    async def fetch_ohlcv(self, symbol: str, timeframe: str) -> Optional[pd.DataFrame]:
+        """Fetch OHLCV data"""
         try:
-            return await self.bingx_api.test_connectivity()
-        except Exception as e:
-            logging.error(f"❌ BingX API initialization failed: {e}")
-            return False
-
-    async def fetch_ohlcv_data(self, symbol: str, timeframe: str, limit: int = 200) -> Optional[pd.DataFrame]:
-        try:
-            ohlcv = await self.bingx_api.fetch_ohlcv(symbol, timeframe, limit)
-            if not ohlcv or len(ohlcv) < 16: return None  # Need 15 closed + 1 forming
+            ohlcv = await self.bingx.fetch_ohlcv(symbol, timeframe, 100)
+            if not ohlcv or len(ohlcv) < 15: return None
             df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
             return df
-        except Exception as e:
+        except:
             return None
 
-    async def fetch_ticker(self, symbol: str) -> Optional[Dict]:
-        try:
-            return await self.bingx_api.fetch_ticker(symbol)
-        except Exception as e:
-            return None
-
-    async def get_btc_context(self) -> Dict[str, Any]:
-        """Get BTC context for HTF alignment only"""
-        try:
-            btc_15m = await self.fetch_ohlcv_data('BTC-USDT', '15m', 100)
-            btc_1h = await self.fetch_ohlcv_data('BTC-USDT', '1h', 100)
-            btc_4h = await self.fetch_ohlcv_data('BTC-USDT', '4h', 100)
-            return {
-                'df_15m': btc_15m,
-                'df_1h': btc_1h,
-                'df_4h': btc_4h
-            }
-        except Exception as e:
-            return {}
-
-    async def scan_symbol(self, symbol: str) -> List[RomeSignal]:
-        """PURE ROMEOPT SCANNING - FIXED TIMING"""
+    async def scan_symbol(self, symbol: str) -> List[Dict]:
+        """Scan single symbol for RomeOPT signals"""
         signals = []
         
         try:
-            context = await self.get_btc_context()
-            
-            # ALL TIMEFRAMES
-            timeframes = ["1m", "3m", "5m", "15m", "30m", "1h"]
-            
-            for tf in timeframes:
-                cooldown_key = f"{symbol}_{tf}"
-                if cooldown_key in self.signal_cooldown:
-                    if time.time() - self.signal_cooldown[cooldown_key] < self.config.COOLDOWN_MINUTES * 60:
-                        continue
+            # SCAN ALL TIMEFRAMES
+            for tf in ["1m", "3m", "5m", "15m", "30m"]:
+                df = await self.fetch_ohlcv(symbol, tf)
+                if df is None: continue
                 
-                if self.trade_monitor.deprioritized(symbol):
-                    continue
+                # Get HTF data for context (but don't block if missing)
+                htf_data = None
+                if tf in ["1m", "3m", "5m"]:
+                    htf_data = await self.fetch_ohlcv(symbol, "15m")
                 
-                bingx_symbol = symbol.replace('/', '-')
-                df = await self.fetch_ohlcv_data(bingx_symbol, tf)
-                if df is None or len(df) < 16:  # Need 15 closed + 1 forming
-                    continue
+                context = {
+                    'tf': tf,
+                    'df_15m': htf_data
+                }
                 
-                scan_context = context.copy()
-                scan_context['tf'] = tf
-                scan_context['current_price'] = df['close'].iloc[-2]  # Use last CLOSED price
-                
-                # Get appropriate HTF data for each timeframe
-                if tf in ['1m', '3m', '5m']:
-                    df_15m = await self.fetch_ohlcv_data(bingx_symbol, '15m', 100)
-                    scan_context['df_15m'] = df_15m
-                elif tf == '15m':
-                    df_1h = await self.fetch_ohlcv_data(bingx_symbol, '1h', 100)
-                    scan_context['df_1h'] = df_1h
-                elif tf == '30m':
-                    df_4h = await self.fetch_ohlcv_data(bingx_symbol, '4h', 100)
-                    scan_context['df_1h'] = df_4h
-                elif tf == '1h':
-                    df_4h = await self.fetch_ohlcv_data(bingx_symbol, '4h', 100)
-                    scan_context['df_4h'] = df_4h
-                
-                # 🎯 PURE ROMEOPT SEQUENCING ONLY - WITH AGE VALIDATION
-                rome_signal = self.rome_analyzer.generate_signal(df, symbol, scan_context)
-                if not rome_signal: 
-                    continue
-                
-                # NEW: Pattern-based cooldown to prevent duplicate signals
-                pattern_id = f"{symbol}_{tf}_s{rome_signal.get('sweep_index', 0)}"
-                if pattern_id in self.pattern_cooldown:
-                    if time.time() - self.pattern_cooldown[pattern_id] < 300:  # 5 min pattern cooldown
-                        continue
-                
-                pure_signal = await self._create_rome_signal(rome_signal)
-                if pure_signal:
-                    if await self._validate_signal(pure_signal):
-                        signals.append(pure_signal)
-                        self.signal_cooldown[cooldown_key] = time.time()
-                        self.pattern_cooldown[pattern_id] = time.time()
-                        await self.trade_monitor.add_signal(pure_signal)
-                        
-                        await self._send_rome_notification(pure_signal, rome_signal)
-                        
-                        early_tag = " 🚀 EARLY" if pure_signal.early_signal else ""
-                        logging.info(f"🏛️ PURE ROME SIGNAL: {symbol} {pure_signal.timeframe} {pure_signal.side.value} | Score: {pure_signal.score}{early_tag}")
+                signal = self.analyzer.generate_signal(df, symbol, context)
+                if signal:
+                    signal_id = f"{symbol}_{tf}_{signal['side']}_{int(time.time() / 60)}"  # Unique per minute
+                    if signal_id not in self.signals_sent:
+                        signals.append(signal)
+                        self.signals_sent.add(signal_id)
+                        logging.info(f"🎯 SIGNAL: {symbol} {tf} {signal['side']} | Entry: {signal['entry']:.6f}")
         
         except Exception as e:
-            logging.error(f"Error scanning {symbol}: {e}")
+            logging.error(f"Scan error {symbol}: {e}")
             
         return signals
 
-    async def _create_rome_signal(self, rome_signal: Dict) -> Optional[RomeSignal]:
-        """Create pure Rome signal object"""
+    async def get_active_symbols(self) -> List[str]:
+        """Get active trading symbols with volume"""
         try:
-            signal = RomeSignal(
-                symbol=rome_signal['symbol'],
-                side=SignalSide.BUY if rome_signal['side'] == 'BUY' else SignalSide.SELL,
-                entry_price=rome_signal['entry'],
-                stop_loss=rome_signal['sl'],
-                take_profit_1=rome_signal['tp1'],
-                take_profit_2=rome_signal['tp2'],
-                take_profit_3=rome_signal['tp3'],
-                timestamp=datetime.datetime.utcnow(),
-                timeframe=rome_signal['timeframe'],
-                score=rome_signal['score'],
-                sequence_steps_passed=rome_signal['sequence_steps_passed'],
-                signal_id=f"ROME_{rome_signal['symbol']}_{rome_signal['timeframe']}_{int(time.time())}",
-                early_signal=rome_signal.get('early_signal', False)
-            )
-            
-            return signal
-        except Exception as e:
-            logging.error(f"Create Rome signal error: {e}")
-            return None
-
-    async def _send_rome_notification(self, rome_signal: RomeSignal, signal_data: Dict):
-        """Send pure Rome signal notification"""
-        try:
-            early_tag = "🚀 EARLY " if rome_signal.early_signal else ""
-            
-            message = f"""
-🏛️ **{early_tag}PURE ROMEOPT INSTITUTIONAL SIGNAL** 🏛️
-
-Symbol: {rome_signal.symbol}
-Timeframe: {rome_signal.timeframe}
-Side: {rome_signal.side.value}
-Entry: {rome_signal.entry_price:.6f}
-
-Risk Management:
-SL: {rome_signal.stop_loss:.6f}
-TP1: {rome_signal.take_profit_1:.6f}
-TP2: {rome_signal.take_profit_2:.6f}
-TP3: {rome_signal.take_profit_3:.6f}
-
-🏆 ROME SCORE: {rome_signal.score}/11
-🎯 Sequence Steps: {rome_signal.sequence_steps_passed}/6
-
-Institutional Sequence:
-{' • '.join(signal_data['reason_list'])}
-"""
-            await send_telegram_message(message)
-        except Exception as e:
-            logging.error(f"Send Rome notification error: {e}")
-
-    async def _validate_signal(self, signal: RomeSignal) -> bool:
-        """Final validation - only block if same symbol/timeframe has ACTIVE signal"""
-        try:
-            for signal_id, open_signal in self.trade_monitor.open_signals.items():
-                if (open_signal.symbol == signal.symbol and 
-                    open_signal.timeframe == signal.timeframe):
-                    logging.info(f"⏸️ Already monitoring {signal.symbol} on {signal.timeframe}")
-                    return False
-                    
-            return True
-        except Exception as e:
-            return False
-
-    async def get_top_symbols(self) -> List[str]:
-        """Get top symbols with volume filter - FIXED VERSION"""
-        try:
-            tickers = await self.bingx_api.fetch_tickers()
-            symbols_data = []
-            filtered_count = 0
-            total_symbols = 0
-            
-            for symbol, ticker in tickers.items():
-                total_symbols += 1
-                if not symbol.endswith('/USDT'): 
-                    continue
-                
-                # 🚨 CRITICAL FIX: Change 'baseVolume' to 'volume'
-                volume = ticker.get('volume', 0)
-                last_price = ticker.get('last', 1)
-                volume_usdt = volume * last_price
-                
-                # Volume filter
-                if volume_usdt < self.config.MIN_VOLUME_USDT: 
-                    filtered_count += 1
-                    continue
-                
-                bid = ticker.get('bid', 0)
-                ask = ticker.get('ask', 0)
-                if bid == 0 or ask == 0: 
-                    filtered_count += 1
-                    continue
-                
-                # 🚨 CRITICAL FIX: Prevent division by zero
-                spread_pct = (ask - bid) / bid if bid > 0 else 999
-                if spread_pct > self.config.MAX_SPREAD_PCT: 
-                    filtered_count += 1
-                    continue
-                
-                symbols_data.append({'symbol': symbol, 'volume': volume_usdt})
-                    
-            symbols_data.sort(key=lambda x: x['volume'], reverse=True)
-            top_symbols = [s['symbol'] for s in symbols_data[:self.config.TOP_N_SYMBOLS]]
-            
-            # Detailed logging to verify fix
-            logging.info(f"📊 Symbol Selection: {len(top_symbols)}/{total_symbols} "
-                        f"(Filtered: {filtered_count}, Min Volume: ${self.config.MIN_VOLUME_USDT:,.0f})")
-            
-            if top_symbols:
-                logging.info(f"🏆 Top 3 by volume: {[s['symbol'] for s in symbols_data[:3]]}")
-            else:
-                logging.warning("⚠️ No symbols passed filters, using fallback")
+            tickers = await self.bingx.fetch_tickers()
+            if not tickers:
                 return self._get_fallback_symbols()
                 
+            symbols_data = []
+            for symbol, ticker in tickers.items():
+                if not symbol.endswith('/USDT'):
+                    continue
+                volume = ticker.get('volume', 0)
+                symbols_data.append({'symbol': symbol, 'volume': volume})
+            
+            symbols_data.sort(key=lambda x: x['volume'], reverse=True)
+            top_symbols = [s['symbol'] for s in symbols_data[:50]]  # Top 50 by volume
+            
+            logging.info(f"📊 Selected {len(top_symbols)} symbols by volume")
             return top_symbols
             
         except Exception as e:
-            logging.error(f"Error getting top symbols from BingX: {e}")
+            logging.error(f"Error getting symbols: {e}")
             return self._get_fallback_symbols()
 
     def _get_fallback_symbols(self) -> List[str]:
-        """Safe fallback symbols when API fails"""
+        """Fallback symbols if API fails"""
         return [
-            'BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'ADA/USDT', 'DOT/USDT',
-            'LINK/USDT', 'LTC/USDT', 'BCH/USDT', 'XLM/USDT', 'ETC/USDT',
-            'XRP/USDT', 'DOGE/USDT', 'SOL/USDT', 'MATIC/USDT', 'AVAX/USDT'
+            'BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT',
+            'ADA/USDT', 'AVAX/USDT', 'DOT/USDT', 'LINK/USDT', 'MATIC/USDT',
+            'DOGE/USDT', 'LTC/USDT', 'ATOM/USDT', 'ETC/USDT', 'XLM/USDT',
+            'ARB/USDT', 'OP/USDT', 'APT/USDT', 'FIL/USDT', 'NEAR/USDT'
         ]
 
-    async def run_scan_cycle(self):
-        """Pure RomeOPT scanning cycle - FIXED TIMING"""
+    async def run_scan(self):
+        """Run single scan cycle"""
         try:
-            logging.info("🔍 Starting PURE ROMEOPT scan cycle - FIXED TIMING...")
-            
-            symbols = await self.get_top_symbols()
-            if not symbols:
-                logging.warning("⚠️ No symbols available for scanning")
-                return
-                
+            symbols = await self.get_active_symbols()
             all_signals = []
             
+            logging.info(f"🔍 Scanning {len(symbols)} symbols...")
+            
             for symbol in symbols:
-                try:
-                    signals = await self.scan_symbol(symbol)
-                    all_signals.extend(signals)
-                    await asyncio.sleep(0.1)
-                except Exception as e:
-                    continue
+                signals = await self.scan_symbol(symbol)
+                all_signals.extend(signals)
+                await asyncio.sleep(0.05)  # Small delay to avoid rate limits
             
             if all_signals:
-                tf_counts = {}
-                early_count = 0
+                logging.info(f"📈 Scan complete: {len(all_signals)} fresh signals")
                 for signal in all_signals:
-                    tf = signal.timeframe
-                    tf_counts[tf] = tf_counts.get(tf, 0) + 1
-                    if signal.early_signal:
-                        early_count += 1
-                
-                tf_info = ", ".join([f"{tf}: {count}" for tf, count in tf_counts.items()])
-                logging.info(f"📈 PURE ROMEOPT scan complete: {len(all_signals)} signals ({early_count} early) across {tf_info}")
+                    await self.send_telegram_alert(signal)
             else:
-                logging.info("📈 PURE ROMEOPT scan complete: No institutional sequences detected")
+                logging.info("📈 Scan complete: No new signals")
                 
         except Exception as e:
-            logging.error(f"ROMEOPT scan cycle error: {e}")
+            logging.error(f"Scan cycle error: {e}")
 
-    async def start_continuous_scanning(self):
-        """Pure RomeOPT continuous scanning - FIXED TIMING"""
-        logging.info("🔄 Starting PURE ROMEOPT continuous scanning - FIXED TIMING...")
+    async def send_telegram_alert(self, signal: Dict):
+        """Send simple Telegram alert"""
+        token = os.getenv("TELEGRAM_BOT_TOKEN")
+        chat_id = os.getenv("TELEGRAM_CHAT_ID")
         
-        startup_msg = (
-            "🏛️ **PURE ROMEOPT INSTITUTIONAL SCANNER v4.1 STARTED** 🏛️\n"
-            "✅ BingX API integration active\n"
-            "✅ Strict 6-step RomeOPT sequencing only\n"
-            "✅ PROPER SIGNAL AGE VALIDATION\n"
-            "✅ ALL TIMEFRAMES: 1m, 3m, 5m, 15m, 30m, 1h\n"
-            "🎯 BALANCED AGE FILTERS (Max 12 minutes)\n"
-            "🚀 EARLY SIGNALS WITH FRESH PATTERNS ONLY"
-        )
-        await send_telegram_message(startup_msg)
+        if not token or not chat_id:
+            print(f"📱 {signal['symbol']} {signal['side']} | Entry: {signal['entry']:.6f}")
+            return
         
-        try:
-            while True:
-                start_time = time.time()
-                
-                await self.run_scan_cycle()
-                await self.trade_monitor.monitor_open_signals()
-                await self.trade_monitor.send_performance_summary()
-                
-                elapsed = time.time() - start_time
-                sleep_time = max(1, self.config.SCAN_INTERVAL - elapsed)
-                await asyncio.sleep(sleep_time)
-                
-        except Exception as e:
-            logging.error(f"PURE ROMEOPT scanning error: {e}")
-            await asyncio.sleep(60)
+        message = f"""
+🎯 **ROMEOPT SIGNAL**
 
-    async def cleanup(self):
-        """Cleanup resources"""
-        try:
-            logging.info("🧹 PURE ROMEOPT scanner cleanup completed")
-        except Exception as e:
-            pass
+Symbol: {signal['symbol']}
+Timeframe: {signal['timeframe']}
+Side: {signal['side']}
+Entry: {signal['entry']:.6f}
 
-# ==================== TELEGRAM NOTIFICATIONS ====================
+SL: {signal['sl']:.6f}
+TP1: {signal['tp1']:.6f}  
+TP2: {signal['tp2']:.6f}
+TP3: {signal['tp3']:.6f}
 
-async def send_telegram_message(message: str):
-    """Telegram notification function"""
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    
-    if not token or not chat_id: 
-        print(f"📱 TELEGRAM: {message}")
-        return
+Score: {signal['score']}/11
+Time: {signal['timestamp']}
+"""
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        async with httpx.AsyncClient() as client:
+            try:
+                await client.post(url, json={
+                    "chat_id": chat_id, 
+                    "text": message, 
+                    "parse_mode": "Markdown"
+                })
+            except Exception as e:
+                logging.error(f"Telegram send error: {e}")
+
+    async def start_scanning(self):
+        """Start continuous scanning"""
+        logging.info("🔄 Starting continuous scanning...")
         
-    def escape_html(msg: str) -> str:
-        if not msg: 
-            return "-"
-        return str(msg).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    
-    safe_msg = escape_html(message)
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    async with httpx.AsyncClient() as client:
-        try:
-            await client.post(url, json={
-                "chat_id": chat_id, 
-                "text": safe_msg, 
-                "parse_mode": "HTML"
-            })
-        except Exception as e:
-            logging.error(f"Telegram failed: {e}")
+        # Clean up old signals every hour
+        last_cleanup = time.time()
+        
+        while True:
+            try:
+                await self.run_scan()
+                
+                # Clean up old signals every hour
+                if time.time() - last_cleanup > 3600:
+                    self._cleanup_old_signals()
+                    last_cleanup = time.time()
+                
+                await asyncio.sleep(30)  # Scan every 30 seconds
+            except Exception as e:
+                logging.error(f"Scanner error: {e}")
+                await asyncio.sleep(60)
 
-# ==================== WEB API SERVER ====================
+    def _cleanup_old_signals(self):
+        """Clean up signals older than 1 hour"""
+        current_time = time.time()
+        old_signals = []
+        
+        for signal_id in self.signals_sent:
+            # Extract timestamp from signal_id (format: symbol_tf_side_timestamp)
+            parts = signal_id.split('_')
+            if len(parts) >= 4:
+                signal_minute = int(parts[-1])
+                if current_time / 60 - signal_minute > 60:  # Older than 1 hour
+                    old_signals.append(signal_id)
+        
+        for old_signal in old_signals:
+            self.signals_sent.remove(old_signal)
+        
+        if old_signals:
+            logging.info(f"🧹 Cleaned up {len(old_signals)} old signals")
 
-scanner: Optional[PureRomeScanner] = None
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Manage scanner lifecycle"""
-    global scanner
-    config = PureRomeConfig()
-    scanner = PureRomeScanner(config)
-    success = await scanner.initialize_exchange()
-    
-    if success:
-        background_tasks = BackgroundTasks()
-        background_tasks.add_task(scanner.start_continuous_scanning)
-    
-    yield
-    
-    if scanner:
-        await scanner.cleanup()
-
-app = FastAPI(title="Pure RomeOPT Institutional Scanner - Fixed Timing", version="4.1.0", lifespan=lifespan)
-
-class SignalResponse(BaseModel):
-    symbol: str
-    side: str
-    entry_price: float
-    score: int
-    timeframe: str
-    sequence_steps: int
-    timestamp: datetime.datetime
-    status: str
-    early_signal: bool
-
-class PerformanceStats(BaseModel):
-    total_trades: int
-    win_rate: float
-    avg_pnl: float
-    open_signals: int
-    avg_rome_score: float
-    early_trades: int
-    early_win_rate: float
-
-@app.get("/")
-async def root():
-    return {"status": "PURE ROMEOPT INSTITUTIONAL SCANNER v4.1 - FIXED TIMING - RUNNING"}
-
-@app.get("/signals", response_model=List[SignalResponse])
-async def get_current_signals():
-    if not scanner: 
-        return []
-    signals = []
-    for signal in scanner.trade_monitor.open_signals.values():
-        signals.append(SignalResponse(
-            symbol=signal.symbol,
-            side=signal.side.value,
-            entry_price=signal.entry_price,
-            score=signal.score,
-            timeframe=signal.timeframe,
-            sequence_steps=signal.sequence_steps_passed,
-            timestamp=signal.timestamp,
-            status=signal.status,
-            early_signal=signal.early_signal
-        ))
-    return signals
-
-@app.get("/performance", response_model=PerformanceStats)
-async def get_performance():
-    if not scanner:
-        return PerformanceStats(total_trades=0, win_rate=0, avg_pnl=0, open_signals=0, avg_rome_score=0, early_trades=0, early_win_rate=0)
-    stats = scanner.trade_monitor.get_performance_stats()
-    return PerformanceStats(
-        total_trades=stats['total_trades'],
-        win_rate=stats['win_rate'],
-        avg_pnl=stats['avg_pnl'],
-        open_signals=len(scanner.trade_monitor.open_signals),
-        avg_rome_score=stats.get('avg_rome_score', 0),
-        early_trades=stats.get('early_trades', 0),
-        early_win_rate=stats.get('early_win_rate', 0)
-    )
-
-@app.post("/scan-now")
-async def trigger_manual_scan():
-    """Trigger manual RomeOPT scan cycle"""
-    if not scanner:
-        raise HTTPException(status_code=500, detail="Scanner not initialized")
-    
-    asyncio.create_task(scanner.run_scan_cycle())
-    return {"status": "PURE ROMEOPT FIXED TIMING scan triggered"}
-
-# ==================== MAIN EXECUTION ====================
+# ==================== MAIN ====================
 
 async def main():
-    """Pure RomeOPT main execution - FIXED TIMING"""
-    try:
-        config = PureRomeConfig()
-        scanner = PureRomeScanner(config)
-        success = await scanner.initialize_exchange()
-        
-        if not success:
-            logging.error("❌ Failed to initialize BingX API. Trying to continue...")
-        
-        await scanner.start_continuous_scanning()
-        
-    except KeyboardInterrupt:
-        logging.info("🛑 PURE ROMEOPT scanner stopped by user")
-    except Exception as e:
-        logging.error(f"❌ PURE ROMEOPT scanner error: {e}")
-    finally:
-        if 'scanner' in locals():
-            await scanner.cleanup()
+    """Main function"""
+    scanner = LeanRomeScanner()
+    await scanner.start_scanning()
 
 if __name__ == "__main__":
     asyncio.run(main())
