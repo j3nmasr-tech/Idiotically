@@ -121,7 +121,7 @@ class BingXClient:
             return {}
     
     async def fetch_ohlcv(self, symbol: str, timeframe: str = '15m', limit: int = 200) -> List:
-        """Fetch OHLCV data from BingX"""
+        """Fetch OHLCV data from BingX - FIXED API RESPONSE PARSING"""
         try:
             # Convert symbol format if needed
             bingx_symbol = symbol.replace("/", "-")
@@ -138,13 +138,21 @@ class BingXClient:
                 if data.get('code') == 0:
                     ohlcv_data = []
                     for candle in data.get('data', []):
+                        # FIXED: Handle different possible field names in BingX API response
+                        timestamp = candle.get('openTime') or candle.get('time') or candle.get('timestamp') or candle[0]
+                        open_price = candle.get('open') or candle[1]
+                        high_price = candle.get('high') or candle[2]
+                        low_price = candle.get('low') or candle[3]
+                        close_price = candle.get('close') or candle[4]
+                        volume = candle.get('volume') or candle[5]
+                        
                         ohlcv_data.append([
-                            candle['openTime'],      # timestamp
-                            float(candle['open']),   # open
-                            float(candle['high']),   # high  
-                            float(candle['low']),    # low
-                            float(candle['close']),  # close
-                            float(candle['volume'])  # volume
+                            int(timestamp),          # timestamp
+                            float(open_price),       # open
+                            float(high_price),       # high  
+                            float(low_price),        # low
+                            float(close_price),      # close
+                            float(volume)            # volume
                         ])
                     return ohlcv_data
                 else:
