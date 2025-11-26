@@ -7,7 +7,7 @@
 - BingX API
 - Complete trade monitoring
 - TP/SL hit detection
-- Top 60 symbols by volume
+- TOP 60 HIGH VOLUME SYMBOLS ONLY
 - Performance tracking
 """
 
@@ -122,7 +122,8 @@ class BingXAPI:
                     return {
                         'symbol': symbol,
                         'last': self._safe_float_convert(ticker_data.get('lastPrice', 0)),
-                        'volume': self._safe_float_convert(ticker_data.get('volume', 0))
+                        'volume': self._safe_float_convert(ticker_data.get('volume', 0)),
+                        'quoteVolume': self._safe_float_convert(ticker_data.get('quoteVolume', 0))
                     }
                 return None
                     
@@ -139,7 +140,7 @@ class BingXAPI:
             
             url = f"{self.base_url}{endpoint}"
             
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=15.0) as client:
                 response = await client.get(url, params=params)
                 data = response.json()
                 
@@ -149,10 +150,19 @@ class BingXAPI:
                         symbol_str = ticker_data.get('symbol', '')
                         if '-' in symbol_str and symbol_str.endswith('-USDT'):
                             standard_symbol = symbol_str.replace('-', '/')
+                            volume = self._safe_float_convert(ticker_data.get('volume', 0))
+                            quote_volume = self._safe_float_convert(ticker_data.get('quoteVolume', 0))
+                            last_price = self._safe_float_convert(ticker_data.get('lastPrice', 0))
+                            
+                            # Calculate real USD volume (quoteVolume is more reliable)
+                            usd_volume = quote_volume if quote_volume > 0 else volume * last_price
+                            
                             tickers[standard_symbol] = {
                                 'symbol': standard_symbol,
-                                'last': self._safe_float_convert(ticker_data.get('lastPrice', 0)),
-                                'volume': self._safe_float_convert(ticker_data.get('volume', 0))
+                                'last': last_price,
+                                'volume': volume,
+                                'quoteVolume': quote_volume,
+                                'usdVolume': usd_volume
                             }
                     return tickers
                 return {}
@@ -692,40 +702,62 @@ class EnhancedRomeScanner:
             
         return signals
 
-    async def get_top_60_symbols(self) -> List[str]:
-        """Get top 60 symbols by volume"""
+    async def get_top_60_high_volume_symbols(self) -> List[str]:
+        """Get top 60 HIGH VOLUME symbols only"""
         try:
             tickers = await self.bingx.fetch_tickers()
             if not tickers:
-                return self._get_fallback_symbols()
+                return self._get_high_volume_fallback_symbols()
                 
             symbols_data = []
             for symbol, ticker in tickers.items():
-                if not symbol.endswith('/USDT'):
+                usd_volume = ticker.get('usdVolume', 0)
+                
+                # FILTER: Only include symbols with significant volume
+                if usd_volume < 1000000:  # Minimum $1M USD volume
                     continue
-                volume = ticker.get('volume', 0)
-                symbols_data.append({'symbol': symbol, 'volume': volume})
+                    
+                symbols_data.append({
+                    'symbol': symbol, 
+                    'usdVolume': usd_volume,
+                    'volume': ticker.get('volume', 0)
+                })
             
-            symbols_data.sort(key=lambda x: x['volume'], reverse=True)
-            top_symbols = [s['symbol'] for s in symbols_data[:60]]  # Top 60 by volume
+            # Sort by USD volume (highest first)
+            symbols_data.sort(key=lambda x: x['usdVolume'], reverse=True)
+            top_symbols = [s['symbol'] for s in symbols_data[:60]]  # Top 60 by REAL volume
             
-            logging.info(f"📊 Selected {len(top_symbols)} symbols by volume")
+            # Log volume information
+            if top_symbols:
+                avg_volume = sum(s['usdVolume'] for s in symbols_data[:10]) / 10
+                logging.info(f"📊 Selected {len(top_symbols)} HIGH VOLUME symbols (Avg: ${avg_volume:,.0f})")
+                logging.info(f"🏆 Top 5: {[s['symbol'] for s in symbols_data[:5]]}")
+            else:
+                logging.warning("⚠️ No high volume symbols found, using fallback")
+                return self._get_high_volume_fallback_symbols()
+                
             return top_symbols
             
         except Exception as e:
-            logging.error(f"Error getting symbols: {e}")
-            return self._get_fallback_symbols()
+            logging.error(f"Error getting high volume symbols: {e}")
+            return self._get_high_volume_fallback_symbols()
 
-    def _get_fallback_symbols(self) -> List[str]:
-        """Fallback symbols if API fails"""
-        major_pairs = [
+    def _get_high_volume_fallback_symbols(self) -> List[str]:
+        """Fallback with only high-volume major pairs"""
+        high_volume_pairs = [
+            # Top Tier (Massive Volume)
             'BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT',
-            'ADA/USDT', 'AVAX/USDT', 'DOT/USDT', 'LINK/USDT', 'MATIC/USDT',
-            'DOGE/USDT', 'LTC/USDT', 'ATOM/USDT', 'ETC/USDT', 'XLM/USDT',
-            'ARB/USDT', 'OP/USDT', 'APT/USDT', 'FIL/USDT', 'NEAR/USDT'
+            'ADA/USDT', 'AVAX/USDT', 'DOGE/USDT', 'DOT/USDT', 'LINK/USDT',
+            
+            # Second Tier (High Volume)
+            'MATIC/USDT', 'LTC/USDT', 'ATOM/USDT', 'ETC/USDT', 'XLM/USDT',
+            'ARB/USDT', 'OP/USDT', 'FIL/USDT', 'NEAR/USDT', 'APT/USDT',
+            
+            # Third Tier (Good Volume)
+            'ALGO/USDT', 'EOS/USDT', 'XTZ/USDT', 'AAVE/USDT', 'MKR/USDT',
+            'COMP/USDT', 'YFI/USDT', 'SUSHI/USDT', 'CRV/USDT', 'UNI/USDT'
         ]
-        # Repeat to get 60 symbols
-        return (major_pairs * 3)[:60]
+        return high_volume_pairs[:60]  # Return exactly 60 symbols
 
     async def scan_and_track(self):
         """Enhanced scanning with trade monitoring"""
@@ -747,10 +779,10 @@ class EnhancedRomeScanner:
     async def run_scan(self):
         """Scan all symbols and track signals"""
         try:
-            symbols = await self.get_top_60_symbols()
+            symbols = await self.get_top_60_high_volume_symbols()
             all_signals = []
             
-            logging.info(f"🔍 Scanning {len(symbols)} symbols...")
+            logging.info(f"🔍 Scanning {len(symbols)} HIGH VOLUME symbols...")
             
             for symbol in symbols:
                 signals = await self.scan_symbol(symbol)
