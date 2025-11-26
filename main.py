@@ -61,11 +61,11 @@ class ScannerConfig:
     MAX_SL_CLUSTER_HITS: int = 3
     
     # OLD WINNER FILTER SETTINGS (EXACT OLD BEHAVIOR)
-    REQUIRE_BTC_ALIGNMENT: bool = False
-    REQUIRE_HIGHER_TF_ALIGNMENT: bool = False
-    REQUIRE_MOMENTUM_CONFIRMATION: bool = False
-    REQUIRE_ZONE_QUALITY: bool = False
-    AVOID_CHOPPY_MARKETS: bool = False
+    REQUIRE_BTC_ALIGNMENT: bool = True
+    REQUIRE_HIGHER_TF_ALIGNMENT: bool = True
+    REQUIRE_MOMENTUM_CONFIRMATION: bool = True
+    REQUIRE_ZONE_QUALITY: bool = True
+    AVOID_CHOPPY_MARKETS: bool = True
     USE_MARKET_REGIME: bool = False  # OLD: No market regime filter!
     
     # OLD SCORING
@@ -83,6 +83,8 @@ class BingXClient:
         
     def _generate_signature(self, params: str) -> str:
         """Generate HMAC SHA256 signature for BingX API"""
+        if not self.secret_key:
+            return ""
         return hmac.new(
             self.secret_key.encode('utf-8'),
             params.encode('utf-8'),
@@ -121,7 +123,7 @@ class BingXClient:
             return {}
     
     async def fetch_ohlcv(self, symbol: str, timeframe: str = '15m', limit: int = 200) -> List:
-        """Fetch OHLCV data from BingX - FIXED API RESPONSE PARSING"""
+        """Fetch OHLCV data from BingX"""
         try:
             # Convert symbol format if needed
             bingx_symbol = symbol.replace("/", "-")
@@ -138,7 +140,7 @@ class BingXClient:
                 if data.get('code') == 0:
                     ohlcv_data = []
                     for candle in data.get('data', []):
-                        # FIXED: Handle different possible field names in BingX API response
+                        # Handle different possible field names in BingX API response
                         timestamp = candle.get('openTime') or candle.get('time') or candle.get('timestamp') or candle[0]
                         open_price = candle.get('open') or candle[1]
                         high_price = candle.get('high') or candle[2]
@@ -1639,8 +1641,7 @@ Signal Reasons: {', '.join(old_signal['reason_list'])}
             "✅ Your exact old filters & scoring preserved\n"
             "✅ Rome signals get priority + higher base scores\n"
             "✅ Advanced monitoring & performance tracking\n"
-            "🎯 Target: INSTITUTIONAL-GRADE SIGNALS\n"
-            "🔧 MODIFIED: BingX API integration active"
+            "🎯 Target: INSTITUTIONAL-GRADE SIGNALS"
         )
         await send_telegram_message(startup_msg)
         
