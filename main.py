@@ -8,7 +8,6 @@
 - NEW ROME-STYLE SIGNAL GENERATION
 - OLD SCORING SYSTEM (BASE + 5 BONUS)
 - MODIFIED: BingX API integration
-- FIXED: TP/SL issues and DataFrame bugs
 """
 
 import os
@@ -62,11 +61,11 @@ class ScannerConfig:
     MAX_SL_CLUSTER_HITS: int = 3
     
     # OLD WINNER FILTER SETTINGS (EXACT OLD BEHAVIOR)
-    REQUIRE_BTC_ALIGNMENT: bool = False
-    REQUIRE_HIGHER_TF_ALIGNMENT: bool = False
-    REQUIRE_MOMENTUM_CONFIRMATION: bool = False
-    REQUIRE_ZONE_QUALITY: bool = False
-    AVOID_CHOPPY_MARKETS: bool = False
+    REQUIRE_BTC_ALIGNMENT: bool = True
+    REQUIRE_HIGHER_TF_ALIGNMENT: bool = True
+    REQUIRE_MOMENTUM_CONFIRMATION: bool = True
+    REQUIRE_ZONE_QUALITY: bool = True
+    AVOID_CHOPPY_MARKETS: bool = True
     USE_MARKET_REGIME: bool = False  # OLD: No market regime filter!
     
     # OLD SCORING
@@ -449,22 +448,13 @@ class RomeSMCAnalyzer:
         }
 
     def _check_htf_alignment(self, df: pd.DataFrame, equilibrium_result: Dict, context: Dict) -> Dict:
-        """STEP 5: Higher Timeframe bias alignment - FIXED DF CHECK"""
+        """STEP 5: Higher Timeframe bias alignment"""
         direction = equilibrium_result["direction"]
         
-        # Get HTF data from context - FIXED: Proper DataFrame validation
+        # Get HTF data from context
         htf_data = context.get('df_15m') or context.get('df_1h')
-        
-        # FIX: Proper DataFrame validation with length check
-        if htf_data is None or not isinstance(htf_data, pd.DataFrame) or len(htf_data) < 20:
-            # Allow continuation if HTF data is missing (don't block the signal)
-            logging.debug(f"HTF data not available for alignment check, continuing...")
-            return {
-                "valid": True,
-                "htf_trend": "neutral",  # Default to neutral
-                "direction": direction,
-                "htf_missing": True  # Flag that HTF data was missing
-            }
+        if htf_data is None or len(htf_data) < 20:
+            return {"valid": False, "reason": "No HTF data available"}
         
         # Simple HTF trend detection
         htf_trend = self._detect_htf_trend(htf_data)
@@ -513,18 +503,15 @@ class RomeSMCAnalyzer:
         }
 
     def _format_rome_signal(self, final_result: Dict, symbol: str, context: Dict) -> Dict:
-        """Format valid Rome signal with OLD scoring - FIXED EMPTY DF BUG"""
+        """Format valid Rome signal with OLD scoring"""
         direction = final_result["direction"]
         side = "BUY" if direction == "bullish" else "SELL"
         current_price = context.get('current_price', 0)
         tf = context.get('tf', '15m')
         
-        # FIX: Get proper DataFrame for TP/SL calculation
-        df = context.get('current_df')  # Use the current timeframe data
-        
-        # Calculate OLD-style TP/SL with proper DataFrame
+        # Calculate OLD-style TP/SL
         sl, tp1, tp2, tp3 = OldSimpleTPSL.calculate_old_tp_sl(
-            df, symbol, side, current_price, context  # Pass the actual DataFrame
+            pd.DataFrame(), symbol, side, current_price, context
         )
         
         # OLD scoring system (base + bonus)
@@ -785,7 +772,7 @@ class OriginalWinnerFilters:
 # ==================== YOUR EXACT OLD SMC CORE LOGIC ====================
 
 class OriginalSMCLogic:
-    """YOUR EXACT ORIGINAL SMC LOGIC - NOW WITH ROME SEQUENCING ONLY"""
+    """YOUR EXACT ORIGINAL SMC LOGIC - NOW WITH ROME SEQUENCING"""
     
     def __init__(self):
         self.rome_analyzer = RomeSMCAnalyzer()
@@ -837,26 +824,83 @@ class OriginalSMCLogic:
         return "bearish", candle["high"], candle["open"]
 
     def generate_signal(self, df: pd.DataFrame, symbol: str, context=None):
-        """STRICT ROMEOPT INSTITUTIONAL SEQUENCING ONLY - NO FALLBACK"""
+        """UPDATED: NOW USES ROMEOPT INSTITUTIONAL SEQUENCING"""
         if context is None: 
             context = {}
         
-        if df is None or len(df) < 20:  # Rome sequencing requires more data
+        if df is None or len(df) < 20:  # Increased minimum for Rome sequencing
             return None
 
+        tf = context.get("tf", "15m")
+
         try:
-            # STRICT ROMEOPT SEQUENCING ONLY - NO FALLBACK TO OLD LOGIC
+            # FIRST TRY ROMEOPT SEQUENCING (HIGHER QUALITY)
             rome_signal = self.rome_analyzer.generate_signal(df, symbol, context)
             if rome_signal:
                 logging.info(f"🏛️ ROMEOPT Signal: {symbol} {rome_signal['side']} | Score: {rome_signal['score']}")
                 return rome_signal
             
-            # NO FALLBACK - RETURN NONE IF ROME SEQUENCE FAILS
-            logging.debug(f"❌ Rome sequence failed for {symbol}: {self.rome_analyzer.rejection_reason}")
-            return None
-            
+            # FALLBACK TO ORIGINAL LOGIC (FOR BACKWARD COMPATIBILITY)
+            last = df["close"].iloc[-1]
+
+            ob_type, ob_hi, ob_lo = self.detect_order_blocks(df)
+            if ob_type is None: 
+                return None
+
+            bull_fvg, bear_fvg = self.detect_fvg(df)
+            sweep_h, sweep_l = self.detect_sweep(df)
+            bos_hh, bos_ll = self.detect_bos_mss(df)
+
+            if not (bos_hh or bos_ll): 
+                return None
+
+            score = 0
+            reasons = []
+
+            if ob_type == "bullish": 
+                score += 2
+                reasons.append("OB Bull +2")
+            else: 
+                score += 2
+                reasons.append("OB Bear +2")
+
+            if bull_fvg: 
+                score += 2
+                reasons.append("FVG Bull +2")
+            elif bear_fvg: 
+                score += 2
+                reasons.append("FVG Bear +2")
+
+            score += 2
+            reasons.append("BOS +2")
+            if sweep_h or sweep_l: 
+                score += 1
+                reasons.append("Sweep +1")
+            else: 
+                reasons.append("No Sweep +0")
+
+            side = "BUY" if ob_type == "bullish" else "SELL"
+
+            # Use OLD SIMPLE ATR TP/SL
+            entry = float(last)
+            sl, tp1, tp2, tp3 = OldSimpleTPSL.calculate_old_tp_sl(df, symbol, side, entry, context)
+
+            return {
+                "symbol": symbol,
+                "side": side,
+                "entry": entry,
+                "sl": sl,
+                "tp1": tp1,
+                "tp2": tp2,
+                "tp3": tp3,
+                "score": score,
+                "reason": "Set B SMC Signal + OLD TP/SL",
+                "reason_list": reasons,
+                "timeframe": tf,
+                "rome_sequence": False  # Mark as non-Rome signal
+            }
         except Exception as e:
-            logging.error(f"Rome sequencing error for {symbol}: {e}")
+            logging.error(f"Signal generation error for {symbol}: {e}")
             return None
 
 # ==================== OLD SIMPLE ATR TP/SL SYSTEM ====================
@@ -866,18 +910,15 @@ class OldSimpleTPSL:
     
     @staticmethod
     def calculate_old_tp_sl(df, symbol, side, entry, context):
-        """YOUR EXACT OLD ATR-BASED TP/SL - ENHANCED ERROR HANDLING"""
+        """YOUR EXACT OLD ATR-BASED TP/SL"""
         try:
-            # FIX: Better DataFrame validation
-            if df is not None and isinstance(df, pd.DataFrame) and len(df) >= 14:
-                atr_val = OldSimpleTPSL.old_atr(df, 14).iloc[-1] 
-            else:
-                atr_val = None
+            # OLD ATR CALCULATION
+            atr_val = OldSimpleTPSL.old_atr(df, 14).iloc[-1] if df is not None and len(df) >= 14 else None
             
             # OLD TP/SL MULTIPLIERS
             tp_mult, sl_mult = 0.8, 1.0
             
-            if atr_val and atr_val > 0 and not np.isnan(atr_val):
+            if atr_val and atr_val > 0:
                 if side == "BUY":
                     sl = entry - sl_mult * atr_val
                     tp1 = entry + tp_mult * atr_val
@@ -889,69 +930,44 @@ class OldSimpleTPSL:
                     tp2 = entry - tp_mult * 1.5 * atr_val
                     tp3 = entry - tp_mult * 2.5 * atr_val
             else:
-                # FIX: More conservative fallback percentages
+                # OLD FALLBACK TO PERCENTAGE
                 if side == "BUY":
-                    sl = entry * 0.995  # 0.5% SL
-                    tp1 = entry * 1.008  # 0.8% TP1
-                    tp2 = entry * 1.015  # 1.5% TP2  
-                    tp3 = entry * 1.025  # 2.5% TP3
+                    sl = entry * 0.998
+                    tp1 = entry * 1.004
+                    tp2 = entry * 1.008  
+                    tp3 = entry * 1.012
                 else:
-                    sl = entry * 1.005   # 0.5% SL
-                    tp1 = entry * 0.992  # 0.8% TP1
-                    tp2 = entry * 0.985  # 1.5% TP2
-                    tp3 = entry * 0.975  # 2.5% TP3
+                    sl = entry * 1.002
+                    tp1 = entry * 0.996
+                    tp2 = entry * 0.992
+                    tp3 = entry * 0.988
 
-            # FIX: Additional validation to ensure SL != entry
-            if abs(sl - entry) < entry * 0.001:  # If SL too close to entry
-                if side == "BUY":
-                    sl = entry * 0.995
-                else:
-                    sl = entry * 1.005
+            # OLD SL VALIDATION
+            if sl == entry:
+                sl = entry - entry * 0.002 if side == "BUY" else entry + entry * 0.002
 
             return sl, tp1, tp2, tp3
         except Exception as e:
-            logging.error(f"TP/SL calculation error for {symbol}: {e}")
-            # More conservative fallback values
+            logging.error(f"TP/SL calculation error: {e}")
+            # Fallback values
             if side == "BUY":
-                return entry * 0.995, entry * 1.008, entry * 1.015, entry * 1.025
+                return entry * 0.998, entry * 1.004, entry * 1.008, entry * 1.012
             else:
-                return entry * 1.005, entry * 0.992, entry * 0.985, entry * 0.975
+                return entry * 1.002, entry * 0.996, entry * 0.992, entry * 0.988
 
     @staticmethod
     def old_atr(df: pd.DataFrame, period=14):
-        """YOUR EXACT OLD ATR CALCULATION - ENHANCED ERROR HANDLING"""
-        try:
-            if df is None or not isinstance(df, pd.DataFrame) or len(df) < period:
-                # Return Series with proper length for the input DataFrame
-                if df is not None and isinstance(df, pd.DataFrame):
-                    return pd.Series([0.0] * len(df), index=df.index)
-                else:
-                    return pd.Series([0.0])
-            
-            high, low, close = df["high"], df["low"], df["close"]
-            
-            # Ensure all columns are numeric
-            high = pd.to_numeric(high, errors='coerce')
-            low = pd.to_numeric(low, errors='coerce')
-            close = pd.to_numeric(close, errors='coerce')
-            
-            tr = pd.DataFrame({
-                "h-l": high - low,
-                "h-pc": (high - close.shift(1)).abs(),
-                "l-pc": (low - close.shift(1)).abs()
-            }).max(axis=1)
-            
-            # Fill NaN values with 0
-            tr = tr.fillna(0)
-            
-            return tr.rolling(period, min_periods=1).mean()
-        except Exception as e:
-            logging.error(f"ATR calculation error: {e}")
-            # Return safe fallback
-            if df is not None and isinstance(df, pd.DataFrame):
-                return pd.Series([0.0] * len(df), index=df.index)
-            else:
-                return pd.Series([0.0])
+        """YOUR EXACT OLD ATR CALCULATION"""
+        if df is None or len(df) < period:
+            return pd.Series([0] * len(df) if df is not None else [0])
+        
+        high, low, close = df["high"], df["low"], df["close"]
+        tr = pd.DataFrame({
+            "h-l": high - low,
+            "h-pc": (high - close.shift(1)).abs(),
+            "l-pc": (low - close.shift(1)).abs()
+        }).max(axis=1)
+        return tr.rolling(period, min_periods=1).mean()
 
 # ==================== ENHANCED DATA MODELS ====================
 
@@ -1336,7 +1352,6 @@ class UltimateHybridScanner:
         logging.info("✅ Your exact old filter strictness & scoring preserved")
         logging.info("✅ Rome signals get priority + higher base scores")
         logging.info("✅ MODIFIED: BingX API integration")
-        logging.info("✅ FIXED: TP/SL issues and DataFrame bugs")
 
     async def initialize_exchange(self):
         """MODIFIED: Initialize BingX client instead of OKX"""
@@ -1389,7 +1404,7 @@ class UltimateHybridScanner:
             return {'btc_direction': 'NEUTRAL'}
 
     async def scan_symbol(self, symbol: str) -> List[TradingSignal]:
-        """ROMEOPT SCANNING WITH OLD FILTER STRICTNESS - FIXED CONTEXT PASSING"""
+        """ROMEOPT SCANNING WITH OLD FILTER STRICTNESS"""
         signals = []
         
         try:
@@ -1415,11 +1430,10 @@ class UltimateHybridScanner:
                 if df is None or len(df) < 20:  # Increased minimum for Rome
                     continue
                 
-                # Add context - FIX: Include current_df for TP/SL calculation
+                # Add context
                 scan_context = context.copy()
                 scan_context['tf'] = tf
                 scan_context['current_price'] = df['close'].iloc[-1]
-                scan_context['current_df'] = df  # FIX: Pass current timeframe data
                 
                 # Get higher timeframe data for alignment (OLD STYLE)
                 if tf in ["1m", "3m", "5m"]:
@@ -1627,7 +1641,6 @@ Signal Reasons: {', '.join(old_signal['reason_list'])}
             "✅ Your exact old filters & scoring preserved\n"
             "✅ Rome signals get priority + higher base scores\n"
             "✅ Advanced monitoring & performance tracking\n"
-            "✅ FIXED: TP/SL issues and DataFrame bugs\n"
             "🎯 Target: INSTITUTIONAL-GRADE SIGNALS"
         )
         await send_telegram_message(startup_msg)
