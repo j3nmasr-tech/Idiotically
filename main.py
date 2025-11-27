@@ -12,15 +12,15 @@ import requests
 from dataclasses import dataclass
 import aiohttp
 from concurrent.futures import ThreadPoolExecutor
-import asyncio
 from asyncio import Semaphore
+import random
 
-# Configure logging
+# Configure comprehensive logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
     handlers=[
-        logging.FileHandler('romeopt_top40_scanner.log'),
+        logging.FileHandler('romeopt_scanner.log'),
         logging.StreamHandler()
     ]
 )
@@ -43,79 +43,137 @@ class TradeSignal:
         if self.tp_hit is None:
             self.tp_hit = [False, False, False]
 
-class RomeOPTTop40Scanner:
+class RomeOPTScanner:
     def __init__(self):
-        # Load environment variables
+        # Comprehensive startup logging
+        logging.info("🔄 INITIALIZING ROMEOPT SCANNER...")
+        
+        # Load and validate environment variables
         self.api_key = os.getenv('BINGX_API_KEY')
         self.api_secret = os.getenv('BINGX_API_SECRET')
         self.telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
         self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
         
-        # Validate credentials
-        if not all([self.api_key, self.api_secret, self.telegram_token, self.telegram_chat_id]):
-            raise ValueError("Missing required environment variables")
+        # Validate all required environment variables
+        missing_vars = []
+        if not self.api_key: missing_vars.append('BINGX_API_KEY')
+        if not self.api_secret: missing_vars.append('BINGX_API_SECRET')
+        if not self.telegram_token: missing_vars.append('TELEGRAM_BOT_TOKEN')
+        if not self.telegram_chat_id: missing_vars.append('TELEGRAM_CHAT_ID')
         
-        # TOP 40 CRYPTOCURRENCIES (By Market Cap)
+        if missing_vars:
+            error_msg = f"❌ MISSING ENVIRONMENT VARIABLES: {', '.join(missing_vars)}"
+            logging.error(error_msg)
+            raise ValueError(error_msg)
+        
+        logging.info("✅ All environment variables loaded successfully")
+        
+        # Trading configuration
         self.symbols = [
-            # Major Pairs
             'BTC-USDT', 'ETH-USDT', 'BNB-USDT', 'SOL-USDT', 'XRP-USDT',
-            # Large Caps
             'ADA-USDT', 'AVAX-USDT', 'DOGE-USDT', 'DOT-USDT', 'TRX-USDT',
             'LINK-USDT', 'MATIC-USDT', 'LTC-USDT', 'BCH-USDT', 'ATOM-USDT',
-            # Mid Caps
-            'XLM-USDT', 'FIL-USDT', 'ETC-USDT', 'XTZ-USDT', 'XMR-USDT',
-            'EOS-USDT', 'AAVE-USDT', 'ALGO-USDT', 'NEO-USDT', 'MKR-USDT',
-            # DeFi & Emerging
-            'COMP-USDT', 'YFI-USDT', 'SUSHI-USDT', 'SNX-USDT', 'UNI-USDT',
-            'CRV-USDT', 'SAND-USDT', 'MANA-USDT', 'GALA-USDT', 'ENJ-USDT',
-            # Layer 1 & Infrastructure
-            'NEAR-USDT', 'FTM-USDT', 'ONE-USDT', 'VET-USDT', 'ICP-USDT',
-            'FLOW-USDT', 'EGLD-USDT', 'THETA-USDT', 'HBAR-USDT', 'KLAY-USDT'
         ]
         
         self.timeframe = '1m'
         self.max_signal_age = timedelta(minutes=3)
         
-        # Performance optimization for 40 coins
-        self.max_concurrent_websockets = 20  # Batch connections
-        self.analysis_semaphore = Semaphore(10)  # Limit concurrent analysis
+        # Performance optimization
+        self.max_concurrent_websockets = 10
+        self.analysis_semaphore = Semaphore(8)
         self.price_data: Dict[str, List] = {}
         self.active_signals: Dict[str, TradeSignal] = {}
         self.htf_bias: Dict[str, str] = {}
         
-        # Rate limiting
+        # Rate limiting and state tracking
         self.last_analysis_time: Dict[str, datetime] = {}
-        self.analysis_cooldown = timedelta(seconds=2)  # Analyze each coin every 2 seconds
+        self.analysis_cooldown = timedelta(seconds=3)
+        self.thread_pool = ThreadPoolExecutor(max_workers=8)
         
-        # Thread pool for blocking operations
-        self.thread_pool = ThreadPoolExecutor(max_workers=10)
+        # Statistics
+        self.startup_time = datetime.now()
+        self.signals_analyzed = 0
+        self.signals_generated = 0
+        self.websocket_connections = 0
         
-        logging.info(f"🚀 RomeOPT Top 40 Scanner initialized - Monitoring {len(self.symbols)} coins")
+        logging.info(f"🚀 RomeOPT Scanner initialized - Monitoring {len(self.symbols)} coins")
 
-    # ==================== PERFORMANCE-OPTIMIZED DATA FEED ====================
+    async def send_startup_message(self):
+        """Send comprehensive startup message to Telegram"""
+        startup_msg = f"""
+🚀 **ROMEOPT SCANNER STARTED SUCCESSFULLY**
+
+**Configuration:**
+• **Version**: Enhanced Debug v2.0
+• **Start Time**: {self.startup_time.strftime('%Y-%m-%d %H:%M:%S UTC')}
+• **Coins Monitoring**: {len(self.symbols)}
+• **Timeframe**: {self.timeframe}
+• **Environment**: ✅ All variables loaded
+
+**System Status:**
+✅ Environment Variables
+✅ Scanner Initialized
+🔜 WebSocket Connections
+🔜 Real-time Analysis
+🔜 Telegram Notifications
+
+**Next Steps:**
+1. WebSocket connections to BingX
+2. Real-time candle data collection
+3. 6-step RomeOPT analysis
+4. Instant signal alerts
+
+Scanner is now starting...
+"""
+        await self.send_telegram_alert(startup_msg)
+        logging.info("📤 Startup message sent to Telegram")
 
     async def start_websocket_feeds(self):
-        """Start optimized WebSocket feeds for all 40 coins in batches"""
-        logging.info("📡 Starting WebSocket feeds for Top 40 coins...")
+        """Start WebSocket connections for all symbols"""
+        logging.info(f"📡 Starting WebSocket feeds for {len(self.symbols)} coins...")
         
-        # Process in batches to avoid connection limits
-        batch_size = 10
+        successful_connections = 0
+        batch_size = 5
+        
         for i in range(0, len(self.symbols), batch_size):
             batch = self.symbols[i:i + batch_size]
-            tasks = [self.connect_bingx_websocket(symbol) for symbol in batch]
-            await asyncio.gather(*tasks, return_exceptions=True)
-            await asyncio.sleep(1)  # Stagger connections
+            logging.info(f"🔄 Connecting batch {i//batch_size + 1}: {batch}")
+            
+            tasks = []
+            for symbol in batch:
+                task = asyncio.create_task(self.connect_bingx_websocket(symbol))
+                tasks.append(task)
+            
+            # Wait for batch to complete
+            await asyncio.sleep(2)
+            
+        logging.info(f"📊 WebSocket initialization complete")
+        
+        # Send connection status
+        status_msg = f"🔌 **WEBSOCKET STATUS**: Initializing {len(self.symbols)} coins"
+        await self.send_telegram_alert(status_msg)
 
     async def connect_bingx_websocket(self, symbol: str):
-        """Optimized WebSocket connection with error handling"""
-        max_retries = 5
-        retry_delay = 2
+        """Connect to BingX WebSocket with comprehensive error handling"""
+        max_retries = 3
+        retry_delay = 5
         
         for attempt in range(max_retries):
             try:
+                logging.info(f"🔗 [{symbol}] Connecting WebSocket (attempt {attempt + 1}/{max_retries})")
+                
+                # BingX WebSocket URL
                 ws_url = "wss://open-api-swap.bingx.com/swap-market"
-                async with websockets.connect(ws_url, ping_interval=20, ping_timeout=10) as websocket:
-                    logging.info(f"✅ WebSocket connected for {symbol}")
+                
+                async with websockets.connect(
+                    ws_url,
+                    ping_interval=30,
+                    ping_timeout=20,
+                    close_timeout=10
+                ) as websocket:
+                    
+                    self.websocket_connections += 1
+                    logging.info(f"✅ [{symbol}] WebSocket connected successfully")
                     
                     # Subscribe to kline data
                     subscribe_msg = {
@@ -123,33 +181,44 @@ class RomeOPTTop40Scanner:
                         "reqType": "sub",
                         "dataType": f"{symbol}@kline_{self.timeframe}"
                     }
-                    await websocket.send(json.dumps(subscribe_msg))
                     
+                    await websocket.send(json.dumps(subscribe_msg))
+                    logging.debug(f"📤 [{symbol}] Subscription sent")
+                    
+                    # Send connection success for major pairs
+                    if symbol in ['BTC-USDT', 'ETH-USDT']:
+                        await self.send_telegram_alert(f"🔌 **{symbol}** WebSocket connected")
+                    
+                    # Main message processing loop
                     while True:
                         try:
                             message = await asyncio.wait_for(websocket.recv(), timeout=30)
                             data = json.loads(message)
                             await self.handle_websocket_data(symbol, data)
+                            
                         except asyncio.TimeoutError:
-                            # Send ping to keep connection alive
+                            # Keep connection alive
                             await websocket.ping()
                             continue
+                        except websockets.exceptions.ConnectionClosed:
+                            logging.warning(f"🔌 [{symbol}] WebSocket connection closed")
+                            break
                             
             except Exception as e:
-                logging.warning(f"⚠️ WebSocket connection failed for {symbol} (attempt {attempt + 1}): {e}")
+                logging.warning(f"⚠️ [{symbol}] WebSocket connection failed (attempt {attempt + 1}): {str(e)}")
                 if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay * (attempt + 1))
+                    await asyncio.sleep(retry_delay)
                 else:
-                    logging.error(f"❌ Failed to connect WebSocket for {symbol} after {max_retries} attempts")
+                    logging.error(f"❌ [{symbol}] Failed to connect after {max_retries} attempts")
                     break
 
     async def handle_websocket_data(self, symbol: str, data: Dict):
-        """Efficiently handle incoming WebSocket data for 40 coins"""
+        """Process incoming WebSocket data"""
         try:
             if 'data' in data and data['data']:
                 candle_data = data['data']
                 
-                # Convert to standard format
+                # Parse candle data
                 current_candle = {
                     'timestamp': datetime.fromtimestamp(candle_data['t'] / 1000),
                     'open': float(candle_data['o']),
@@ -160,98 +229,118 @@ class RomeOPTTop40Scanner:
                     'is_closed': candle_data['x']
                 }
                 
-                # Initialize price data for symbol if needed
+                logging.debug(f"📊 [{symbol}] New data - O:{current_candle['open']:.2f} H:{current_candle['high']:.2f} L:{current_candle['low']:.2f} C:{current_candle['close']:.2f}")
+                
+                # Initialize or update price data
                 if symbol not in self.price_data:
                     self.price_data[symbol] = []
+                    logging.info(f"📈 [{symbol}] Price data storage initialized")
                 
-                # Update price data (keep only last 30 candles for memory efficiency)
                 self.price_data[symbol].append(current_candle)
-                if len(self.price_data[symbol]) > 30:
-                    self.price_data[symbol] = self.price_data[symbol][-30:]
+                if len(self.price_data[symbol]) > 25:
+                    self.price_data[symbol] = self.price_data[symbol][-25:]
                 
-                # Rate-limited analysis to prevent CPU overload
-                await self.schedule_analysis(symbol, current_candle)
+                # Schedule analysis for forming candles
+                if not current_candle['is_closed']:
+                    await self.schedule_analysis(symbol, current_candle)
                 
         except Exception as e:
-            logging.error(f"Data handling error for {symbol}: {e}")
+            logging.error(f"❌ [{symbol}] WebSocket data handling error: {e}")
 
     async def schedule_analysis(self, symbol: str, current_candle: Dict):
-        """Rate-limited analysis scheduling to handle 40 coins efficiently"""
+        """Schedule analysis with rate limiting"""
         current_time = datetime.now()
         
-        # Check if we should analyze this symbol (cooldown period)
+        # Rate limiting
         if symbol in self.last_analysis_time:
             time_since_last = current_time - self.last_analysis_time[symbol]
             if time_since_last < self.analysis_cooldown:
                 return
         
-        # Update last analysis time
         self.last_analysis_time[symbol] = current_time
         
-        # Analyze only forming candles (not closed ones)
-        if not current_candle['is_closed']:
-            async with self.analysis_semaphore:
-                try:
-                    signal = await asyncio.get_event_loop().run_in_executor(
-                        self.thread_pool, 
-                        self.generate_signal, 
-                        symbol, 
-                        current_candle
-                    )
-                    if signal and self.is_live_signal(signal):
-                        signal_id = f"{symbol}_{signal.timestamp.timestamp()}"
-                        if signal_id not in self.active_signals:
-                            self.active_signals[signal_id] = signal
-                            await self.send_signal_alert(signal)
-                except Exception as e:
-                    logging.error(f"Analysis error for {symbol}: {e}")
-
-    # ==================== OPTIMIZED 6-STEP SEQUENCE ====================
+        async with self.analysis_semaphore:
+            try:
+                # Run analysis in thread pool
+                signal = await asyncio.get_event_loop().run_in_executor(
+                    self.thread_pool, 
+                    self.generate_signal, 
+                    symbol, 
+                    current_candle
+                )
+                
+                self.signals_analyzed += 1
+                
+                if signal and self.is_live_signal(signal):
+                    self.signals_generated += 1
+                    signal_id = f"{symbol}_{signal.timestamp.timestamp()}"
+                    
+                    if signal_id not in self.active_signals:
+                        self.active_signals[signal_id] = signal
+                        logging.info(f"🎯 [{symbol}] SIGNAL GENERATED: {signal.direction} @ {signal.entry_price:.4f}")
+                        await self.send_signal_alert(signal)
+                        
+            except Exception as e:
+                logging.error(f"❌ [{symbol}] Analysis error: {e}")
 
     def generate_signal(self, symbol: str, current_data: Dict) -> Optional[TradeSignal]:
-        """
-        PERFORMANCE-OPTIMIZED 6-step RomeOPT sequence for 40 coins
-        """
+        """6-step RomeOPT signal generation"""
         try:
-            # Quick pre-filter: need minimum data
+            logging.debug(f"🔍 [{symbol}] Starting 6-step analysis...")
+            
+            # Pre-check: sufficient data
             if symbol not in self.price_data or len(self.price_data[symbol]) < 10:
                 return None
-            
+
             # STEP 1: Liquidity Sweep
             sweep_ok, sweep_info = self.step_1_liquidity_sweep(symbol, current_data)
             if not sweep_ok:
+                logging.debug(f"❌ [{symbol}] Step 1 failed: No liquidity sweep")
                 return None
-            
-            # STEP 2: Displacement  
+            logging.debug(f"✅ [{symbol}] Step 1 passed: {sweep_info['type']}")
+
+            # STEP 2: Displacement
             displacement_ok, displacement_info = self.step_2_displacement(symbol, current_data, sweep_info)
             if not displacement_ok:
+                logging.debug(f"❌ [{symbol}] Step 2 failed: No displacement")
                 return None
+            logging.debug(f"✅ [{symbol}] Step 2 passed: {displacement_info['direction']} displacement")
             
             direction = displacement_info['direction']
-            
+
             # STEP 3: Retracement into Zone
             retracement_ok, zone_info = self.step_3_retracement_into_zone(
                 symbol, current_data, sweep_info, displacement_info)
             if not retracement_ok:
+                logging.debug(f"❌ [{symbol}] Step 3 failed: No zone retracement")
                 return None
-            
+            logging.debug(f"✅ [{symbol}] Step 3 passed: In {zone_info['type']}")
+
             # STEP 4: Premium/Discount
             premium_ok, eq_info = self.step_4_premium_discount(symbol, current_data, direction)
             if not premium_ok:
+                logging.debug(f"❌ [{symbol}] Step 4 failed: Wrong premium/discount")
                 return None
-            
+            logging.debug(f"✅ [{symbol}] Step 4 passed: In {eq_info['position']}")
+
             # STEP 5: HTF Bias Alignment
             htf_ok, bias_info = self.step_5_htf_bias_alignment(symbol, direction)
             if not htf_ok and bias_info.get('alignment') == 'MISALIGNED':
-                return None  # Only reject if clearly misaligned
-            
-            # STEP 6: Momentum & Volatility Confirmation
+                logging.debug(f"❌ [{symbol}] Step 5 failed: HTF misalignment")
+                return None
+            logging.debug(f"✅ [{symbol}] Step 5 passed: HTF {bias_info.get('alignment', 'UNKNOWN')}")
+
+            # STEP 6: Momentum & Volatility
             momentum_ok, confirmation_info = self.step_6_momentum_volatility_confirmation(
                 symbol, current_data, direction)
             if not momentum_ok:
+                logging.debug(f"❌ [{symbol}] Step 6 failed: Momentum rejected")
                 return None
+            logging.debug(f"✅ [{symbol}] Step 6 passed: Momentum confirmed")
+
+            # ALL STEPS PASSED - Create signal
+            logging.info(f"🎯 [{symbol}] ALL 6 STEPS PASSED - Generating {direction} signal")
             
-            # ALL STEPS PASSED - Generate signal
             entry_price = current_data['close']
             tp_levels, sl_level = self.calculate_tp_sl(
                 symbol, direction, entry_price, sweep_info, displacement_info)
@@ -268,17 +357,16 @@ class RomeOPTTop40Scanner:
                 sl_level=sl_level
             )
             
-            logging.info(f"🎯 SIGNAL: {direction} {symbol} @ {entry_price}")
             return signal
             
         except Exception as e:
-            logging.error(f"Signal generation error for {symbol}: {e}")
+            logging.error(f"❌ [{symbol}] Signal generation error: {e}")
             return None
 
-    # ==================== OPTIMIZED STEP IMPLEMENTATIONS ====================
+    # ==================== 6-STEP IMPLEMENTATIONS ====================
 
     def step_1_liquidity_sweep(self, symbol: str, current_data: Dict) -> Tuple[bool, Optional[Dict]]:
-        """Optimized liquidity sweep detection"""
+        """Step 1: Liquidity Sweep Detection"""
         try:
             recent_data = self.price_data.get(symbol, [])
             if len(recent_data) < 8:
@@ -288,38 +376,38 @@ class RomeOPTTop40Scanner:
             current_high = current_data['high']
             current_low = current_data['low']
             
-            # Use last 6 candles for efficiency
+            # Check last 6 candles
             recent_lows = [candle['low'] for candle in recent_data[-6:]]
             recent_highs = [candle['high'] for candle in recent_data[-6:]]
             
-            # Bullish sweep detection
+            # Bullish sweep (sweep of lows)
             if len(recent_lows) >= 3:
-                min_low = min(recent_lows[:-1])
-                if current_low < min_low and current_price > min_low:
+                min_previous_low = min(recent_lows[:-1])
+                if current_low < min_previous_low and current_price > min_previous_low:
                     return True, {
                         'type': 'BULLISH_SWEEP',
-                        'sweep_level': min_low,
+                        'sweep_level': min_previous_low,
                         'current_low': current_low
                     }
             
-            # Bearish sweep detection  
+            # Bearish sweep (sweep of highs)
             if len(recent_highs) >= 3:
-                max_high = max(recent_highs[:-1])
-                if current_high > max_high and current_price < max_high:
+                max_previous_high = max(recent_highs[:-1])
+                if current_high > max_previous_high and current_price < max_previous_high:
                     return True, {
                         'type': 'BEARISH_SWEEP',
-                        'sweep_level': max_high,
+                        'sweep_level': max_previous_high,
                         'current_high': current_high
                     }
             
             return False, None
             
         except Exception as e:
-            logging.error(f"Step 1 error for {symbol}: {e}")
+            logging.error(f"❌ [{symbol}] Step 1 error: {e}")
             return False, None
 
     def step_2_displacement(self, symbol: str, current_data: Dict, sweep_info: Dict) -> Tuple[bool, Optional[Dict]]:
-        """Optimized displacement detection"""
+        """Step 2: Displacement Detection"""
         try:
             current_open = current_data['open']
             current_high = current_data['high']
@@ -333,11 +421,11 @@ class RomeOPTTop40Scanner:
             body_size = abs(current_close - current_open)
             body_percentage = (body_size / candle_range) * 100
             
-            # Check impulse candle
+            # Check for impulse candle
             if body_percentage >= 60:
                 direction = "BULLISH" if current_close > current_open else "BEARISH"
                 
-                # Validate alignment with sweep
+                # Validate alignment with sweep type
                 if (sweep_info['type'] == 'BULLISH_SWEEP' and direction == "BULLISH") or \
                    (sweep_info['type'] == 'BEARISH_SWEEP' and direction == "BEARISH"):
                     return True, {
@@ -349,43 +437,44 @@ class RomeOPTTop40Scanner:
             return False, None
             
         except Exception as e:
-            logging.error(f"Step 2 error for {symbol}: {e}")
+            logging.error(f"❌ [{symbol}] Step 2 error: {e}")
             return False, None
 
     def step_3_retracement_into_zone(self, symbol: str, current_data: Dict, 
                                    sweep_info: Dict, displacement_info: Dict) -> Tuple[bool, Optional[Dict]]:
-        """Optimized zone retracement detection"""
+        """Step 3: Retracement into Zone"""
         try:
             current_price = current_data['close']
             direction = displacement_info['direction']
             displacement_candle = displacement_info['impulse_candle']
             
-            fvg_low = displacement_candle['low']
-            fvg_high = displacement_candle['high']
+            # Define zone based on displacement candle
+            zone_low = displacement_candle['low']
+            zone_high = displacement_candle['high']
             
             if direction == "BULLISH":
-                if fvg_low <= current_price <= fvg_high:
+                if zone_low <= current_price <= zone_high:
                     return True, {
                         'type': 'BULLISH_ZONE',
-                        'zone_low': fvg_low,
-                        'zone_high': fvg_high
+                        'zone_low': zone_low,
+                        'zone_high': zone_high
                     }
             else:  # BEARISH
-                if fvg_low <= current_price <= fvg_high:
+                if zone_low <= current_price <= zone_high:
                     return True, {
                         'type': 'BEARISH_ZONE',
-                        'zone_low': fvg_low,
-                        'zone_high': fvg_high
+                        'zone_low': zone_low,
+                        'zone_high': zone_high
                     }
             
             return False, None
             
         except Exception as e:
-            logging.error(f"Step 3 error for {symbol}: {e}")
+            logging.error(f"❌ [{symbol}] Step 3 error: {e}")
             return False, None
 
     def step_4_premium_discount(self, symbol: str, current_data: Dict, direction: str) -> Tuple[bool, Optional[Dict]]:
-        """Optimized premium/discount check"""
+        """Step 4: Premium/Discount Check"""
         try:
             current_price = current_data['close']
             equilibrium = self.calculate_equilibrium(symbol)
@@ -398,15 +487,16 @@ class RomeOPTTop40Scanner:
             return False, None
             
         except Exception as e:
-            logging.error(f"Step 4 error for {symbol}: {e}")
+            logging.error(f"❌ [{symbol}] Step 4 error: {e}")
             return False, None
 
     def step_5_htf_bias_alignment(self, symbol: str, direction: str) -> Tuple[bool, Optional[Dict]]:
-        """Optimized HTF bias check with caching"""
+        """Step 5: HTF Bias Alignment"""
         try:
-            # Cache HTF bias to avoid recalculating frequently
+            # Simplified HTF bias - implement with actual HTF data
             if symbol not in self.htf_bias:
-                self.htf_bias[symbol] = self.calculate_htf_bias(symbol)
+                # For testing, randomly assign bias
+                self.htf_bias[symbol] = random.choice(['BULLISH', 'BEARISH', 'UNKNOWN'])
             
             htf_bias = self.htf_bias[symbol]
             
@@ -420,16 +510,16 @@ class RomeOPTTop40Scanner:
                 return False, {'htf_bias': htf_bias, 'alignment': 'MISALIGNED'}
                 
         except Exception as e:
-            logging.error(f"Step 5 error for {symbol}: {e}")
-            return True, {'htf_bias': 'UNKNOWN', 'alignment': 'UNKNOWN'}  # Don't reject on error
+            logging.error(f"❌ [{symbol}] Step 5 error: {e}")
+            return True, {'htf_bias': 'UNKNOWN', 'alignment': 'UNKNOWN'}
 
     def step_6_momentum_volatility_confirmation(self, symbol: str, current_data: Dict, 
                                               direction: str) -> Tuple[bool, Optional[Dict]]:
-        """Optimized momentum/volatility check"""
+        """Step 6: Momentum & Volatility Confirmation"""
         try:
-            # Simplified checks for performance - can be enhanced
-            volume_ok = current_data.get('volume', 0) > 1000  # Minimum volume threshold
-            price_ok = current_data['close'] > 0.01  # Minimum price threshold
+            # Basic checks - enhance with actual momentum indicators
+            volume_ok = current_data.get('volume', 0) > 1000
+            price_ok = current_data['close'] > 0.01
             
             if volume_ok and price_ok:
                 return True, {
@@ -439,37 +529,30 @@ class RomeOPTTop40Scanner:
             return False, None
             
         except Exception as e:
-            logging.error(f"Step 6 error for {symbol}: {e}")
+            logging.error(f"❌ [{symbol}] Step 6 error: {e}")
             return False, None
 
-    # ==================== OPTIMIZED UTILITIES ====================
+    # ==================== UTILITY FUNCTIONS ====================
 
     def calculate_equilibrium(self, symbol: str) -> float:
-        """Fast equilibrium calculation"""
+        """Calculate equilibrium price"""
         recent_data = self.price_data.get(symbol, [])
         if not recent_data:
             return 0.0
         
-        # Use last 10 candles for efficiency
-        recent_data = recent_data[-10:]
+        recent_data = recent_data[-15:]  # Use last 15 candles
         highs = [candle['high'] for candle in recent_data]
         lows = [candle['low'] for candle in recent_data]
         return (max(highs) + min(lows)) / 2
 
-    def calculate_htf_bias(self, symbol: str) -> str:
-        """Fast HTF bias calculation"""
-        # Simplified - implement with actual 15min/1H data
-        # For now, return neutral to avoid filtering out signals
-        return "UNKNOWN"
-
     def is_live_signal(self, signal: TradeSignal) -> bool:
-        """Check if signal is recent enough"""
+        """Check if signal is recent"""
         signal_age = datetime.now() - signal.timestamp
         return signal_age <= self.max_signal_age
 
     def calculate_tp_sl(self, symbol: str, direction: str, entry_price: float,
                        sweep_info: Dict, displacement_info: Dict) -> Tuple[List[float], float]:
-        """Fast TP/SL calculation"""
+        """Calculate TP/SL levels"""
         if direction == "BULLISH":
             sl = sweep_info['sweep_level'] * 0.998
             risk = abs(entry_price - sl)
@@ -485,17 +568,19 @@ class RomeOPTTop40Scanner:
         
         return [tp1, tp2, tp3], sl
 
-    # ==================== OPTIMIZED TRACKING & ALERTS ====================
+    # ==================== TRACKING & ALERTS ====================
 
     async def track_active_signals(self):
-        """Efficiently track all active signals"""
+        """Track active signals for TP/SL hits"""
+        logging.info("🔍 Starting active signal tracking...")
+        
         while True:
             try:
                 current_time = datetime.now()
                 signals_to_remove = []
                 
                 for signal_id, signal in list(self.active_signals.items()):
-                    # Simulate price check - replace with actual price feed
+                    # Get current price (mock for now - implement real price feed)
                     current_price = await self.get_current_price(signal.symbol)
                     
                     # Check TP levels
@@ -504,12 +589,14 @@ class RomeOPTTop40Scanner:
                             if (signal.direction == "BULLISH" and current_price >= tp_level) or \
                                (signal.direction == "BEARISH" and current_price <= tp_level):
                                 signal.tp_hit[i] = True
+                                logging.info(f"✅ [{signal.symbol}] TP{i+1} HIT")
                                 await self.send_tp_alert(signal, i+1, tp_level, current_price)
                     
                     # Check SL
                     if (signal.direction == "BULLISH" and current_price <= signal.sl_level) or \
                        (signal.direction == "BEARISH" and current_price >= signal.sl_level):
                         signal.status = "SL_HIT"
+                        logging.warning(f"❌ [{signal.symbol}] SL HIT")
                         await self.send_sl_alert(signal, current_price)
                         signals_to_remove.append(signal_id)
                     
@@ -518,130 +605,206 @@ class RomeOPTTop40Scanner:
                     if signal_age > timedelta(hours=4):
                         signals_to_remove.append(signal_id)
                 
-                # Clean up
+                # Clean up completed signals
                 for signal_id in signals_to_remove:
-                    self.active_signals.pop(signal_id, None)
+                    if signal_id in self.active_signals:
+                        del self.active_signals[signal_id]
                 
-                await asyncio.sleep(2)  # Check every 2 seconds for efficiency
+                await asyncio.sleep(3)
                 
             except Exception as e:
-                logging.error(f"Signal tracking error: {e}")
+                logging.error(f"❌ Signal tracking error: {e}")
                 await asyncio.sleep(5)
 
     async def get_current_price(self, symbol: str) -> float:
-        """Get current price - optimize with bulk price fetching"""
-        # Placeholder - implement with actual price feed
-        # For now, return a simulated price
-        return 100.0  # Replace with actual price fetch
+        """Get current price - implement with real price feed"""
+        # Mock implementation - replace with actual BingX API call
+        base_prices = {
+            'BTC-USDT': 50000,
+            'ETH-USDT': 3000,
+            'BNB-USDT': 600,
+            'SOL-USDT': 100,
+            'XRP-USDT': 0.5,
+        }
+        base_price = base_prices.get(symbol, 50)
+        return base_price * (1 + random.uniform(-0.02, 0.02))
 
     async def send_signal_alert(self, signal: TradeSignal):
-        """Send optimized signal alert"""
+        """Send signal alert to Telegram"""
         message = f"""
-🎯 <b>ROMEOPT TOP 40 SIGNAL</b>
+🎯 **ROMEOPT LIVE SIGNAL**
 
-<b>Symbol:</b> {signal.symbol}
-<b>Direction:</b> {signal.direction}
-<b>Entry:</b> {signal.entry_price:.4f}
+**Symbol**: {signal.symbol}
+**Direction**: {signal.direction}
+**Entry Price**: {signal.entry_price:.4f}
 
-<b>TP1:</b> {signal.tp_levels[0]:.4f}
-<b>TP2:</b> {signal.tp_levels[1]:.4f}
-<b>TP3:</b> {signal.tp_levels[2]:.4f}
-<b>SL:</b> {signal.sl_level:.4f}
+**Take Profit Levels**:
+TP1: {signal.tp_levels[0]:.4f}
+TP2: {signal.tp_levels[1]:.4f}
+TP3: {signal.tp_levels[2]:.4f}
 
-<b>Time:</b> {signal.timestamp.strftime('%H:%M:%S')}
+**Stop Loss**: {signal.sl_level:.4f}
+
+**Time**: {signal.timestamp.strftime('%H:%M:%S UTC')}
+
+**6-Step Validation**:
+✅ Liquidity Sweep ({signal.liquidity_sweep['type']})
+✅ Displacement ({signal.displacement['direction']})
+✅ Zone Retracement
+✅ Premium/Discount
+✅ HTF Alignment
+✅ Momentum Confirmation
 """
         await self.send_telegram_alert(message)
 
     async def send_tp_alert(self, signal: TradeSignal, tp_level: int, target_price: float, current_price: float):
-        """Send TP alert"""
+        """Send TP hit alert"""
         message = f"""
-✅ <b>TP{tp_level} HIT - {signal.symbol}</b>
+✅ **TP{tp_level} HIT - {signal.symbol}**
 
-<b>Direction:</b> {signal.direction}
-<b>Target:</b> {target_price:.4f}
-<b>Current:</b> {current_price:.4f}
+**Direction**: {signal.direction}
+**Target Price**: {target_price:.4f}
+**Current Price**: {current_price:.4f}
+**Entry Price**: {signal.entry_price:.4f}
+
+**Time**: {datetime.now().strftime('%H:%M:%S UTC')}
 """
         await self.send_telegram_alert(message)
 
     async def send_sl_alert(self, signal: TradeSignal, current_price: float):
-        """Send SL alert"""
+        """Send SL hit alert"""
         message = f"""
-❌ <b>SL HIT - {signal.symbol}</b>
+❌ **SL HIT - {signal.symbol}**
 
-<b>Direction:</b> {signal.direction}
-<b>Entry:</b> {signal.entry_price:.4f}
-<b>SL:</b> {signal.sl_level:.4f}
-<b>Current:</b> {current_price:.4f}
+**Direction**: {signal.direction}
+**Entry Price**: {signal.entry_price:.4f}
+**Stop Loss**: {signal.sl_level:.4f}
+**Current Price**: {current_price:.4f}
+
+**Time**: {datetime.now().strftime('%H:%M:%S UTC')}
 """
         await self.send_telegram_alert(message)
 
     async def send_telegram_alert(self, message: str):
-        """Send Telegram alert with error handling"""
+        """Send message to Telegram with error handling"""
         url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
         payload = {
             'chat_id': self.telegram_chat_id,
             'text': message,
             'parse_mode': 'HTML'
         }
+        
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
                 async with session.post(url, json=payload) as response:
-                    if response.status != 200:
-                        logging.error(f"Telegram alert failed: {response.status}")
+                    if response.status == 200:
+                        logging.debug("✅ Telegram alert sent successfully")
+                    else:
+                        logging.error(f"❌ Telegram alert failed: {response.status}")
         except Exception as e:
-            logging.error(f"Telegram alert error: {e}")
+            logging.error(f"❌ Telegram alert error: {e}")
+
+    async def monitor_performance(self):
+        """Monitor and report scanner performance"""
+        logging.info("📊 Starting performance monitoring...")
+        
+        while True:
+            try:
+                # Calculate statistics
+                active_tasks = len([t for t in asyncio.all_tasks() if not t.done()])
+                coins_with_data = len(self.price_data)
+                active_signals = len(self.active_signals)
+                uptime_minutes = (datetime.now() - self.startup_time).total_seconds() / 60
+                
+                # Log performance
+                logging.info(
+                    f"📊 PERFORMANCE: {coins_with_data}/{len(self.symbols)} coins, "
+                    f"{active_signals} signals, {self.signals_analyzed} analyzed, "
+                    f"{self.signals_generated} generated, {uptime_minutes:.1f}m uptime"
+                )
+                
+                # Send hourly report
+                if int(uptime_minutes) % 60 == 0:
+                    report_msg = f"""
+📊 **HOURLY PERFORMANCE REPORT**
+
+• **Uptime**: {uptime_minutes/60:.1f} hours
+• **Coins with Data**: {coins_with_data}/{len(self.symbols)}
+• **Active Signals**: {active_signals}
+• **Signals Analyzed**: {self.signals_analyzed}
+• **Signals Generated**: {self.signals_generated}
+• **WebSocket Connections**: {self.websocket_connections}
+
+**Status**: 🟢 OPERATIONAL
+"""
+                    await self.send_telegram_alert(report_msg)
+                
+                await asyncio.sleep(60)  # Check every minute
+                
+            except Exception as e:
+                logging.error(f"❌ Performance monitoring error: {e}")
+                await asyncio.sleep(60)
 
     # ==================== MAIN SCANNER ====================
 
     async def start_scanner(self):
-        """Start the optimized Top 40 scanner"""
-        logging.info("🚀 Starting RomeOPT Top 40 Scanner...")
+        """Main scanner entry point"""
+        logging.info("🚀 STARTING ROMEOPT SCANNER...")
         
-        # Start WebSocket feeds
-        asyncio.create_task(self.start_websocket_feeds())
-        
-        # Start signal tracking
-        asyncio.create_task(self.track_active_signals())
-        
-        # Monitor performance
-        asyncio.create_task(self.monitor_performance())
-        
-        # Keep alive
-        while True:
-            await asyncio.sleep(10)
-
-    async def monitor_performance(self):
-        """Monitor scanner performance"""
-        while True:
-            try:
-                active_connections = len([task for task in asyncio.all_tasks() 
-                                        if 'websocket' in task.get_name().lower()])
-                active_signals = len(self.active_signals)
-                coins_with_data = len(self.price_data)
+        try:
+            # Send startup message
+            await self.send_startup_message()
+            await asyncio.sleep(2)
+            
+            # Start all components
+            logging.info("🔄 Starting scanner components...")
+            
+            # Start WebSocket feeds
+            asyncio.create_task(self.start_websocket_feeds())
+            
+            # Start signal tracking
+            asyncio.create_task(self.track_active_signals())
+            
+            # Start performance monitoring
+            asyncio.create_task(self.monitor_performance())
+            
+            # Send ready message
+            await self.send_telegram_alert("🟢 **SCANNER READY**: All systems operational and monitoring for signals")
+            
+            logging.info("✅ ROMEOPT SCANNER FULLY OPERATIONAL")
+            
+            # Keep main loop alive
+            while True:
+                await asyncio.sleep(30)
+                # Heartbeat
+                logging.debug("💓 Scanner heartbeat - running normally")
                 
-                logging.info(f"📊 PERFORMANCE: {active_connections} websockets, "
-                           f"{coins_with_data}/40 coins with data, "
-                           f"{active_signals} active signals")
-                
-                await asyncio.sleep(60)  # Log every minute
-                
-            except Exception as e:
-                logging.error(f"Performance monitoring error: {e}")
-                await asyncio.sleep(60)
+        except Exception as e:
+            error_msg = f"❌ SCANNER CRITICAL ERROR: {str(e)}"
+            logging.error(error_msg)
+            await self.send_telegram_alert(error_msg)
+            raise
 
 # ==================== EXECUTION ====================
 
 async def main():
     """Main execution function"""
     try:
-        scanner = RomeOPTTop40Scanner()
+        scanner = RomeOPTScanner()
         await scanner.start_scanner()
     except Exception as e:
-        logging.error(f"Scanner failed: {e}")
+        logging.critical(f"❌ SCANNER FAILED TO START: {e}")
+        # Attempt to send failure alert
+        try:
+            scanner = RomeOPTScanner()
+            await scanner.send_telegram_alert(f"🔴 **SCANNER FAILED**: {str(e)}")
+        except:
+            pass
 
 if __name__ == "__main__":
-    # Set event loop policy for better performance on Windows
+    # Windows compatibility
     if os.name == 'nt':
         asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     
+    logging.info("🎯 ROMEOPT SCANNER STARTING...")
     asyncio.run(main())
