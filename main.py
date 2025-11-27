@@ -12,15 +12,15 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - [%(name)s] - %(message)s',
     handlers=[
-        logging.FileHandler('romeopt_scanner.log', encoding='utf-8'),
+        logging.FileHandler('bybit_romeopt_scanner.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
 
-class PerfectRomeOPTScanner:
+class PerfectBybitRomeOPTScanner:
     def __init__(self):
-        self.logger = logging.getLogger("RomeOPT")
-        self.logger.info("🚀 INITIALIZING PERFECT ROMEOPT SCANNER")
+        self.logger = logging.getLogger("BybitRomeOPT")
+        self.logger.info("🚀 INITIALIZING PERFECT BYBIT ROMEOPT SCANNER")
         
         # Load environment variables
         self.telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
@@ -30,9 +30,12 @@ class PerfectRomeOPTScanner:
             raise ValueError("❌ Missing Telegram credentials")
         
         # OPTIMAL CONFIGURATION
-        self.coins = ['BTC-USDT', 'ETH-USDT', 'BNB-USDT']  # 3 major coins
-        self.timeframe = '5m'  # Optimal for RomeOPT
+        self.coins = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT']  # Bybit symbol format
+        self.timeframe = '5'  # Bybit uses numbers: 1,3,5,15,30,60,120,240,360,720,D,W,M
         self.analysis_interval = 30  # Seconds between cycles
+        
+        # Bybit API configuration
+        self.base_url = "https://api.bybit.com"
         
         # Data storage
         self.price_data = {}
@@ -44,15 +47,15 @@ class PerfectRomeOPTScanner:
         self.signals_generated = 0
         self.analysis_count = 0
         
-        self.logger.info("✅ PERFECT SCANNER INITIALIZED")
+        self.logger.info("✅ PERFECT BYBIT SCANNER INITIALIZED")
 
-    async def get_binance_klines(self, symbol: str, limit: int = 25) -> Optional[List[Dict]]:
-        """Get reliable klines data from Binance"""
+    async def get_bybit_klines(self, symbol: str, limit: int = 25) -> Optional[List[Dict]]:
+        """Get reliable klines data from Bybit"""
         try:
-            binance_symbol = symbol.replace('-', '')
-            url = "https://api.binance.com/api/v3/klines"
+            url = f"{self.base_url}/v5/market/kline"
             params = {
-                'symbol': binance_symbol,
+                'category': 'spot',  # Use spot market
+                'symbol': symbol,
                 'interval': self.timeframe,
                 'limit': limit
             }
@@ -61,43 +64,64 @@ class PerfectRomeOPTScanner:
                 async with session.get(url, params=params) as response:
                     if response.status == 200:
                         data = await response.json()
-                        candles = []
-                        for candle in data:
-                            candles.append({
-                                'timestamp': datetime.fromtimestamp(candle[0] / 1000),
-                                'open': float(candle[1]),
-                                'high': float(candle[2]),
-                                'low': float(candle[3]),
-                                'close': float(candle[4]),
-                                'volume': float(candle[5]),
-                                'is_closed': True
-                            })
-                        self.logger.debug(f"📊 {symbol}: {len(candles)} candles loaded")
-                        return candles
+                        
+                        if data['retCode'] == 0 and 'result' in data and 'list' in data['result']:
+                            candles = []
+                            for candle in data['result']['list']:
+                                # Bybit returns: [startTime, openPrice, highPrice, lowPrice, closePrice, volume, turnover]
+                                candles.append({
+                                    'timestamp': datetime.fromtimestamp(int(candle[0]) / 1000),
+                                    'open': float(candle[1]),
+                                    'high': float(candle[2]),
+                                    'low': float(candle[3]),
+                                    'close': float(candle[4]),
+                                    'volume': float(candle[5]),
+                                    'is_closed': True
+                                })
+                            # Reverse to get chronological order (oldest first)
+                            candles.reverse()
+                            self.logger.debug(f"📊 {symbol}: {len(candles)} Bybit candles loaded")
+                            return candles
+                        else:
+                            self.logger.warning(f"❌ {symbol}: Bybit API error: {data.get('retMsg', 'Unknown error')}")
+                            return None
                     else:
-                        self.logger.warning(f"❌ {symbol}: Binance API error {response.status}")
+                        self.logger.warning(f"❌ {symbol}: Bybit HTTP error {response.status}")
                         return None
         except Exception as e:
-            self.logger.error(f"❌ {symbol}: Klines error: {str(e)}")
+            self.logger.error(f"❌ {symbol}: Bybit klines error: {str(e)}")
             return None
 
-    async def get_binance_ticker(self, symbol: str) -> Optional[float]:
-        """Get reliable current price from Binance"""
+    async def get_bybit_ticker(self, symbol: str) -> Optional[float]:
+        """Get reliable current price from Bybit"""
         try:
-            binance_symbol = symbol.replace('-', '')
-            url = f"https://api.binance.com/api/v3/ticker/price?symbol={binance_symbol}"
+            url = f"{self.base_url}/v5/market/tickers"
+            params = {
+                'category': 'spot',
+                'symbol': symbol
+            }
             
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as session:
-                async with session.get(url) as response:
+                async with session.get(url, params=params) as response:
                     if response.status == 200:
                         data = await response.json()
-                        price = float(data['price'])
-                        return price
+                        
+                        if data['retCode'] == 0 and 'result' in data and 'list' in data['result']:
+                            for ticker in data['result']['list']:
+                                if ticker['symbol'] == symbol:
+                                    price = float(ticker['lastPrice'])
+                                    self.logger.debug(f"💰 {symbol}: Bybit price = {price}")
+                                    return price
+                            self.logger.warning(f"❌ {symbol}: Symbol not found in ticker data")
+                            return None
+                        else:
+                            self.logger.warning(f"❌ {symbol}: Bybit ticker error: {data.get('retMsg', 'Unknown error')}")
+                            return None
                     else:
-                        self.logger.warning(f"❌ {symbol}: Ticker error {response.status}")
+                        self.logger.warning(f"❌ {symbol}: Bybit HTTP error {response.status}")
                         return None
         except Exception as e:
-            self.logger.error(f"❌ {symbol}: Ticker error: {str(e)}")
+            self.logger.error(f"❌ {symbol}: Bybit ticker error: {str(e)}")
             return None
 
     # ==================== PERFECT 6-STEP ROMEOPT ANALYSIS ====================
@@ -296,15 +320,15 @@ class PerfectRomeOPTScanner:
         """Generate perfect RomeOPT signal with all 6 steps"""
         self.logger.info(f"🔍 {symbol}: Starting 6-step RomeOPT analysis...")
         
-        # Get reliable market data
-        candles = await self.get_binance_klines(symbol, limit=20)
+        # Get reliable market data from Bybit
+        candles = await self.get_bybit_klines(symbol, limit=20)
         if not candles or len(candles) < 15:
-            self.logger.warning(f"❌ {symbol}: Insufficient data")
+            self.logger.warning(f"❌ {symbol}: Insufficient Bybit data")
             return None
         
-        current_price = await self.get_binance_ticker(symbol)
+        current_price = await self.get_bybit_ticker(symbol)
         if not current_price:
-            self.logger.warning(f"❌ {symbol}: No current price")
+            self.logger.warning(f"❌ {symbol}: No current price from Bybit")
             return None
             
         # Update latest candle with real-time price
@@ -321,7 +345,7 @@ class PerfectRomeOPTScanner:
         # Step 1: Liquidity Sweep
         step1_ok, step1_info = self.step_1_liquidity_sweep(symbol, candles)
         if not step1_ok:
-            self.logger.debug(f"❌ {symbol}: Failed Step 1")
+            self.logger.debug(f"❌ {symbol}: Failed Step 1 - No liquidity sweep")
             return None
         steps_passed.append("Liquidity Sweep")
         step_details['sweep'] = step1_info
@@ -329,7 +353,7 @@ class PerfectRomeOPTScanner:
         # Step 2: Displacement
         step2_ok, step2_info = self.step_2_displacement(symbol, candles, step1_info)
         if not step2_ok:
-            self.logger.debug(f"❌ {symbol}: Failed Step 2")
+            self.logger.debug(f"❌ {symbol}: Failed Step 2 - No displacement")
             return None
         steps_passed.append("Displacement")
         step_details['displacement'] = step2_info
@@ -338,7 +362,7 @@ class PerfectRomeOPTScanner:
         # Step 3: Retracement Zone
         step3_ok, step3_info = self.step_3_retracement_zone(symbol, candles, step1_info, step2_info)
         if not step3_ok:
-            self.logger.debug(f"❌ {symbol}: Failed Step 3")
+            self.logger.debug(f"❌ {symbol}: Failed Step 3 - No retracement")
             return None
         steps_passed.append("Zone Retracement")
         step_details['retracement'] = step3_info
@@ -346,7 +370,7 @@ class PerfectRomeOPTScanner:
         # Step 4: Premium/Discount
         step4_ok, step4_info = self.step_4_premium_discount(symbol, candles, direction)
         if not step4_ok:
-            self.logger.debug(f"❌ {symbol}: Failed Step 4")
+            self.logger.debug(f"❌ {symbol}: Failed Step 4 - Wrong premium/discount")
             return None
         steps_passed.append("Premium/Discount")
         step_details['value'] = step4_info
@@ -354,7 +378,7 @@ class PerfectRomeOPTScanner:
         # Step 5: Momentum
         step5_ok, step5_info = self.step_5_momentum_confirmation(symbol, candles, direction)
         if not step5_ok:
-            self.logger.debug(f"❌ {symbol}: Failed Step 5")
+            self.logger.debug(f"❌ {symbol}: Failed Step 5 - No momentum")
             return None
         steps_passed.append("Momentum")
         step_details['momentum'] = step5_info
@@ -362,7 +386,7 @@ class PerfectRomeOPTScanner:
         # Step 6: Volume
         step6_ok, step6_info = self.step_6_volume_confirmation(symbol, candles)
         if not step6_ok:
-            self.logger.debug(f"❌ {symbol}: Failed Step 6")
+            self.logger.debug(f"❌ {symbol}: Failed Step 6 - Low volume")
             return None
         steps_passed.append("Volume")
         step_details['volume'] = step6_info
@@ -391,7 +415,7 @@ class PerfectRomeOPTScanner:
             'direction': direction,
             'entry_price': entry_price,
             'timestamp': datetime.now(),
-            'timeframe': self.timeframe,
+            'timeframe': f"{self.timeframe}m",
             'tp_levels': tp_levels,
             'sl_level': sl_level,
             'current_price': current_price,
@@ -399,7 +423,8 @@ class PerfectRomeOPTScanner:
             'steps_passed': steps_passed,
             'step_details': step_details,
             'signal_id': f"{symbol}_{direction}_{int(time.time())}",
-            'quality_score': len(steps_passed)  # 6/6 perfect score
+            'quality_score': len(steps_passed),  # 6/6 perfect score
+            'data_source': 'Bybit'
         }
         
         self.signals_generated += 1
@@ -468,10 +493,11 @@ TP3: `{signal['tp_levels'][2]:.4f}` (3.0R)
 ✅ Momentum Confirmation
 ✅ Volume Confirmation
 
+**Data Source**: Bybit API
 **Time**: {signal['timestamp'].strftime('%H:%M:%S UTC')}
 **Signal ID**: `{signal['signal_id']}`
 
-*Perfect RomeOPT Strategy • Real Market Data*
+*Perfect RomeOPT Strategy • Bybit Market Data*
 """
         
         success = await self.send_telegram_alert(message)
@@ -488,8 +514,8 @@ TP3: `{signal['tp_levels'][2]:.4f}` (3.0R)
                 completed_signals = []
                 
                 for signal_id, signal in self.active_signals.items():
-                    # Get current price
-                    current_price = await self.get_binance_ticker(signal['symbol'])
+                    # Get current price from Bybit
+                    current_price = await self.get_bybit_ticker(signal['symbol'])
                     if not current_price:
                         continue
                     
@@ -516,6 +542,7 @@ TP3: `{signal['tp_levels'][2]:.4f}` (3.0R)
 **Profit**: `{abs(current_price - signal['entry_price']):.4f}`
 
 **Time**: {current_time.strftime('%H:%M:%S UTC')}
+**Data Source**: Bybit
 """
                                 await self.send_telegram_alert(tp_msg)
                                 self.logger.info(f"✅ {signal['symbol']} TP{i+1} hit!")
@@ -524,7 +551,7 @@ TP3: `{signal['tp_levels'][2]:.4f}` (3.0R)
                     sl_key = 'sl_hit'
                     if sl_key not in signal:
                         if (signal['direction'] == "BULLISH" and current_price <= signal['sl_level']) or \
-                           (signal['direction'] == "BEARISH" and current_price >= signal['sl_level']):
+                           (signal['direction'] == "BEARISH' and current_price >= signal['sl_level']):
                             signal[sl_key] = {
                                 'timestamp': current_time,
                                 'price': current_price
@@ -542,6 +569,7 @@ TP3: `{signal['tp_levels'][2]:.4f}` (3.0R)
 **Loss**: `{abs(current_price - signal['entry_price']):.4f}`
 
 **Time**: {current_time.strftime('%H:%M:%S UTC')}
+**Data Source**: Bybit
 """
                             await self.send_telegram_alert(sl_msg)
                             self.logger.warning(f"❌ {signal['symbol']} SL hit")
@@ -576,19 +604,20 @@ TP3: `{signal['tp_levels'][2]:.4f}` (3.0R)
                 hours = uptime.total_seconds() / 3600
                 
                 status_msg = f"""
-📊 **ROMEOPT SCANNER STATUS**
+📊 **BYBIT ROMEOPT SCANNER STATUS**
 
 • **Uptime**: {hours:.1f} hours
 • **Analysis Cycles**: {self.analysis_count}
 • **Signals Generated**: {self.signals_generated}
 • **Active Signals**: {len(self.active_signals)}
 • **Coins Monitoring**: {len(self.coins)}
-• **Timeframe**: {self.timeframe}
+• **Timeframe**: {self.timeframe}m
 
 **Performance**:
 • Success Rate: {len([s for s in self.signal_history if any(k in s for k in ['tp_1_hit', 'tp_2_hit', 'tp_3_hit'])]) / max(1, len(self.signal_history)):.1%}
 • Avg Quality: {sum(s.get('quality_score', 0) for s in self.signal_history) / max(1, len(self.signal_history)):.1f}/6
 
+**Data Source**: Bybit API
 **Status**: 🟢 PERFECTLY OPERATIONAL
 **Last Update**: {datetime.now().strftime('%H:%M UTC')}
 **Report**: #{report_count}
@@ -601,6 +630,32 @@ TP3: `{signal['tp_levels'][2]:.4f}` (3.0R)
             except Exception as e:
                 self.logger.error(f"❌ Status report error: {str(e)}")
                 await asyncio.sleep(3600)
+
+    async def test_bybit_connection(self):
+        """Test Bybit API connection"""
+        self.logger.info("🔧 Testing Bybit API connection...")
+        
+        test_symbol = 'BTCUSDT'
+        
+        # Test klines
+        klines = await self.get_bybit_klines(test_symbol, limit=5)
+        if klines:
+            self.logger.info(f"✅ Bybit klines test PASSED - Got {len(klines)} candles")
+            for candle in klines[-3:]:  # Show last 3 candles
+                self.logger.info(f"   📊 {candle['timestamp']}: O:{candle['open']} H:{candle['high']} L:{candle['low']} C:{candle['close']}")
+        else:
+            self.logger.error("❌ Bybit klines test FAILED")
+            return False
+        
+        # Test ticker
+        price = await self.get_bybit_ticker(test_symbol)
+        if price:
+            self.logger.info(f"✅ Bybit ticker test PASSED - Price: {price}")
+        else:
+            self.logger.error("❌ Bybit ticker test FAILED")
+            return False
+            
+        return True
 
     async def analyze_coins_sequentially(self):
         """Perfect sequential coin analysis"""
@@ -638,28 +693,35 @@ TP3: `{signal['tp_levels'][2]:.4f}` (3.0R)
 
     async def run_perfect_scanner(self):
         """Main scanner loop - perfectly optimized"""
-        self.logger.info("🚀 STARTING PERFECT ROMEOPT SCANNER")
+        self.logger.info("🚀 STARTING PERFECT BYBIT ROMEOPT SCANNER")
+        
+        # Test Bybit connection first
+        connection_ok = await self.test_bybit_connection()
+        if not connection_ok:
+            self.logger.error("❌ Cannot start scanner - Bybit connection failed")
+            return
         
         # Send startup message
         startup_msg = f"""
-🚀 **PERFECT ROMEOPT SCANNER STARTED**
+🚀 **PERFECT BYBIT ROMEOPT SCANNER STARTED**
 
 • **Version**: Final Working v1.0
 • **Coins**: {', '.join(self.coins)}
-• **Timeframe**: {self.timeframe}
+• **Timeframe**: {self.timeframe}m
 • **Strategy**: 6-Step RomeOPT
-• **Data Source**: Binance API (Reliable)
+• **Data Source**: Bybit API ✅
 
 **Features**:
 ✅ Perfect 6-step validation
 ✅ Real-time signal tracking
 ✅ Performance monitoring
 ✅ Error-resistant design
+✅ Bybit API integration
 
 **Status**: 🟢 OPERATIONAL
 **Start Time**: {self.start_time.strftime('%Y-%m-%d %H:%M UTC')}
 
-*Ready to find perfect trading opportunities!*
+*Ready to find perfect trading opportunities with Bybit!*
 """
         await self.send_telegram_alert(startup_msg)
         
@@ -694,12 +756,12 @@ TP3: `{signal['tp_levels'][2]:.4f}` (3.0R)
 # 🎯 PERFECT EXECUTION
 async def main():
     try:
-        scanner = PerfectRomeOPTScanner()
+        scanner = PerfectBybitRomeOPTScanner()
         await scanner.run_perfect_scanner()
     except Exception as e:
         logging.critical(f"💥 CRITICAL FAILURE: {str(e)}")
         raise
 
 if __name__ == "__main__":
-    logging.info("🎯 STARTING PERFECT ROMEOPT SCANNER - FINAL VERSION")
+    logging.info("🎯 STARTING PERFECT BYBIT ROMEOPT SCANNER - FINAL VERSION")
     asyncio.run(main())
