@@ -48,39 +48,21 @@ class RomeOPTScanner:
         # Comprehensive startup logging
         logging.info("🔄 INITIALIZING ROMEOPT SCANNER...")
         
-        # Load and validate environment variables
-        self.api_key = os.getenv('BINGX_API_KEY')
-        self.api_secret = os.getenv('BINGX_API_SECRET')
-        self.telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
-        self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
-        
-        # Validate all required environment variables
-        missing_vars = []
-        if not self.api_key: missing_vars.append('BINGX_API_KEY')
-        if not self.api_secret: missing_vars.append('BINGX_API_SECRET')
-        if not self.telegram_token: missing_vars.append('TELEGRAM_BOT_TOKEN')
-        if not self.telegram_chat_id: missing_vars.append('TELEGRAM_CHAT_ID')
-        
-        if missing_vars:
-            error_msg = f"❌ MISSING ENVIRONMENT VARIABLES: {', '.join(missing_vars)}"
-            logging.error(error_msg)
-            raise ValueError(error_msg)
-        
-        logging.info("✅ All environment variables loaded successfully")
+        # Enhanced environment variable loading with debugging
+        self.load_environment_variables()
         
         # Trading configuration
         self.symbols = [
             'BTC-USDT', 'ETH-USDT', 'BNB-USDT', 'SOL-USDT', 'XRP-USDT',
             'ADA-USDT', 'AVAX-USDT', 'DOGE-USDT', 'DOT-USDT', 'TRX-USDT',
-            'LINK-USDT', 'MATIC-USDT', 'LTC-USDT', 'BCH-USDT', 'ATOM-USDT',
         ]
         
         self.timeframe = '1m'
         self.max_signal_age = timedelta(minutes=3)
         
         # Performance optimization
-        self.max_concurrent_websockets = 10
-        self.analysis_semaphore = Semaphore(8)
+        self.max_concurrent_websockets = 8
+        self.analysis_semaphore = Semaphore(6)
         self.price_data: Dict[str, List] = {}
         self.active_signals: Dict[str, TradeSignal] = {}
         self.htf_bias: Dict[str, str] = {}
@@ -88,7 +70,7 @@ class RomeOPTScanner:
         # Rate limiting and state tracking
         self.last_analysis_time: Dict[str, datetime] = {}
         self.analysis_cooldown = timedelta(seconds=3)
-        self.thread_pool = ThreadPoolExecutor(max_workers=8)
+        self.thread_pool = ThreadPoolExecutor(max_workers=6)
         
         # Statistics
         self.startup_time = datetime.now()
@@ -98,32 +80,87 @@ class RomeOPTScanner:
         
         logging.info(f"🚀 RomeOPT Scanner initialized - Monitoring {len(self.symbols)} coins")
 
+    def load_environment_variables(self):
+        """Enhanced environment variable loading with comprehensive debugging"""
+        logging.info("🔍 LOADING ENVIRONMENT VARIABLES...")
+        
+        # Get all environment variables for debugging
+        all_env_vars = dict(os.environ)
+        
+        # Log available environment variables (filtered for security)
+        logging.info("📋 AVAILABLE ENVIRONMENT VARIABLES:")
+        for key in sorted(all_env_vars.keys()):
+            if any(term in key.upper() for term in ['BINGX', 'TELEGRAM', 'API', 'SECRET', 'KEY', 'TOKEN', 'BOT', 'CHAT']):
+                value = all_env_vars[key]
+                # Show partial values for verification (not full secrets)
+                display_value = f"{value[:4]}...{value[-4:]}" if len(value) > 8 else "***"
+                logging.info(f"   📝 {key}: {display_value}")
+        
+        # Load specific variables with multiple fallback methods
+        self.api_key = self.get_env_variable('BINGX_API_KEY', ['BINGX_API_KEY', 'BINGX_KEY', 'API_KEY'])
+        self.api_secret = self.get_env_variable('BINGX_API_SECRET', ['BINGX_API_SECRET', 'BINGX_SECRET', 'API_SECRET'])
+        self.telegram_token = self.get_env_variable('TELEGRAM_BOT_TOKEN', ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_TOKEN', 'BOT_TOKEN'])
+        self.telegram_chat_id = self.get_env_variable('TELEGRAM_CHAT_ID', ['TELEGRAM_CHAT_ID', 'CHAT_ID'])
+        
+        # Final validation
+        missing_vars = []
+        if not self.api_key: missing_vars.append('BINGX_API_KEY')
+        if not self.api_secret: missing_vars.append('BINGX_API_SECRET')
+        if not self.telegram_token: missing_vars.append('TELEGRAM_BOT_TOKEN')
+        if not self.telegram_chat_id: missing_vars.append('TELEGRAM_CHAT_ID')
+        
+        if missing_vars:
+            error_msg = f"❌ MISSING ENVIRONMENT VARIABLES: {', '.join(missing_vars)}"
+            logging.error(error_msg)
+            
+            # Provide detailed help
+            logging.info("💡 TROUBLESHOOTING HELP:")
+            logging.info("   1. Check variable names in Northflank dashboard")
+            logging.info("   2. Ensure no typos in variable names")
+            logging.info("   3. Verify values are properly set")
+            logging.info("   4. Restart service after adding variables")
+            
+            raise ValueError(error_msg)
+        
+        logging.info("✅ ALL ENVIRONMENT VARIABLES SUCCESSFULLY LOADED")
+
+    def get_env_variable(self, primary_name: str, alternative_names: List[str]) -> str:
+        """Get environment variable with multiple fallback options"""
+        value = os.getenv(primary_name)
+        if value:
+            logging.info(f"   ✅ {primary_name}: Found (primary)")
+            return value
+        
+        # Try alternative names
+        for alt_name in alternative_names:
+            value = os.getenv(alt_name)
+            if value:
+                logging.info(f"   🔄 {primary_name}: Found via alternative '{alt_name}'")
+                return value
+        
+        logging.warning(f"   ❌ {primary_name}: Not found (tried: {alternative_names})")
+        return None
+
     async def send_startup_message(self):
         """Send comprehensive startup message to Telegram"""
         startup_msg = f"""
 🚀 **ROMEOPT SCANNER STARTED SUCCESSFULLY**
 
 **Configuration:**
-• **Version**: Enhanced Debug v2.0
+• **Version**: Production Ready v3.0
 • **Start Time**: {self.startup_time.strftime('%Y-%m-%d %H:%M:%S UTC')}
 • **Coins Monitoring**: {len(self.symbols)}
 • **Timeframe**: {self.timeframe}
 • **Environment**: ✅ All variables loaded
 
 **System Status:**
-✅ Environment Variables
-✅ Scanner Initialized
+✅ Environment Variables Loaded
+✅ Scanner Initialized  
 🔜 WebSocket Connections
 🔜 Real-time Analysis
 🔜 Telegram Notifications
 
-**Next Steps:**
-1. WebSocket connections to BingX
-2. Real-time candle data collection
-3. 6-step RomeOPT analysis
-4. Instant signal alerts
-
-Scanner is now starting...
+**Ready to monitor for RomeOPT 6-step sequences...**
 """
         await self.send_telegram_alert(startup_msg)
         logging.info("📤 Startup message sent to Telegram")
@@ -133,7 +170,7 @@ Scanner is now starting...
         logging.info(f"📡 Starting WebSocket feeds for {len(self.symbols)} coins...")
         
         successful_connections = 0
-        batch_size = 5
+        batch_size = 4
         
         for i in range(0, len(self.symbols), batch_size):
             batch = self.symbols[i:i + batch_size]
@@ -145,12 +182,13 @@ Scanner is now starting...
                 tasks.append(task)
             
             # Wait for batch to complete
+            await asyncio.gather(*tasks, return_exceptions=True)
             await asyncio.sleep(2)
             
-        logging.info(f"📊 WebSocket initialization complete")
+        logging.info(f"📊 WebSocket initialization complete - {successful_connections} connections")
         
         # Send connection status
-        status_msg = f"🔌 **WEBSOCKET STATUS**: Initializing {len(self.symbols)} coins"
+        status_msg = f"🔌 **WEBSOCKET STATUS**: {successful_connections}/{len(self.symbols)} coins connected"
         await self.send_telegram_alert(status_msg)
 
     async def connect_bingx_websocket(self, symbol: str):
@@ -700,7 +738,10 @@ TP3: {signal.tp_levels[2]:.4f}
                     if response.status == 200:
                         logging.debug("✅ Telegram alert sent successfully")
                     else:
-                        logging.error(f"❌ Telegram alert failed: {response.status}")
+                        error_text = await response.text()
+                        logging.error(f"❌ Telegram alert failed: {response.status} - {error_text}")
+        except asyncio.TimeoutError:
+            logging.error("❌ Telegram alert timeout")
         except Exception as e:
             logging.error(f"❌ Telegram alert error: {e}")
 
@@ -782,7 +823,11 @@ TP3: {signal.tp_levels[2]:.4f}
         except Exception as e:
             error_msg = f"❌ SCANNER CRITICAL ERROR: {str(e)}"
             logging.error(error_msg)
-            await self.send_telegram_alert(error_msg)
+            # Try to send error alert
+            try:
+                await self.send_telegram_alert(f"🔴 **SCANNER FAILED**: {str(e)}")
+            except:
+                pass
             raise
 
 # ==================== EXECUTION ====================
@@ -794,10 +839,22 @@ async def main():
         await scanner.start_scanner()
     except Exception as e:
         logging.critical(f"❌ SCANNER FAILED TO START: {e}")
-        # Attempt to send failure alert
+        # Final attempt to send failure alert
         try:
-            scanner = RomeOPTScanner()
-            await scanner.send_telegram_alert(f"🔴 **SCANNER FAILED**: {str(e)}")
+            # Create minimal scanner just for error reporting
+            import os
+            telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
+            chat_id = os.getenv('TELEGRAM_CHAT_ID')
+            if telegram_token and chat_id:
+                url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
+                payload = {
+                    'chat_id': chat_id,
+                    'text': f'🔴 **SCANNER CRASHED**: {str(e)}',
+                    'parse_mode': 'HTML'
+                }
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=payload) as response:
+                        pass
         except:
             pass
 
