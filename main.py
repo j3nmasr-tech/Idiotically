@@ -61,8 +61,8 @@ class RomeOPTScanner:
         self.max_signal_age = timedelta(minutes=3)
         
         # Performance optimization
-        self.max_concurrent_websockets = 8
-        self.analysis_semaphore = Semaphore(6)
+        self.max_concurrent_websockets = 5  # Reduced for stability
+        self.analysis_semaphore = Semaphore(4)
         self.price_data: Dict[str, List] = {}
         self.active_signals: Dict[str, TradeSignal] = {}
         self.htf_bias: Dict[str, str] = {}
@@ -70,13 +70,14 @@ class RomeOPTScanner:
         # Rate limiting and state tracking
         self.last_analysis_time: Dict[str, datetime] = {}
         self.analysis_cooldown = timedelta(seconds=3)
-        self.thread_pool = ThreadPoolExecutor(max_workers=6)
+        self.thread_pool = ThreadPoolExecutor(max_workers=4)
         
         # Statistics
         self.startup_time = datetime.now()
         self.signals_analyzed = 0
         self.signals_generated = 0
         self.websocket_connections = 0
+        self.failed_connections = 0
         
         logging.info(f"🚀 RomeOPT Scanner initialized - Monitoring {len(self.symbols)} coins")
 
@@ -89,12 +90,19 @@ class RomeOPTScanner:
         
         # Log available environment variables (filtered for security)
         logging.info("📋 AVAILABLE ENVIRONMENT VARIABLES:")
+        bingx_found = False
+        telegram_found = False
+        
         for key in sorted(all_env_vars.keys()):
             if any(term in key.upper() for term in ['BINGX', 'TELEGRAM', 'API', 'SECRET', 'KEY', 'TOKEN', 'BOT', 'CHAT']):
                 value = all_env_vars[key]
                 # Show partial values for verification (not full secrets)
                 display_value = f"{value[:4]}...{value[-4:]}" if len(value) > 8 else "***"
                 logging.info(f"   📝 {key}: {display_value}")
+                if 'BINGX' in key.upper():
+                    bingx_found = True
+                if 'TELEGRAM' in key.upper():
+                    telegram_found = True
         
         # Load specific variables with multiple fallback methods
         self.api_key = self.get_env_variable('BINGX_API_KEY', ['BINGX_API_KEY', 'BINGX_KEY', 'API_KEY'])
@@ -112,14 +120,6 @@ class RomeOPTScanner:
         if missing_vars:
             error_msg = f"❌ MISSING ENVIRONMENT VARIABLES: {', '.join(missing_vars)}"
             logging.error(error_msg)
-            
-            # Provide detailed help
-            logging.info("💡 TROUBLESHOOTING HELP:")
-            logging.info("   1. Check variable names in Northflank dashboard")
-            logging.info("   2. Ensure no typos in variable names")
-            logging.info("   3. Verify values are properly set")
-            logging.info("   4. Restart service after adding variables")
-            
             raise ValueError(error_msg)
         
         logging.info("✅ ALL ENVIRONMENT VARIABLES SUCCESSFULLY LOADED")
@@ -147,140 +147,222 @@ class RomeOPTScanner:
 🚀 **ROMEOPT SCANNER STARTED SUCCESSFULLY**
 
 **Configuration:**
-• **Version**: Production Ready v3.0
+• **Version**: WebSocket Fixed v4.0
 • **Start Time**: {self.startup_time.strftime('%Y-%m-%d %H:%M:%S UTC')}
 • **Coins Monitoring**: {len(self.symbols)}
 • **Timeframe**: {self.timeframe}
 • **Environment**: ✅ All variables loaded
 
-**System Status:**
-✅ Environment Variables Loaded
-✅ Scanner Initialized  
-🔜 WebSocket Connections
-🔜 Real-time Analysis
-🔜 Telegram Notifications
+**WebSocket Status**: Starting connections...
+**Analysis Engine**: Ready
+**Telegram Alerts**: Active
 
-**Ready to monitor for RomeOPT 6-step sequences...**
+**Next Steps:**
+1. Establishing WebSocket connections to BingX
+2. Real-time candle data collection
+3. 6-step RomeOPT analysis
+4. Instant signal alerts
+
+Scanner is now starting...
 """
         await self.send_telegram_alert(startup_msg)
         logging.info("📤 Startup message sent to Telegram")
 
     async def start_websocket_feeds(self):
-        """Start WebSocket connections for all symbols"""
+        """Start WebSocket connections for all symbols with proper error handling"""
         logging.info(f"📡 Starting WebSocket feeds for {len(self.symbols)} coins...")
         
         successful_connections = 0
-        batch_size = 4
+        connection_tasks = []
         
-        for i in range(0, len(self.symbols), batch_size):
-            batch = self.symbols[i:i + batch_size]
-            logging.info(f"🔄 Connecting batch {i//batch_size + 1}: {batch}")
-            
-            tasks = []
-            for symbol in batch:
-                task = asyncio.create_task(self.connect_bingx_websocket(symbol))
-                tasks.append(task)
-            
-            # Wait for batch to complete
-            await asyncio.gather(*tasks, return_exceptions=True)
-            await asyncio.sleep(2)
-            
-        logging.info(f"📊 WebSocket initialization complete - {successful_connections} connections")
+        # Create connection tasks for all symbols
+        for symbol in self.symbols:
+            task = asyncio.create_task(
+                self.connect_bingx_websocket(symbol),
+                name=f"ws_{symbol}"
+            )
+            connection_tasks.append(task)
+        
+        # Wait for all connections to complete (or fail)
+        await asyncio.sleep(10)  # Give connections time to establish
+        
+        # Check connection results
+        for task in connection_tasks:
+            if task.done():
+                try:
+                    result = task.result()
+                    if result:
+                        successful_connections += 1
+                except Exception as e:
+                    logging.error(f"WebSocket task failed: {e}")
+        
+        logging.info(f"📊 WebSocket initialization complete - {successful_connections}/{len(self.symbols)} successful connections")
         
         # Send connection status
         status_msg = f"🔌 **WEBSOCKET STATUS**: {successful_connections}/{len(self.symbols)} coins connected"
         await self.send_telegram_alert(status_msg)
+        
+        if successful_connections == 0:
+            error_msg = "❌ **CRITICAL**: No WebSocket connections established. Check BingX API status and WebSocket URL."
+            await self.send_telegram_alert(error_msg)
+            logging.error("No WebSocket connections could be established")
 
     async def connect_bingx_websocket(self, symbol: str):
-        """Connect to BingX WebSocket with comprehensive error handling"""
-        max_retries = 3
+        """Connect to BingX WebSocket with CORRECT URL and comprehensive error handling"""
+        max_retries = 2
         retry_delay = 5
         
         for attempt in range(max_retries):
             try:
-                logging.info(f"🔗 [{symbol}] Connecting WebSocket (attempt {attempt + 1}/{max_retries})")
+                logging.info(f"🔗 [{symbol}] Attempting WebSocket connection (attempt {attempt + 1}/{max_retries})")
                 
-                # BingX WebSocket URL
-                ws_url = "wss://open-api-swap.bingx.com/swap-market"
+                # CORRECT BingX WebSocket URLs - Try multiple endpoints
+                ws_urls = [
+                    "wss://open-api-ws.bingx.com/market",
+                    "wss://open-api-swap.bingx.com/swap-market",
+                    "wss://open-api.bingx.com/market"
+                ]
                 
-                async with websockets.connect(
-                    ws_url,
-                    ping_interval=30,
-                    ping_timeout=20,
-                    close_timeout=10
-                ) as websocket:
-                    
-                    self.websocket_connections += 1
-                    logging.info(f"✅ [{symbol}] WebSocket connected successfully")
-                    
-                    # Subscribe to kline data
-                    subscribe_msg = {
-                        "id": f"{symbol}_{int(time.time())}",
-                        "reqType": "sub",
-                        "dataType": f"{symbol}@kline_{self.timeframe}"
-                    }
-                    
-                    await websocket.send(json.dumps(subscribe_msg))
-                    logging.debug(f"📤 [{symbol}] Subscription sent")
-                    
-                    # Send connection success for major pairs
-                    if symbol in ['BTC-USDT', 'ETH-USDT']:
-                        await self.send_telegram_alert(f"🔌 **{symbol}** WebSocket connected")
-                    
-                    # Main message processing loop
-                    while True:
-                        try:
-                            message = await asyncio.wait_for(websocket.recv(), timeout=30)
-                            data = json.loads(message)
-                            await self.handle_websocket_data(symbol, data)
+                connected = False
+                last_error = None
+                
+                for ws_url in ws_urls:
+                    try:
+                        logging.info(f"   🔗 Trying URL: {ws_url}")
+                        
+                        async with websockets.connect(
+                            ws_url,
+                            ping_interval=20,
+                            ping_timeout=10,
+                            close_timeout=5
+                        ) as websocket:
                             
-                        except asyncio.TimeoutError:
-                            # Keep connection alive
-                            await websocket.ping()
-                            continue
-                        except websockets.exceptions.ConnectionClosed:
-                            logging.warning(f"🔌 [{symbol}] WebSocket connection closed")
-                            break
+                            # Test connection
+                            await asyncio.wait_for(websocket.ping(), timeout=5)
+                            
+                            self.websocket_connections += 1
+                            logging.info(f"✅ [{symbol}] WebSocket connected successfully to {ws_url}")
+                            
+                            # Subscribe to kline data with proper format
+                            subscribe_msg = {
+                                "id": f"sub_{symbol}_{int(time.time())}",
+                                "reqType": "sub",
+                                "dataType": f"{symbol.upper()}@kline_{self.timeframe}"
+                            }
+                            
+                            await websocket.send(json.dumps(subscribe_msg))
+                            logging.info(f"📤 [{symbol}] Subscription sent for {self.timeframe} data")
+                            
+                            # Send connection success for major pairs
+                            if symbol in ['BTC-USDT', 'ETH-USDT']:
+                                await self.send_telegram_alert(f"🔌 **{symbol}** WebSocket connected successfully")
+                            
+                            connected = True
+                            
+                            # Main message processing loop
+                            while True:
+                                try:
+                                    message = await asyncio.wait_for(websocket.recv(), timeout=30)
+                                    data = json.loads(message)
+                                    
+                                    if 'data' in data or 'k' in data:
+                                        await self.handle_websocket_data(symbol, data)
+                                    else:
+                                        logging.debug(f"📨 [{symbol}] Received: {data}")
+                                        
+                                except asyncio.TimeoutError:
+                                    # Keep connection alive
+                                    await websocket.ping()
+                                    continue
+                                except websockets.exceptions.ConnectionClosed:
+                                    logging.warning(f"🔌 [{symbol}] WebSocket connection closed")
+                                    break
+                                except json.JSONDecodeError as e:
+                                    logging.warning(f"📨 [{symbol}] Invalid JSON received: {e}")
+                                    continue
+                            
+                            break  # Break out of URL loop if connected
+                            
+                    except Exception as e:
+                        last_error = e
+                        logging.warning(f"   ❌ URL {ws_url} failed: {str(e)}")
+                        continue
+                
+                if connected:
+                    return True
+                else:
+                    raise last_error or Exception("All WebSocket URLs failed")
                             
             except Exception as e:
-                logging.warning(f"⚠️ [{symbol}] WebSocket connection failed (attempt {attempt + 1}): {str(e)}")
+                self.failed_connections += 1
+                error_msg = f"⚠️ [{symbol}] WebSocket connection failed (attempt {attempt + 1}): {str(e)}"
+                logging.warning(error_msg)
+                
                 if attempt < max_retries - 1:
+                    logging.info(f"   ⏳ Retrying in {retry_delay} seconds...")
                     await asyncio.sleep(retry_delay)
                 else:
                     logging.error(f"❌ [{symbol}] Failed to connect after {max_retries} attempts")
-                    break
+                    # Send critical failure for major pairs
+                    if symbol in ['BTC-USDT', 'ETH-USDT']:
+                        await self.send_telegram_alert(f"❌ **{symbol}** WebSocket failed: {str(e)}")
+                    return False
+        
+        return False
 
     async def handle_websocket_data(self, symbol: str, data: Dict):
-        """Process incoming WebSocket data"""
+        """Process incoming WebSocket data with enhanced parsing"""
         try:
+            # Handle different data formats from BingX
+            candle_data = None
+            
             if 'data' in data and data['data']:
                 candle_data = data['data']
-                
-                # Parse candle data
+            elif 'k' in data:
+                candle_data = data['k']
+            else:
+                logging.debug(f"📨 [{symbol}] Unknown data format: {data}")
+                return
+            
+            # Parse candle data with error handling
+            try:
                 current_candle = {
-                    'timestamp': datetime.fromtimestamp(candle_data['t'] / 1000),
-                    'open': float(candle_data['o']),
-                    'high': float(candle_data['h']),
-                    'low': float(candle_data['l']),
-                    'close': float(candle_data['c']),
-                    'volume': float(candle_data['v']),
-                    'is_closed': candle_data['x']
+                    'timestamp': datetime.fromtimestamp(candle_data.get('t', candle_data.get('T', 0)) / 1000),
+                    'open': float(candle_data.get('o', candle_data.get('O', 0))),
+                    'high': float(candle_data.get('h', candle_data.get('H', 0))),
+                    'low': float(candle_data.get('l', candle_data.get('L', 0))),
+                    'close': float(candle_data.get('c', candle_data.get('C', 0))),
+                    'volume': float(candle_data.get('v', candle_data.get('V', 0))),
+                    'is_closed': candle_data.get('x', candle_data.get('X', False))
                 }
                 
-                logging.debug(f"📊 [{symbol}] New data - O:{current_candle['open']:.2f} H:{current_candle['high']:.2f} L:{current_candle['low']:.2f} C:{current_candle['close']:.2f}")
+                # Validate candle data
+                if current_candle['close'] <= 0:
+                    logging.warning(f"📊 [{symbol}] Invalid candle data: {current_candle}")
+                    return
                 
-                # Initialize or update price data
-                if symbol not in self.price_data:
-                    self.price_data[symbol] = []
-                    logging.info(f"📈 [{symbol}] Price data storage initialized")
+                logging.debug(f"📊 [{symbol}] New candle - O:{current_candle['open']:.2f} H:{current_candle['high']:.2f} L:{current_candle['low']:.2f} C:{current_candle['close']:.2f} Closed:{current_candle['is_closed']}")
                 
-                self.price_data[symbol].append(current_candle)
-                if len(self.price_data[symbol]) > 25:
-                    self.price_data[symbol] = self.price_data[symbol][-25:]
-                
-                # Schedule analysis for forming candles
-                if not current_candle['is_closed']:
-                    await self.schedule_analysis(symbol, current_candle)
+            except (KeyError, ValueError, TypeError) as e:
+                logging.warning(f"📊 [{symbol}] Candle parsing error: {e} - Data: {candle_data}")
+                return
+            
+            # Initialize or update price data
+            if symbol not in self.price_data:
+                self.price_data[symbol] = []
+                logging.info(f"📈 [{symbol}] Price data storage initialized - First candle received")
+            
+            self.price_data[symbol].append(current_candle)
+            if len(self.price_data[symbol]) > 30:
+                self.price_data[symbol] = self.price_data[symbol][-30:]
+            
+            # Schedule analysis for forming candles
+            if not current_candle['is_closed']:
+                await self.schedule_analysis(symbol, current_candle)
+            
+            # Log data collection progress
+            if len(self.price_data[symbol]) % 10 == 0:
+                logging.info(f"📈 [{symbol}] Collected {len(self.price_data[symbol])} candles")
                 
         except Exception as e:
             logging.error(f"❌ [{symbol}] WebSocket data handling error: {e}")
@@ -333,16 +415,12 @@ class RomeOPTScanner:
             # STEP 1: Liquidity Sweep
             sweep_ok, sweep_info = self.step_1_liquidity_sweep(symbol, current_data)
             if not sweep_ok:
-                logging.debug(f"❌ [{symbol}] Step 1 failed: No liquidity sweep")
                 return None
-            logging.debug(f"✅ [{symbol}] Step 1 passed: {sweep_info['type']}")
 
             # STEP 2: Displacement
             displacement_ok, displacement_info = self.step_2_displacement(symbol, current_data, sweep_info)
             if not displacement_ok:
-                logging.debug(f"❌ [{symbol}] Step 2 failed: No displacement")
                 return None
-            logging.debug(f"✅ [{symbol}] Step 2 passed: {displacement_info['direction']} displacement")
             
             direction = displacement_info['direction']
 
@@ -350,31 +428,23 @@ class RomeOPTScanner:
             retracement_ok, zone_info = self.step_3_retracement_into_zone(
                 symbol, current_data, sweep_info, displacement_info)
             if not retracement_ok:
-                logging.debug(f"❌ [{symbol}] Step 3 failed: No zone retracement")
                 return None
-            logging.debug(f"✅ [{symbol}] Step 3 passed: In {zone_info['type']}")
 
             # STEP 4: Premium/Discount
             premium_ok, eq_info = self.step_4_premium_discount(symbol, current_data, direction)
             if not premium_ok:
-                logging.debug(f"❌ [{symbol}] Step 4 failed: Wrong premium/discount")
                 return None
-            logging.debug(f"✅ [{symbol}] Step 4 passed: In {eq_info['position']}")
 
             # STEP 5: HTF Bias Alignment
             htf_ok, bias_info = self.step_5_htf_bias_alignment(symbol, direction)
             if not htf_ok and bias_info.get('alignment') == 'MISALIGNED':
-                logging.debug(f"❌ [{symbol}] Step 5 failed: HTF misalignment")
                 return None
-            logging.debug(f"✅ [{symbol}] Step 5 passed: HTF {bias_info.get('alignment', 'UNKNOWN')}")
 
             # STEP 6: Momentum & Volatility
             momentum_ok, confirmation_info = self.step_6_momentum_volatility_confirmation(
                 symbol, current_data, direction)
             if not momentum_ok:
-                logging.debug(f"❌ [{symbol}] Step 6 failed: Momentum rejected")
                 return None
-            logging.debug(f"✅ [{symbol}] Step 6 passed: Momentum confirmed")
 
             # ALL STEPS PASSED - Create signal
             logging.info(f"🎯 [{symbol}] ALL 6 STEPS PASSED - Generating {direction} signal")
@@ -749,6 +819,8 @@ TP3: {signal.tp_levels[2]:.4f}
         """Monitor and report scanner performance"""
         logging.info("📊 Starting performance monitoring...")
         
+        initial_report_sent = False
+        
         while True:
             try:
                 # Calculate statistics
@@ -759,13 +831,29 @@ TP3: {signal.tp_levels[2]:.4f}
                 
                 # Log performance
                 logging.info(
-                    f"📊 PERFORMANCE: {coins_with_data}/{len(self.symbols)} coins, "
-                    f"{active_signals} signals, {self.signals_analyzed} analyzed, "
+                    f"📊 PERFORMANCE: {coins_with_data}/{len(self.symbols)} coins with data, "
+                    f"{active_signals} active signals, {self.signals_analyzed} analyzed, "
                     f"{self.signals_generated} generated, {uptime_minutes:.1f}m uptime"
                 )
                 
+                # Send initial data collection report
+                if not initial_report_sent and coins_with_data > 0:
+                    report_msg = f"""
+📊 **INITIAL DATA COLLECTION REPORT**
+
+• **Coins with Data**: {coins_with_data}/{len(self.symbols)}
+• **WebSocket Connections**: {self.websocket_connections}
+• **Failed Connections**: {self.failed_connections}
+• **Uptime**: {uptime_minutes:.1f} minutes
+
+**Status**: 🟢 COLLECTING MARKET DATA
+**Analysis**: Ready for RomeOPT signals
+"""
+                    await self.send_telegram_alert(report_msg)
+                    initial_report_sent = True
+                
                 # Send hourly report
-                if int(uptime_minutes) % 60 == 0:
+                if int(uptime_minutes) % 60 == 0 and int(uptime_minutes) > 0:
                     report_msg = f"""
 📊 **HOURLY PERFORMANCE REPORT**
 
@@ -809,16 +897,14 @@ TP3: {signal.tp_levels[2]:.4f}
             # Start performance monitoring
             asyncio.create_task(self.monitor_performance())
             
-            # Send ready message
-            await self.send_telegram_alert("🟢 **SCANNER READY**: All systems operational and monitoring for signals")
-            
             logging.info("✅ ROMEOPT SCANNER FULLY OPERATIONAL")
             
             # Keep main loop alive
             while True:
                 await asyncio.sleep(30)
                 # Heartbeat
-                logging.debug("💓 Scanner heartbeat - running normally")
+                if random.random() < 0.1:  # Log occasionally
+                    logging.info("💓 Scanner heartbeat - running normally")
                 
         except Exception as e:
             error_msg = f"❌ SCANNER CRITICAL ERROR: {str(e)}"
@@ -841,7 +927,6 @@ async def main():
         logging.critical(f"❌ SCANNER FAILED TO START: {e}")
         # Final attempt to send failure alert
         try:
-            # Create minimal scanner just for error reporting
             import os
             telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
             chat_id = os.getenv('TELEGRAM_CHAT_ID')
