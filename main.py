@@ -1,115 +1,35 @@
 import os
 import asyncio
-import websockets
-import json
-import time
+import aiohttp
 import logging
+import hmac
+import hashlib
+import urllib.parse
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
-from dataclasses import dataclass
-import aiohttp
-from concurrent.futures import ThreadPoolExecutor
-from asyncio import Semaphore
-import random
+import json
 
-# Configure comprehensive logging
+# Configure honest logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s',
+    format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('romeopt_scanner.log'),
+        logging.FileHandler('bingx_romeopt_scanner.log'),
         logging.StreamHandler()
     ]
 )
 
-@dataclass
-class TradeSignal:
-    symbol: str
-    direction: str  # "LONG" or "SHORT"
-    entry_price: float
-    timestamp: datetime
-    timeframe: str
-    liquidity_sweep: Dict
-    displacement: Dict
-    retracement_zone: Dict
-    tp_levels: List[float]
-    sl_level: float
-    status: str = "ACTIVE"
-    tp_hit: List[bool] = None
-    
-    def __post_init__(self):
-        if self.tp_hit is None:
-            self.tp_hit = [False, False, False]
-
-class RomeOPTScanner:
+class BingXRomeOPTScanner:
     def __init__(self):
-        # Comprehensive startup logging
-        logging.info("🔄 INITIALIZING ENHANCED ROMEOPT SCANNER...")
+        logging.info("🚀 INITIALIZING BINGX ROMEOPT SCANNER")
         
-        # Enhanced environment variable loading with debugging
-        self.load_environment_variables()
+        # Load ALL your environment variables
+        self.api_key = os.getenv('BINGX_API_KEY')
+        self.api_secret = os.getenv('BINGX_API_SECRET')
+        self.telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
+        self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
         
-        # EXPANDED TRADING CONFIGURATION
-        self.symbols = [
-            # Major Pairs (15 coins)
-            'BTC-USDT', 'ETH-USDT', 'BNB-USDT', 'SOL-USDT', 'XRP-USDT',
-            'ADA-USDT', 'AVAX-USDT', 'DOGE-USDT', 'DOT-USDT', 'TRX-USDT',
-            'LINK-USDT', 'MATIC-USDT', 'LTC-USDT', 'BCH-USDT', 'ATOM-USDT',
-            # Additional Large Caps (10 coins)
-            'XLM-USDT', 'FIL-USDT', 'ETC-USDT', 'XTZ-USDT', 'XMR-USDT',
-            'EOS-USDT', 'AAVE-USDT', 'ALGO-USDT', 'NEO-USDT', 'MKR-USDT',
-        ]
-        
-        # MULTIPLE TIMEFRAMES
-        self.timeframes = ['1m', '3m', '5m', '15m']
-        self.max_signal_age = timedelta(minutes=10)
-        
-        # Enhanced performance optimization
-        self.max_concurrent_websockets = 15
-        self.analysis_semaphore = Semaphore(10)
-        self.price_data: Dict[str, Dict[str, List]] = {}  # symbol -> timeframe -> candles
-        self.active_signals: Dict[str, TradeSignal] = {}
-        self.htf_bias: Dict[str, str] = {}
-        
-        # Rate limiting and state tracking
-        self.last_analysis_time: Dict[str, Dict[str, datetime]] = {}  # symbol -> timeframe -> time
-        self.analysis_cooldown = timedelta(seconds=2)  # Reduced for multiple timeframes
-        self.thread_pool = ThreadPoolExecutor(max_workers=12)
-        
-        # Enhanced Statistics
-        self.startup_time = datetime.now()
-        self.signals_analyzed = 0
-        self.signals_generated = 0
-        self.websocket_connections = 0
-        self.failed_connections = 0
-        self.data_messages_received = 0
-        self.protobuf_messages = 0
-        self.json_messages = 0
-        
-        logging.info(f"🚀 Enhanced RomeOPT Scanner initialized - Monitoring {len(self.symbols)} coins across {len(self.timeframes)} timeframes")
-
-    def load_environment_variables(self):
-        """Enhanced environment variable loading with comprehensive debugging"""
-        logging.info("🔍 LOADING ENVIRONMENT VARIABLES...")
-        
-        # Get all environment variables for debugging
-        all_env_vars = dict(os.environ)
-        
-        # Log available environment variables (filtered for security)
-        logging.info("📋 AVAILABLE ENVIRONMENT VARIABLES:")
-        for key in sorted(all_env_vars.keys()):
-            if any(term in key.upper() for term in ['BINGX', 'TELEGRAM', 'API', 'SECRET', 'KEY', 'TOKEN', 'BOT', 'CHAT']):
-                value = all_env_vars[key]
-                display_value = f"{value[:4]}...{value[-4:]}" if len(value) > 8 else "***"
-                logging.info(f"   📝 {key}: {display_value}")
-        
-        # Load specific variables with multiple fallback methods
-        self.api_key = self.get_env_variable('BINGX_API_KEY', ['BINGX_API_KEY', 'BINGX_KEY', 'API_KEY'])
-        self.api_secret = self.get_env_variable('BINGX_API_SECRET', ['BINGX_API_SECRET', 'BINGX_SECRET', 'API_SECRET'])
-        self.telegram_token = self.get_env_variable('TELEGRAM_BOT_TOKEN', ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_TOKEN', 'BOT_TOKEN'])
-        self.telegram_chat_id = self.get_env_variable('TELEGRAM_CHAT_ID', ['TELEGRAM_CHAT_ID', 'CHAT_ID'])
-        
-        # Final validation
+        # Validate all credentials
         missing_vars = []
         if not self.api_key: missing_vars.append('BINGX_API_KEY')
         if not self.api_secret: missing_vars.append('BINGX_API_SECRET')
@@ -121,764 +41,549 @@ class RomeOPTScanner:
             logging.error(error_msg)
             raise ValueError(error_msg)
         
-        logging.info("✅ ALL ENVIRONMENT VARIABLES SUCCESSFULLY LOADED")
+        logging.info("✅ ALL CREDENTIALS LOADED SUCCESSFULLY")
 
-    def get_env_variable(self, primary_name: str, alternative_names: List[str]) -> str:
-        """Get environment variable with multiple fallback options"""
-        value = os.getenv(primary_name)
-        if value:
-            logging.info(f"   ✅ {primary_name}: Found (primary)")
-            return value
+        # REALISTIC CONFIGURATION
+        self.coins = ['BTC-USDT', 'ETH-USDT', 'BNB-USDT', 'SOL-USDT']  # 4 COINS MAX
+        self.timeframe = '5m'  # ONE TIMEFRAME ONLY
+        self.analysis_interval = 45  # SECONDS BETWEEN CYCLES
         
-        for alt_name in alternative_names:
-            value = os.getenv(alt_name)
-            if value:
-                logging.info(f"   🔄 {primary_name}: Found via alternative '{alt_name}'")
-                return value
+        # BingX API endpoints
+        self.base_url = "https://open-api.bingx.com"
         
-        logging.warning(f"   ❌ {primary_name}: Not found (tried: {alternative_names})")
-        return None
+        # STATE
+        self.price_data: Dict[str, List] = {}
+        self.active_signals: Dict[str, Dict] = {}
+        
+        # PERFORMANCE TRACKING
+        self.real_signals_generated = 0
+        self.analysis_cycles = 0
+        self.start_time = datetime.now()
+        
+        logging.info(f"✅ BINGX SCANNER READY: {len(self.coins)} coins, {self.timeframe} timeframe")
 
-    async def send_startup_message(self):
-        """Send comprehensive startup message to Telegram"""
-        startup_msg = f"""
-🚀 **ENHANCED ROMEOPT SCANNER STARTED**
+    def generate_signature(self, params: str) -> str:
+        """Generate BingX API signature"""
+        return hmac.new(
+            self.api_secret.encode('utf-8'),
+            params.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
 
-**Configuration:**
-• **Version**: Multi-Timeframe Enhanced v9.0
-• **Start Time**: {self.startup_time.strftime('%Y-%m-%d %H:%M:%S UTC')}
-• **Coins Monitoring**: {len(self.symbols)} coins
-• **Timeframes**: {', '.join(self.timeframes)}
-• **Enhanced Sensitivity**: ✅ Enabled
-• **Environment**: ✅ All variables loaded
-
-**Status**: Starting WebSocket connections...
-**Analysis Engine**: Ready for RomeOPT 6-step sequences
-
-Scanner is now operational with enhanced signal detection!
-"""
-        await self.send_telegram_alert(startup_msg)
-        logging.info("📤 Startup message sent to Telegram")
-
-    async def start_websocket_feeds(self):
-        """Start WebSocket connections for all symbols and timeframes"""
-        logging.info(f"📡 Starting WebSocket feeds for {len(self.symbols)} coins across {len(self.timeframes)} timeframes...")
-        
-        successful_connections = 0
-        connection_tasks = []
-        
-        # Create connection tasks for all symbols and timeframes
-        for symbol in self.symbols:
-            for timeframe in self.timeframes:
-                task = asyncio.create_task(
-                    self.connect_bingx_websocket(symbol, timeframe),
-                    name=f"ws_{symbol}_{timeframe}"
-                )
-                connection_tasks.append(task)
-                # Small delay to avoid connection limits
-                await asyncio.sleep(0.5)
-        
-        # Wait for connections to establish
-        await asyncio.sleep(20)
-        
-        # Check connection results
-        for task in connection_tasks:
-            if task.done():
-                try:
-                    result = task.result()
-                    if result:
-                        successful_connections += 1
-                except Exception as e:
-                    logging.error(f"WebSocket task failed: {e}")
-        
-        total_expected = len(self.symbols) * len(self.timeframes)
-        logging.info(f"📊 WebSocket initialization complete - {successful_connections}/{total_expected} successful connections")
-        
-        # Send connection status
-        status_msg = f"🔌 **WEBSOCKET STATUS**: {successful_connections}/{total_expected} connections established"
-        await self.send_telegram_alert(status_msg)
-        
-        if successful_connections > 0:
-            data_msg = f"📊 **DATA COLLECTION**: Started receiving market data from {successful_connections} streams"
-            await self.send_telegram_alert(data_msg)
-        else:
-            error_msg = "❌ **CRITICAL**: No WebSocket connections established"
-            await self.send_telegram_alert(error_msg)
-
-    async def connect_bingx_websocket(self, symbol: str, timeframe: str):
-        """Connect to BingX WebSocket for specific symbol and timeframe"""
-        max_retries = 2
-        retry_delay = 5
-        
-        for attempt in range(max_retries):
-            try:
-                logging.info(f"🔗 [{symbol} {timeframe}] Connecting WebSocket (attempt {attempt + 1}/{max_retries})")
-                
-                # Use the working WebSocket URL
-                ws_url = "wss://open-api-swap.bingx.com/swap-market"
-                
-                async with websockets.connect(
-                    ws_url,
-                    ping_interval=20,
-                    ping_timeout=10,
-                    close_timeout=5
-                ) as websocket:
-                    
-                    self.websocket_connections += 1
-                    logging.info(f"✅ [{symbol} {timeframe}] WebSocket connected successfully")
-                    
-                    # Subscribe to kline data for specific timeframe
-                    subscribe_msg = {
-                        "id": f"sub_{symbol}_{timeframe}_{int(time.time())}",
-                        "reqType": "sub",
-                        "dataType": f"{symbol.upper()}@kline_{timeframe}"
-                    }
-                    
-                    await websocket.send(json.dumps(subscribe_msg))
-                    logging.info(f"📤 [{symbol} {timeframe}] Subscription sent")
-                    
-                    # Send connection success for major pairs
-                    if symbol in ['BTC-USDT', 'ETH-USDT'] and timeframe == '1m':
-                        await self.send_telegram_alert(f"🔌 **{symbol} {timeframe}** WebSocket connected")
-                    
-                    # Main message processing loop
-                    message_count = 0
-                    while True:
-                        try:
-                            message = await asyncio.wait_for(websocket.recv(), timeout=30)
-                            message_count += 1
-                            self.data_messages_received += 1
-                            
-                            # Process the message with timeframe context
-                            await self.process_websocket_message(symbol, timeframe, message, message_count)
-                            
-                        except asyncio.TimeoutError:
-                            await websocket.ping()
-                            continue
-                        except websockets.exceptions.ConnectionClosed:
-                            logging.warning(f"🔌 [{symbol} {timeframe}] WebSocket connection closed")
-                            break
-                        except Exception as e:
-                            logging.error(f"❌ [{symbol} {timeframe}] Message processing error: {e}")
-                            continue
-                            
-            except Exception as e:
-                self.failed_connections += 1
-                error_msg = f"⚠️ [{symbol} {timeframe}] WebSocket connection failed (attempt {attempt + 1}): {str(e)}"
-                logging.warning(error_msg)
-                
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay)
-                else:
-                    logging.error(f"❌ [{symbol} {timeframe}] Failed to connect after {max_retries} attempts")
-                    return False
-        
-        return True
-
-    async def process_websocket_message(self, symbol: str, timeframe: str, message: any, message_count: int):
-        """Process WebSocket message with timeframe context"""
+    async def bingx_api_request(self, endpoint: str, params: Dict = None, signed: bool = False) -> Optional[Dict]:
+        """Make authenticated request to BingX API"""
         try:
-            # Debug first few messages to understand data format
-            if message_count <= 2:
-                logging.info(f"🔍 [{symbol} {timeframe}] Message #{message_count} - Type: {type(message)}")
+            url = f"{self.base_url}{endpoint}"
             
-            # Handle different message types
-            if isinstance(message, str):
-                # Try to parse as JSON
-                try:
-                    data = json.loads(message)
-                    self.json_messages += 1
-                    await self.handle_websocket_data(symbol, timeframe, data)
-                    return
-                except json.JSONDecodeError:
-                    logging.debug(f"📨 [{symbol} {timeframe}] Invalid JSON string")
-                    return
+            if params is None:
+                params = {}
             
-            elif isinstance(message, (bytes, bytearray)):
-                # Handle binary data (likely protobuf)
-                self.protobuf_messages += 1
-                
-                # Create simulated candle data from binary
-                simulated_candle = self.create_simulated_candle(symbol, timeframe, message)
-                if simulated_candle:
-                    await self.handle_candle_data(symbol, timeframe, simulated_candle)
-                return
-            
+            if signed:
+                params['timestamp'] = int(datetime.now().timestamp() * 1000)
+                query_string = urllib.parse.urlencode(params)
+                signature = self.generate_signature(query_string)
+                params['signature'] = signature
+                headers = {'X-BX-APIKEY': self.api_key}
             else:
-                logging.debug(f"📨 [{symbol} {timeframe}] Unknown message type: {type(message)}")
-                return
-                
+                headers = {}
+            
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                if signed:
+                    async with session.get(url, params=params, headers=headers) as response:
+                        if response.status == 200:
+                            return await response.json()
+                        else:
+                            logging.error(f"BingX API error: {response.status}")
+                            return None
+                else:
+                    async with session.get(url, params=params) as response:
+                        if response.status == 200:
+                            return await response.json()
+                        else:
+                            logging.error(f"BingX API error: {response.status}")
+                            return None
+                            
         except Exception as e:
-            logging.error(f"❌ [{symbol} {timeframe}] Message processing error: {e}")
-
-    def create_simulated_candle(self, symbol: str, timeframe: str, binary_data: bytes) -> Optional[Dict]:
-        """Create simulated candle data from binary message with timeframe context"""
-        try:
-            # Use message characteristics to create realistic price movements
-            base_prices = {
-                'BTC-USDT': 50000, 'ETH-USDT': 3000, 'BNB-USDT': 600, 'SOL-USDT': 100, 'XRP-USDT': 0.5,
-                'ADA-USDT': 0.4, 'AVAX-USDT': 40, 'DOGE-USDT': 0.1, 'DOT-USDT': 7, 'TRX-USDT': 0.1,
-                'LINK-USDT': 15, 'MATIC-USDT': 0.8, 'LTC-USDT': 70, 'BCH-USDT': 300, 'ATOM-USDT': 10,
-                'XLM-USDT': 0.12, 'FIL-USDT': 5, 'ETC-USDT': 30, 'XTZ-USDT': 1, 'XMR-USDT': 150,
-                'EOS-USDT': 0.8, 'AAVE-USDT': 100, 'ALGO-USDT': 0.2, 'NEO-USDT': 12, 'MKR-USDT': 2000,
-            }
-            
-            base_price = base_prices.get(symbol, 50)
-            
-            # Generate realistic price movement based on binary data characteristics
-            data_hash = hash(binary_data) % 1000 / 1000  # 0.0 to 1.0
-            
-            # Adjust volatility based on timeframe
-            timeframe_volatility = {
-                '1m': 0.02,   # ±2%
-                '3m': 0.03,   # ±3%  
-                '5m': 0.04,   # ±4%
-                '15m': 0.06,  # ±6%
-            }
-            volatility = timeframe_volatility.get(timeframe, 0.03)
-            
-            price_change = (data_hash - 0.5) * volatility
-            
-            current_price = base_price * (1 + price_change)
-            
-            # Create realistic OHLC data
-            open_price = current_price * (1 + random.uniform(-0.005, 0.005))
-            high_price = max(open_price, current_price) * (1 + random.uniform(0, 0.01))
-            low_price = min(open_price, current_price) * (1 - random.uniform(0, 0.01))
-            
-            simulated_candle = {
-                'timestamp': datetime.now(),
-                'open': open_price,
-                'high': high_price,
-                'low': low_price,
-                'close': current_price,
-                'volume': 10000 + len(binary_data) * 10,
-                'is_closed': False
-            }
-            
-            logging.debug(f"📊 [{symbol} {timeframe}] Simulated candle - O:{open_price:.4f} H:{high_price:.4f} L:{low_price:.4f} C:{current_price:.4f}")
-            
-            return simulated_candle
-            
-        except Exception as e:
-            logging.error(f"❌ [{symbol} {timeframe}] Simulated candle creation error: {e}")
+            logging.error(f"BingX API request failed: {e}")
             return None
 
-    async def handle_websocket_data(self, symbol: str, timeframe: str, data: any):
-        """Process incoming WebSocket data with timeframe context"""
+    async def get_bingx_klines(self, symbol: str, limit: int = 25) -> Optional[List[Dict]]:
+        """Get REAL klines data from BingX"""
         try:
-            # Handle different data structures
-            candle_data = None
-            
-            if isinstance(data, dict):
-                if 'data' in data and data['data']:
-                    candle_data = data['data']
-                elif 'k' in data:
-                    candle_data = data['k']
-                elif all(key in data for key in ['open', 'high', 'low', 'close']):
-                    candle_data = data
-                else:
-                    logging.debug(f"📨 [{symbol} {timeframe}] Other dict data received")
-                    return
-            
-            elif isinstance(data, list) and len(data) >= 4:
-                # Convert list to candle format
-                candle_data = {
-                    'timestamp': datetime.now(),
-                    'open': float(data[0]),
-                    'high': float(data[1]),
-                    'low': float(data[2]),
-                    'close': float(data[3]),
-                    'volume': float(data[4]) if len(data) > 4 else 10000,
-                    'is_closed': False
-                }
-            else:
-                logging.debug(f"📨 [{symbol} {timeframe}] Unhandled data type: {type(data)}")
-                return
-            
-            # Parse and handle candle data
-            await self.handle_candle_data(symbol, timeframe, candle_data)
-                
-        except Exception as e:
-            logging.error(f"❌ [{symbol} {timeframe}] WebSocket data handling error: {e}")
-
-    async def handle_candle_data(self, symbol: str, timeframe: str, candle_data: any):
-        """Handle candle data processing with timeframe context"""
-        try:
-            # Parse candle data
-            current_candle = self.parse_candle_data(symbol, timeframe, candle_data)
-            if not current_candle:
-                return
-            
-            # Initialize price data structure if needed
-            if symbol not in self.price_data:
-                self.price_data[symbol] = {}
-            if timeframe not in self.price_data[symbol]:
-                self.price_data[symbol][timeframe] = []
-                logging.info(f"📈 [{symbol} {timeframe}] Price data storage initialized")
-            
-            # Add candle to timeframe-specific data
-            self.price_data[symbol][timeframe].append(current_candle)
-            if len(self.price_data[symbol][timeframe]) > 35:  # Keep more candles for higher timeframes
-                self.price_data[symbol][timeframe] = self.price_data[symbol][timeframe][-35:]
-            
-            # Log data collection progress
-            data_count = len(self.price_data[symbol][timeframe])
-            if data_count == 1:
-                logging.info(f"📈 [{symbol} {timeframe}] First candle received: {current_candle['close']:.4f}")
-            elif data_count % 15 == 0:
-                logging.info(f"📈 [{symbol} {timeframe}] Collected {data_count} candles - Latest: {current_candle['close']:.4f}")
-            
-            # Schedule analysis for forming candles
-            if not current_candle['is_closed']:
-                await self.schedule_analysis(symbol, timeframe, current_candle)
-                
-        except Exception as e:
-            logging.error(f"❌ [{symbol} {timeframe}] Candle data handling error: {e}")
-
-    def parse_candle_data(self, symbol: str, timeframe: str, candle_data: any) -> Optional[Dict]:
-        """Parse candle data from various formats with timeframe context"""
-        try:
-            # Extract fields with fallbacks
-            if isinstance(candle_data, dict):
-                timestamp = candle_data.get('t') or candle_data.get('T') or candle_data.get('time')
-                open_price = candle_data.get('o') or candle_data.get('O') or candle_data.get('open')
-                high_price = candle_data.get('h') or candle_data.get('H') or candle_data.get('high')
-                low_price = candle_data.get('l') or candle_data.get('L') or candle_data.get('low')
-                close_price = candle_data.get('c') or candle_data.get('C') or candle_data.get('close')
-                volume = candle_data.get('v') or candle_data.get('V') or candle_data.get('volume')
-                is_closed = candle_data.get('x') or candle_data.get('X') or candle_data.get('is_closed')
-            else:
-                # Assume direct values
-                timestamp = datetime.now()
-                open_price = getattr(candle_data, 'open', 0)
-                high_price = getattr(candle_data, 'high', 0)
-                low_price = getattr(candle_data, 'low', 0)
-                close_price = getattr(candle_data, 'close', 0)
-                volume = getattr(candle_data, 'volume', 10000)
-                is_closed = getattr(candle_data, 'is_closed', False)
-            
-            # Convert timestamp
-            if isinstance(timestamp, (int, float)):
-                if timestamp > 1e12:  # Milliseconds
-                    timestamp_dt = datetime.fromtimestamp(timestamp / 1000)
-                else:  # Seconds
-                    timestamp_dt = datetime.fromtimestamp(timestamp)
-            else:
-                timestamp_dt = datetime.now()
-            
-            current_candle = {
-                'timestamp': timestamp_dt,
-                'open': float(open_price) if open_price else 0.0,
-                'high': float(high_price) if high_price else 0.0,
-                'low': float(low_price) if low_price else 0.0,
-                'close': float(close_price) if close_price else 0.0,
-                'volume': float(volume) if volume else 10000.0,
-                'is_closed': bool(is_closed) if is_closed is not None else False
+            # Convert symbol format: BTC-USDT -> BTC-USDT (BingX uses this format)
+            params = {
+                'symbol': symbol,
+                'interval': self.timeframe,
+                'limit': limit
             }
             
-            # Validate candle data
-            if current_candle['close'] <= 0:
+            data = await self.bingx_api_request('/openApi/swap/v2/quote/klines', params)
+            
+            if data and 'data' in data:
+                candles = []
+                for candle in data['data']:
+                    candles.append({
+                        'timestamp': datetime.fromtimestamp(candle[0] / 1000),
+                        'open': float(candle[1]),
+                        'high': float(candle[2]),
+                        'low': float(candle[3]),
+                        'close': float(candle[4]),
+                        'volume': float(candle[5]),
+                        'is_closed': True
+                    })
+                
+                logging.debug(f"📊 {symbol}: Got {len(candles)} REAL BingX candles")
+                return candles
+            else:
+                logging.warning(f"❌ {symbol}: No klines data from BingX")
                 return None
-            
-            return current_candle
-            
+                
         except Exception as e:
-            logging.warning(f"📊 [{symbol} {timeframe}] Candle parsing error: {e}")
+            logging.error(f"❌ {symbol}: BingX klines failed: {e}")
             return None
 
-    async def schedule_analysis(self, symbol: str, timeframe: str, current_candle: Dict):
-        """Schedule analysis with rate limiting and timeframe context"""
-        current_time = datetime.now()
+    async def get_bingx_ticker(self, symbol: str) -> Optional[float]:
+        """Get REAL current price from BingX"""
+        try:
+            params = {'symbol': symbol}
+            data = await self.bingx_api_request('/openApi/swap/v2/quote/ticker', params)
+            
+            if data and 'data' in data and len(data['data']) > 0:
+                price = float(data['data'][0]['lastPrice'])
+                logging.debug(f"💰 {symbol}: Current price = {price}")
+                return price
+            else:
+                logging.warning(f"❌ {symbol}: No ticker data from BingX")
+                return None
+                
+        except Exception as e:
+            logging.error(f"❌ {symbol}: BingX ticker failed: {e}")
+            return None
+
+    async def get_account_balance(self) -> Optional[float]:
+        """Get account balance (optional - for position sizing)"""
+        try:
+            params = {}
+            data = await self.bingx_api_request('/openApi/swap/v2/user/balance', params, signed=True)
+            
+            if data and 'data' in data and 'balance' in data['data']:
+                balance = float(data['data']['balance'])
+                logging.info(f"💳 Account balance: ${balance:.2f}")
+                return balance
+            return None
+            
+        except Exception as e:
+            logging.error(f"Account balance check failed: {e}")
+            return None
+
+    # ==================== 6-STEP ROMEOPT ANALYSIS ====================
+
+    def step_1_liquidity_sweep(self, symbol: str, candles: List[Dict]) -> Tuple[bool, Optional[Dict]]:
+        """REAL liquidity sweep detection"""
+        if len(candles) < 10:
+            return False, None
+            
+        current_candle = candles[-1]
+        current_low = current_candle['low']
+        current_high = current_candle['high']
         
-        # Initialize timeframe tracking if needed
-        if symbol not in self.last_analysis_time:
-            self.last_analysis_time[symbol] = {}
+        # Look at previous candles for liquidity levels
+        previous_candles = candles[-9:-1]
+        if not previous_candles:
+            return False, None
+            
+        previous_lows = [c['low'] for c in previous_candles]
+        previous_highs = [c['high'] for c in previous_candles]
         
-        # Rate limiting per symbol and timeframe
-        if timeframe in self.last_analysis_time[symbol]:
-            time_since_last = current_time - self.last_analysis_time[symbol][timeframe]
-            if time_since_last < self.analysis_cooldown:
-                return
+        min_previous_low = min(previous_lows)
+        max_previous_high = max(previous_highs)
         
-        self.last_analysis_time[symbol][timeframe] = current_time
+        # Bullish sweep: current low breaks previous lows but closes above
+        sweep_threshold = 0.001  # 0.1% tolerance
+        if current_low <= min_previous_low * (1 + sweep_threshold) and current_candle['close'] > min_previous_low:
+            logging.info(f"✅ {symbol}: Bullish sweep - {current_low:.2f} < {min_previous_low:.2f}")
+            return True, {
+                'type': 'BULLISH_SWEEP', 
+                'sweep_level': min_previous_low,
+                'current_low': current_low
+            }
         
-        async with self.analysis_semaphore:
+        # Bearish sweep: current high breaks previous highs but closes below  
+        if current_high >= max_previous_high * (1 - sweep_threshold) and current_candle['close'] < max_previous_high:
+            logging.info(f"✅ {symbol}: Bearish sweep - {current_high:.2f} > {max_previous_high:.2f}")
+            return True, {
+                'type': 'BEARISH_SWEEP',
+                'sweep_level': max_previous_high, 
+                'current_high': current_high
+            }
+            
+        return False, None
+
+    def step_2_displacement(self, symbol: str, candles: List[Dict], sweep_info: Dict) -> Tuple[bool, Optional[Dict]]:
+        """REAL displacement detection"""
+        current_candle = candles[-1]
+        open_price = current_candle['open']
+        close_price = current_candle['close']
+        high = current_candle['high']
+        low = current_candle['low']
+        
+        candle_range = high - low
+        if candle_range == 0:
+            return False, None
+            
+        body_size = abs(close_price - open_price)
+        body_ratio = body_size / candle_range
+        
+        # Real impulse candle: at least 60% body
+        if body_ratio >= 0.6:
+            direction = "BULLISH" if close_price > open_price else "BEARISH"
+            
+            # Validate alignment with sweep
+            if (sweep_info['type'] == 'BULLISH_SWEEP' and direction == "BULLISH") or \
+               (sweep_info['type'] == 'BEARISH_SWEEP' and direction == "BEARISH"):
+                logging.info(f"✅ {symbol}: Displacement - {direction} candle ({body_ratio:.1%} body)")
+                return True, {
+                    'direction': direction,
+                    'body_ratio': body_ratio,
+                    'impulse_candle': current_candle
+                }
+                
+        return False, None
+
+    def step_3_retracement_zone(self, symbol: str, candles: List[Dict], sweep_info: Dict, displacement_info: Dict) -> Tuple[bool, Optional[Dict]]:
+        """REAL retracement zone detection"""
+        current_price = candles[-1]['close']
+        displacement_candle = displacement_info['impulse_candle']
+        direction = displacement_info['direction']
+        
+        # Define realistic zone around displacement candle
+        zone_extension = 0.008  # 0.8% extension
+        zone_low = displacement_candle['low'] * (1 - zone_extension)
+        zone_high = displacement_candle['high'] * (1 + zone_extension)
+        
+        if zone_low <= current_price <= zone_high:
+            logging.info(f"✅ {symbol}: Retracement - {current_price:.2f} in zone [{zone_low:.2f}, {zone_high:.2f}]")
+            return True, {
+                'zone_low': zone_low,
+                'zone_high': zone_high
+            }
+            
+        return False, None
+
+    def step_4_premium_discount(self, symbol: str, candles: List[Dict], direction: str) -> Tuple[bool, Optional[Dict]]:
+        """REAL premium/discount check"""
+        if len(candles) < 15:
+            return False, None
+            
+        current_price = candles[-1]['close']
+        
+        # Calculate equilibrium from recent highs/lows
+        recent_high = max(c['high'] for c in candles[-15:])
+        recent_low = min(c['low'] for c in candles[-15:])
+        equilibrium = (recent_high + recent_low) / 2
+        
+        position = "DISCOUNT" if current_price < equilibrium else "PREMIUM"
+        
+        if (direction == "BULLISH" and position == "DISCOUNT") or \
+           (direction == "BEARISH" and position == "PREMIUM"):
+            logging.info(f"✅ {symbol}: Premium/Discount - Trading at {position}")
+            return True, {
+                'position': position, 
+                'equilibrium': equilibrium,
+                'current_price': current_price
+            }
+            
+        return False, None
+
+    def step_5_momentum_confirmation(self, symbol: str, candles: List[Dict], direction: str) -> Tuple[bool, Optional[Dict]]:
+        """REAL momentum confirmation"""
+        if len(candles) < 6:
+            return False, None
+            
+        # Simple momentum: price above/below 5-candle MA
+        recent_closes = [c['close'] for c in candles[-5:]]
+        ma_5 = sum(recent_closes) / len(recent_closes)
+        current_price = candles[-1]['close']
+        
+        momentum = "BULLISH" if current_price > ma_5 else "BEARISH"
+        
+        if momentum == direction:
+            logging.info(f"✅ {symbol}: Momentum - {direction} confirmed")
+            return True, {
+                'momentum': momentum, 
+                'ma_5': ma_5,
+                'current_price': current_price
+            }
+            
+        return False, None
+
+    def step_6_volume_confirmation(self, symbol: str, candles: List[Dict]) -> Tuple[bool, Optional[Dict]]:
+        """REAL volume confirmation"""
+        if len(candles) < 10:
+            return False, None
+            
+        current_volume = candles[-1]['volume']
+        avg_volume = sum(c['volume'] for c in candles[-10:]) / 10
+        
+        volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
+        
+        if volume_ratio >= 0.7:  # At least 70% of average volume
+            logging.info(f"✅ {symbol}: Volume - Adequate ({volume_ratio:.1%} of average)")
+            return True, {
+                'volume_status': 'ADEQUATE',
+                'current_volume': current_volume,
+                'avg_volume': avg_volume,
+                'volume_ratio': volume_ratio
+            }
+            
+        logging.debug(f"❌ {symbol}: Volume too low ({volume_ratio:.1%} of average)")
+        return False, None
+
+    async def generate_romeopt_signal(self, symbol: str) -> Optional[Dict]:
+        """REAL 6-step RomeOPT signal generation"""
+        logging.info(f"🔍 {symbol}: Starting 6-step RomeOPT analysis...")
+        
+        # Get REAL BingX data
+        candles = await self.get_bingx_klines(symbol, limit=20)
+        if not candles or len(candles) < 15:
+            logging.warning(f"❌ {symbol}: Insufficient BingX data")
+            return None
+        
+        current_price = await self.get_bingx_ticker(symbol)
+        if not current_price:
+            logging.warning(f"❌ {symbol}: Could not get current price from BingX")
+            return None
+            
+        # Update latest candle with current price
+        candles[-1]['close'] = current_price
+        if current_price > candles[-1]['high']:
+            candles[-1]['high'] = current_price
+        if current_price < candles[-1]['low']:
+            candles[-1]['low'] = current_price
+
+        # 6-STEP ROMEOPT VALIDATION
+        steps_passed = []
+        
+        # Step 1: Liquidity Sweep
+        step1_ok, step1_info = self.step_1_liquidity_sweep(symbol, candles)
+        if not step1_ok:
+            logging.debug(f"❌ {symbol}: Failed Step 1 - No liquidity sweep")
+            return None
+        steps_passed.append("Liquidity Sweep")
+
+        # Step 2: Displacement
+        step2_ok, step2_info = self.step_2_displacement(symbol, candles, step1_info)
+        if not step2_ok:
+            logging.debug(f"❌ {symbol}: Failed Step 2 - No displacement")
+            return None
+        steps_passed.append("Displacement")
+        direction = step2_info['direction']
+
+        # Step 3: Retracement Zone
+        step3_ok, step3_info = self.step_3_retracement_zone(symbol, candles, step1_info, step2_info)
+        if not step3_ok:
+            logging.debug(f"❌ {symbol}: Failed Step 3 - No retracement")
+            return None
+        steps_passed.append("Zone Retracement")
+
+        # Step 4: Premium/Discount
+        step4_ok, step4_info = self.step_4_premium_discount(symbol, candles, direction)
+        if not step4_ok:
+            logging.debug(f"❌ {symbol}: Failed Step 4 - Wrong premium/discount")
+            return None
+        steps_passed.append("Premium/Discount")
+
+        # Step 5: Momentum
+        step5_ok, step5_info = self.step_5_momentum_confirmation(symbol, candles, direction)
+        if not step5_ok:
+            logging.debug(f"❌ {symbol}: Failed Step 5 - No momentum")
+            return None
+        steps_passed.append("Momentum")
+
+        # Step 6: Volume
+        step6_ok, step6_info = self.step_6_volume_confirmation(symbol, candles)
+        if not step6_ok:
+            logging.debug(f"❌ {symbol}: Failed Step 6 - Low volume")
+            return None
+        steps_passed.append("Volume Confirmation")
+
+        # ALL 6 STEPS PASSED - REAL ROMEOPT SIGNAL!
+        logging.info(f"🎯 {symbol}: ALL 6 STEPS PASSED - {direction} ROMEOPT SIGNAL!")
+        
+        # Calculate realistic TP/SL based on RomeOPT methodology
+        entry_price = current_price
+        if direction == "BULLISH":
+            sl = step1_info['sweep_level'] * 0.995  # 0.5% below sweep low
+            risk = entry_price - sl
+            tp1 = entry_price + (risk * 1.2)
+            tp2 = entry_price + (risk * 2.0)
+            tp3 = entry_price + (risk * 3.0)
+        else:  # BEARISH
+            sl = step1_info['sweep_level'] * 1.005  # 0.5% above sweep high
+            risk = sl - entry_price
+            tp1 = entry_price - (risk * 1.2)
+            tp2 = entry_price - (risk * 2.0)
+            tp3 = entry_price - (risk * 3.0)
+        
+        risk_reward = f"1:{(tp1 - entry_price) / (entry_price - sl):.1f}" if direction == "BULLISH" else f"1:{(entry_price - tp1) / (sl - entry_price):.1f}"
+        
+        signal = {
+            'symbol': symbol,
+            'direction': direction,
+            'entry_price': entry_price,
+            'timestamp': datetime.now(),
+            'timeframe': self.timeframe,
+            'tp_levels': [tp1, tp2, tp3],
+            'sl_level': sl,
+            'current_price': current_price,
+            'risk_reward': risk_reward,
+            'steps_passed': steps_passed,
+            'signal_id': f"{symbol}_{direction}_{int(datetime.now().timestamp())}"
+        }
+        
+        self.real_signals_generated += 1
+        return signal
+
+    async def send_telegram_alert(self, message: str):
+        """Send REAL signal alert to Telegram"""
+        try:
+            url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
+            payload = {
+                'chat_id': self.telegram_chat_id,
+                'text': message,
+                'parse_mode': 'Markdown'
+            }
+            
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                async with session.post(url, json=payload) as response:
+                    if response.status == 200:
+                        logging.info("✅ Telegram alert sent successfully")
+                    else:
+                        error_text = await response.text()
+                        logging.error(f"❌ Telegram failed: {response.status} - {error_text}")
+        except Exception as e:
+            logging.error(f"❌ Telegram alert error: {e}")
+
+    async def analyze_all_coins(self):
+        """Realistic sequential analysis of all coins"""
+        logging.info(f"🔄 Starting analysis cycle for {len(self.coins)} coins")
+        
+        signals_found = 0
+        
+        for symbol in self.coins:
             try:
-                # Run analysis in thread pool
-                signal = await asyncio.get_event_loop().run_in_executor(
-                    self.thread_pool, 
-                    self.generate_signal, 
-                    symbol, 
-                    timeframe,
-                    current_candle
-                )
+                # Realistic delay between coin analyses
+                await asyncio.sleep(3)
                 
-                self.signals_analyzed += 1
+                signal = await self.generate_romeopt_signal(symbol)
                 
-                if signal and self.is_live_signal(signal):
-                    self.signals_generated += 1
-                    signal_id = f"{symbol}_{timeframe}_{signal.timestamp.timestamp()}"
+                if signal:
+                    signal_id = signal['signal_id']
                     
                     if signal_id not in self.active_signals:
                         self.active_signals[signal_id] = signal
-                        logging.info(f"🎯 [{symbol} {timeframe}] ROMEOPT SIGNAL: {signal.direction} @ {signal.entry_price:.4f}")
-                        await self.send_signal_alert(signal)
+                        signals_found += 1
+                        
+                        # Format beautiful Telegram message
+                        emoji = "🟢" if signal['direction'] == "BULLISH" else "🔴"
+                        
+                        alert_msg = f"""
+{emoji} **ROMEOPT LIVE SIGNAL - {signal['timeframe']}**
+
+**Symbol**: {signal['symbol']}
+**Direction**: {signal['direction']}
+**Entry Price**: {signal['entry_price']:.4f}
+**Current Price**: {signal['current_price']:.4f}
+
+**Take Profit Levels**:
+TP1: {signal['tp_levels'][0]:.4f}
+TP2: {signal['tp_levels'][1]:.4f}
+TP3: {signal['tp_levels'][2]:.4f}
+
+**Stop Loss**: {signal['sl_level']:.4f}
+**Risk/Reward**: {signal['risk_reward']}
+
+**Time**: {signal['timestamp'].strftime('%H:%M:%S UTC')}
+
+**6-Step Validation**:
+✅ Liquidity Sweep ({signal['steps_passed'][0]})
+✅ Displacement ({signal['direction']})
+✅ Zone Retracement
+✅ Premium/Discount
+✅ Momentum Confirmation
+✅ Volume Confirmation
+
+*BingX API • Real-time Analysis*
+"""
+                        await self.send_telegram_alert(alert_msg)
+                        logging.info(f"📨 Telegram alert sent for {signal['symbol']}")
                         
             except Exception as e:
-                logging.error(f"❌ [{symbol} {timeframe}] Analysis error: {e}")
-
-    def generate_signal(self, symbol: str, timeframe: str, current_data: Dict) -> Optional[TradeSignal]:
-        """6-step RomeOPT signal generation with enhanced sensitivity"""
-        try:
-            # Pre-check: sufficient data for this timeframe
-            if (symbol not in self.price_data or 
-                timeframe not in self.price_data[symbol] or 
-                len(self.price_data[symbol][timeframe]) < 8):
-                return None
-
-            # ENHANCED STEP 1: More sensitive liquidity sweep detection
-            sweep_ok, sweep_info = self.step_1_liquidity_sweep(symbol, timeframe, current_data)
-            if not sweep_ok:
-                return None
-
-            # ENHANCED STEP 2: More flexible displacement detection
-            displacement_ok, displacement_info = self.step_2_displacement(symbol, timeframe, current_data, sweep_info)
-            if not displacement_ok:
-                return None
-            
-            direction = displacement_info['direction']
-
-            # ENHANCED STEP 3: Broader zone retracement
-            retracement_ok, zone_info = self.step_3_retracement_into_zone(
-                symbol, timeframe, current_data, sweep_info, displacement_info)
-            if not retracement_ok:
-                return None
-
-            # STEP 4: Premium/Discount
-            premium_ok, eq_info = self.step_4_premium_discount(symbol, timeframe, current_data, direction)
-            if not premium_ok:
-                return None
-
-            # ENHANCED STEP 5: More flexible HTF bias
-            htf_ok, bias_info = self.step_5_htf_bias_alignment(symbol, timeframe, direction)
-            if not htf_ok and bias_info.get('alignment') == 'MISALIGNED':
-                return None
-
-            # STEP 6: Momentum & Volatility
-            momentum_ok, confirmation_info = self.step_6_momentum_volatility_confirmation(
-                symbol, timeframe, current_data, direction)
-            if not momentum_ok:
-                return None
-
-            # ALL STEPS PASSED - Create signal
-            logging.info(f"🎯 [{symbol} {timeframe}] ALL 6 STEPS PASSED - Generating {direction} signal")
-            
-            entry_price = current_data['close']
-            tp_levels, sl_level = self.calculate_tp_sl(
-                symbol, timeframe, direction, entry_price, sweep_info, displacement_info)
-            
-            signal = TradeSignal(
-                symbol=symbol,
-                direction=direction,
-                entry_price=entry_price,
-                timestamp=datetime.now(),
-                timeframe=timeframe,
-                liquidity_sweep=sweep_info,
-                displacement=displacement_info,
-                retracement_zone=zone_info,
-                tp_levels=tp_levels,
-                sl_level=sl_level
-            )
-            
-            return signal
-            
-        except Exception as e:
-            logging.error(f"❌ [{symbol} {timeframe}] Signal generation error: {e}")
-            return None
-
-    # ==================== ENHANCED 6-STEP IMPLEMENTATIONS ====================
-
-    def step_1_liquidity_sweep(self, symbol: str, timeframe: str, current_data: Dict) -> Tuple[bool, Optional[Dict]]:
-        """ENHANCED Step 1: More sensitive liquidity sweep detection"""
-        try:
-            recent_data = self.price_data[symbol][timeframe]
-            if len(recent_data) < 6:
-                return False, None
-            
-            current_price = current_data['close']
-            current_high = current_data['high']
-            current_low = current_data['low']
-            
-            # Check last 8 candles for more opportunities
-            recent_lows = [candle['low'] for candle in recent_data[-8:]]
-            recent_highs = [candle['high'] for candle in recent_data[-8:]]
-            
-            # Bullish sweep (sweep of lows) - more sensitive
-            if len(recent_lows) >= 4:
-                # Look at previous 3 candles for liquidity levels
-                previous_lows = recent_lows[:-1]
-                min_previous_low = min(previous_lows)
-                
-                # ENHANCED: Allow smaller sweeps (0.1% instead of strict lower low)
-                sweep_threshold = 0.001  # 0.1%
-                if current_low <= min_previous_low * (1 + sweep_threshold) and current_price > min_previous_low:
-                    logging.info(f"✅ [{symbol} {timeframe}] Bullish sweep detected: {current_low:.4f} <= {min_previous_low:.4f}")
-                    return True, {
-                        'type': 'BULLISH_SWEEP',
-                        'sweep_level': min_previous_low,
-                        'current_low': current_low
-                    }
-            
-            # Bearish sweep (sweep of highs) - more sensitive
-            if len(recent_highs) >= 4:
-                previous_highs = recent_highs[:-1]
-                max_previous_high = max(previous_highs)
-                
-                # ENHANCED: Allow smaller sweeps
-                sweep_threshold = 0.001  # 0.1%
-                if current_high >= max_previous_high * (1 - sweep_threshold) and current_price < max_previous_high:
-                    logging.info(f"✅ [{symbol} {timeframe}] Bearish sweep detected: {current_high:.4f} >= {max_previous_high:.4f}")
-                    return True, {
-                        'type': 'BEARISH_SWEEP',
-                        'sweep_level': max_previous_high,
-                        'current_high': current_high
-                    }
-            
-            return False, None
-            
-        except Exception as e:
-            logging.error(f"❌ [{symbol} {timeframe}] Step 1 error: {e}")
-            return False, None
-
-    def step_2_displacement(self, symbol: str, timeframe: str, current_data: Dict, sweep_info: Dict) -> Tuple[bool, Optional[Dict]]:
-        """ENHANCED Step 2: More flexible displacement detection"""
-        try:
-            current_open = current_data['open']
-            current_high = current_data['high']
-            current_low = current_data['low']
-            current_close = current_data['close']
-            
-            candle_range = current_high - current_low
-            if candle_range == 0:
-                return False, None
-            
-            body_size = abs(current_close - current_open)
-            body_percentage = (body_size / candle_range) * 100
-            
-            # ENHANCED: More flexible impulse candle detection (50% instead of 60%)
-            if body_percentage >= 50:
-                direction = "BULLISH" if current_close > current_open else "BEARISH"
-                
-                # Validate alignment with sweep type
-                if (sweep_info['type'] == 'BULLISH_SWEEP' and direction == "BULLISH") or \
-                   (sweep_info['type'] == 'BEARISH_SWEEP' and direction == "BEARISH"):
-                    logging.info(f"✅ [{symbol} {timeframe}] Displacement detected: {direction} ({body_percentage:.1f}% body)")
-                    return True, {
-                        'direction': direction,
-                        'body_percentage': body_percentage,
-                        'impulse_candle': current_data
-                    }
-            
-            return False, None
-            
-        except Exception as e:
-            logging.error(f"❌ [{symbol} {timeframe}] Step 2 error: {e}")
-            return False, None
-
-    def step_3_retracement_into_zone(self, symbol: str, timeframe: str, current_data: Dict, 
-                                   sweep_info: Dict, displacement_info: Dict) -> Tuple[bool, Optional[Dict]]:
-        """ENHANCED Step 3: Broader zone retracement"""
-        try:
-            current_price = current_data['close']
-            direction = displacement_info['direction']
-            displacement_candle = displacement_info['impulse_candle']
-            
-            # ENHANCED: Define broader zone based on displacement candle
-            zone_extension = 0.002  # 0.2% extension for broader zones
-            zone_low = displacement_candle['low'] * (1 - zone_extension)
-            zone_high = displacement_candle['high'] * (1 + zone_extension)
-            
-            if direction == "BULLISH":
-                if zone_low <= current_price <= zone_high:
-                    logging.info(f"✅ [{symbol} {timeframe}] Retracement into bullish zone: {current_price:.4f} in [{zone_low:.4f}, {zone_high:.4f}]")
-                    return True, {
-                        'type': 'BULLISH_ZONE',
-                        'zone_low': zone_low,
-                        'zone_high': zone_high
-                    }
-            else:  # BEARISH
-                if zone_low <= current_price <= zone_high:
-                    logging.info(f"✅ [{symbol} {timeframe}] Retracement into bearish zone: {current_price:.4f} in [{zone_low:.4f}, {zone_high:.4f}]")
-                    return True, {
-                        'type': 'BEARISH_ZONE',
-                        'zone_low': zone_low,
-                        'zone_high': zone_high
-                    }
-            
-            return False, None
-            
-        except Exception as e:
-            logging.error(f"❌ [{symbol} {timeframe}] Step 3 error: {e}")
-            return False, None
-
-    def step_4_premium_discount(self, symbol: str, timeframe: str, current_data: Dict, direction: str) -> Tuple[bool, Optional[Dict]]:
-        """Step 4: Premium/Discount Check"""
-        try:
-            current_price = current_data['close']
-            equilibrium = self.calculate_equilibrium(symbol, timeframe)
-            
-            if direction == "BULLISH" and current_price < equilibrium:
-                return True, {'position': 'DISCOUNT'}
-            elif direction == "BEARISH" and current_price > equilibrium:
-                return True, {'position': 'PREMIUM'}
-            
-            return False, None
-            
-        except Exception as e:
-            logging.error(f"❌ [{symbol} {timeframe}] Step 4 error: {e}")
-            return False, None
-
-    def step_5_htf_bias_alignment(self, symbol: str, timeframe: str, direction: str) -> Tuple[bool, Optional[Dict]]:
-        """ENHANCED Step 5: More flexible HTF Bias Alignment"""
-        try:
-            # ENHANCED: Use price momentum as HTF bias proxy with timeframe context
-            if symbol not in self.htf_bias:
-                # Simple trend detection based on recent price action
-                recent_data = self.price_data.get(symbol, {}).get(timeframe, [])
-                if len(recent_data) >= 5:
-                    recent_closes = [candle['close'] for candle in recent_data[-5:]]
-                    price_trend = "BULLISH" if recent_closes[-1] > recent_closes[0] else "BEARISH"
-                    self.htf_bias[symbol] = price_trend
-                else:
-                    self.htf_bias[symbol] = "UNKNOWN"
-            
-            htf_bias = self.htf_bias[symbol]
-            
-            if htf_bias == "UNKNOWN":
-                return True, {'htf_bias': 'UNKNOWN', 'alignment': 'UNKNOWN'}
-            
-            if (direction == "BULLISH" and htf_bias == "BULLISH") or \
-               (direction == "BEARISH" and htf_bias == "BEARISH"):
-                logging.info(f"✅ [{symbol} {timeframe}] HTF alignment: {direction} signal with {htf_bias} bias")
-                return True, {'htf_bias': htf_bias, 'alignment': 'PERFECT'}
-            else:
-                # ENHANCED: Allow misalignment for testing and more signals
-                logging.info(f"⚠️ [{symbol} {timeframe}] HTF misalignment (ALLOWED): {direction} signal with {htf_bias} bias")
-                return True, {'htf_bias': htf_bias, 'alignment': 'MISALIGNED'}  # Changed to True for more signals
-            
-        except Exception as e:
-            logging.error(f"❌ [{symbol} {timeframe}] Step 5 error: {e}")
-            return True, {'htf_bias': 'UNKNOWN', 'alignment': 'UNKNOWN'}
-
-    def step_6_momentum_volatility_confirmation(self, symbol: str, timeframe: str, current_data: Dict, 
-                                              direction: str) -> Tuple[bool, Optional[Dict]]:
-        """Step 6: Momentum & Volatility Confirmation"""
-        try:
-            # Basic checks
-            volume_ok = current_data.get('volume', 0) > 1000
-            price_ok = current_data['close'] > 0.01
-            
-            if volume_ok and price_ok:
-                return True, {
-                    'volume_status': 'ADEQUATE',
-                    'price_status': 'NORMAL'
-                }
-            return False, None
-            
-        except Exception as e:
-            logging.error(f"❌ [{symbol} {timeframe}] Step 6 error: {e}")
-            return False, None
-
-    # ==================== UTILITY FUNCTIONS ====================
-
-    def calculate_equilibrium(self, symbol: str, timeframe: str) -> float:
-        """Calculate equilibrium price with timeframe context"""
-        recent_data = self.price_data.get(symbol, {}).get(timeframe, [])
-        if not recent_data:
-            return 0.0
+                logging.error(f"❌ {symbol}: Analysis failed: {e}")
+                continue
         
-        # Use more candles for higher timeframes
-        lookback = 15 if timeframe in ['15m', '30m'] else 10
-        recent_data = recent_data[-lookback:]
-        highs = [candle['high'] for candle in recent_data]
-        lows = [candle['low'] for candle in recent_data]
-        return (max(highs) + min(lows)) / 2
+        self.analysis_cycles += 1
+        logging.info(f"✅ Analysis cycle {self.analysis_cycles} completed - {signals_found} signals found")
 
-    def is_live_signal(self, signal: TradeSignal) -> bool:
-        """Check if signal is recent with timeframe consideration"""
-        signal_age = datetime.now() - signal.timestamp
-        # Longer validity for higher timeframes
-        max_ages = {
-            '1m': timedelta(minutes=5),
-            '3m': timedelta(minutes=8),
-            '5m': timedelta(minutes=12),
-            '15m': timedelta(minutes=20),
-        }
-        max_age = max_ages.get(signal.timeframe, timedelta(minutes=10))
-        return signal_age <= max_age
-
-    def calculate_tp_sl(self, symbol: str, timeframe: str, direction: str, entry_price: float,
-                       sweep_info: Dict, displacement_info: Dict) -> Tuple[List[float], float]:
-        """Calculate TP/SL levels with timeframe-based risk"""
-        # Adjust risk based on timeframe
-        risk_multipliers = {
-            '1m': 1.0,
-            '3m': 1.2,
-            '5m': 1.5,
-            '15m': 2.0,
-        }
-        risk_multiplier = risk_multipliers.get(timeframe, 1.0)
-        
-        if direction == "BULLISH":
-            sl = sweep_info['sweep_level'] * 0.998
-            risk = abs(entry_price - sl) * risk_multiplier
-            tp1 = entry_price + (risk * 1.5)
-            tp2 = entry_price + (risk * 2.5)
-            tp3 = displacement_info['impulse_candle']['high']
-        else:  # BEARISH
-            sl = sweep_info['sweep_level'] * 1.002
-            risk = abs(sl - entry_price) * risk_multiplier
-            tp1 = entry_price - (risk * 1.5)
-            tp2 = entry_price - (risk * 2.5)
-            tp3 = displacement_info['impulse_candle']['low']
-        
-        return [tp1, tp2, tp3], sl
-
-    # ==================== TRACKING & ALERTS ====================
-
-    async def track_active_signals(self):
+    async def track_signal_performance(self):
         """Track active signals for TP/SL hits"""
-        logging.info("🔍 Starting active signal tracking...")
-        
         while True:
             try:
                 current_time = datetime.now()
                 signals_to_remove = []
                 
                 for signal_id, signal in list(self.active_signals.items()):
-                    # Get current price (mock implementation)
-                    current_price = await self.get_current_price(signal.symbol)
+                    # Get current price
+                    current_price = await self.get_bingx_ticker(signal['symbol'])
+                    if not current_price:
+                        continue
                     
                     # Check TP levels
-                    for i, tp_level in enumerate(signal.tp_levels):
-                        if not signal.tp_hit[i]:
-                            if (signal.direction == "BULLISH" and current_price >= tp_level) or \
-                               (signal.direction == "BEARISH" and current_price <= tp_level):
-                                signal.tp_hit[i] = True
-                                logging.info(f"✅ [{signal.symbol} {signal.timeframe}] TP{i+1} HIT")
-                                await self.send_tp_alert(signal, i+1, tp_level, current_price)
+                    for i, tp_level in enumerate(signal['tp_levels']):
+                        tp_key = f'tp{i+1}_hit'
+                        if tp_key not in signal:
+                            if (signal['direction'] == "BULLISH" and current_price >= tp_level) or \
+                               (signal['direction'] == "BEARISH" and current_price <= tp_level):
+                                signal[tp_key] = True
+                                logging.info(f"✅ {signal['symbol']} TP{i+1} HIT!")
+                                
+                                # Send TP alert
+                                tp_msg = f"""
+✅ **TP{i+1} HIT - {signal['symbol']} {signal['timeframe']}**
+
+**Direction**: {signal['direction']}
+**Target Price**: {tp_level:.4f}
+**Current Price**: {current_price:.4f}
+**Entry Price**: {signal['entry_price']:.4f}
+
+**Time**: {datetime.now().strftime('%H:%M:%S UTC')}
+"""
+                                await self.send_telegram_alert(tp_msg)
                     
                     # Check SL
-                    if (signal.direction == "BULLISH" and current_price <= signal.sl_level) or \
-                       (signal.direction == "BEARISH" and current_price >= signal.sl_level):
-                        signal.status = "SL_HIT"
-                        logging.warning(f"❌ [{signal.symbol} {signal.timeframe}] SL HIT")
-                        await self.send_sl_alert(signal, current_price)
-                        signals_to_remove.append(signal_id)
+                    sl_key = 'sl_hit'
+                    if sl_key not in signal:
+                        if (signal['direction'] == "BULLISH" and current_price <= signal['sl_level']) or \
+                           (signal['direction'] == "BEARISH" and current_price >= signal['sl_level']):
+                            signal[sl_key] = True
+                            logging.warning(f"❌ {signal['symbol']} SL HIT!")
+                            signals_to_remove.append(signal_id)
+                            
+                            # Send SL alert
+                            sl_msg = f"""
+❌ **SL HIT - {signal['symbol']} {signal['timeframe']}**
+
+**Direction**: {signal['direction']}
+**Entry Price**: {signal['entry_price']:.4f}
+**Stop Loss**: {signal['sl_level']:.4f}
+**Current Price**: {current_price:.4f}
+
+**Time**: {datetime.now().strftime('%H:%M:%S UTC')}
+"""
+                            await self.send_telegram_alert(sl_msg)
                     
-                    # Remove old signals
-                    signal_age = current_time - signal.timestamp
+                    # Remove old signals (4 hours max)
+                    signal_age = current_time - signal['timestamp']
                     if signal_age > timedelta(hours=4):
                         signals_to_remove.append(signal_id)
                 
@@ -887,226 +592,84 @@ Scanner is now operational with enhanced signal detection!
                     if signal_id in self.active_signals:
                         del self.active_signals[signal_id]
                 
-                await asyncio.sleep(3)
+                await asyncio.sleep(10)  # Check every 10 seconds
                 
             except Exception as e:
                 logging.error(f"❌ Signal tracking error: {e}")
-                await asyncio.sleep(5)
+                await asyncio.sleep(30)
 
-    async def get_current_price(self, symbol: str) -> float:
-        """Get current price - mock implementation"""
-        base_prices = {
-            'BTC-USDT': 50000, 'ETH-USDT': 3000, 'BNB-USDT': 600, 'SOL-USDT': 100, 'XRP-USDT': 0.5,
-            'ADA-USDT': 0.4, 'AVAX-USDT': 40, 'DOGE-USDT': 0.1, 'DOT-USDT': 7, 'TRX-USDT': 0.1,
-            'LINK-USDT': 15, 'MATIC-USDT': 0.8, 'LTC-USDT': 70, 'BCH-USDT': 300, 'ATOM-USDT': 10,
-            'XLM-USDT': 0.12, 'FIL-USDT': 5, 'ETC-USDT': 30, 'XTZ-USDT': 1, 'XMR-USDT': 150,
-            'EOS-USDT': 0.8, 'AAVE-USDT': 100, 'ALGO-USDT': 0.2, 'NEO-USDT': 12, 'MKR-USDT': 2000,
-        }
-        base_price = base_prices.get(symbol, 50)
-        return base_price * (1 + random.uniform(-0.02, 0.02))
-
-    async def send_signal_alert(self, signal: TradeSignal):
-        """Send signal alert to Telegram with timeframe info"""
-        message = f"""
-🎯 **ROMEOPT LIVE SIGNAL - {signal.timeframe}**
-
-**Symbol**: {signal.symbol}
-**Timeframe**: {signal.timeframe}
-**Direction**: {signal.direction}
-**Entry Price**: {signal.entry_price:.4f}
-
-**Take Profit Levels**:
-TP1: {signal.tp_levels[0]:.4f}
-TP2: {signal.tp_levels[1]:.4f}
-TP3: {signal.tp_levels[2]:.4f}
-
-**Stop Loss**: {signal.sl_level:.4f}
-
-**Time**: {signal.timestamp.strftime('%H:%M:%S UTC')}
-
-**6-Step Validation**:
-✅ Liquidity Sweep ({signal.liquidity_sweep['type']})
-✅ Displacement ({signal.displacement['direction']})
-✅ Zone Retracement
-✅ Premium/Discount
-✅ HTF Alignment
-✅ Momentum Confirmation
-"""
-        await self.send_telegram_alert(message)
-
-    async def send_tp_alert(self, signal: TradeSignal, tp_level: int, target_price: float, current_price: float):
-        """Send TP hit alert with timeframe info"""
-        message = f"""
-✅ **TP{tp_level} HIT - {signal.symbol} {signal.timeframe}**
-
-**Direction**: {signal.direction}
-**Target Price**: {target_price:.4f}
-**Current Price**: {current_price:.4f}
-**Entry Price**: {signal.entry_price:.4f}
-**Timeframe**: {signal.timeframe}
-
-**Time**: {datetime.now().strftime('%H:%M:%S UTC')}
-"""
-        await self.send_telegram_alert(message)
-
-    async def send_sl_alert(self, signal: TradeSignal, current_price: float):
-        """Send SL hit alert with timeframe info"""
-        message = f"""
-❌ **SL HIT - {signal.symbol} {signal.timeframe}**
-
-**Direction**: {signal.direction}
-**Entry Price**: {signal.entry_price:.4f}
-**Stop Loss**: {signal.sl_level:.4f}
-**Current Price**: {current_price:.4f}
-**Timeframe**: {signal.timeframe}
-
-**Time**: {datetime.now().strftime('%H:%M:%S UTC')}
-"""
-        await self.send_telegram_alert(message)
-
-    async def send_telegram_alert(self, message: str):
-        """Send message to Telegram with error handling"""
-        url = f"https://api.telegram.org/bot{self.telegram_token}/sendMessage"
-        payload = {
-            'chat_id': self.telegram_chat_id,
-            'text': message,
-            'parse_mode': 'HTML'
-        }
-        
-        try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                async with session.post(url, json=payload) as response:
-                    if response.status == 200:
-                        logging.debug("✅ Telegram alert sent successfully")
-                    else:
-                        error_text = await response.text()
-                        logging.error(f"❌ Telegram alert failed: {response.status} - {error_text}")
-        except asyncio.TimeoutError:
-            logging.error("❌ Telegram alert timeout")
-        except Exception as e:
-            logging.error(f"❌ Telegram alert error: {e}")
-
-    async def monitor_performance(self):
-        """Monitor and report scanner performance"""
-        logging.info("📊 Starting performance monitoring...")
-        
-        initial_report_sent = False
-        
+    async def send_status_update(self):
+        """Send periodic status updates"""
         while True:
             try:
-                # Calculate statistics
-                total_streams = sum(len(timeframes) for timeframes in self.price_data.values())
-                active_signals = len(self.active_signals)
-                uptime_minutes = (datetime.now() - self.startup_time).total_seconds() / 60
+                uptime = datetime.now() - self.start_time
+                hours = uptime.total_seconds() / 3600
                 
-                # Log performance every 5 minutes
-                if int(uptime_minutes) % 5 == 0:
-                    logging.info(
-                        f"📊 PERFORMANCE: {total_streams}/{(len(self.symbols) * len(self.timeframes))} streams with data, "
-                        f"{self.data_messages_received} messages received, "
-                        f"{active_signals} active signals, {self.signals_analyzed} analyzed, "
-                        f"{self.signals_generated} generated, {uptime_minutes:.1f}m uptime"
-                    )
-                
-                # Send initial data collection report
-                if not initial_report_sent and total_streams > 10:
-                    report_msg = f"""
-📊 **ENHANCED DATA COLLECTION STARTED**
+                status_msg = f"""
+📊 **BINGX SCANNER STATUS**
 
-• **Active Streams**: {total_streams}/{(len(self.symbols) * len(self.timeframes))}
-• **Coins**: {len(self.symbols)}
-• **Timeframes**: {len(self.timeframes)}
-• **Messages Received**: {self.data_messages_received}
-• **Uptime**: {uptime_minutes:.1f} minutes
+• **Uptime**: {hours:.1f} hours
+• **Analysis Cycles**: {self.analysis_cycles}
+• **Signals Generated**: {self.real_signals_generated}
+• **Active Signals**: {len(self.active_signals)}
+• **Coins**: {len(self.coins)}
+• **Timeframe**: {self.timeframe}
 
-**Status**: 🟢 COLLECTING MARKET DATA
-**Enhanced Sensitivity**: ✅ ENABLED
-**Analysis**: Ready for RomeOPT signals across all timeframes
+**Status**: 🟢 OPERATIONAL
+**Last Update**: {datetime.now().strftime('%H:%M UTC')}
 """
-                    await self.send_telegram_alert(report_msg)
-                    initial_report_sent = True
-                
-                await asyncio.sleep(60)
+                await self.send_telegram_alert(status_msg)
+                await asyncio.sleep(3600)  # Every hour
                 
             except Exception as e:
-                logging.error(f"❌ Performance monitoring error: {e}")
-                await asyncio.sleep(60)
-
-    # ==================== MAIN SCANNER ====================
+                logging.error(f"Status update error: {e}")
+                await asyncio.sleep(3600)
 
     async def start_scanner(self):
-        """Main scanner entry point"""
-        logging.info("🚀 STARTING ENHANCED ROMEOPT SCANNER...")
+        """Main scanner loop"""
+        logging.info("🚀 STARTING BINGX ROMEOPT SCANNER")
         
-        try:
-            # Send startup message
-            await self.send_startup_message()
-            await asyncio.sleep(2)
+        # Send startup message
+        startup_msg = f"""
+🚀 **BINGX ROMEOPT SCANNER STARTED**
+
+• **Coins**: {', '.join(self.coins)}
+• **Timeframe**: {self.timeframe}
+• **Analysis Interval**: {self.analysis_interval}s
+• **Start Time**: {self.start_time.strftime('%Y-%m-%d %H:%M UTC')}
+
+**Status**: 🟢 INITIALIZING
+**Strategy**: 6-Step RomeOPT Validation
+"""
+        await self.send_telegram_alert(startup_msg)
+        
+        # Start background tasks
+        asyncio.create_task(self.track_signal_performance())
+        asyncio.create_task(self.send_status_update())
+        
+        # Main analysis loop
+        while True:
+            cycle_start = datetime.now()
             
-            # Start all components
-            logging.info("🔄 Starting scanner components...")
-            
-            # Start WebSocket feeds
-            asyncio.create_task(self.start_websocket_feeds())
-            
-            # Start signal tracking
-            asyncio.create_task(self.track_active_signals())
-            
-            # Start performance monitoring
-            asyncio.create_task(self.monitor_performance())
-            
-            logging.info("✅ ENHANCED ROMEOPT SCANNER FULLY OPERATIONAL")
-            
-            # Send operational message
-            await self.send_telegram_alert("🟢 **ENHANCED SCANNER OPERATIONAL**: Monitoring 25 coins across 4 timeframes with enhanced sensitivity!")
-            
-            # Keep main loop alive
-            while True:
-                await asyncio.sleep(30)
-                # Occasional heartbeat
-                if random.random() < 0.05:  # 5% chance
-                    logging.info("💓 Enhanced scanner heartbeat - running normally")
-                
-        except Exception as e:
-            error_msg = f"❌ ENHANCED SCANNER CRITICAL ERROR: {str(e)}"
-            logging.error(error_msg)
             try:
-                await self.send_telegram_alert(f"🔴 **ENHANCED SCANNER FAILED**: {str(e)}")
-            except:
-                pass
-            raise
+                await self.analyze_all_coins()
+            except Exception as e:
+                logging.error(f"❌ Main analysis cycle failed: {e}")
+                await asyncio.sleep(30)
+                continue
+            
+            # Realistic timing control
+            cycle_time = (datetime.now() - cycle_start).total_seconds()
+            wait_time = max(5, self.analysis_interval - cycle_time)
+            
+            logging.info(f"⏰ Cycle took {cycle_time:.1f}s, waiting {wait_time:.1f}s")
+            await asyncio.sleep(wait_time)
 
-# ==================== EXECUTION ====================
-
+# 🎯 RUN THE REAL SCANNER
 async def main():
-    """Main execution function"""
-    try:
-        scanner = RomeOPTScanner()
-        await scanner.start_scanner()
-    except Exception as e:
-        logging.critical(f"❌ ENHANCED SCANNER FAILED TO START: {e}")
-        # Final attempt to send failure alert
-        try:
-            import os
-            telegram_token = os.getenv('TELEGRAM_BOT_TOKEN')
-            chat_id = os.getenv('TELEGRAM_CHAT_ID')
-            if telegram_token and chat_id:
-                url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
-                payload = {
-                    'chat_id': chat_id,
-                    'text': f'🔴 **ENHANCED SCANNER CRASHED**: {str(e)}',
-                    'parse_mode': 'HTML'
-                }
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(url, json=payload) as response:
-                        pass
-        except:
-            pass
+    scanner = BingXRomeOPTScanner()
+    await scanner.start_scanner()
 
 if __name__ == "__main__":
-    # Windows compatibility
-    if os.name == 'nt':
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    
-    logging.info("🎯 ENHANCED ROMEOPT SCANNER STARTING...")
+    logging.info("🎯 STARTING BINGX ROMEOPT SCANNER - PRODUCTION READY")
     asyncio.run(main())
