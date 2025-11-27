@@ -15,7 +15,6 @@ from concurrent.futures import ThreadPoolExecutor
 from asyncio import Semaphore
 import random
 import gzip
-import brotli
 
 # Configure comprehensive logging
 logging.basicConfig(
@@ -141,14 +140,14 @@ class RomeOPTScanner:
 🚀 **ROMEOPT SCANNER STARTED SUCCESSFULLY**
 
 **Configuration:**
-• **Version**: Compression Fixed v5.0
+• **Version**: GZIP Compression Fixed v6.0
 • **Start Time**: {self.startup_time.strftime('%Y-%m-%d %H:%M:%S UTC')}
 • **Coins Monitoring**: {len(self.symbols)}
 • **Timeframe**: {self.timeframe}
 • **Environment**: ✅ All variables loaded
 
 **WebSocket Status**: Starting connections...
-**Data Compression**: GZIP/Brotli support enabled
+**Data Compression**: GZIP support enabled
 **Analysis Engine**: Ready
 
 Scanner is now starting...
@@ -282,12 +281,18 @@ Scanner is now starting...
                     return
             
             elif isinstance(message, bytes):
-                # Handle compressed data
+                # Handle compressed data with GZIP
                 decompressed_data = await self.decompress_message(message)
                 if decompressed_data:
                     await self.handle_websocket_data(symbol, decompressed_data)
                 else:
-                    logging.warning(f"📨 [{symbol}] Failed to decompress binary message")
+                    # Try direct decoding as fallback
+                    try:
+                        decoded_message = message.decode('utf-8')
+                        data = json.loads(decoded_message)
+                        await self.handle_websocket_data(symbol, data)
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        logging.warning(f"📨 [{symbol}] Failed to process binary message")
                     return
             
             else:
@@ -298,35 +303,28 @@ Scanner is now starting...
             logging.error(f"❌ [{symbol}] Message processing error: {e}")
 
     async def decompress_message(self, compressed_data: bytes) -> Optional[Dict]:
-        """Decompress WebSocket message using multiple methods"""
+        """Decompress WebSocket message using GZIP"""
         try:
-            # Try GZIP decompression first
+            # Try GZIP decompression
             try:
                 decompressed = gzip.decompress(compressed_data)
                 data = json.loads(decompressed.decode('utf-8'))
                 logging.debug("✅ Used GZIP decompression")
                 return data
             except (gzip.BadGzipFile, OSError):
-                pass
-            
-            # Try Brotli decompression
-            try:
-                decompressed = brotli.decompress(compressed_data)
-                data = json.loads(decompressed.decode('utf-8'))
-                logging.debug("✅ Used Brotli decompression")
-                return data
-            except brotli.error:
+                logging.debug("❌ Not GZIP compressed")
                 pass
             
             # Try direct JSON parsing (might be already decompressed)
             try:
                 data = json.loads(compressed_data.decode('utf-8'))
-                logging.debug("✅ Direct JSON parsing")
+                logging.debug("✅ Direct JSON parsing from bytes")
                 return data
             except (UnicodeDecodeError, json.JSONDecodeError):
+                logging.debug("❌ Not direct JSON")
                 pass
             
-            logging.warning("❌ Failed to decompress message with all methods")
+            logging.warning("❌ Failed to decompress message")
             return None
             
         except Exception as e:
@@ -336,9 +334,9 @@ Scanner is now starting...
     async def handle_websocket_data(self, symbol: str, data: Dict):
         """Process incoming WebSocket data"""
         try:
-            # Log raw data occasionally for debugging
-            if random.random() < 0.01:  # 1% of messages
-                logging.debug(f"📨 [{symbol}] Raw data: {json.dumps(data)[:200]}...")
+            # Log raw data occasionally for debugging (first few messages)
+            if self.data_messages_received <= 10:
+                logging.info(f"📨 [{symbol}] Message #{self.data_messages_received}: {json.dumps(data)[:200]}...")
             
             # Handle different data formats from BingX
             candle_data = None
@@ -347,7 +345,7 @@ Scanner is now starting...
                 candle_data = data['data']
                 logging.debug(f"📊 [{symbol}] Using 'data' field")
             elif 'k' in data:
-                candle_data = data['k']
+                candle_data = data['k'] 
                 logging.debug(f"📊 [{symbol}] Using 'k' field")
             elif 'e' in data and data['e'] == 'kline':
                 candle_data = data
@@ -375,7 +373,9 @@ Scanner is now starting...
                 self.price_data[symbol] = self.price_data[symbol][-30:]
             
             # Log data collection progress
-            if len(self.price_data[symbol]) % 5 == 0:
+            if len(self.price_data[symbol]) == 1:
+                logging.info(f"📈 [{symbol}] First candle received: {current_candle['close']:.4f}")
+            elif len(self.price_data[symbol]) % 10 == 0:
                 logging.info(f"📈 [{symbol}] Collected {len(self.price_data[symbol])} candles - Latest: {current_candle['close']:.4f}")
             
             # Schedule analysis for forming candles
@@ -392,7 +392,7 @@ Scanner is now starting...
             timestamp = candle_data.get('t') or candle_data.get('T') or candle_data.get('time')
             open_price = candle_data.get('o') or candle_data.get('O')
             high_price = candle_data.get('h') or candle_data.get('H')
-            low_price = candle_data.get('l') or candle_data.get('L')
+            low_price = candle_data.get('l') or candle_data.get('L') 
             close_price = candle_data.get('c') or candle_data.get('C')
             volume = candle_data.get('v') or candle_data.get('V')
             is_closed = candle_data.get('x') or candle_data.get('X') or candle_data.get('isClosed')
