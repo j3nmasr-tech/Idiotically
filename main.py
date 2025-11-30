@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 
 """
-PRODUCTION SCANNER - ALL ORIGINAL LOGIC + ALL WINNER FILTERS
-- Your exact SMC core + ATR TP/SL + SL-cluster
-- BTC direction filter
-- Higher timeframe alignment 
-- Momentum confirmation
-- Zone quality detection
-- Market condition filter
+LIVE ROMEOPT 6-STEP SCANNER
+- Fully live early signals
+- RomeOPT 6-step logic
+- TP/SL tracking with ATR or OB
+- Telegram alerts
+- Async SQLite logging
+- Minimal filters for maximum early detection
 """
 
 import os, time, asyncio, logging, datetime
@@ -20,26 +20,23 @@ from fastapi import FastAPI, Request, HTTPException
 import uvicorn
 from collections import defaultdict, deque
 
-# ---------------- EXACT ORIGINAL CONFIG ----------------
+# ---------------- CONFIG ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))  # very fast scan
 TOP_N = int(os.getenv("TOP_N", 40))
-MIN_VOLUME = float(os.getenv("MIN_VOLUME", 1000000))
-MAX_SPREAD = float(os.getenv("MAX_SPREAD", 0.002))
+TIMEFRAMES = ["1m", "3m", "5m"]
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", 3600))
-DAILY_SUMMARY_HOUR = int(os.getenv("DAILY_SUMMARY_HOUR", 23))
-TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
 
-# ---------------- EXACT ORIGINAL LOGGING ----------------
+# ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-log = logging.getLogger("smc_bot")
+log = logging.getLogger("romeopt_bot")
 db_lock = asyncio.Lock()
 
-# ---------------- EXACT ORIGINAL TELEGRAM ----------------
+# ---------------- TELEGRAM ----------------
 def escape_html(msg: str) -> str:
     if not msg: return "-"
     return str(msg).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -53,7 +50,7 @@ async def tg(msg: str):
             await client.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": safe_msg, "parse_mode":"HTML"})
         except: pass
 
-# ---------------- EXACT ORIGINAL DATABASE ----------------
+# ---------------- DATABASE ----------------
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
@@ -75,21 +72,14 @@ async def init_db():
             tp3_hit INTEGER DEFAULT 0
         );
         """)
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS pauses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            reason TEXT,
-            timestamp TEXT
-        );
-        """)
         await db.commit()
 
-# ---------------- EXACT ORIGINAL OHLCV ----------------
+# ---------------- OHLCV ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
     try: return await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     except: return None
 
-# ---------------- EXACT ORIGINAL INDICATORS ----------------
+# ---------------- INDICATORS ----------------
 def atr(df: pd.DataFrame, period=14):
     high, low, close = df["high"], df["low"], df["close"]
     tr = pd.DataFrame({
@@ -99,120 +89,99 @@ def atr(df: pd.DataFrame, period=14):
     }).max(axis=1)
     return tr.rolling(period, min_periods=1).mean()
 
-def sma(series: pd.Series, period: int):
-    return series.rolling(period, min_periods=1).mean()
-
-# ---------------- EXACT ORIGINAL SMC CORE ----------------
-def detect_swing_points(df: pd.DataFrame):
-    if len(df) < 5: return None
-    last = df.iloc[-1]; prev = df.iloc[-3:-1]
-    swing_high = last["high"] > prev["high"].max()
-    swing_low = last["low"] < prev["low"].min()
-    return swing_high, swing_low
-
-def detect_active_range(df: pd.DataFrame, lookback=10):
-    last = df.iloc[-lookback:]
-    return last["high"].max(), last["low"].min()
-
-def detect_liquidity_pools(df: pd.DataFrame):
-    hh, ll = detect_swing_points(df)
-    return hh, ll
-
-def detect_sweep(df: pd.DataFrame):
-    if len(df) < 6: return False, False
-    last = df.iloc[-1]; prev = df.iloc[-5:-1]
-    return last["high"] > prev["high"].max(), last["low"] < prev["low"].min()
-
-def detect_bos_mss(df: pd.DataFrame):
-    hh, ll = detect_sweep(df)
-    return hh, ll
-
-def detect_fvg(df: pd.DataFrame):
-    if len(df) < 3: return False, False
-    c1, c2, c3 = df.iloc[-3], df.iloc[-2], df.iloc[-1]
-    bull = c2["low"] > c1["high"] and c3["low"] > c2["high"]
-    bear = c2["high"] < c1["low"] and c3["high"] < c2["low"]
-    return bull, bear
-
-def detect_order_blocks(df: pd.DataFrame):
-    if len(df) < 3: return None, None, None
-    candle = df.iloc[-3]
-    if candle["close"] > candle["open"]:
-        return "bullish", candle["open"], candle["low"]
-    return "bearish", candle["high"], candle["open"]
-
-# ---------------- EXACT ORIGINAL SL-CLUSTER ----------------
-recent_sl = defaultdict(lambda: deque())
-def record_sl_hit(symbol: str, lookback_minutes=30):
-    now = time.time(); dq = recent_sl[symbol]; dq.append(now)
-    cutoff = now - lookback_minutes * 60
-    while dq and dq[0] < cutoff: dq.popleft()
-    
-def deprioritized(symbol: str, threshold=3, lookback=30):
-    dq = recent_sl[symbol]; now = time.time(); cutoff = now - lookback * 60
-    while dq and dq[0] < cutoff: dq.popleft()
-    return len(dq) >= threshold
-
-# ---------------- EXACT ORIGINAL SIGNAL GENERATOR ----------------
-def generate_signal(df: pd.DataFrame, symbol: str, context=None):
-    if context is None: context = {}
-    tf = context.get("tf","15m")
+# ---------------- ROMEOPT 6-STEP SIGNAL ----------------
+def generate_signal_romeopt(df: pd.DataFrame, symbol: str):
+    """
+    RomeOPT 6-step live logic:
+    1. Early Liquidity Sweep
+    2. Early Displacement
+    3. Early Zone Approach
+    4. Relaxed Premium/Discount
+    5. Relaxed HTF Alignment
+    6. Early Momentum
+    """
 
     if df is None or len(df) < 6: return None
+    last = df.iloc[-1]
+    prev5 = df.iloc[-6:-1]
 
-    last = df["close"].iloc[-1]
+    score = 0
+    reasons = []
 
-    ob_type, ob_hi, ob_lo = detect_order_blocks(df)
-    if ob_type is None: return None
+    # Step 1: Early Liquidity Sweep
+    sweep_high = last["high"] > prev5["high"].max()
+    sweep_low = last["low"] < prev5["low"].min()
+    if sweep_high or sweep_low:
+        score += 2
+        reasons.append("Liquidity Sweep +2")
+    else:
+        reasons.append("No Sweep +0")
 
-    bull_fvg, bear_fvg = detect_fvg(df)
-    sweep_h, sweep_l = detect_sweep(df)
-    bos_hh, bos_ll = detect_bos_mss(df)
+    # Step 2: Early Displacement (momentum candle)
+    displacement = abs(last["close"] - last["open"]) / (last["high"] - last["low"] + 1e-8)
+    if displacement > 0.6:
+        score += 2
+        reasons.append("Displacement +2")
+    else:
+        reasons.append("No Displacement +0")
 
-    if not (bos_hh or bos_ll): return None
+    # Step 3: Early Zone Approach (approaching OB)
+    ob_type = None
+    ob_hi, ob_lo = last["high"], last["low"]
+    candle = df.iloc[-3]
+    if candle["close"] > candle["open"]:
+        ob_type = "bullish"
+        ob_lo = candle["low"]
+        ob_hi = candle["open"]
+    else:
+        ob_type = "bearish"
+        ob_lo = candle["open"]
+        ob_hi = candle["high"]
 
-    score = 0; reasons = []
+    if ob_type == "bullish" and last["close"] <= ob_hi:
+        score += 1; reasons.append("Zone Approach +1")
+    elif ob_type == "bearish" and last["close"] >= ob_lo:
+        score += 1; reasons.append("Zone Approach +1")
+    else:
+        reasons.append("Zone Approach +0")
 
-    if ob_type=="bullish": score+=2; reasons.append("OB Bull +2")
-    else: score+=2; reasons.append("OB Bear +2")
+    # Step 4: Relaxed Premium/Discount
+    range_high = df["high"].tail(10).max()
+    range_low = df["low"].tail(10).min()
+    pos = (last["close"] - range_low) / (range_high - range_low + 1e-8)
+    if ob_type=="bullish" and pos < 0.6:
+        score +=1; reasons.append("Premium/Discount +1")
+    elif ob_type=="bearish" and pos > 0.4:
+        score +=1; reasons.append("Premium/Discount +1")
+    else:
+        reasons.append("Premium/Discount +0")
 
-    if bull_fvg: score+=2; reasons.append("FVG Bull +2")
-    elif bear_fvg: score+=2; reasons.append("FVG Bear +2")
+    # Step 5: Relaxed HTF Alignment (skip strict EMA)
+    score +=1; reasons.append("HTF Relaxed +1")
 
-    score+=2; reasons.append("BOS +2")
-    if sweep_h or sweep_l: score+=1; reasons.append("Sweep +1")
-    else: reasons.append("No Sweep +0")
+    # Step 6: Early Momentum
+    if ob_type=="bullish" and last["close"] > last["open"]:
+        score +=1; reasons.append("Momentum +1")
+    elif ob_type=="bearish" and last["close"] < last["open"]:
+        score +=1; reasons.append("Momentum +1")
+    else:
+        reasons.append("Momentum +0")
 
     side = "BUY" if ob_type=="bullish" else "SELL"
 
-    # EXACT ORIGINAL ATR-based TP/SL
-    atr_val = None
-    df15 = context.get("df_15m")
-    if df15 is not None and len(df15)>=10:
-        atr_val = float(atr(df15,14).iloc[-1])
-    entry = float(last)
-    tp_mult, sl_mult = 0.8, 1.0
-    if atr_val:
-        if side=="BUY":
-            sl = entry - sl_mult*atr_val
-            tp1 = entry + tp_mult*atr_val
-            tp2 = entry + tp_mult*1.5*atr_val
-            tp3 = entry + tp_mult*2.5*atr_val
-        else:
-            sl = entry + sl_mult*atr_val
-            tp1 = entry - tp_mult*atr_val
-            tp2 = entry - tp_mult*1.5*atr_val
-            tp3 = entry - tp_mult*2.5*atr_val
+    # TP/SL calculation
+    atr_val = float(atr(df,14).iloc[-1])
+    entry = float(last["close"])
+    if side=="BUY":
+        sl = entry - atr_val
+        tp1 = entry + 0.8*atr_val
+        tp2 = entry + 1.5*atr_val
+        tp3 = entry + 2.5*atr_val
     else:
-        if side=="BUY":
-            sl = float(ob_lo)
-            tp1 = entry*1.004; tp2 = entry*1.008; tp3 = entry*1.012
-        else:
-            sl = float(ob_hi)
-            tp1 = entry*0.996; tp2 = entry*0.992; tp3 = entry*0.988
-
-    if sl==entry:
-        sl = entry - entry*0.002 if side=="BUY" else entry + entry*0.002
+        sl = entry + atr_val
+        tp1 = entry - 0.8*atr_val
+        tp2 = entry - 1.5*atr_val
+        tp3 = entry - 2.5*atr_val
 
     return {
         "symbol": symbol,
@@ -223,11 +192,22 @@ def generate_signal(df: pd.DataFrame, symbol: str, context=None):
         "tp2": tp2,
         "tp3": tp3,
         "score": score,
-        "reason": "Set B SMC Signal",
+        "reason": "RomeOPT 6-Step",
         "reason_list": reasons
     }
 
-# ---------------- EXACT ORIGINAL LOG SIGNAL ----------------
+# ---------------- SL CLUSTER ----------------
+recent_sl = defaultdict(lambda: deque())
+def record_sl_hit(symbol: str, lookback_minutes=30):
+    now = time.time(); dq = recent_sl[symbol]; dq.append(now)
+    cutoff = now - lookback_minutes*60
+    while dq and dq[0]<cutoff: dq.popleft()
+def deprioritized(symbol: str, threshold=3, lookback=30):
+    dq = recent_sl[symbol]; now=time.time(); cutoff=now-lookback*60
+    while dq and dq[0]<cutoff: dq.popleft()
+    return len(dq)>=threshold
+
+# ---------------- LOG SIGNAL ----------------
 async def log_signal(sig):
     async with db_lock:
         async with aiosqlite.connect(DB_PATH) as db:
@@ -238,85 +218,12 @@ async def log_signal(sig):
                   datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"]))
             await db.commit()
 
-# ---------------- WINNER FILTERS ----------------
-def get_btc_direction(btc_15m, btc_1h):
-    """BTC direction detection"""
-    if btc_15m is None or btc_1h is None: return "NEUTRAL"
-    try:
-        price = btc_15m['close'].iloc[-1]
-        ema_1h_50 = btc_1h['close'].ewm(span=50).mean().iloc[-1]
-        ema_15m_20 = btc_15m['close'].ewm(span=20).mean().iloc[-1]
-        
-        if price > ema_1h_50 and price > ema_15m_20: return "BULLISH"
-        elif price < ema_1h_50 and price < ema_15m_20: return "BEARISH"
-        else: return "NEUTRAL"
-    except: return "NEUTRAL"
-
-def is_trade_allowed(signal_side, btc_direction):
-    """BTC BULLISH: Only BUY allowed | BTC BEARISH: Only SELL allowed"""
-    if btc_direction == "BULLISH": return signal_side == "BUY"
-    elif btc_direction == "BEARISH": return signal_side == "SELL"
-    else: return True
-
-def check_higher_tf_alignment(signal, higher_tf_data):
-    """Higher timeframe alignment filter"""
-    if higher_tf_data is None or len(higher_tf_data) < 20:
-        return False
-    current_price = signal['entry']
-    higher_tf_ema_20 = higher_tf_data['close'].ewm(span=20).mean().iloc[-1]
-    higher_tf_ema_50 = higher_tf_data['close'].ewm(span=50).mean().iloc[-1]
-    if signal['side'] == 'BUY':
-        return current_price > higher_tf_ema_20 and current_price > higher_tf_ema_50
-    else:
-        return current_price < higher_tf_ema_20 and current_price < higher_tf_ema_50
-
-def check_momentum_confirmation(df, signal_direction):
-    """Momentum confirmation filter"""
-    if len(df) < 3: return False
-    current_candle = df.iloc[-1]
-    prev_candle = df.iloc[-2]
-    if signal_direction == 'BUY':
-        return (current_candle['close'] > current_candle['open'] and 
-                current_candle['close'] > prev_candle['close'])
-    else:
-        return (current_candle['close'] < current_candle['open'] and
-                current_candle['close'] < prev_candle['close'])
-
-def check_entry_zone_quality(df, signal_direction):
-    """Zone quality detection"""
-    if len(df) < 15: return False
-    recent_high = df['high'].tail(15).max()
-    recent_low = df['low'].tail(15).min()
-    current_price = df['close'].iloc[-1]
-    if recent_high == recent_low: return False
-    range_position = (current_price - recent_low) / (recent_high - recent_low)
-    if signal_direction == 'BUY':
-        return range_position < 0.3
-    else:
-        return range_position > 0.7
-
-def detect_choppy_market(df):
-    """Market condition filter"""
-    if len(df) < 25: return True
-    high, low, close = df['high'], df['low'], df['close']
-    tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    true_range = pd.DataFrame({'tr1': tr1, 'tr2': tr2, 'tr3': tr3}).max(axis=1)
-    atr = true_range.rolling(14).mean().iloc[-1]
-    current_price = close.iloc[-1]
-    price_range_pct = (df['high'].tail(20).max() - df['low'].tail(20).min()) / current_price
-    return (atr < (current_price * 0.002) and price_range_pct < 0.02)
-
-# ---------------- EXACT ORIGINAL MONITOR ----------------
+# ---------------- MONITOR SIGNALS ----------------
 async def monitor_signals(exchange):
     while True:
         try:
             async with aiosqlite.connect(DB_PATH) as db:
-                async with db.execute("""
-                    SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,tp1_hit,tp2_hit,tp3_hit,status 
-                    FROM signals WHERE status='OPEN'
-                """) as cursor:
+                async with db.execute("SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,tp1_hit,tp2_hit,tp3_hit,status FROM signals WHERE status='OPEN'") as cursor:
                     async for row in cursor:
                         sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status = row
                         ticker = await exchange.fetch_ticker(symbol)
@@ -341,107 +248,42 @@ async def monitor_signals(exchange):
                         if sl_hit: record_sl_hit(symbol)
 
                         async with db_lock:
-                            await db.execute("""
-                                UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?
-                            """,(tp1_hit,tp2_hit,tp3_hit,status,sig_id))
+                            await db.execute("UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?",
+                                             (tp1_hit,tp2_hit,tp3_hit,status,sig_id))
                 await db.commit()
         except Exception as e: log.exception("monitor error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
 
-# ---------------- OPTIMIZED SCAN LOOP WITH ALL FILTERS ----------------
+# ---------------- SCAN LOOP ----------------
 last_signal_time = {}
 async def scan_loop(exchange):
     while True:
         t0=time.time()
         try:
-            # Get BTC direction first
-            btc_15m_data = await fetch_ohlcv(exchange, "BTC/USDT", "15m", 100)
-            btc_1h_data = await fetch_ohlcv(exchange, "BTC/USDT", "1h", 100)
-            btc_15m = pd.DataFrame(btc_15m_data, columns=["ts","open","high","low","close","vol"]) if btc_15m_data else None
-            btc_1h = pd.DataFrame(btc_1h_data, columns=["ts","open","high","low","close","vol"]) if btc_1h_data else None
-            btc_direction = get_btc_direction(btc_15m, btc_1h)
-            log.info(f"🎯 BTC Direction: {btc_direction}")
-            
-            # Get top coins
             tickers = await exchange.fetch_tickers()
-            top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")], 
-                        key=lambda x:x[1], reverse=True)[:TOP_N]
-            
+            top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")], key=lambda x:x[1], reverse=True)[:TOP_N]
             signals_found = 0
             for symbol,_ in top:
                 if deprioritized(symbol): continue
-                ohlcvs={}
                 for tf in TIMEFRAMES:
                     key=f"{symbol}:{tf}"
-                    if key in last_signal_time and time.time()-last_signal_time[key]<1800: continue
+                    if key in last_signal_time and time.time()-last_signal_time[key]<60: continue
                     ohlcv = await fetch_ohlcv(exchange,symbol,tf,200)
                     if not ohlcv: continue
                     df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
                     for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
-                    context={"tf":tf,"df_15m":ohlcvs.get("15m"),"df_1h":ohlcvs.get("1h")}
-                    if tf in ("1m","3m","5m"):
-                        if "15m" not in ohlcvs: 
-                            ohlcv15 = await fetch_ohlcv(exchange,symbol,"15m",200)
-                            if ohlcv15: ohlcvs["15m"]=pd.DataFrame(ohlcv15,columns=["ts","open","high","low","close","vol"])
-                        if "1h" not in ohlcvs:
-                            ohlcv1h = await fetch_ohlcv(exchange,symbol,"1h",200)
-                            if ohlcv1h: ohlcvs["1h"]=pd.DataFrame(ohlcv1h,columns=["ts","open","high","low","close","vol"])
-                        context["df_15m"]=ohlcvs.get("15m"); context["df_1h"]=ohlcvs.get("1h")
-                    
-                    # Generate original signal
-                    sig = generate_signal(df,symbol,context)
-                    
-                    # APPLY ALL WINNER FILTERS
+                    sig = generate_signal_romeopt(df,symbol)
                     if sig:
-                        filters_passed = True
-                        
-                        # 1. BTC Direction Filter
-                        if not is_trade_allowed(sig['side'], btc_direction):
-                            log.info(f"⏸️ Blocked: {sig['side']} vs BTC {btc_direction}")
-                            filters_passed = False
-                            
-                        # 2. Higher TF Alignment
-                        elif not check_higher_tf_alignment(sig, context.get("df_15m")):
-                            log.info(f"⏸️ Blocked: Higher TF misalignment")
-                            filters_passed = False
-                            
-                        # 3. Momentum Confirmation (skip for 1m/3m)
-                        elif tf not in ["1m", "3m"] and not check_momentum_confirmation(df, sig['side']):
-                            log.info(f"⏸️ Blocked: No momentum confirmation")
-                            filters_passed = False
-                            
-                        # 4. Zone Quality
-                        elif not check_entry_zone_quality(df, sig['side']):
-                            log.info(f"⏸️ Blocked: Poor entry zone")
-                            filters_passed = False
-                            
-                        # 5. Market Condition
-                        elif detect_choppy_market(df):
-                            log.info(f"⏸️ Blocked: Choppy market")
-                            filters_passed = False
-                        
-                        if filters_passed:
-                            # Add winner bonuses
-                            sig['reason_list'].extend([
-                                f"BTC {btc_direction} ✓", "Higher TF ✓", 
-                                "Zone ✓", "Trending ✓"
-                            ])
-                            if tf not in ["1m", "3m"]:
-                                sig['reason_list'].append("Momentum ✓")
-                            sig['score'] += 5
-                            
-                            await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{sig['score']}\nBreakdown:{', '.join(sig['reason_list'])}")
-                            await log_signal(sig)
-                            last_signal_time[key]=time.time()
-                            signals_found += 1
-                            
-            log.info(f"📊 Scan complete: {signals_found} winner signals found")
-                        
+                        await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{sig['score']}\nBreakdown:{', '.join(sig['reason_list'])}")
+                        await log_signal(sig)
+                        last_signal_time[key]=time.time()
+                        signals_found+=1
+            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found")
         except Exception as e: log.exception("scan error: %s", e)
         elapsed=time.time()-t0
         await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
 
-# ---------------- EXACT ORIGINAL FASTAPI ----------------
+# ---------------- FASTAPI ----------------
 app = FastAPI()
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -451,25 +293,11 @@ async def webhook(request: Request):
     log.info("Webhook received: %s", data)
     return {"ok":True}
 
-# ---------------- EXACT ORIGINAL MAIN ----------------
+# ---------------- MAIN ----------------
 async def main():
     await init_db()
     exchange = ccxt.okx({"enableRateLimit": True})
-    
-    # Startup message
-    startup_msg = (
-        "🏆 ULTIMATE WINNER SCANNER STARTED\n"
-        "• All original SMC logic preserved\n"
-        "• BTC direction alignment enforced\n" 
-        "• Higher TF alignment required\n"
-        "• Momentum confirmation (5m+)\n"
-        "• Zone quality checks\n"
-        "• Trending markets only\n"
-        "🎯 Target: 80%+ Win Rate"
-    )
-    await tg(startup_msg)
-    log.info("✅ Scanner started with all winner filters")
-    
+    await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals")
     await asyncio.gather(scan_loop(exchange), monitor_signals(exchange))
 
 if __name__=="__main__":
