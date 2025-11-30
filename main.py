@@ -79,11 +79,19 @@ async def init_db():
             score INTEGER,
             tp1_hit INTEGER DEFAULT 0,
             tp2_hit INTEGER DEFAULT 0,
-            tp3_hit INTEGER DEFAULT 0,
-            latest_ob TEXT
+            tp3_hit INTEGER DEFAULT 0
         );
     """)
     await db_conn.commit()
+
+    # Add latest_ob column if missing
+    async with db_lock:
+        try:
+            await db_conn.execute("ALTER TABLE signals ADD COLUMN latest_ob TEXT;")
+            await db_conn.commit()
+            log.info("Added missing column latest_ob to signals table")
+        except aiosqlite.Error:
+            log.info("Column latest_ob already exists, skipping...")
 
 # ---------------- OHLCV ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
@@ -105,22 +113,17 @@ def atr(df: pd.DataFrame, period=14):
 
 # ---------------- ROMEOPT 6-STEP SIGNAL ----------------
 async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
-    """
-    Returns signal dict or None.
-    NOTE: This function now enforces the gating:
-        HTF Alignment == +1 AND Liquidity Sweep == +2
-    """
     if df is None or len(df) < 20: return None
     last = df.iloc[-1]
     prev5 = df.iloc[-6:-1]
     score = 0
     reasons = []
 
-    # Step 1: Liquidity Sweep (existing simple logic)
+    # Step 1: Liquidity Sweep
     sweep_high = last["high"] > prev5["high"].max()
     sweep_low = last["low"] < prev5["low"].min()
     has_sweep = sweep_high or sweep_low
-    liquidity_sweep = 2 if has_sweep else 0  # <-- ADDED: numeric sweep flag
+    liquidity_sweep = 2 if has_sweep else 0
     if has_sweep:
         score += 2
         reasons.append("Liquidity Sweep +2")
@@ -172,10 +175,9 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     tf_map={"1m":"15m","3m":"30m","5m":"1h","15m":"4h","30m":"1h"}
     htf=tf_map.get(tf,"15m")
     ohlcv_htf = await fetch_ohlcv(exchange, symbol, htf, 50)
-    htf_alignment = 0  # numeric flag 1 or 0
+    htf_alignment = 0
     if ohlcv_htf:
         df_htf = pd.DataFrame(ohlcv_htf, columns=["ts","open","high","low","close","vol"])
-        # basic HTF trend detection: simple slope over last 5 candles
         trend = df_htf["close"].iloc[-1] - df_htf["close"].iloc[-5]
         htf_dir = "bullish" if trend>0 else "bearish"
         if ob_type and htf_dir==ob_type:
@@ -185,7 +187,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         else:
             reasons.append("HTF Alignment +0")
     else:
-        reasons.append("HTF Alignment ?")  # no HTF data available
+        reasons.append("HTF Alignment ?")
 
     # Step 6: Momentum
     momentum_ratio = abs(last["close"]-last["open"])/(last["high"]-last["low"]+1e-8)
@@ -196,40 +198,22 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     else:
         reasons.append("Momentum +0")
 
-    if not ob_type:
-        # We require an Order Block (OB) to compute TP/SL etc. If missing, we bail.
-        return None
+    if not ob_type: return None
 
     side = "BUY" if ob_type=="bullish" else "SELL"
-
-    # Initial TP/SL (ATR-based)
     atr_val = float(atr(df,14).iloc[-1])
     entry = float(last["close"])
     sig = {
         "symbol":symbol, "side":side, "entry":entry,
         "score":score, "reason":"RomeOPT 6-Step",
         "reason_list":reasons,
-        # expose flags for logging / downstream
         "htf_alignment": htf_alignment,
         "liquidity_sweep": liquidity_sweep
     }
 
-    # --------- FINAL GATING: ENFORCE BOTH HTF ALIGNMENT AND LIQUIDITY SWEEP ----------
-    # Only pass signals that have BOTH htf_alignment == 1 AND liquidity_sweep == 2
-    if htf_alignment != 1:
-        # suppressed due to HTF misalignment
-        return None
-    if liquidity_sweep != 2:
-        # suppressed due to missing sweep
-        return None
-    # ------------------------------------------------------------------------------
+    if htf_alignment != 1 or liquidity_sweep != 2: return None
+    if score < MIN_SCORE or not has_disp: return None
 
-    # Additional winning filters (kept for robustness)
-    if score < MIN_SCORE: 
-        return None
-    if not has_disp:
-        return None
-    # Must have either sweep (we already enforced it) or zone (we already require ob_type)
     trend_ma = df["close"].rolling(20).mean().iloc[-1]
     if (side=="BUY" and last["close"]<trend_ma) or (side=="SELL" and last["close"]>trend_ma):
         return None
@@ -304,7 +288,6 @@ async def monitor_signals():
                         last_price = ticker.get("last")
                         if last_price is None: continue
 
-                        # Update TP/SL dynamically
                         ohlcv = await fetch_ohlcv(exchange, symbol, "1m", 50)
                         if ohlcv:
                             df_live = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
@@ -356,7 +339,6 @@ async def scan_loop(exchange):
                     for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
                     sig = await generate_signal_romeopt(exchange,df,symbol,tf)
                     if sig:
-                        # Include HTF and Sweep flags in alert (if present)
                         htf_flag = sig.get("htf_alignment", "N/A")
                         sweep_flag = sig.get("liquidity_sweep", "N/A")
                         await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig.get('sl')}\nTP1:{sig.get('tp1')} TP2:{sig.get('tp2')} TP3:{sig.get('tp3')}\nScore:{sig['score']}\nHTF:{htf_flag} Sweep:{sweep_flag}\nBreakdown:{', '.join(sig['reason_list'])}")
