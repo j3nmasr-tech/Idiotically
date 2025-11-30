@@ -6,7 +6,7 @@ LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features)
 - Fully live early signals
 - RomeOPT 6-step logic
 - TP/SL tracking with ATR or OB
-- Dynamic TP/SL updates
+- Dynamic TP/SL updates (market-structure-based)
 - Telegram alerts
 - Async SQLite logging
 - Filters: Score >=5, Displacement +2, Sweep+2 OR Zone+1, avoid counter-trend
@@ -139,7 +139,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     score = 0
     reasons = []
 
-    # Step 1: Liquidity Sweep (high-quality near swing highs/lows)
+    # Step 1: Liquidity Sweep
     sweep_high = last["high"] > prev5["high"].max()
     sweep_low = last["low"] < prev5["low"].min()
     has_sweep = sweep_high or sweep_low
@@ -199,7 +199,6 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
 
     if not ob_type: return None
     side = "BUY" if ob_type=="bullish" else "SELL"
-    atr_val = float(atr(df,14).iloc[-1])
     entry = float(last["close"])
 
     # ---------------- CRITICAL FILTERS ----------------
@@ -225,18 +224,27 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     return sig
 
 # ---------------- TP/SL HELPERS ----------------
-def romeopt_tp_sl(entry, side, atr_val, ob_zone):
-    if side=="BUY":
-        sl_candidate1 = entry - atr_val * 1.5
-        sl_candidate2 = ob_zone["low"] - atr_val*0.5
-        sl = min(sl_candidate1, sl_candidate2)
-        tp1 = entry + 0.8*atr_val; tp2 = entry + 1.5*atr_val; tp3 = entry + 2.5*atr_val
+def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
+    """
+    Enhanced TP/SL using market structure + ATR
+    """
+    recent_high = df['high'].iloc[-20:].max()
+    recent_low = df['low'].iloc[-20:].min()
+
+    if side == "BUY":
+        sl = min(ob_zone["low"] - atr_val*0.3, recent_low - atr_val*0.3)
+        risk = entry - sl
+        tp1 = min(entry + risk, df['high'].iloc[-15:-1].max())
+        tp2 = min(entry + risk*1.8, df['high'].iloc[-50:-15].max())
+        tp3 = entry + risk*2.5
     else:
-        sl_candidate1 = entry + atr_val*1.5
-        sl_candidate2 = ob_zone["high"] + atr_val*0.5
-        sl = max(sl_candidate1, sl_candidate2)
-        tp1 = entry - 0.8*atr_val; tp2 = entry - 1.5*atr_val; tp3 = entry - 2.5*atr_val
-    return sl,tp1,tp2,tp3
+        sl = max(ob_zone["high"] + atr_val*0.3, recent_high + atr_val*0.3)
+        risk = sl - entry
+        tp1 = max(entry - risk, df['low'].iloc[-15:-1].min())
+        tp2 = max(entry - risk*1.8, df['low'].iloc[-50:-15].min())
+        tp3 = entry - risk*2.5
+
+    return sl, tp1, tp2, tp3
 
 def find_latest_ob(df: pd.DataFrame):
     for i in range(len(df)-5, len(df)-1):
@@ -253,7 +261,7 @@ def update_tp_sl_live(sig: dict, df: pd.DataFrame):
     atr_val = float(atr(df,14).iloc[-1])
     entry = sig["entry"]
     side = sig["side"]
-    sl,tp1,tp2,tp3 = romeopt_tp_sl(entry, side, atr_val, latest_ob)
+    sl,tp1,tp2,tp3 = romeopt_tp_sl(entry, side, atr_val, latest_ob, df)
     sig["sl"]=sl; sig["tp1"]=tp1; sig["tp2"]=tp2; sig["tp3"]=tp3
     sig["latest_ob"]=latest_ob
     return sig
