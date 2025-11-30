@@ -27,7 +27,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))  # fast scan
-TOP_N = int(os.getenv("TOP_N", 2))
+TOP_N = int(os.getenv("TOP_N", 10))
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", 3600))
 
