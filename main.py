@@ -221,6 +221,16 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     sig = {"symbol":symbol,"side":side,"entry":entry,"score":score,"reason":"RomeOPT 6-Step",
            "reason_list":reasons,"htf_alignment":htf_alignment,"liquidity_sweep":liquidity_sweep}
     sig = update_tp_sl_live(sig, df)
+    
+    # ---------------- NEW: TP1 DISTANCE FILTER ----------------
+    if sig and "sl" in sig and "tp1" in sig:
+        risk = abs(sig["entry"] - sig["sl"])
+        tp1_distance = abs(sig["tp1"] - sig["entry"])
+        
+        # Reject if TP1 is less than 10% of risk (meaningless profit)
+        if tp1_distance < risk * 0.1:
+            return None
+    
     return sig
 
 # ---------------- TP/SL HELPERS ----------------
