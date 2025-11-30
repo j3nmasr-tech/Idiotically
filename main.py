@@ -17,18 +17,85 @@ import logging
 import httpx
 import aiosqlite
 import pandas as pd
+import numpy as np
 from dataclasses import dataclass, field
 
-# -------------------- ENV --------------------
-BINGX_API_KEY = os.getenv("BINGX_API_KEY")
-BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+# -------------------- ENV with Better Handling --------------------
+def load_environment_variables():
+    """Load and validate environment variables with detailed error reporting"""
+    env_vars = {}
+    
+    # BingX API
+    BINGX_API_KEY = os.getenv("BINGX_API_KEY")
+    BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY")
+    
+    # Telegram
+    TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+    TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+    
+    # Debug: Log what we found
+    logging.info("Environment variables check:")
+    logging.info(f"BINGX_API_KEY: {'***SET***' if BINGX_API_KEY else 'MISSING'}")
+    logging.info(f"BINGX_SECRET_KEY: {'***SET***' if BINGX_SECRET_KEY else 'MISSING'}")
+    logging.info(f"TELEGRAM_BOT_TOKEN: {'***SET***' if TELEGRAM_TOKEN else 'MISSING'}")
+    logging.info(f"TELEGRAM_CHAT_ID: {'***SET***' if TELEGRAM_CHAT_ID else 'MISSING'}")
+    
+    # Check required variables
+    missing_vars = []
+    if not BINGX_API_KEY:
+        missing_vars.append("BINGX_API_KEY")
+    if not BINGX_SECRET_KEY:
+        missing_vars.append("BINGX_SECRET_KEY")
+    if not TELEGRAM_TOKEN:
+        missing_vars.append("TELEGRAM_BOT_TOKEN")
+    if not TELEGRAM_CHAT_ID:
+        missing_vars.append("TELEGRAM_CHAT_ID")
+    
+    if missing_vars:
+        error_msg = f"Missing required environment variables: {', '.join(missing_vars)}"
+        logging.error(error_msg)
+        # Also try to read from file as fallback
+        logging.info("Attempting to read from .env file...")
+        try:
+            from dotenv import load_dotenv
+            load_dotenv()
+            # Retry getting env vars after loading .env
+            BINGX_API_KEY = os.getenv("BINGX_API_KEY") or BINGX_API_KEY
+            BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY") or BINGX_SECRET_KEY
+            TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or TELEGRAM_TOKEN
+            TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or TELEGRAM_CHAT_ID
+            
+            # Check again
+            missing_vars = []
+            if not BINGX_API_KEY:
+                missing_vars.append("BINGX_API_KEY")
+            if not BINGX_SECRET_KEY:
+                missing_vars.append("BINGX_SECRET_KEY")
+            if not TELEGRAM_TOKEN:
+                missing_vars.append("TELEGRAM_BOT_TOKEN")
+            if not TELEGRAM_CHAT_ID:
+                missing_vars.append("TELEGRAM_CHAT_ID")
+                
+            if missing_vars:
+                raise ValueError(f"Missing environment variables after .env load: {', '.join(missing_vars)}")
+            else:
+                logging.info("Successfully loaded environment variables from .env file")
+        except ImportError:
+            raise ValueError(f"Missing environment variables: {', '.join(missing_vars)}. Install python-dotenv to use .env files.")
+    
+    return {
+        'BINGX_API_KEY': BINGX_API_KEY,
+        'BINGX_SECRET_KEY': BINGX_SECRET_KEY,
+        'TELEGRAM_TOKEN': TELEGRAM_TOKEN,
+        'TELEGRAM_CHAT_ID': TELEGRAM_CHAT_ID
+    }
 
-if not BINGX_API_KEY or not BINGX_SECRET_KEY:
-    raise ValueError("Missing BingX API key/secret.")
-if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    raise ValueError("Missing Telegram token/chat id.")
+# Load environment variables
+env = load_environment_variables()
+BINGX_API_KEY = env['BINGX_API_KEY']
+BINGX_SECRET_KEY = env['BINGX_SECRET_KEY']
+TELEGRAM_TOKEN = env['TELEGRAM_TOKEN']
+TELEGRAM_CHAT_ID = env['TELEGRAM_CHAT_ID']
 
 # -------------------- CONFIG --------------------
 BINGX_BASE = "https://open-api.bingx.com"
@@ -38,14 +105,29 @@ DB_PATH = "./romeopt_signals.db"
 TIMEFRAMES = ["1m", "3m", "5m", "15m"]
 CANDLE_LIMIT = 150
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
 
 # -------------------- Telegram --------------------
 async def telegram_send(msg: str):
+    """Send message to Telegram with error handling"""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     async with httpx.AsyncClient() as client:
         try:
-            await client.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+            response = await client.post(
+                url, 
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID, 
+                    "text": msg,
+                    "parse_mode": "HTML"
+                },
+                timeout=10
+            )
+            if response.status_code != 200:
+                logging.error(f"Telegram API error: {response.status_code} - {response.text}")
         except Exception as e:
             logging.error(f"Telegram send failed: {e}")
 
@@ -68,6 +150,7 @@ class Signal:
 
 # -------------------- Database --------------------
 async def init_db():
+    """Initialize SQLite database"""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
         CREATE TABLE IF NOT EXISTS signals (
@@ -89,8 +172,10 @@ async def init_db():
         )
         """)
         await db.commit()
+        logging.info("Database initialized successfully")
 
 async def save_signal(sig: Signal):
+    """Save signal to database"""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("""
         INSERT INTO signals(symbol, side, timeframe, entry_low, entry_high, stoploss, tp1, tp2, tp3, trigger_step, rome_score, sequence_steps, created_at, status)
@@ -99,9 +184,11 @@ async def save_signal(sig: Signal):
               sig.stop_loss, sig.tp1, sig.tp2, sig.tp3, sig.trigger_step,
               sig.rome_score, json.dumps(sig.sequence_verified), sig.created_at.isoformat(), sig.status))
         await db.commit()
+        logging.info(f"Signal saved to database: {sig.symbol} {sig.side}")
 
 # -------------------- BingX Market Data --------------------
 async def fetch_json(path: str, params: dict = None):
+    """Fetch JSON data from BingX API"""
     url = BINGX_BASE + path
     async with httpx.AsyncClient() as client:
         try:
@@ -133,7 +220,7 @@ async def get_top_symbols() -> List[str]:
         usdt_pairs = []
         for symbol_data in symbols_data:
             symbol = symbol_data.get('symbol', '')
-            if symbol.endswith('-USDT') or 'USDT' in symbol:
+            if symbol and ('USDT' in symbol or '-USDT' in symbol):
                 # Handle different possible volume field names
                 volume_str = symbol_data.get('quoteVolume') or symbol_data.get('volume') or '0'
                 try:
@@ -329,8 +416,19 @@ def build_signal(symbol: str, df: pd.DataFrame, timeframe: str) -> Optional[Sign
 
 # -------------------- Main Scanner --------------------
 async def scanner():
+    """Main scanner loop"""
+    logging.info("Initializing ROMEOPT Scanner...")
     await init_db()
-    await telegram_send("🚀 ROMEOPT ULTRA-SCANNER STARTED\nTracking top 20 BingX USDT pairs on 1m,3m,5m,15m")
+    
+    startup_msg = """🚀 <b>ROMEOPT ULTRA-SCANNER STARTED</b>
+    
+Tracking top 20 BingX USDT pairs
+Timeframes: 1m, 3m, 5m, 15m
+Scan interval: 5 seconds
+Database: Active"""
+    
+    await telegram_send(startup_msg)
+    logging.info("Scanner started successfully")
 
     while True:
         try:
@@ -340,8 +438,7 @@ async def scanner():
                 await asyncio.sleep(SCAN_INTERVAL)
                 continue
 
-            logging.info(f"Scanning {len(symbols)} symbols...")
-            tasks = []
+            logging.info(f"Scanning {len(symbols)} symbols across {len(TIMEFRAMES)} timeframes...")
             
             for symbol in symbols:
                 for tf in TIMEFRAMES:
@@ -354,15 +451,15 @@ async def scanner():
                     if sig:
                         await save_signal(sig)
                         msg = (
-                            f"🏛 EARLY ROMEOPT SIGNAL\n\n"
-                            f"Symbol: {sig.symbol}\n"
-                            f"Side: {sig.side}\n"
-                            f"TF: {sig.timeframe}\n"
-                            f"Entry: ({sig.entry_zone[0]:.6f}, {sig.entry_zone[1]:.6f})\n"
-                            f"SL: {sig.stop_loss:.6f}\n"
-                            f"TP1: {sig.tp1:.6f}\nTP2: {sig.tp2:.6f}\nTP3: {sig.tp3:.6f}\n"
-                            f"Rome Score: {sig.rome_score}\n"
-                            f"Steps: {sum(sig.sequence_verified)}/6 verified"
+                            f"🏛 <b>EARLY ROMEOPT SIGNAL</b>\n\n"
+                            f"<b>Symbol:</b> {sig.symbol}\n"
+                            f"<b>Side:</b> {sig.side}\n"
+                            f"<b>TF:</b> {sig.timeframe}\n"
+                            f"<b>Entry:</b> ({sig.entry_zone[0]:.6f}, {sig.entry_zone[1]:.6f})\n"
+                            f"<b>SL:</b> {sig.stop_loss:.6f}\n"
+                            f"<b>TP1:</b> {sig.tp1:.6f}\n<b>TP2:</b> {sig.tp2:.6f}\n<b>TP3:</b> {sig.tp3:.6f}\n"
+                            f"<b>Rome Score:</b> {sig.rome_score}\n"
+                            f"<b>Steps:</b> {sum(sig.sequence_verified)}/6 verified"
                         )
                         await telegram_send(msg)
                         logging.info(f"Signal detected: {sig.symbol} {sig.side} {sig.timeframe}")
@@ -375,12 +472,11 @@ async def scanner():
 
 # -------------------- Run --------------------
 if __name__ == "__main__":
-    # Import numpy for ATR calculation
-    import numpy as np
-    
     try:
         asyncio.run(scanner())
     except KeyboardInterrupt:
         logging.info("Scanner stopped by user")
+        asyncio.run(telegram_send("🛑 <b>ROMEOPT SCANNER STOPPED</b>\n\nManual interruption by user."))
     except Exception as e:
         logging.error(f"Fatal error: {e}")
+        asyncio.run(telegram_send(f"💥 <b>ROMEOPT SCANNER CRASHED</b>\n\nError: {e}"))
