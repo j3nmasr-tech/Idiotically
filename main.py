@@ -226,7 +226,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
 # ---------------- TP/SL HELPERS ----------------
 def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
     """
-    Enhanced TP/SL using market structure + ATR
+    FIXED TP/SL using market structure + ATR
     """
     recent_high = df['high'].iloc[-20:].max()
     recent_low = df['low'].iloc[-20:].min()
@@ -234,38 +234,48 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
     if side == "BUY":
         sl = min(ob_zone["low"] - atr_val*0.3, recent_low - atr_val*0.3)
         risk = entry - sl
-        tp1 = min(entry + risk, df['high'].iloc[-15:-1].max())
-        tp2 = min(entry + risk*1.8, df['high'].iloc[-50:-15].max())
-        tp3 = entry + risk*2.5
-    else:
+        
+        # Calculate base TP levels
+        base_tp1 = entry + risk * 0.8
+        base_tp2 = entry + risk * 1.5
+        base_tp3 = entry + risk * 2.5
+        
+        # Get market structure levels
+        nearest_resistance = df['high'].iloc[-15:-1].max()
+        major_resistance = df['high'].iloc[-50:-15].max()
+        
+        # Ensure TP levels are ABOVE entry and in correct order
+        tp1 = min(base_tp1, nearest_resistance)
+        tp1 = max(tp1, entry + 0.001)  # Force above entry
+        
+        tp2 = min(base_tp2, major_resistance)
+        tp2 = max(tp2, tp1 + 0.001)   # Force above TP1
+        
+        tp3 = max(base_tp3, tp2 + 0.001)  # Force above TP2
+        
+    else:  # SELL
         sl = max(ob_zone["high"] + atr_val*0.3, recent_high + atr_val*0.3)
         risk = sl - entry
-        tp1 = max(entry - risk, df['low'].iloc[-15:-1].min())
-        tp2 = max(entry - risk*1.8, df['low'].iloc[-50:-15].min())
-        tp3 = entry - risk*2.5
+        
+        # Calculate base TP levels
+        base_tp1 = entry - risk * 0.8
+        base_tp2 = entry - risk * 1.5
+        base_tp3 = entry - risk * 2.5
+        
+        # Get market structure levels
+        nearest_support = df['low'].iloc[-15:-1].min()
+        major_support = df['low'].iloc[-50:-15].min()
+        
+        # Ensure TP levels are BELOW entry and in correct order
+        tp1 = max(base_tp1, nearest_support)
+        tp1 = min(tp1, entry - 0.001)  # Force below entry
+        
+        tp2 = max(base_tp2, major_support)
+        tp2 = min(tp2, tp1 - 0.001)   # Force below TP1
+        
+        tp3 = min(base_tp3, tp2 - 0.001)  # Force below TP2
 
     return sl, tp1, tp2, tp3
-
-def find_latest_ob(df: pd.DataFrame):
-    for i in range(len(df)-5, len(df)-1):
-        candle, prev_candle = df.iloc[i], df.iloc[i-1]
-        if candle["close"]>candle["open"] and prev_candle["close"]<prev_candle["open"]:
-            return {"type":"bullish","low":min(candle["low"], prev_candle["low"]),"high":candle["close"]}
-        elif candle["close"]<candle["open"] and prev_candle["close"]>prev_candle["open"]:
-            return {"type":"bearish","low":candle["close"],"high":max(candle["high"], prev_candle["high"])}
-    return None
-
-def update_tp_sl_live(sig: dict, df: pd.DataFrame):
-    latest_ob = find_latest_ob(df)
-    if not latest_ob: return sig
-    atr_val = float(atr(df,14).iloc[-1])
-    entry = sig["entry"]
-    side = sig["side"]
-    sl,tp1,tp2,tp3 = romeopt_tp_sl(entry, side, atr_val, latest_ob, df)
-    sig["sl"]=sl; sig["tp1"]=tp1; sig["tp2"]=tp2; sig["tp3"]=tp3
-    sig["latest_ob"]=latest_ob
-    return sig
-
 # ---------------- SL CLUSTER ----------------
 recent_sl = defaultdict(lambda: deque())
 def record_sl_hit(symbol: str, lookback_minutes=30):
