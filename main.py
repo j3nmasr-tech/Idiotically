@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-LIVE ROMEOPT 6-STEP SCANNER
+LIVE ROMEOPT 6-STEP SCANNER (Enhanced)
 - Fully live early signals
 - RomeOPT 6-step logic
 - TP/SL tracking with ATR or OB
@@ -10,7 +10,9 @@ LIVE ROMEOPT 6-STEP SCANNER
 - Telegram alerts
 - Async SQLite logging
 - Filters: Score >=5, Displacement +2, Sweep+2 OR Zone+1, avoid counter-trend
-- Market Regime detection integrated
+- Improved Order Block detection
+- Adaptive Market Regime detection
+- HTF + Sweep scoring threshold
 """
 
 import os, time, asyncio, logging, datetime
@@ -33,6 +35,7 @@ TOP_N = int(os.getenv("TOP_N", 10))
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", 3600))
 MIN_SCORE = 5
+CRITICAL_FACTORS_MIN = 2  # HTF Alignment + Liquidity Sweep minimum
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -78,19 +81,10 @@ async def init_db():
             tp1_hit INTEGER DEFAULT 0,
             tp2_hit INTEGER DEFAULT 0,
             tp3_hit INTEGER DEFAULT 0,
-            latest_ob TEXT,
-            market_regime TEXT
+            latest_ob TEXT
         );
     """)
     await db_conn.commit()
-    # Add latest_ob column if missing
-    async with db_lock:
-        try:
-            await db_conn.execute("ALTER TABLE signals ADD COLUMN latest_ob TEXT;")
-            await db_conn.commit()
-            log.info("Added missing column latest_ob to signals table")
-        except aiosqlite.Error:
-            log.info("Column latest_ob already exists, skipping...")
 
 # ---------------- OHLCV ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
@@ -111,22 +105,20 @@ def atr(df: pd.DataFrame, period=14):
     return tr.rolling(period, min_periods=1).mean()
 
 # ---------------- MARKET REGIME ----------------
-async def detect_market_regime(exchange, symbol):
-    """
-    Simple regime detection:
-    - BULL: recent 20-close avg trending up
-    - BEAR: trending down
-    - RANGE: sideways (small slope)
-    """
-    ohlcv = await fetch_ohlcv(exchange, symbol, "15m", 50)
-    if not ohlcv: return "UNKNOWN"
-    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-    df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    slope = df["close"].iloc[-1] - df["close"].iloc[-20]
-    pct_change = slope / df["close"].iloc[-20]
-    if pct_change > 0.003: return "BULL"
-    elif pct_change < -0.003: return "BEAR"
-    else: return "RANGE"
+async def detect_market_regime(df: pd.DataFrame):
+    # Higher timeframe MA for trend bias
+    ma_htf = df["close"].rolling(50).mean().iloc[-1]
+    price = df["close"].iloc[-1]
+    recent_high = df["high"].iloc[-20:].max()
+    recent_low = df["low"].iloc[-20:].min()
+    range_pct = (recent_high - recent_low) / max(1e-8, recent_low)
+
+    if price > ma_htf and range_pct > 0.02:
+        return "BULL"
+    elif price < ma_htf and range_pct > 0.02:
+        return "BEAR"
+    else:
+        return "RANGE"
 
 # ---------------- ROMEOPT 6-STEP SIGNAL ----------------
 async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
@@ -141,52 +133,33 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     sweep_low = last["low"] < prev5["low"].min()
     has_sweep = sweep_high or sweep_low
     liquidity_sweep = 2 if has_sweep else 0
-    if has_sweep:
-        score += 2
-        reasons.append("Liquidity Sweep +2")
-    else:
-        reasons.append("No Sweep +0")
+    score += liquidity_sweep
+    reasons.append(f"Liquidity Sweep +{liquidity_sweep}")
 
     # Step 2: Displacement
     displacement = abs(last["close"] - last["open"]) / (last["high"] - last["low"] + 1e-8)
     has_disp = displacement > 0.6
     if has_disp:
-        score += 2
-        reasons.append("Displacement +2")
+        score += 2; reasons.append("Displacement +2")
     else:
-        reasons.append("No Displacement +0")
+        reasons.append("Displacement +0")
 
-    # Step 3: Zone Approach
+    # Step 3 & 4: Order Block & Zone
     ob_zone = None
-    for i in range(len(df)-20, len(df)-1):
+    for i in range(len(df)-5, len(df)-1):
         candle, prev_candle = df.iloc[i], df.iloc[i-1]
         if candle["close"]>candle["open"] and prev_candle["close"]<prev_candle["open"]:
-            ob_zone={"type":"bullish","low":candle["low"],"high":candle["close"]}; break
+            ob_zone={"type":"bullish","low":min(candle["low"], prev_candle["low"]),"high":candle["close"]}; break
         elif candle["close"]<candle["open"] and prev_candle["close"]>prev_candle["open"]:
-            ob_zone={"type":"bearish","low":candle["close"],"high":candle["high"]}; break
+            ob_zone={"type":"bearish","low":candle["close"],"high":max(candle["high"], prev_candle["high"])}; break
 
-    has_zone=False
-    ob_type = ob_zone["type"] if ob_zone else None
     if ob_zone:
-        if ob_type=="bullish" and last["close"] <= ob_zone["high"]:
-            score+=1; reasons.append("Zone Approach +1"); has_zone=True
-        elif ob_type=="bearish" and last["close"] >= ob_zone["low"]:
-            score+=1; reasons.append("Zone Approach +1"); has_zone=True
-        else:
-            reasons.append("Zone Approach +0")
+        ob_type = ob_zone["type"]
+        if ob_type=="bullish" and last["close"] <= ob_zone["high"]: score+=1; reasons.append("Zone Approach +1")
+        elif ob_type=="bearish" and last["close"] >= ob_zone["low"]: score+=1; reasons.append("Zone Approach +1")
+        else: reasons.append("Zone Approach +0")
     else:
-        reasons.append("Zone Approach +0")
-
-    # Step 4: Premium/Discount
-    if ob_zone:
-        if ob_type=="bullish" and last["close"]<ob_zone["high"]:
-            score+=1; reasons.append("Premium/Discount +1")
-        elif ob_type=="bearish" and last["close"]>ob_zone["low"]:
-            score+=1; reasons.append("Premium/Discount +1")
-        else:
-            reasons.append("Premium/Discount +0")
-    else:
-        reasons.append("Premium/Discount +0")
+        reasons.append("Zone Approach +0"); ob_type=None
 
     # Step 5: HTF Alignment
     tf_map={"1m":"15m","3m":"30m","5m":"1h","15m":"4h","30m":"1h"}
@@ -198,9 +171,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         trend = df_htf["close"].iloc[-1] - df_htf["close"].iloc[-5]
         htf_dir = "bullish" if trend>0 else "bearish"
         if ob_type and htf_dir==ob_type:
-            score+=1
-            htf_alignment = 1
-            reasons.append("HTF Alignment +1")
+            score+=1; htf_alignment=1; reasons.append("HTF Alignment +1")
         else:
             reasons.append("HTF Alignment +0")
     else:
@@ -216,59 +187,47 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         reasons.append("Momentum +0")
 
     if not ob_type: return None
-
     side = "BUY" if ob_type=="bullish" else "SELL"
     atr_val = float(atr(df,14).iloc[-1])
     entry = float(last["close"])
 
-    # ----- NEW: Market Regime -----
-    market_regime = await detect_market_regime(exchange, symbol)
-    if (market_regime=="BULL" and side=="SELL") or (market_regime=="BEAR" and side=="BUY"):
-        return None  # skip counter-trend
+    # ---------------- CRITICAL FILTERS ----------------
+    critical_score = htf_alignment + liquidity_sweep
+    if critical_score < CRITICAL_FACTORS_MIN: return None
+    if score < MIN_SCORE: return None
+    if not has_disp: return None
 
-    sig = {
-        "symbol": symbol,
-        "side": side,
-        "entry": entry,
-        "score": score,
-        "reason": "RomeOPT 6-Step",
-        "reason_list": reasons,
-        "htf_alignment": htf_alignment,
-        "liquidity_sweep": liquidity_sweep,
-        "market_regime": market_regime
-    }
-
-    if htf_alignment != 1 or liquidity_sweep != 2: return None
-    if score < MIN_SCORE or not has_disp: return None
+    market_regime = await detect_market_regime(df)
+    if (market_regime=="BULL" and side=="SELL") or (market_regime=="BEAR" and side=="BUY"): return None
 
     trend_ma = df["close"].rolling(20).mean().iloc[-1]
-    if (side=="BUY" and last["close"]<trend_ma) or (side=="SELL" and last["close"]>trend_ma):
-        return None
+    if (side=="BUY" and last["close"]<trend_ma) or (side=="SELL" and last["close"]>trend_ma): return None
 
+    sig = {"symbol":symbol,"side":side,"entry":entry,"score":score,"reason":"RomeOPT 6-Step","reason_list":reasons,"htf_alignment":htf_alignment,"liquidity_sweep":liquidity_sweep}
     sig = update_tp_sl_live(sig, df)
     return sig
 
 # ---------------- TP/SL HELPERS ----------------
 def romeopt_tp_sl(entry, side, atr_val, ob_zone):
     if side=="BUY":
-        sl = min(entry - atr_val, ob_zone["low"])
-        tp1 = entry + 0.8*atr_val
-        tp2 = entry + 1.5*atr_val
-        tp3 = entry + 2.5*atr_val
+        sl_candidate1 = entry - atr_val * 1.5
+        sl_candidate2 = ob_zone["low"] - atr_val*0.5
+        sl = min(sl_candidate1, sl_candidate2)
+        tp1 = entry + 0.8*atr_val; tp2 = entry + 1.5*atr_val; tp3 = entry + 2.5*atr_val
     else:
-        sl = max(entry + atr_val, ob_zone["high"])
-        tp1 = entry - 0.8*atr_val
-        tp2 = entry - 1.5*atr_val
-        tp3 = entry - 2.5*atr_val
+        sl_candidate1 = entry + atr_val*1.5
+        sl_candidate2 = ob_zone["high"] + atr_val*0.5
+        sl = max(sl_candidate1, sl_candidate2)
+        tp1 = entry - 0.8*atr_val; tp2 = entry - 1.5*atr_val; tp3 = entry - 2.5*atr_val
     return sl,tp1,tp2,tp3
 
 def find_latest_ob(df: pd.DataFrame):
-    for i in range(len(df)-20, len(df)-1):
+    for i in range(len(df)-5, len(df)-1):
         candle, prev_candle = df.iloc[i], df.iloc[i-1]
         if candle["close"]>candle["open"] and prev_candle["close"]<prev_candle["open"]:
-            return {"type":"bullish","low":candle["low"],"high":candle["close"]}
+            return {"type":"bullish","low":min(candle["low"], prev_candle["low"]),"high":candle["close"]}
         elif candle["close"]<candle["open"] and prev_candle["close"]>prev_candle["open"]:
-            return {"type":"bearish","low":candle["close"],"high":candle["high"]}
+            return {"type":"bearish","low":candle["close"],"high":max(candle["high"], prev_candle["high"])}
     return None
 
 def update_tp_sl_live(sig: dict, df: pd.DataFrame):
@@ -297,11 +256,10 @@ def deprioritized(symbol: str, threshold=3, lookback=30):
 async def log_signal(sig):
     async with db_lock:
         await db_conn.execute("""
-            INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score,latest_ob,market_regime)
+            INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score,latest_ob)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (sig["symbol"], sig["side"], sig["entry"], sig.get("sl"), sig.get("tp1"),
-              sig.get("tp2"), sig.get("tp3"), datetime.datetime.utcnow().isoformat(),
-              "OPEN", sig["reason"], sig["score"], str(sig.get("latest_ob","")), sig.get("market_regime")))
+        """, (sig["symbol"],sig["side"],sig["entry"],sig.get("sl"),sig.get("tp1"),sig.get("tp2"),sig.get("tp3"),
+              datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"],str(sig.get("latest_ob",""))))
         await db_conn.commit()
 
 # ---------------- MONITOR SIGNALS ----------------
@@ -340,7 +298,6 @@ async def monitor_signals():
                             await tg(f"🎯 {symbol} {side} update\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP1:{tp1} TP2:{tp2} TP3:{tp3}")
 
                         if sl_hit: record_sl_hit(symbol)
-
                         await db_conn.execute("UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?",
                                              (tp1_hit,tp2_hit,tp3_hit,status,sig_id))
                 await db_conn.commit()
@@ -369,7 +326,7 @@ async def scan_loop(exchange):
                     if sig:
                         htf_flag = sig.get("htf_alignment", "N/A")
                         sweep_flag = sig.get("liquidity_sweep", "N/A")
-                        await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']} [{sig['market_regime']}]\nEntry:{sig['entry']}\nSL:{sig.get('sl')}\nTP1:{sig.get('tp1')} TP2:{sig.get('tp2')} TP3:{sig.get('tp3')}\nScore:{sig['score']}\nHTF:{htf_flag} Sweep:{sweep_flag}\nBreakdown:{', '.join(sig['reason_list'])}")
+                        await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig.get('sl')}\nTP1:{sig.get('tp1')} TP2:{sig.get('tp2')} TP3:{sig.get('tp3')}\nScore:{sig['score']}\nHTF:{htf_flag} Sweep:{sweep_flag}\nBreakdown:{', '.join(sig['reason_list'])}")
                         await log_signal(sig)
                         last_signal_time[key]=time.time()
                         signals_found+=1
