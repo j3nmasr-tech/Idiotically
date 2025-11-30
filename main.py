@@ -23,79 +23,61 @@ from dataclasses import dataclass, field
 # -------------------- ENV with Better Handling --------------------
 def load_environment_variables():
     """Load and validate environment variables with detailed error reporting"""
-    env_vars = {}
     
-    # BingX API
+    # Try to load from .env file first
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+        logging.info("Attempted to load .env file")
+    except ImportError:
+        logging.warning("python-dotenv not installed, skipping .env file")
+    
+    # Get all environment variables
     BINGX_API_KEY = os.getenv("BINGX_API_KEY")
     BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY")
-    
-    # Telegram
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-    
+
     # Debug: Log what we found
-    logging.info("Environment variables check:")
+    logging.info("=== ENVIRONMENT VARIABLES CHECK ===")
     logging.info(f"BINGX_API_KEY: {'***SET***' if BINGX_API_KEY else 'MISSING'}")
     logging.info(f"BINGX_SECRET_KEY: {'***SET***' if BINGX_SECRET_KEY else 'MISSING'}")
     logging.info(f"TELEGRAM_BOT_TOKEN: {'***SET***' if TELEGRAM_TOKEN else 'MISSING'}")
     logging.info(f"TELEGRAM_CHAT_ID: {'***SET***' if TELEGRAM_CHAT_ID else 'MISSING'}")
     
-    # Check required variables
+    # For debugging, also check if any env vars exist at all
+    all_env_vars = dict(os.environ)
+    bingx_vars = {k: v for k, v in all_env_vars.items() if 'BINGX' in k}
+    telegram_vars = {k: v for k, v in all_env_vars.items() if 'TELEGRAM' in k}
+    
+    logging.info(f"All BINGX related vars: {list(bingx_vars.keys())}")
+    logging.info(f"All TELEGRAM related vars: {list(telegram_vars.keys())}")
+    
+    # Check required variables but don't crash immediately
     missing_vars = []
     if not BINGX_API_KEY:
         missing_vars.append("BINGX_API_KEY")
     if not BINGX_SECRET_KEY:
         missing_vars.append("BINGX_SECRET_KEY")
-    if not TELEGRAM_TOKEN:
-        missing_vars.append("TELEGRAM_BOT_TOKEN")
-    if not TELEGRAM_CHAT_ID:
-        missing_vars.append("TELEGRAM_CHAT_ID")
     
+    # Telegram is optional for scanner operation
+    telegram_available = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
+    if not telegram_available:
+        logging.warning("Telegram notifications disabled - missing token or chat ID")
+
     if missing_vars:
-        error_msg = f"Missing required environment variables: {', '.join(missing_vars)}"
+        error_msg = f"CRITICAL: Missing required BingX API variables: {', '.join(missing_vars)}"
         logging.error(error_msg)
-        # Also try to read from file as fallback
-        logging.info("Attempting to read from .env file...")
-        try:
-            from dotenv import load_dotenv
-            load_dotenv()
-            # Retry getting env vars after loading .env
-            BINGX_API_KEY = os.getenv("BINGX_API_KEY") or BINGX_API_KEY
-            BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY") or BINGX_SECRET_KEY
-            TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") or TELEGRAM_TOKEN
-            TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID") or TELEGRAM_CHAT_ID
-            
-            # Check again
-            missing_vars = []
-            if not BINGX_API_KEY:
-                missing_vars.append("BINGX_API_KEY")
-            if not BINGX_SECRET_KEY:
-                missing_vars.append("BINGX_SECRET_KEY")
-            if not TELEGRAM_TOKEN:
-                missing_vars.append("TELEGRAM_BOT_TOKEN")
-            if not TELEGRAM_CHAT_ID:
-                missing_vars.append("TELEGRAM_CHAT_ID")
-                
-            if missing_vars:
-                raise ValueError(f"Missing environment variables after .env load: {', '.join(missing_vars)}")
-            else:
-                logging.info("Successfully loaded environment variables from .env file")
-        except ImportError:
-            raise ValueError(f"Missing environment variables: {', '.join(missing_vars)}. Install python-dotenv to use .env files.")
+        logging.error("Scanner cannot function without BingX API credentials")
+        return None
     
     return {
         'BINGX_API_KEY': BINGX_API_KEY,
         'BINGX_SECRET_KEY': BINGX_SECRET_KEY,
         'TELEGRAM_TOKEN': TELEGRAM_TOKEN,
-        'TELEGRAM_CHAT_ID': TELEGRAM_CHAT_ID
+        'TELEGRAM_CHAT_ID': TELEGRAM_CHAT_ID,
+        'TELEGRAM_AVAILABLE': telegram_available
     }
-
-# Load environment variables
-env = load_environment_variables()
-BINGX_API_KEY = env['BINGX_API_KEY']
-BINGX_SECRET_KEY = env['BINGX_SECRET_KEY']
-TELEGRAM_TOKEN = env['TELEGRAM_TOKEN']
-TELEGRAM_CHAT_ID = env['TELEGRAM_CHAT_ID']
 
 # -------------------- CONFIG --------------------
 BINGX_BASE = "https://open-api.bingx.com"
@@ -112,21 +94,27 @@ logging.basicConfig(
 )
 
 # -------------------- Telegram --------------------
-async def telegram_send(msg: str):
+async def telegram_send(msg: str, telegram_token: str, chat_id: str):
     """Send message to Telegram with error handling"""
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    if not telegram_token or not chat_id:
+        logging.warning("Telegram not configured - skipping message")
+        return
+        
+    url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
                 url, 
                 json={
-                    "chat_id": TELEGRAM_CHAT_ID, 
+                    "chat_id": chat_id, 
                     "text": msg,
                     "parse_mode": "HTML"
                 },
                 timeout=10
             )
-            if response.status_code != 200:
+            if response.status_code == 200:
+                logging.info("Telegram message sent successfully")
+            else:
                 logging.error(f"Telegram API error: {response.status_code} - {response.text}")
         except Exception as e:
             logging.error(f"Telegram send failed: {e}")
@@ -194,9 +182,10 @@ async def fetch_json(path: str, params: dict = None):
         try:
             response = await client.get(url, params=params, timeout=10)
             response.raise_for_status()
-            return response.json()
+            data = response.json()
+            return data
         except httpx.HTTPStatusError as e:
-            logging.error(f"HTTP error {e.response.status_code} for {url}: {e}")
+            logging.error(f"HTTP error {e.response.status_code} for {url}")
             return {}
         except Exception as e:
             logging.error(f"Request failed for {url}: {e}")
@@ -204,15 +193,20 @@ async def fetch_json(path: str, params: dict = None):
 
 async def get_top_symbols() -> List[str]:
     """Get top volume symbols from BingX"""
+    logging.info("Fetching top symbols from BingX...")
     data = await fetch_json("/openApi/spot/v1/ticker/24hr")
     
-    if not data or 'data' not in data:
-        logging.error("Failed to fetch symbols data or invalid response structure")
+    if not data:
+        logging.error("No data returned from BingX API")
+        return []
+    
+    if 'data' not in data:
+        logging.error(f"Unexpected API response structure: {data}")
         return []
     
     symbols_data = data['data']
     if not symbols_data:
-        logging.warning("No symbols data returned from API")
+        logging.warning("Empty symbols data returned from API")
         return []
     
     try:
@@ -226,9 +220,14 @@ async def get_top_symbols() -> List[str]:
                 try:
                     volume = float(volume_str)
                     usdt_pairs.append((symbol, volume))
-                except (ValueError, TypeError):
+                except (ValueError, TypeError) as e:
+                    logging.debug(f"Could not convert volume for {symbol}: {volume_str}")
                     continue
         
+        if not usdt_pairs:
+            logging.warning("No USDT pairs found in API response")
+            return []
+            
         # Sort by volume and get top N
         usdt_pairs.sort(key=lambda x: x[1], reverse=True)
         top_symbols = [pair[0] for pair in usdt_pairs[:TOP_N]]
@@ -251,7 +250,7 @@ async def get_ohlcv(symbol: str, timeframe: str) -> pd.DataFrame:
     data = await fetch_json("/openApi/spot/v1/market/klines", params)
     
     if not data or 'data' not in data or not data['data']:
-        logging.warning(f"No OHLCV data for {symbol} {timeframe}")
+        logging.debug(f"No OHLCV data for {symbol} {timeframe}")
         return pd.DataFrame()
     
     try:
@@ -418,17 +417,28 @@ def build_signal(symbol: str, df: pd.DataFrame, timeframe: str) -> Optional[Sign
 async def scanner():
     """Main scanner loop"""
     logging.info("Initializing ROMEOPT Scanner...")
+    
+    # Load environment variables
+    env = load_environment_variables()
+    if env is None:
+        logging.error("Cannot start scanner - missing required environment variables")
+        return
+    
+    # Initialize database
     await init_db()
     
-    startup_msg = """🚀 <b>ROMEOPT ULTRA-SCANNER STARTED</b>
-    
+    # Send startup message if Telegram is available
+    if env['TELEGRAM_AVAILABLE']:
+        startup_msg = """🚀 <b>ROMEOPT ULTRA-SCANNER STARTED</b>
+        
 Tracking top 20 BingX USDT pairs
 Timeframes: 1m, 3m, 5m, 15m
 Scan interval: 5 seconds
 Database: Active"""
+        await telegram_send(startup_msg, env['TELEGRAM_TOKEN'], env['TELEGRAM_CHAT_ID'])
     
-    await telegram_send(startup_msg)
     logging.info("Scanner started successfully")
+    logging.info(f"Telegram notifications: {'ENABLED' if env['TELEGRAM_AVAILABLE'] else 'DISABLED'}")
 
     while True:
         try:
@@ -440,6 +450,7 @@ Database: Active"""
 
             logging.info(f"Scanning {len(symbols)} symbols across {len(TIMEFRAMES)} timeframes...")
             
+            signals_found = 0
             for symbol in symbols:
                 for tf in TIMEFRAMES:
                     # Process each symbol/timeframe sequentially to avoid rate limits
@@ -450,6 +461,8 @@ Database: Active"""
                     sig = build_signal(symbol, df, tf)
                     if sig:
                         await save_signal(sig)
+                        signals_found += 1
+                        
                         msg = (
                             f"🏛 <b>EARLY ROMEOPT SIGNAL</b>\n\n"
                             f"<b>Symbol:</b> {sig.symbol}\n"
@@ -461,8 +474,16 @@ Database: Active"""
                             f"<b>Rome Score:</b> {sig.rome_score}\n"
                             f"<b>Steps:</b> {sum(sig.sequence_verified)}/6 verified"
                         )
-                        await telegram_send(msg)
-                        logging.info(f"Signal detected: {sig.symbol} {sig.side} {sig.timeframe}")
+                        
+                        if env['TELEGRAM_AVAILABLE']:
+                            await telegram_send(msg, env['TELEGRAM_TOKEN'], env['TELEGRAM_CHAT_ID'])
+                        else:
+                            logging.info(f"SIGNAL (No Telegram): {sig.symbol} {sig.side} {sig.timeframe}")
+            
+            if signals_found > 0:
+                logging.info(f"Scan complete. Found {signals_found} signals.")
+            else:
+                logging.info("Scan complete. No signals found.")
 
             await asyncio.sleep(SCAN_INTERVAL)
 
@@ -476,7 +497,16 @@ if __name__ == "__main__":
         asyncio.run(scanner())
     except KeyboardInterrupt:
         logging.info("Scanner stopped by user")
-        asyncio.run(telegram_send("🛑 <b>ROMEOPT SCANNER STOPPED</b>\n\nManual interruption by user."))
+        # Try to send shutdown message if env vars were loaded
+        try:
+            env = load_environment_variables()
+            if env and env['TELEGRAM_AVAILABLE']:
+                asyncio.run(telegram_send(
+                    "🛑 <b>ROMEOPT SCANNER STOPPED</b>\n\nManual interruption by user.",
+                    env['TELEGRAM_TOKEN'],
+                    env['TELEGRAM_CHAT_ID']
+                ))
+        except:
+            pass
     except Exception as e:
         logging.error(f"Fatal error: {e}")
-        asyncio.run(telegram_send(f"💥 <b>ROMEOPT SCANNER CRASHED</b>\n\nError: {e}"))
