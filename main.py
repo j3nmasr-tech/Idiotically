@@ -8,8 +8,7 @@ LIVE ROMEOPT 6-STEP SCANNER
 - TP/SL tracking with ATR or OB
 - Telegram alerts
 - Async SQLite logging
-- Minimal filters for maximum early detection
-- Filters applied: Score ≥5, Displacement +2, Sweep+2 or Zone+1, Avoid counter-trend
+- Filters: Score >=5, Displacement +2, Sweep+2 OR Zone+1, avoid counter-trend
 """
 
 import os, time, asyncio, logging, datetime
@@ -27,18 +26,19 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))  # very fast scan
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))  # fast scan
 TOP_N = int(os.getenv("TOP_N", 5))
 TIMEFRAMES = ["1m", "3m", "5m"]
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", 3600))
 
-# Minimum score to trigger a signal
-MIN_SCORE = 4
+# Filters
+MIN_SCORE = 5
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger("romeopt_bot")
 db_lock = asyncio.Lock()
+db_conn = None  # global SQLite connection
 
 # ---------------- TELEGRAM ----------------
 def escape_html(msg: str) -> str:
@@ -52,12 +52,16 @@ async def tg(msg: str):
     async with httpx.AsyncClient() as client:
         try:
             await client.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": safe_msg, "parse_mode":"HTML"})
-        except: pass
+        except Exception as e:
+            log.warning(f"Telegram send failed: {e}")
 
 # ---------------- DATABASE ----------------
 async def init_db():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
+    global db_conn
+    db_conn = await aiosqlite.connect(DB_PATH)
+    await db_conn.execute("PRAGMA journal_mode=WAL;")
+    await db_conn.execute("PRAGMA synchronous=NORMAL;")
+    await db_conn.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol TEXT,
@@ -75,13 +79,15 @@ async def init_db():
             tp2_hit INTEGER DEFAULT 0,
             tp3_hit INTEGER DEFAULT 0
         );
-        """)
-        await db.commit()
+    """)
+    await db_conn.commit()
 
 # ---------------- OHLCV ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
-    try: return await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    except: return None
+    try:
+        return await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+    except:
+        return None
 
 # ---------------- INDICATORS ----------------
 def atr(df: pd.DataFrame, period=14):
@@ -108,16 +114,20 @@ def generate_signal_romeopt(df: pd.DataFrame, symbol: str):
     if sweep_high or sweep_low:
         score += 2
         reasons.append("Liquidity Sweep +2")
+        has_sweep = True
     else:
         reasons.append("No Sweep +0")
+        has_sweep = False
 
     # Step 2: Early Displacement (momentum candle)
     displacement = abs(last["close"] - last["open"]) / (last["high"] - last["low"] + 1e-8)
     if displacement > 0.6:
         score += 2
         reasons.append("Displacement +2")
+        has_disp = True
     else:
         reasons.append("No Displacement +0")
+        has_disp = False
 
     # Step 3: Early Zone Approach (approaching OB)
     ob_type = None
@@ -133,11 +143,11 @@ def generate_signal_romeopt(df: pd.DataFrame, symbol: str):
         ob_hi = candle["high"]
 
     if ob_type == "bullish" and last["close"] <= ob_hi:
-        score += 1; reasons.append("Zone Approach +1")
+        score += 1; reasons.append("Zone Approach +1"); has_zone = True
     elif ob_type == "bearish" and last["close"] >= ob_lo:
-        score += 1; reasons.append("Zone Approach +1")
+        score += 1; reasons.append("Zone Approach +1"); has_zone = True
     else:
-        reasons.append("Zone Approach +0")
+        reasons.append("Zone Approach +0"); has_zone = False
 
     # Step 4: Relaxed Premium/Discount
     range_high = df["high"].tail(10).max()
@@ -162,6 +172,19 @@ def generate_signal_romeopt(df: pd.DataFrame, symbol: str):
         reasons.append("Momentum +0")
 
     side = "BUY" if ob_type=="bullish" else "SELL"
+
+    # ---------------- Apply Winning Filters ----------------
+    # 1. Score >= MIN_SCORE
+    if score < MIN_SCORE: return None
+    # 2. Must have Displacement +2
+    if not has_disp: return None
+    # 3. Must have Liquidity Sweep +2 OR Zone Approach +1
+    if not (has_sweep or has_zone): return None
+    # 4. Avoid counter-trend signals (example: check against simple MA)
+    # For simplicity assume market trend check: bullish if last close > rolling mean
+    trend = df["close"].rolling(20).mean().iloc[-1]
+    if (side=="BUY" and last["close"] < trend) or (side=="SELL" and last["close"] > trend):
+        return None
 
     # TP/SL calculation
     atr_val = float(atr(df,14).iloc[-1])
@@ -204,20 +227,19 @@ def deprioritized(symbol: str, threshold=3, lookback=30):
 # ---------------- LOG SIGNAL ----------------
 async def log_signal(sig):
     async with db_lock:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("""
-                INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)
-            """, (sig["symbol"],sig["side"],sig["entry"],sig["sl"],sig["tp1"],sig["tp2"],sig["tp3"],
-                  datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"]))
-            await db.commit()
+        await db_conn.execute("""
+            INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+        """, (sig["symbol"],sig["side"],sig["entry"],sig["sl"],sig["tp1"],sig["tp2"],sig["tp3"],
+              datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"]))
+        await db_conn.commit()
 
 # ---------------- MONITOR SIGNALS ----------------
-async def monitor_signals(exchange):
+async def monitor_signals():
     while True:
         try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                async with db.execute("SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,tp1_hit,tp2_hit,tp3_hit,status FROM signals WHERE status='OPEN'") as cursor:
+            async with db_lock:
+                async with db_conn.execute("SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,tp1_hit,tp2_hit,tp3_hit,status FROM signals WHERE status='OPEN'") as cursor:
                     async for row in cursor:
                         sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status = row
                         ticker = await exchange.fetch_ticker(symbol)
@@ -241,10 +263,9 @@ async def monitor_signals(exchange):
 
                         if sl_hit: record_sl_hit(symbol)
 
-                        async with db_lock:
-                            await db.execute("UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?",
+                        await db_conn.execute("UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?",
                                              (tp1_hit,tp2_hit,tp3_hit,status,sig_id))
-                await db.commit()
+                await db_conn.commit()
         except Exception as e: log.exception("monitor error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
 
@@ -267,27 +288,11 @@ async def scan_loop(exchange):
                     df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
                     for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
                     sig = generate_signal_romeopt(df,symbol)
-
                     if sig:
-                        # --- APPLY WINNING FILTERS ---
-                        reasons = sig.get("reason_list",[])
-                        score_ok = sig["score"] >= 5
-                        displacement_ok = "Displacement +2" in reasons
-                        sweep_or_zone_ok = ("Liquidity Sweep +2" in reasons) or ("Zone Approach +1" in reasons)
-                        counter_trend_ok = True
-                        last_close = df["close"].iloc[-1]
-                        prev_close = df["close"].iloc[-2]
-                        if sig["side"]=="BUY" and last_close < prev_close:
-                            counter_trend_ok = False
-                        elif sig["side"]=="SELL" and last_close > prev_close:
-                            counter_trend_ok = False
-
-                        if score_ok and displacement_ok and sweep_or_zone_ok and counter_trend_ok:
-                            await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{sig['score']}\nBreakdown:{', '.join(sig['reason_list'])}")
-                            await log_signal(sig)
-                            last_signal_time[key]=time.time()
-                            signals_found+=1
-
+                        await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{sig['score']}\nBreakdown:{', '.join(sig['reason_list'])}")
+                        await log_signal(sig)
+                        last_signal_time[key]=time.time()
+                        signals_found+=1
             log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found")
         except Exception as e: log.exception("scan error: %s", e)
         elapsed=time.time()-t0
@@ -306,9 +311,10 @@ async def webhook(request: Request):
 # ---------------- MAIN ----------------
 async def main():
     await init_db()
+    global exchange
     exchange = ccxt.okx({"enableRateLimit": True})
     await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals")
-    await asyncio.gather(scan_loop(exchange), monitor_signals(exchange))
+    await asyncio.gather(scan_loop(exchange), monitor_signals())
 
 if __name__=="__main__":
     import argparse
@@ -318,4 +324,8 @@ if __name__=="__main__":
     if args.http:
         uvicorn.run(app, host="0.0.0.0", port=9000)
     else:
-        asyncio.run(main())
+        try:
+            asyncio.run(main())
+        finally:
+            if db_conn:
+                asyncio.run(db_conn.close())
