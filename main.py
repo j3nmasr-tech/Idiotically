@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-LIVE ROMEOPT 6-STEP SCANNER (Enhanced)
+LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features)
 - Fully live early signals
 - RomeOPT 6-step logic
 - TP/SL tracking with ATR or OB
@@ -13,6 +13,7 @@ LIVE ROMEOPT 6-STEP SCANNER (Enhanced)
 - Improved Order Block detection
 - Adaptive Market Regime detection
 - HTF + Sweep scoring threshold
+- Elite multi-timeframe confirmation (15m,1h,4h)
 """
 
 import os, time, asyncio, logging, datetime
@@ -33,7 +34,6 @@ DB_PATH = "/app/data/signals.db"
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
 TOP_N = int(os.getenv("TOP_N", 10))
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
-HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", 3600))
 MIN_SCORE = 5
 CRITICAL_FACTORS_MIN = 2  # HTF Alignment + Liquidity Sweep minimum
 
@@ -106,19 +106,30 @@ def atr(df: pd.DataFrame, period=14):
 
 # ---------------- MARKET REGIME ----------------
 async def detect_market_regime(df: pd.DataFrame):
-    # Higher timeframe MA for trend bias
     ma_htf = df["close"].rolling(50).mean().iloc[-1]
     price = df["close"].iloc[-1]
     recent_high = df["high"].iloc[-20:].max()
     recent_low = df["low"].iloc[-20:].min()
     range_pct = (recent_high - recent_low) / max(1e-8, recent_low)
-
     if price > ma_htf and range_pct > 0.02:
         return "BULL"
     elif price < ma_htf and range_pct > 0.02:
         return "BEAR"
     else:
         return "RANGE"
+
+# ---------------- MULTI-TIMEFRAME ELITE CONFIRM ----------------
+async def elite_tf_alignment(exchange, symbol: str, side: str):
+    tfs = ["15m","1h","4h"]
+    for tf in tfs:
+        ohlcv = await fetch_ohlcv(exchange, symbol, tf, 50)
+        if not ohlcv: return False
+        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+        trend = df["close"].iloc[-1] - df["close"].iloc[-5]
+        trend_side = "BUY" if trend>0 else "SELL"
+        if trend_side != side:
+            return False
+    return True
 
 # ---------------- ROMEOPT 6-STEP SIGNAL ----------------
 async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
@@ -128,7 +139,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     score = 0
     reasons = []
 
-    # Step 1: Liquidity Sweep
+    # Step 1: Liquidity Sweep (high-quality near swing highs/lows)
     sweep_high = last["high"] > prev5["high"].max()
     sweep_low = last["low"] < prev5["low"].min()
     has_sweep = sweep_high or sweep_low
@@ -203,7 +214,13 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     trend_ma = df["close"].rolling(20).mean().iloc[-1]
     if (side=="BUY" and last["close"]<trend_ma) or (side=="SELL" and last["close"]>trend_ma): return None
 
-    sig = {"symbol":symbol,"side":side,"entry":entry,"score":score,"reason":"RomeOPT 6-Step","reason_list":reasons,"htf_alignment":htf_alignment,"liquidity_sweep":liquidity_sweep}
+    # ---------------- ELITE MTF CONFIRMATION ----------------
+    if not await elite_tf_alignment(exchange, symbol, side):
+        return None
+    reasons.append("Elite MTF Alignment ✅")
+
+    sig = {"symbol":symbol,"side":side,"entry":entry,"score":score,"reason":"RomeOPT 6-Step",
+           "reason_list":reasons,"htf_alignment":htf_alignment,"liquidity_sweep":liquidity_sweep}
     sig = update_tp_sl_live(sig, df)
     return sig
 
