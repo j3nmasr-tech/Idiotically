@@ -45,7 +45,7 @@ async def telegram_send(msg: str):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     async with httpx.AsyncClient() as client:
         try:
-            await client.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
+            await client.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg})
         except Exception as e:
             logging.error(f"Telegram send failed: {e}")
 
@@ -102,65 +102,170 @@ async def save_signal(sig: Signal):
 
 # -------------------- BingX Market Data --------------------
 async def fetch_json(path: str, params: dict = None):
+    url = BINGX_BASE + path
     async with httpx.AsyncClient() as client:
-        r = await client.get(BINGX_BASE + path, params=params, timeout=10)
-        return r.json()
+        try:
+            response = await client.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logging.error(f"HTTP error {e.response.status_code} for {url}: {e}")
+            return {}
+        except Exception as e:
+            logging.error(f"Request failed for {url}: {e}")
+            return {}
 
 async def get_top_symbols() -> List[str]:
-    r = await fetch_json("/openApi/spot/v1/ticker/24hr")
-    data = r.get("data", [])
-    df = pd.DataFrame(data)
-    df = df[df["symbol"].str.contains("USDT")]
-    df["vol"] = pd.to_numeric(df.get("quoteVolume", df.get("volume", 0)), errors="coerce")
-    df = df.sort_values("vol", ascending=False).head(TOP_N)
-    return df["symbol"].tolist()
+    """Get top volume symbols from BingX"""
+    data = await fetch_json("/openApi/spot/v1/ticker/24hr")
+    
+    if not data or 'data' not in data:
+        logging.error("Failed to fetch symbols data or invalid response structure")
+        return []
+    
+    symbols_data = data['data']
+    if not symbols_data:
+        logging.warning("No symbols data returned from API")
+        return []
+    
+    try:
+        # Filter for USDT pairs and process volume
+        usdt_pairs = []
+        for symbol_data in symbols_data:
+            symbol = symbol_data.get('symbol', '')
+            if symbol.endswith('-USDT') or 'USDT' in symbol:
+                # Handle different possible volume field names
+                volume_str = symbol_data.get('quoteVolume') or symbol_data.get('volume') or '0'
+                try:
+                    volume = float(volume_str)
+                    usdt_pairs.append((symbol, volume))
+                except (ValueError, TypeError):
+                    continue
+        
+        # Sort by volume and get top N
+        usdt_pairs.sort(key=lambda x: x[1], reverse=True)
+        top_symbols = [pair[0] for pair in usdt_pairs[:TOP_N]]
+        
+        logging.info(f"Found {len(top_symbols)} top symbols")
+        return top_symbols
+        
+    except Exception as e:
+        logging.error(f"Error processing symbols: {e}")
+        return []
 
 async def get_ohlcv(symbol: str, timeframe: str) -> pd.DataFrame:
-    r = await fetch_json("/openApi/spot/v1/market/klines", {
+    """Get OHLCV data from BingX"""
+    params = {
         "symbol": symbol,
         "interval": timeframe,
         "limit": CANDLE_LIMIT
-    })
-    data = r.get("data", [])
-    if not data: return pd.DataFrame()
-    df = pd.DataFrame(data, columns=["time","open","high","low","close","volume"])
-    df[["open","high","low","close","volume"]] = df[["open","high","low","close","volume"]].astype(float)
-    return df
+    }
+    
+    data = await fetch_json("/openApi/spot/v1/market/klines", params)
+    
+    if not data or 'data' not in data or not data['data']:
+        logging.warning(f"No OHLCV data for {symbol} {timeframe}")
+        return pd.DataFrame()
+    
+    try:
+        candles = data['data']
+        # BingX returns: [timestamp, open, high, low, close, volume, ...]
+        df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        
+        # Convert to numeric types
+        numeric_columns = ["open", "high", "low", "close", "volume"]
+        for col in numeric_columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        
+        # Convert timestamp to datetime if needed
+        df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce')
+        df = df.dropna()
+        
+        return df
+        
+    except Exception as e:
+        logging.error(f"Error processing OHLCV for {symbol} {timeframe}: {e}")
+        return pd.DataFrame()
 
 # -------------------- RomeOPT Logic --------------------
 def detect_liquidity_sweep(df: pd.DataFrame) -> bool:
+    if len(df) < 1:
+        return False
     last = df.iloc[-1]
     wick_up = last["high"] - max(last["open"], last["close"])
     wick_down = min(last["open"], last["close"]) - last["low"]
-    return wick_up > (last["high"] - last["low"]) * 0.3 or wick_down > (last["high"] - last["low"]) * 0.3
+    total_range = last["high"] - last["low"]
+    
+    if total_range == 0:
+        return False
+        
+    return wick_up > total_range * 0.3 or wick_down > total_range * 0.3
 
 def detect_displacement(df: pd.DataFrame) -> bool:
-    body = abs(df.iloc[-1]["close"] - df.iloc[-1]["open"])
-    rng = df["high"].iloc[-14:] - df["low"].iloc[-14:]
-    atr = rng.mean()
+    if len(df) < 14:
+        return False
+        
+    last = df.iloc[-1]
+    body = abs(last["close"] - last["open"])
+    
+    # Calculate ATR-like value from recent range
+    recent_highs = df["high"].iloc[-14:]
+    recent_lows = df["low"].iloc[-14:]
+    ranges = recent_highs.values - recent_lows.values
+    atr = np.mean(ranges) if len(ranges) > 0 else 0
+    
+    if atr == 0:
+        return False
+        
     return body > atr * 0.6
 
 def detect_zone_approach(df: pd.DataFrame) -> bool:
-    return df.iloc[-1]["close"] < df["open"].iloc[-5] or df.iloc[-1]["close"] > df["close"].iloc[-5]
+    if len(df) < 6:
+        return False
+        
+    current_close = df.iloc[-1]["close"]
+    reference_open = df.iloc[-5]["open"]
+    reference_close = df.iloc[-5]["close"]
+    
+    return current_close < reference_open or current_close > reference_close
 
 def detect_pd_alignment(df: pd.DataFrame) -> bool:
+    if len(df) < 1:
+        return False
+        
     mid = (df["high"].max() + df["low"].min()) / 2
-    return abs(df.iloc[-1]["close"] - mid) < (mid * 0.03)
+    current_close = df.iloc[-1]["close"]
+    
+    return abs(current_close - mid) < (mid * 0.03)
 
 def detect_htf_relaxed() -> bool:
+    # Placeholder - you can implement higher timeframe analysis here
     return True
 
 def detect_early_momentum(df: pd.DataFrame) -> bool:
-    return abs(df.iloc[-1]["close"] - df.iloc[-2]["close"]) > df.iloc[-1]["close"] * 0.0015
+    if len(df) < 2:
+        return False
+        
+    price_change = abs(df.iloc[-1]["close"] - df.iloc[-2]["close"])
+    return price_change > df.iloc[-1]["close"] * 0.0015
 
 # -------------------- Determine BUY/SELL --------------------
 def determine_side(df: pd.DataFrame) -> str:
+    if len(df) < 1:
+        return "NEUTRAL"
+        
     last = df.iloc[-1]
     wick_up = last["high"] - max(last["open"], last["close"])
     wick_down = min(last["open"], last["close"]) - last["low"]
 
     sweep_dir = "BUY" if wick_down > wick_up else "SELL"
-    mid = (df["high"].max() + df["low"].min()) / 2
+    
+    # Calculate mid price of recent range
+    lookback = min(14, len(df))
+    recent_high = df["high"].iloc[-lookback:].max()
+    recent_low = df["low"].iloc[-lookback:].min()
+    mid = (recent_high + recent_low) / 2
+    
     zone_dir = "BUY" if last["close"] < mid else "SELL"
 
     if sweep_dir == zone_dir:
@@ -170,6 +275,9 @@ def determine_side(df: pd.DataFrame) -> str:
 
 # -------------------- Build Signal --------------------
 def build_signal(symbol: str, df: pd.DataFrame, timeframe: str) -> Optional[Signal]:
+    if df.empty or len(df) < 14:
+        return None
+
     steps = [
         detect_liquidity_sweep(df),
         detect_displacement(df),
@@ -178,18 +286,32 @@ def build_signal(symbol: str, df: pd.DataFrame, timeframe: str) -> Optional[Sign
         detect_htf_relaxed(),
         detect_early_momentum(df),
     ]
+    
+    # Require first 3 steps to be true
     if not all(steps[:3]):
         return None
 
     side = determine_side(df)
+    if side == "NEUTRAL":
+        return None
+        
     price = df.iloc[-1]["close"]
 
-    entry_low = price * 0.999
-    entry_high = price * 1.001
-    sl = price * (0.996 if side == "BUY" else 1.004)
-    tp1 = price * (1.003 if side == "BUY" else 0.997)
-    tp2 = price * (1.006 if side == "BUY" else 0.994)
-    tp3 = price * (1.010 if side == "BUY" else 0.990)
+    # Calculate entry zone and targets
+    if side == "BUY":
+        entry_low = price * 0.999
+        entry_high = price * 1.001
+        sl = price * 0.996
+        tp1 = price * 1.003
+        tp2 = price * 1.006
+        tp3 = price * 1.010
+    else:  # SELL
+        entry_low = price * 0.999
+        entry_high = price * 1.001
+        sl = price * 1.004
+        tp1 = price * 0.997
+        tp2 = price * 0.994
+        tp3 = price * 0.990
 
     return Signal(
         symbol=symbol,
@@ -213,13 +335,21 @@ async def scanner():
     while True:
         try:
             symbols = await get_top_symbols()
-            logging.info(f"Scanning {len(symbols)} symbols...")
+            if not symbols:
+                logging.warning("No symbols to scan, retrying...")
+                await asyncio.sleep(SCAN_INTERVAL)
+                continue
 
+            logging.info(f"Scanning {len(symbols)} symbols...")
+            tasks = []
+            
             for symbol in symbols:
                 for tf in TIMEFRAMES:
+                    # Process each symbol/timeframe sequentially to avoid rate limits
                     df = await get_ohlcv(symbol, tf)
                     if df.empty:
                         continue
+                        
                     sig = build_signal(symbol, df, tf)
                     if sig:
                         await save_signal(sig)
@@ -228,20 +358,29 @@ async def scanner():
                             f"Symbol: {sig.symbol}\n"
                             f"Side: {sig.side}\n"
                             f"TF: {sig.timeframe}\n"
-                            f"Entry: {sig.entry_zone}\n"
-                            f"SL: {sig.stop_loss}\n"
-                            f"TP1: {sig.tp1}\nTP2: {sig.tp2}\nTP3: {sig.tp3}\n"
+                            f"Entry: ({sig.entry_zone[0]:.6f}, {sig.entry_zone[1]:.6f})\n"
+                            f"SL: {sig.stop_loss:.6f}\n"
+                            f"TP1: {sig.tp1:.6f}\nTP2: {sig.tp2:.6f}\nTP3: {sig.tp3:.6f}\n"
                             f"Rome Score: {sig.rome_score}\n"
-                            f"Steps: {sig.sequence_verified}"
+                            f"Steps: {sum(sig.sequence_verified)}/6 verified"
                         )
                         await telegram_send(msg)
+                        logging.info(f"Signal detected: {sig.symbol} {sig.side} {sig.timeframe}")
 
             await asyncio.sleep(SCAN_INTERVAL)
 
         except Exception as e:
             logging.error(f"Scanner error: {e}")
-            await asyncio.sleep(3)
+            await asyncio.sleep(SCAN_INTERVAL)
 
 # -------------------- Run --------------------
 if __name__ == "__main__":
-    asyncio.run(scanner())
+    # Import numpy for ATR calculation
+    import numpy as np
+    
+    try:
+        asyncio.run(scanner())
+    except KeyboardInterrupt:
+        logging.info("Scanner stopped by user")
+    except Exception as e:
+        logging.error(f"Fatal error: {e}")
