@@ -10,9 +10,7 @@ LIVE ROMEOPT 6-STEP SCANNER
 - Telegram alerts
 - Async SQLite logging
 - Filters: Score >=5, Displacement +2, Sweep+2 OR Zone+1, avoid counter-trend
-
-MODIFIED: Enforced gating - only emit signals that have BOTH:
-    HTF Alignment == +1  AND  Liquidity Sweep == +2
+- Market Regime detection integrated
 """
 
 import os, time, asyncio, logging, datetime
@@ -79,11 +77,12 @@ async def init_db():
             score INTEGER,
             tp1_hit INTEGER DEFAULT 0,
             tp2_hit INTEGER DEFAULT 0,
-            tp3_hit INTEGER DEFAULT 0
+            tp3_hit INTEGER DEFAULT 0,
+            latest_ob TEXT,
+            market_regime TEXT
         );
     """)
     await db_conn.commit()
-
     # Add latest_ob column if missing
     async with db_lock:
         try:
@@ -110,6 +109,24 @@ def atr(df: pd.DataFrame, period=14):
         "l-pc": (low - close.shift(1)).abs()
     }).max(axis=1)
     return tr.rolling(period, min_periods=1).mean()
+
+# ---------------- MARKET REGIME ----------------
+async def detect_market_regime(exchange, symbol):
+    """
+    Simple regime detection:
+    - BULL: recent 20-close avg trending up
+    - BEAR: trending down
+    - RANGE: sideways (small slope)
+    """
+    ohlcv = await fetch_ohlcv(exchange, symbol, "15m", 50)
+    if not ohlcv: return "UNKNOWN"
+    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    slope = df["close"].iloc[-1] - df["close"].iloc[-20]
+    pct_change = slope / df["close"].iloc[-20]
+    if pct_change > 0.003: return "BULL"
+    elif pct_change < -0.003: return "BEAR"
+    else: return "RANGE"
 
 # ---------------- ROMEOPT 6-STEP SIGNAL ----------------
 async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
@@ -203,12 +220,22 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     side = "BUY" if ob_type=="bullish" else "SELL"
     atr_val = float(atr(df,14).iloc[-1])
     entry = float(last["close"])
+
+    # ----- NEW: Market Regime -----
+    market_regime = await detect_market_regime(exchange, symbol)
+    if (market_regime=="BULL" and side=="SELL") or (market_regime=="BEAR" and side=="BUY"):
+        return None  # skip counter-trend
+
     sig = {
-        "symbol":symbol, "side":side, "entry":entry,
-        "score":score, "reason":"RomeOPT 6-Step",
-        "reason_list":reasons,
+        "symbol": symbol,
+        "side": side,
+        "entry": entry,
+        "score": score,
+        "reason": "RomeOPT 6-Step",
+        "reason_list": reasons,
         "htf_alignment": htf_alignment,
-        "liquidity_sweep": liquidity_sweep
+        "liquidity_sweep": liquidity_sweep,
+        "market_regime": market_regime
     }
 
     if htf_alignment != 1 or liquidity_sweep != 2: return None
@@ -270,10 +297,11 @@ def deprioritized(symbol: str, threshold=3, lookback=30):
 async def log_signal(sig):
     async with db_lock:
         await db_conn.execute("""
-            INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score,latest_ob)
+            INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score,latest_ob,market_regime)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (sig["symbol"],sig["side"],sig["entry"],sig.get("sl"),sig.get("tp1"),sig.get("tp2"),sig.get("tp3"),
-              datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"],str(sig.get("latest_ob",""))))
+        """, (sig["symbol"], sig["side"], sig["entry"], sig.get("sl"), sig.get("tp1"),
+              sig.get("tp2"), sig.get("tp3"), datetime.datetime.utcnow().isoformat(),
+              "OPEN", sig["reason"], sig["score"], str(sig.get("latest_ob","")), sig.get("market_regime")))
         await db_conn.commit()
 
 # ---------------- MONITOR SIGNALS ----------------
@@ -341,7 +369,7 @@ async def scan_loop(exchange):
                     if sig:
                         htf_flag = sig.get("htf_alignment", "N/A")
                         sweep_flag = sig.get("liquidity_sweep", "N/A")
-                        await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig.get('sl')}\nTP1:{sig.get('tp1')} TP2:{sig.get('tp2')} TP3:{sig.get('tp3')}\nScore:{sig['score']}\nHTF:{htf_flag} Sweep:{sweep_flag}\nBreakdown:{', '.join(sig['reason_list'])}")
+                        await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']} [{sig['market_regime']}]\nEntry:{sig['entry']}\nSL:{sig.get('sl')}\nTP1:{sig.get('tp1')} TP2:{sig.get('tp2')} TP3:{sig.get('tp3')}\nScore:{sig['score']}\nHTF:{htf_flag} Sweep:{sweep_flag}\nBreakdown:{', '.join(sig['reason_list'])}")
                         await log_signal(sig)
                         last_signal_time[key]=time.time()
                         signals_found+=1
