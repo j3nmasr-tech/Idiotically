@@ -9,6 +9,7 @@ LIVE ROMEOPT 6-STEP SCANNER
 - Telegram alerts
 - Async SQLite logging
 - Minimal filters for maximum early detection
+- Filters applied: Score ≥5, Displacement +2, Sweep+2 or Zone+1, Avoid counter-trend
 """
 
 import os, time, asyncio, logging, datetime
@@ -94,16 +95,6 @@ def atr(df: pd.DataFrame, period=14):
 
 # ---------------- ROMEOPT 6-STEP SIGNAL ----------------
 def generate_signal_romeopt(df: pd.DataFrame, symbol: str):
-    """
-    RomeOPT 6-step live logic:
-    1. Early Liquidity Sweep
-    2. Early Displacement
-    3. Early Zone Approach
-    4. Relaxed Premium/Discount
-    5. Relaxed HTF Alignment
-    6. Early Momentum
-    """
-
     if df is None or len(df) < 6: return None
     last = df.iloc[-1]
     prev5 = df.iloc[-6:-1]
@@ -159,7 +150,7 @@ def generate_signal_romeopt(df: pd.DataFrame, symbol: str):
     else:
         reasons.append("Premium/Discount +0")
 
-    # Step 5: Relaxed HTF Alignment (skip strict EMA)
+    # Step 5: Relaxed HTF Alignment
     score +=1; reasons.append("HTF Relaxed +1")
 
     # Step 6: Early Momentum
@@ -276,11 +267,27 @@ async def scan_loop(exchange):
                     df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
                     for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
                     sig = generate_signal_romeopt(df,symbol)
-                    if sig and sig["score"] >= MIN_SCORE:  # <-- FILTER MIN SCORE
-                        await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{sig['score']}\nBreakdown:{', '.join(sig['reason_list'])}")
-                        await log_signal(sig)
-                        last_signal_time[key]=time.time()
-                        signals_found+=1
+
+                    if sig:
+                        # --- APPLY WINNING FILTERS ---
+                        reasons = sig.get("reason_list",[])
+                        score_ok = sig["score"] >= 5
+                        displacement_ok = "Displacement +2" in reasons
+                        sweep_or_zone_ok = ("Liquidity Sweep +2" in reasons) or ("Zone Approach +1" in reasons)
+                        counter_trend_ok = True
+                        last_close = df["close"].iloc[-1]
+                        prev_close = df["close"].iloc[-2]
+                        if sig["side"]=="BUY" and last_close < prev_close:
+                            counter_trend_ok = False
+                        elif sig["side"]=="SELL" and last_close > prev_close:
+                            counter_trend_ok = False
+
+                        if score_ok and displacement_ok and sweep_or_zone_ok and counter_trend_ok:
+                            await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{sig['score']}\nBreakdown:{', '.join(sig['reason_list'])}")
+                            await log_signal(sig)
+                            last_signal_time[key]=time.time()
+                            signals_found+=1
+
             log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found")
         except Exception as e: log.exception("scan error: %s", e)
         elapsed=time.time()-t0
