@@ -100,93 +100,110 @@ def atr(df: pd.DataFrame, period=14):
     return tr.rolling(period, min_periods=1).mean()
 
 # ---------------- ROMEOPT 6-STEP SIGNAL ----------------
-def generate_signal_romeopt(df: pd.DataFrame, symbol: str):
-    if df is None or len(df) < 6: return None
+async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
+    if df is None or len(df) < 20:
+        return None
+
     last = df.iloc[-1]
     prev5 = df.iloc[-6:-1]
 
     score = 0
     reasons = []
 
-    # Step 1: Early Liquidity Sweep
+    # ---------------- Step 1: Early Liquidity Sweep ----------------
     sweep_high = last["high"] > prev5["high"].max()
     sweep_low = last["low"] < prev5["low"].min()
-    if sweep_high or sweep_low:
+    has_sweep = sweep_high or sweep_low
+    if has_sweep:
         score += 2
         reasons.append("Liquidity Sweep +2")
-        has_sweep = True
     else:
         reasons.append("No Sweep +0")
-        has_sweep = False
 
-    # Step 2: Early Displacement (momentum candle)
+    # ---------------- Step 2: Early Displacement ----------------
     displacement = abs(last["close"] - last["open"]) / (last["high"] - last["low"] + 1e-8)
-    if displacement > 0.6:
+    has_disp = displacement > 0.6
+    if has_disp:
         score += 2
         reasons.append("Displacement +2")
-        has_disp = True
     else:
         reasons.append("No Displacement +0")
-        has_disp = False
 
-    # Step 3: Early Zone Approach (approaching OB)
-    ob_type = None
-    ob_hi, ob_lo = last["high"], last["low"]
-    candle = df.iloc[-3]
-    if candle["close"] > candle["open"]:
-        ob_type = "bullish"
-        ob_lo = candle["low"]
-        ob_hi = candle["open"]
+    # ---------------- Step 3: Early Zone Approach (OB/FVG) ----------------
+    ob_zone = None
+    for i in range(len(df)-20, len(df)-1):
+        candle = df.iloc[i]
+        prev_candle = df.iloc[i-1]
+        # Bullish OB: strong up candle after down
+        if candle["close"] > candle["open"] and prev_candle["close"] < prev_candle["open"]:
+            ob_zone = {"type":"bullish", "low":candle["low"], "high":candle["close"]}
+            break
+        elif candle["close"] < candle["open"] and prev_candle["close"] > prev_candle["open"]:
+            ob_zone = {"type":"bearish", "low":candle["close"], "high":candle["high"]}
+            break
+
+    has_zone = False
+    ob_type = ob_zone["type"] if ob_zone else None
+    if ob_zone:
+        if ob_type=="bullish" and last["close"] <= ob_zone["high"]:
+            score += 1; reasons.append("Zone Approach +1"); has_zone=True
+        elif ob_type=="bearish" and last["close"] >= ob_zone["low"]:
+            score += 1; reasons.append("Zone Approach +1"); has_zone=True
+        else:
+            reasons.append("Zone Approach +0")
     else:
-        ob_type = "bearish"
-        ob_lo = candle["open"]
-        ob_hi = candle["high"]
+        reasons.append("Zone Approach +0")
 
-    if ob_type == "bullish" and last["close"] <= ob_hi:
-        score += 1; reasons.append("Zone Approach +1"); has_zone = True
-    elif ob_type == "bearish" and last["close"] >= ob_lo:
-        score += 1; reasons.append("Zone Approach +1"); has_zone = True
-    else:
-        reasons.append("Zone Approach +0"); has_zone = False
-
-    # Step 4: Relaxed Premium/Discount
-    range_high = df["high"].tail(10).max()
-    range_low = df["low"].tail(10).min()
-    pos = (last["close"] - range_low) / (range_high - range_low + 1e-8)
-    if ob_type=="bullish" and pos < 0.6:
-        score +=1; reasons.append("Premium/Discount +1")
-    elif ob_type=="bearish" and pos > 0.4:
-        score +=1; reasons.append("Premium/Discount +1")
+    # ---------------- Step 4: Relaxed Premium/Discount ----------------
+    if ob_zone:
+        if ob_type=="bullish" and last["close"] < ob_zone["high"]:
+            score += 1; reasons.append("Premium/Discount +1")
+        elif ob_type=="bearish" and last["close"] > ob_zone["low"]:
+            score += 1; reasons.append("Premium/Discount +1")
+        else:
+            reasons.append("Premium/Discount +0")
     else:
         reasons.append("Premium/Discount +0")
 
-    # Step 5: Relaxed HTF Alignment
-    score +=1; reasons.append("HTF Relaxed +1")
+    # ---------------- Step 5: HTF Alignment ----------------
+    tf_map = {"1m":"15m","3m":"30m","5m":"1h","15m":"4h","30m":"1h"}
+    htf = tf_map.get(tf, "15m")
+    ohlcv_htf = await fetch_ohlcv(exchange, symbol, htf, 50)
+    if ohlcv_htf:
+        df_htf = pd.DataFrame(ohlcv_htf, columns=["ts","open","high","low","close","vol"])
+        trend = df_htf["close"].iloc[-1] - df_htf["close"].iloc[-5]
+        htf_dir = "bullish" if trend>0 else "bearish"
+        if htf_dir == ob_type:
+            score += 1; reasons.append("HTF Alignment +1")
+        else:
+            reasons.append("HTF Alignment +0")
+    else:
+        reasons.append("HTF Alignment ?")
 
-    # Step 6: Early Momentum
-    if ob_type=="bullish" and last["close"] > last["open"]:
+    # ---------------- Step 6: Early Momentum ----------------
+    momentum_ratio = abs(last["close"]-last["open"])/(last["high"]-last["low"]+1e-8)
+    if ob_type=="bullish" and momentum_ratio>0.5 and last["close"]>last["open"]:
         score +=1; reasons.append("Momentum +1")
-    elif ob_type=="bearish" and last["close"] < last["open"]:
+    elif ob_type=="bearish" and momentum_ratio>0.5 and last["close"]<last["open"]:
         score +=1; reasons.append("Momentum +1")
     else:
         reasons.append("Momentum +0")
 
+    if not ob_type:
+        return None
+
     side = "BUY" if ob_type=="bullish" else "SELL"
 
-    # ---------------- Apply Winning Filters ----------------
-    # 1. Score >= MIN_SCORE
+    # ---------------- Winning Filters ----------------
     if score < MIN_SCORE: return None
-    # 2. Must have Displacement +2
     if not has_disp: return None
-    # 3. Must have Liquidity Sweep +2 OR Zone Approach +1
     if not (has_sweep or has_zone): return None
-    # 4. Avoid counter-trend signals (example: check against simple MA)
-    # For simplicity assume market trend check: bullish if last close > rolling mean
+
     trend = df["close"].rolling(20).mean().iloc[-1]
     if (side=="BUY" and last["close"] < trend) or (side=="SELL" and last["close"] > trend):
         return None
 
-    # TP/SL calculation
+    # ---------------- TP/SL ----------------
     atr_val = float(atr(df,14).iloc[-1])
     entry = float(last["close"])
     if side=="BUY":
@@ -287,7 +304,7 @@ async def scan_loop(exchange):
                     if not ohlcv: continue
                     df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
                     for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
-                    sig = generate_signal_romeopt(df,symbol)
+                    sig = await generate_signal_romeopt(exchange,df,symbol,tf)
                     if sig:
                         await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{sig['score']}\nBreakdown:{', '.join(sig['reason_list'])}")
                         await log_signal(sig)
