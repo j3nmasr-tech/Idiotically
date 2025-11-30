@@ -159,18 +159,13 @@ def determine_side(df: pd.DataFrame) -> str:
     wick_up = last["high"] - max(last["open"], last["close"])
     wick_down = min(last["open"], last["close"]) - last["low"]
 
-    # Step1: liquidity sweep direction
     sweep_dir = "BUY" if wick_down > wick_up else "SELL"
-
-    # Step2: PD zone alignment
     mid = (df["high"].max() + df["low"].min()) / 2
     zone_dir = "BUY" if last["close"] < mid else "SELL"
 
-    # Step3: combine
     if sweep_dir == zone_dir:
         return sweep_dir
     else:
-        # fallback to momentum
         return "BUY" if last["close"] > last["open"] else "SELL"
 
 # -------------------- Build Signal --------------------
@@ -229,7 +224,7 @@ async def scanner():
                     if sig:
                         await save_signal(sig)
                         msg = (
-                            f"🏛 **EARLY ROMEOPT SIGNAL**\n\n"
+                            f"🏛 EARLY ROMEOPT SIGNAL\n\n"
                             f"Symbol: {sig.symbol}\n"
                             f"Side: {sig.side}\n"
                             f"TF: {sig.timeframe}\n"
