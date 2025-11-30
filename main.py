@@ -11,6 +11,9 @@ import os
 import asyncio
 import time
 import json
+import hmac
+import hashlib
+import urllib.parse
 from datetime import datetime
 from typing import List, Tuple, Optional
 import logging
@@ -32,9 +35,9 @@ def load_environment_variables():
     except ImportError:
         logging.warning("python-dotenv not installed, skipping .env file")
     
-    # Get all environment variables
+    # Get all environment variables - handle the typo case
     BINGX_API_KEY = os.getenv("BINGX_API_KEY")
-    BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY")
+    BINGX_SECRET_KEY = os.getenv("BINGX_SECRET_KEY") or os.getenv("BINGX_SECRET_KET")  # Handle typo
     TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -44,14 +47,6 @@ def load_environment_variables():
     logging.info(f"BINGX_SECRET_KEY: {'***SET***' if BINGX_SECRET_KEY else 'MISSING'}")
     logging.info(f"TELEGRAM_BOT_TOKEN: {'***SET***' if TELEGRAM_TOKEN else 'MISSING'}")
     logging.info(f"TELEGRAM_CHAT_ID: {'***SET***' if TELEGRAM_CHAT_ID else 'MISSING'}")
-    
-    # For debugging, also check if any env vars exist at all
-    all_env_vars = dict(os.environ)
-    bingx_vars = {k: v for k, v in all_env_vars.items() if 'BINGX' in k}
-    telegram_vars = {k: v for k, v in all_env_vars.items() if 'TELEGRAM' in k}
-    
-    logging.info(f"All BINGX related vars: {list(bingx_vars.keys())}")
-    logging.info(f"All TELEGRAM related vars: {list(telegram_vars.keys())}")
     
     # Check required variables but don't crash immediately
     missing_vars = []
@@ -174,30 +169,62 @@ async def save_signal(sig: Signal):
         await db.commit()
         logging.info(f"Signal saved to database: {sig.symbol} {sig.side}")
 
-# -------------------- BingX Market Data --------------------
-async def fetch_json(path: str, params: dict = None):
-    """Fetch JSON data from BingX API"""
+# -------------------- BingX API Helpers --------------------
+def generate_signature(secret_key: str, payload: str) -> str:
+    """Generate HMAC SHA256 signature"""
+    return hmac.new(
+        secret_key.encode('utf-8'),
+        payload.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
+
+async def fetch_json(path: str, params: dict = None, env: dict = None):
+    """Fetch JSON data from BingX API with proper authentication"""
     url = BINGX_BASE + path
+    
+    # Add required timestamp parameter
+    if params is None:
+        params = {}
+    
+    params['timestamp'] = str(int(time.time() * 1000))
+    
+    # For authenticated endpoints, add signature
+    if env and path not in ['/openApi/spot/v1/ticker/24hr', '/openApi/spot/v1/market/klines']:
+        # These are public endpoints, no signature needed
+        query_string = urllib.parse.urlencode(params)
+        signature = generate_signature(env['BINGX_SECRET_KEY'], query_string)
+        params['signature'] = signature
+    
     async with httpx.AsyncClient() as client:
         try:
-            response = await client.get(url, params=params, timeout=10)
+            headers = {}
+            if env and path not in ['/openApi/spot/v1/ticker/24hr', '/openApi/spot/v1/market/klines']:
+                headers['X-BX-APIKEY'] = env['BINGX_API_KEY']
+            
+            response = await client.get(url, params=params, headers=headers, timeout=10)
             response.raise_for_status()
             data = response.json()
             return data
         except httpx.HTTPStatusError as e:
             logging.error(f"HTTP error {e.response.status_code} for {url}")
+            logging.error(f"Response: {e.response.text}")
             return {}
         except Exception as e:
             logging.error(f"Request failed for {url}: {e}")
             return {}
 
-async def get_top_symbols() -> List[str]:
+async def get_top_symbols(env: dict) -> List[str]:
     """Get top volume symbols from BingX"""
     logging.info("Fetching top symbols from BingX...")
-    data = await fetch_json("/openApi/spot/v1/ticker/24hr")
+    data = await fetch_json("/openApi/spot/v1/ticker/24hr", env=env)
     
     if not data:
         logging.error("No data returned from BingX API")
+        return []
+    
+    # Check if it's an error response
+    if 'code' in data and data['code'] != 0:
+        logging.error(f"BingX API error: {data.get('msg', 'Unknown error')}")
         return []
     
     if 'data' not in data:
@@ -232,14 +259,14 @@ async def get_top_symbols() -> List[str]:
         usdt_pairs.sort(key=lambda x: x[1], reverse=True)
         top_symbols = [pair[0] for pair in usdt_pairs[:TOP_N]]
         
-        logging.info(f"Found {len(top_symbols)} top symbols")
+        logging.info(f"Found {len(top_symbols)} top symbols: {top_symbols[:5]}...")  # Log first 5
         return top_symbols
         
     except Exception as e:
         logging.error(f"Error processing symbols: {e}")
         return []
 
-async def get_ohlcv(symbol: str, timeframe: str) -> pd.DataFrame:
+async def get_ohlcv(symbol: str, timeframe: str, env: dict) -> pd.DataFrame:
     """Get OHLCV data from BingX"""
     params = {
         "symbol": symbol,
@@ -247,10 +274,19 @@ async def get_ohlcv(symbol: str, timeframe: str) -> pd.DataFrame:
         "limit": CANDLE_LIMIT
     }
     
-    data = await fetch_json("/openApi/spot/v1/market/klines", params)
+    data = await fetch_json("/openApi/spot/v1/market/klines", params, env=env)
     
-    if not data or 'data' not in data or not data['data']:
+    if not data:
         logging.debug(f"No OHLCV data for {symbol} {timeframe}")
+        return pd.DataFrame()
+    
+    # Check if it's an error response
+    if 'code' in data and data['code'] != 0:
+        logging.debug(f"BingX API error for {symbol} {timeframe}: {data.get('msg', 'Unknown error')}")
+        return pd.DataFrame()
+    
+    if 'data' not in data or not data['data']:
+        logging.debug(f"No OHLCV data in response for {symbol} {timeframe}")
         return pd.DataFrame()
     
     try:
@@ -267,6 +303,7 @@ async def get_ohlcv(symbol: str, timeframe: str) -> pd.DataFrame:
         df['timestamp'] = pd.to_numeric(df['timestamp'], errors='coerce')
         df = df.dropna()
         
+        logging.debug(f"Retrieved {len(df)} candles for {symbol} {timeframe}")
         return df
         
     except Exception as e:
@@ -442,7 +479,7 @@ Database: Active"""
 
     while True:
         try:
-            symbols = await get_top_symbols()
+            symbols = await get_top_symbols(env)
             if not symbols:
                 logging.warning("No symbols to scan, retrying...")
                 await asyncio.sleep(SCAN_INTERVAL)
@@ -454,7 +491,7 @@ Database: Active"""
             for symbol in symbols:
                 for tf in TIMEFRAMES:
                     # Process each symbol/timeframe sequentially to avoid rate limits
-                    df = await get_ohlcv(symbol, tf)
+                    df = await get_ohlcv(symbol, tf, env)
                     if df.empty:
                         continue
                         
