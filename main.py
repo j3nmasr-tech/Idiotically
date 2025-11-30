@@ -31,6 +31,9 @@ TOP_N = int(os.getenv("TOP_N", 10))
 TIMEFRAMES = ["1m", "3m", "5m"]
 HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", 3600))
 
+# Minimum score to trigger a signal
+MIN_SCORE = 4
+
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger("romeopt_bot")
@@ -273,7 +276,7 @@ async def scan_loop(exchange):
                     df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
                     for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
                     sig = generate_signal_romeopt(df,symbol)
-                    if sig:
+                    if sig and sig["score"] >= MIN_SCORE:  # <-- FILTER MIN SCORE
                         await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig['sl']}\nTP1:{sig['tp1']} TP2:{sig['tp2']} TP3:{sig['tp3']}\nScore:{sig['score']}\nBreakdown:{', '.join(sig['reason_list'])}")
                         await log_signal(sig)
                         last_signal_time[key]=time.time()
