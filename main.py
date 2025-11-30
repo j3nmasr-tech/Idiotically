@@ -276,6 +276,27 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
         tp3 = min(base_tp3, tp2 - 0.001)  # Force below TP2
 
     return sl, tp1, tp2, tp3
+
+def find_latest_ob(df: pd.DataFrame):
+    for i in range(len(df)-5, len(df)-1):
+        candle, prev_candle = df.iloc[i], df.iloc[i-1]
+        if candle["close"]>candle["open"] and prev_candle["close"]<prev_candle["open"]:
+            return {"type":"bullish","low":min(candle["low"], prev_candle["low"]),"high":candle["close"]}
+        elif candle["close"]<candle["open"] and prev_candle["close"]>prev_candle["open"]:
+            return {"type":"bearish","low":candle["close"],"high":max(candle["high"], prev_candle["high"])}
+    return None
+
+def update_tp_sl_live(sig: dict, df: pd.DataFrame):
+    latest_ob = find_latest_ob(df)
+    if not latest_ob: return sig
+    atr_val = float(atr(df,14).iloc[-1])
+    entry = sig["entry"]
+    side = sig["side"]
+    sl,tp1,tp2,tp3 = romeopt_tp_sl(entry, side, atr_val, latest_ob, df)
+    sig["sl"]=sl; sig["tp1"]=tp1; sig["tp2"]=tp2; sig["tp3"]=tp3
+    sig["latest_ob"]=latest_ob
+    return sig
+
 # ---------------- SL CLUSTER ----------------
 recent_sl = defaultdict(lambda: deque())
 def record_sl_hit(symbol: str, lookback_minutes=30):
