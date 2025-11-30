@@ -32,7 +32,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
-TOP_N = int(os.getenv("TOP_N", 30))
+TOP_N = int(os.getenv("TOP_N", 60))
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
 MIN_SCORE = 5
 CRITICAL_FACTORS_MIN = 2  # HTF Alignment + Liquidity Sweep minimum
@@ -236,54 +236,83 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
 # ---------------- TP/SL HELPERS ----------------
 def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
     """
-    FIXED TP/SL using market structure + ATR
+    OPTIMIZED TP/SL using market structure + ATR
+    - Fixes calculation bugs
+    - Ensures meaningful profit targets
+    - Maintains all your elite logic
     """
-    recent_high = df['high'].iloc[-20:].max()
-    recent_low = df['low'].iloc[-20:].min()
+    recent_high = df['high'].iloc[-10:].max()  # Shorter lookback for relevance
+    recent_low = df['low'].iloc[-10:].min()
 
     if side == "BUY":
-        sl = min(ob_zone["low"] - atr_val*0.3, recent_low - atr_val*0.3)
+        # Calculate SL using the MORE CONSERVATIVE approach
+        sl_ob = ob_zone["low"] - (atr_val * 0.3)
+        sl_structure = recent_low - (atr_val * 0.3)
+        sl = min(sl_ob, sl_structure)
+        
         risk = entry - sl
         
-        # Calculate base TP levels
-        base_tp1 = entry + risk * 0.8
-        base_tp2 = entry + risk * 1.5
-        base_tp3 = entry + risk * 2.5
+        # Ensure minimum meaningful risk (avoid micro moves)
+        min_risk = atr_val * 0.5  # At least half ATR
+        if risk < min_risk:
+            risk = min_risk
+            sl = entry - risk
         
-        # Get market structure levels
-        nearest_resistance = df['high'].iloc[-15:-1].max()
-        major_resistance = df['high'].iloc[-50:-15].max()
+        # Calculate TP levels with PROPER spacing
+        base_tp1 = entry + (risk * 0.8)
+        base_tp2 = entry + (risk * 1.5)
+        base_tp3 = entry + (risk * 2.5)
         
-        # Ensure TP levels are ABOVE entry and in correct order
-        tp1 = min(base_tp1, nearest_resistance)
-        tp1 = max(tp1, entry + 0.001)  # Force above entry
+        # Get meaningful market structure levels
+        nearest_resistance = df['high'].tail(20).max()  # Last 20 candles only
+        major_resistance = df['high'].tail(50).max()    # Last 50 candles
         
-        tp2 = min(base_tp2, major_resistance)
-        tp2 = max(tp2, tp1 + 0.001)   # Force above TP1
+        # Choose BETTER profit level (calculated vs structure)
+        tp1 = min(base_tp1, nearest_resistance) if nearest_resistance > entry else base_tp1
+        tp2 = min(base_tp2, major_resistance) if major_resistance > tp1 else base_tp2
+        tp3 = base_tp3  # Extended target
         
-        tp3 = max(base_tp3, tp2 + 0.001)  # Force above TP2
+        # ENSURE PROPER ORDERING with meaningful distances
+        min_tp_gap = risk * 0.3  # Minimum 30% of risk between TPs
+        
+        tp1 = max(tp1, entry + (risk * 0.5))  # At least 0.5R profit
+        tp2 = max(tp2, tp1 + min_tp_gap)      # Meaningful gap from TP1
+        tp3 = max(tp3, tp2 + min_tp_gap)      # Meaningful gap from TP2
         
     else:  # SELL
-        sl = max(ob_zone["high"] + atr_val*0.3, recent_high + atr_val*0.3)
+        # Calculate SL using the MORE CONSERVATIVE approach
+        sl_ob = ob_zone["high"] + (atr_val * 0.3)
+        sl_structure = recent_high + (atr_val * 0.3)
+        sl = max(sl_ob, sl_structure)
+        
         risk = sl - entry
         
-        # Calculate base TP levels
-        base_tp1 = entry - risk * 0.8
-        base_tp2 = entry - risk * 1.5
-        base_tp3 = entry - risk * 2.5
+        # Ensure minimum meaningful risk
+        min_risk = atr_val * 0.5
+        if risk < min_risk:
+            risk = min_risk
+            sl = entry + risk
         
-        # Get market structure levels
-        nearest_support = df['low'].iloc[-15:-1].min()
-        major_support = df['low'].iloc[-50:-15].min()
+        # Calculate TP levels with PROPER spacing
+        base_tp1 = entry - (risk * 0.8)
+        base_tp2 = entry - (risk * 1.5)
+        base_tp3 = entry - (risk * 2.5)
         
-        # Ensure TP levels are BELOW entry and in correct order
-        tp1 = max(base_tp1, nearest_support)
-        tp1 = min(tp1, entry - 0.001)  # Force below entry
+        # Get meaningful market structure levels
+        nearest_support = df['low'].tail(20).min()
+        major_support = df['low'].tail(50).min()
         
-        tp2 = max(base_tp2, major_support)
-        tp2 = min(tp2, tp1 - 0.001)   # Force below TP1
+        # Choose BETTER profit level
+        tp1 = max(base_tp1, nearest_support) if nearest_support < entry else base_tp1
+        tp2 = max(base_tp2, major_support) if major_support < tp1 else base_tp2
+        tp3 = base_tp3  # Extended target
         
-        tp3 = min(base_tp3, tp2 - 0.001)  # Force below TP2
+        # ENSURE PROPER ORDERING with meaningful distances
+        min_tp_gap = risk * 0.3
+        
+        tp1 = min(tp1, entry - (risk * 0.5))  # At least 0.5R profit
+        tp2 = min(tp2, tp1 - min_tp_gap)      # Meaningful gap from TP1
+        tp3 = min(tp3, tp2 - min_tp_gap)      # Meaningful gap from TP2
 
     return sl, tp1, tp2, tp3
 
