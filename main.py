@@ -581,6 +581,8 @@ async def init_db():
     db_conn = await aiosqlite.connect(DB_PATH)
     await db_conn.execute("PRAGMA journal_mode=WAL;")
     await db_conn.execute("PRAGMA synchronous=NORMAL;")
+    
+    # Create table if not exists with all columns
     await db_conn.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -602,7 +604,33 @@ async def init_db():
             structure_data TEXT
         );
     """)
+    
+    # Check and add missing columns if needed
+    await check_and_add_columns()
+    
     await db_conn.commit()
+
+async def check_and_add_columns():
+    """Check for missing columns and add them if needed"""
+    try:
+        # Get the current table schema
+        async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
+            columns = await cursor.fetchall()
+            column_names = [col[1] for col in columns]
+        
+        # List of required columns
+        required_columns = [
+            ('structure_data', 'TEXT')
+        ]
+        
+        # Add any missing columns
+        for column_name, column_type in required_columns:
+            if column_name not in column_names:
+                log.info(f"Adding column {column_name} to signals table...")
+                await db_conn.execute(f"ALTER TABLE signals ADD COLUMN {column_name} {column_type}")
+                
+    except Exception as e:
+        log.error(f"Error checking/adding columns: {e}")
 
 # ---------------- OHLCV ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
@@ -910,9 +938,29 @@ async def monitor_signals():
     while True:
         try:
             async with db_lock:
-                async with db_conn.execute("SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,tp1_hit,tp2_hit,tp3_hit,status,structure_data FROM signals WHERE status='OPEN'") as cursor:
+                # First check if structure_data column exists
+                try:
+                    async with db_conn.execute("SELECT structure_data FROM signals LIMIT 1") as cursor:
+                        await cursor.fetchone()
+                    column_exists = True
+                except:
+                    column_exists = False
+                    log.warning("structure_data column doesn't exist yet")
+                
+                # Build query based on column existence
+                if column_exists:
+                    query = "SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,tp1_hit,tp2_hit,tp3_hit,status,structure_data FROM signals WHERE status='OPEN'"
+                else:
+                    query = "SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,tp1_hit,tp2_hit,tp3_hit,status,NULL FROM signals WHERE status='OPEN'"
+                
+                async with db_conn.execute(query) as cursor:
                     async for row in cursor:
-                        sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status, structure_data = row
+                        if column_exists:
+                            sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status, structure_data = row
+                        else:
+                            sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status, _ = row
+                            structure_data = None
+                        
                         try:
                             ticker = await exchange.fetch_ticker(symbol)
                             last_price = ticker.get("last")
@@ -934,8 +982,14 @@ async def monitor_signals():
                                 await tg(f"🎯 {symbol} {side} update\nEntry:{entry:.6f}\nLast:{last_price:.6f}\nHits:{','.join(hits)}\nSL:{sl:.6f}\nTP1:{tp1:.6f} TP2:{tp2:.6f} TP3:{tp3:.6f}")
 
                             if sl_hit: record_sl_hit(symbol)
-                            await db_conn.execute("UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?",
-                                                 (tp1_hit,tp2_hit,tp3_hit,status,sig_id))
+                            
+                            # Update with structure_data only if column exists
+                            if column_exists:
+                                await db_conn.execute("UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=?,structure_data=? WHERE id=?",
+                                                     (tp1_hit,tp2_hit,tp3_hit,status,structure_data,sig_id))
+                            else:
+                                await db_conn.execute("UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?",
+                                                     (tp1_hit,tp2_hit,tp3_hit,status,sig_id))
                         except Exception as e:
                             log.error(f"Error monitoring signal {symbol}: {e}")
                 await db_conn.commit()
