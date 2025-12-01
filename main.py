@@ -67,6 +67,8 @@ async def init_db():
     db_conn = await aiosqlite.connect(DB_PATH)
     await db_conn.execute("PRAGMA journal_mode=WAL;")
     await db_conn.execute("PRAGMA synchronous=NORMAL;")
+    
+    # Create table with ALL columns
     await db_conn.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -88,6 +90,18 @@ async def init_db():
             tp_sl_type TEXT DEFAULT 'Legacy'
         );
     """)
+    
+    # Check and add missing columns if needed
+    await db_conn.execute("PRAGMA table_info(signals)")
+    cursor = await db_conn.execute("PRAGMA table_info(signals)")
+    columns = await cursor.fetchall()
+    column_names = [col[1] for col in columns]
+    
+    # Add missing columns
+    if 'tp_sl_type' not in column_names:
+        log.info("Adding tp_sl_type column to signals table")
+        await db_conn.execute("ALTER TABLE signals ADD COLUMN tp_sl_type TEXT DEFAULT 'Legacy'")
+    
     await db_conn.commit()
     log.info("Database initialized successfully")
 
@@ -1063,6 +1077,7 @@ async def log_signal(sig: Dict):
     """Log signal to database"""
     async with db_lock:
         try:
+            # Check if tp_sl_type column exists by trying to insert
             await db_conn.execute("""
                 INSERT INTO signals (symbol, side, entry, sl, tp1, tp2, tp3, timestamp, status, reason, score, latest_ob, tp_sl_type)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1085,6 +1100,29 @@ async def log_signal(sig: Dict):
             log.info(f"✅ Signal logged: {sig['symbol']} {sig['side']} at {sig['entry']:.5f}")
         except Exception as e:
             log.error(f"Error logging signal: {e}")
+            # Try without tp_sl_type column (fallback for old database)
+            try:
+                await db_conn.execute("""
+                    INSERT INTO signals (symbol, side, entry, sl, tp1, tp2, tp3, timestamp, status, reason, score, latest_ob)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    sig["symbol"],
+                    sig["side"],
+                    sig["entry"],
+                    sig.get("sl"),
+                    sig.get("tp1"),
+                    sig.get("tp2"),
+                    sig.get("tp3"),
+                    datetime.datetime.utcnow().isoformat(),
+                    "OPEN",
+                    sig.get("reason", "RomeOPT 6-Step"),
+                    sig.get("score", 0),
+                    json.dumps(sig.get("latest_ob", {}))
+                ))
+                await db_conn.commit()
+                log.info(f"✅ Signal logged (fallback): {sig['symbol']} {sig['side']}")
+            except Exception as e2:
+                log.error(f"Fallback logging also failed: {e2}")
 
 # ---------------- MONITOR SIGNALS ----------------
 async def monitor_signals():
@@ -1094,12 +1132,32 @@ async def monitor_signals():
     while True:
         try:
             async with db_lock:
-                async with db_conn.execute("""
-                    SELECT id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status, tp_sl_type 
-                    FROM signals WHERE status='OPEN'
-                """) as cursor:
+                # First check if tp_sl_type column exists
+                cursor = await db_conn.execute("PRAGMA table_info(signals)")
+                columns = await cursor.fetchall()
+                column_names = [col[1] for col in columns]
+                
+                has_tp_sl_type = 'tp_sl_type' in column_names
+                
+                # Build query based on available columns
+                if has_tp_sl_type:
+                    query = """
+                        SELECT id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status, tp_sl_type 
+                        FROM signals WHERE status='OPEN'
+                    """
+                else:
+                    query = """
+                        SELECT id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status, 'Legacy' as tp_sl_type 
+                        FROM signals WHERE status='OPEN'
+                    """
+                
+                async with db_conn.execute(query) as cursor:
                     async for row in cursor:
-                        sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status, tp_sl_type = row
+                        if has_tp_sl_type:
+                            sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status, tp_sl_type = row
+                        else:
+                            sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status = row
+                            tp_sl_type = 'Legacy'  # Default for old database
                         
                         # Fetch current price
                         ticker = await exchange.fetch_ticker(symbol)
@@ -1348,7 +1406,7 @@ async def health():
 async def get_signals(limit: int = 10):
     async with db_lock:
         async with db_conn.execute("""
-            SELECT id, symbol, side, entry, sl, tp1, tp2, tp3, timestamp, status, score, tp_sl_type 
+            SELECT id, symbol, side, entry, sl, tp1, tp2, tp3, timestamp, status, score 
             FROM signals ORDER BY id DESC LIMIT ?
         """, (limit,)) as cursor:
             rows = await cursor.fetchall()
@@ -1364,8 +1422,7 @@ async def get_signals(limit: int = 10):
                     "tp3": row[7],
                     "timestamp": row[8],
                     "status": row[9],
-                    "score": row[10],
-                    "tp_sl_type": row[11]
+                    "score": row[10]
                 }
                 for row in rows
             ]
