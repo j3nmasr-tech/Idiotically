@@ -206,6 +206,10 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     if critical_score < CRITICAL_FACTORS_MIN: return None
     if score < MIN_SCORE: return None
     if not has_disp: return None
+    
+    # ---------------- NEW: HTF ALIGNMENT MANDATORY FILTER ----------------
+    if htf_alignment != 1:  # MUST HAVE HTF Alignment = 1
+        return None
 
     market_regime = await detect_market_regime(df)
     if (market_regime=="BULL" and side=="SELL") or (market_regime=="BEAR" and side=="BUY"): return None
