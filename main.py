@@ -5,7 +5,7 @@
 LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features)
 - Fully live early signals
 - RomeOPT 6-step logic
-- TP/SL tracking with ATR or OB
+- TP/SL tracking with RomeOPT-P structure-based system
 - Dynamic TP/SL updates (market-structure-based)
 - Telegram alerts
 - Async SQLite logging
@@ -16,15 +16,16 @@ LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features)
 - Elite multi-timeframe confirmation (15m,1h,4h)
 """
 
-import os, time, asyncio, logging, datetime
+import os, time, asyncio, logging, datetime, json
 import aiosqlite
 import httpx
 import ccxt.async_support as ccxt
 import pandas as pd
+import numpy as np
 from fastapi import FastAPI, Request, HTTPException
 import uvicorn
 from collections import defaultdict, deque
-import math
+from typing import Dict, List, Optional, Tuple, Any
 
 # ---------------- CONFIG ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -43,6 +44,521 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger("romeopt_bot")
 db_lock = asyncio.Lock()
 db_conn = None
+
+# ---------------- UTILITY FUNCTIONS ----------------
+def safe_json_dumps(obj):
+    """Safely convert object to JSON, handling numpy and pandas types"""
+    def _convert(item):
+        if isinstance(item, (np.integer, np.floating)):
+            return float(item)
+        elif isinstance(item, np.ndarray):
+            return item.tolist()
+        elif isinstance(item, pd.Series):
+            return item.tolist()
+        elif isinstance(item, pd.DataFrame):
+            return item.to_dict()
+        elif isinstance(item, dict):
+            return {k: _convert(v) for k, v in item.items()}
+        elif isinstance(item, list):
+            return [_convert(i) for i in item]
+        elif isinstance(item, (int, float, str, bool, type(None))):
+            return item
+        else:
+            return str(item)
+    return json.dumps(_convert(obj))
+
+# ---------------- ROMEOPT-P TP/SL SYSTEM ----------------
+class RomeOPTTPSLSystem:
+    """
+    RomeOPT-P 6-Step TP/SL System
+    Implements structure-based stop loss and liquidity-based take profit logic
+    """
+    
+    @staticmethod
+    def find_structure_elements(df: pd.DataFrame, symbol: str, side: str, ob_zone: dict) -> Dict[str, Any]:
+        """
+        Find all structure elements for TP/SL calculation
+        """
+        structure = {
+            'order_blocks': [],
+            'protected_levels': [],
+            'fvgs': [],
+            'bos_zones': [],
+            'liquidity_pools': {'upside': [], 'downside': []}
+        }
+        
+        if df is None or len(df) < 20:
+            return structure
+        
+        try:
+            # 1. Origin Order Block
+            if ob_zone and isinstance(ob_zone, dict):
+                structure['order_blocks'].append({
+                    'type': 'bullish' if side == 'BUY' else 'bearish',
+                    'high': float(ob_zone.get('high', 0)),
+                    'low': float(ob_zone.get('low', 0)),
+                    'origin': True
+                })
+            
+            # 2. Protected levels (significant swing highs/lows)
+            structure['protected_levels'].extend(
+                RomeOPTTPSLSystem._find_protected_levels(df, side)
+            )
+            
+            # 3. FVGs (Fair Value Gaps)
+            structure['fvgs'].extend(
+                RomeOPTTPSLSystem._find_fvgs(df, side)
+            )
+            
+            # 4. BOS (Break of Structure) zones
+            structure['bos_zones'].extend(
+                RomeOPTTPSLSystem._find_bos_zones(df, side)
+            )
+            
+            # 5. Liquidity pools
+            structure['liquidity_pools'] = RomeOPTTPSLSystem._find_liquidity_pools(df, side)
+            
+        except Exception as e:
+            log.error(f"Error finding structure elements for {symbol}: {e}")
+        
+        return structure
+    
+    @staticmethod
+    def _find_protected_levels(df: pd.DataFrame, side: str) -> List[Dict]:
+        """Find protected highs/lows (significant swing points)"""
+        levels = []
+        try:
+            if len(df) < 20:
+                return levels
+                
+            lookback = min(50, len(df) - 6)
+            
+            # Find swing highs
+            for i in range(lookback, len(df) - 6):
+                if i - 5 >= 0 and i + 6 <= len(df):
+                    if float(df['high'].iloc[i]) == float(df['high'].iloc[i-5:i+6].max()):
+                        levels.append({'type': 'high', 'price': float(df['high'].iloc[i])})
+            
+            # Find swing lows
+            for i in range(lookback, len(df) - 6):
+                if i - 5 >= 0 and i + 6 <= len(df):
+                    if float(df['low'].iloc[i]) == float(df['low'].iloc[i-5:i+6].min()):
+                        levels.append({'type': 'low', 'price': float(df['low'].iloc[i])})
+                        
+        except Exception as e:
+            log.error(f"Error finding protected levels: {e}")
+        
+        return levels
+    
+    @staticmethod
+    def _find_fvgs(df: pd.DataFrame, side: str) -> List[Dict]:
+        """Find Fair Value Gaps"""
+        fvgs = []
+        try:
+            if len(df) < 3:
+                return fvgs
+                
+            for i in range(2, len(df)):
+                # Bullish FVG: current low > previous high
+                if float(df['low'].iloc[i]) > float(df['high'].iloc[i-1]):
+                    fvgs.append({
+                        'type': 'buy',
+                        'high': float(df['low'].iloc[i]),
+                        'low': float(df['high'].iloc[i-1]),
+                        'origin_candle': {
+                            'high': float(df['high'].iloc[i]),
+                            'low': float(df['low'].iloc[i]),
+                            'open': float(df['open'].iloc[i]),
+                            'close': float(df['close'].iloc[i])
+                        }
+                    })
+                # Bearish FVG: current high < previous low
+                elif float(df['high'].iloc[i]) < float(df['low'].iloc[i-1]):
+                    fvgs.append({
+                        'type': 'sell',
+                        'high': float(df['low'].iloc[i-1]),
+                        'low': float(df['high'].iloc[i]),
+                        'origin_candle': {
+                            'high': float(df['high'].iloc[i]),
+                            'low': float(df['low'].iloc[i]),
+                            'open': float(df['open'].iloc[i]),
+                            'close': float(df['close'].iloc[i])
+                        }
+                    })
+        except Exception as e:
+            log.error(f"Error finding FVGs: {e}")
+        
+        return fvgs
+    
+    @staticmethod
+    def _find_bos_zones(df: pd.DataFrame, side: str) -> List[Dict]:
+        """Find Break of Structure zones"""
+        bos_zones = []
+        try:
+            if len(df) < 25:
+                return bos_zones
+                
+            window = min(20, len(df) - 5)
+            
+            for i in range(window, len(df) - 5):
+                # Bullish BOS: price breaks above previous structure
+                if float(df['high'].iloc[i]) > float(df['high'].iloc[i-window:i].max()):
+                    bos_zones.append({
+                        'type': 'buy',
+                        'high': float(df['high'].iloc[i]),
+                        'low': float(df['low'].iloc[i-window:i].min())
+                    })
+                # Bearish BOS: price breaks below previous structure
+                elif float(df['low'].iloc[i]) < float(df['low'].iloc[i-window:i].min()):
+                    bos_zones.append({
+                        'type': 'sell',
+                        'high': float(df['high'].iloc[i-window:i].max()),
+                        'low': float(df['low'].iloc[i])
+                    })
+        except Exception as e:
+            log.error(f"Error finding BOS zones: {e}")
+        
+        return bos_zones
+    
+    @staticmethod
+    def _find_liquidity_pools(df: pd.DataFrame, side: str) -> Dict[str, List]:
+        """Find liquidity pools (swing points, equal highs/lows, premium/discount zones)"""
+        pools = {'upside': [], 'downside': []}
+        
+        try:
+            if len(df) < 50:
+                return pools
+            
+            # Swing highs (upside liquidity)
+            for i in range(30, len(df) - 10):
+                if i - 10 >= 0 and i + 11 <= len(df):
+                    if float(df['high'].iloc[i]) == float(df['high'].iloc[i-10:i+11].max()):
+                        pools['upside'].append({
+                            'type': 'swing_high',
+                            'price': float(df['high'].iloc[i]),
+                            'strength': 3
+                        })
+            
+            # Swing lows (downside liquidity)
+            for i in range(30, len(df) - 10):
+                if i - 10 >= 0 and i + 11 <= len(df):
+                    if float(df['low'].iloc[i]) == float(df['low'].iloc[i-10:i+11].min()):
+                        pools['downside'].append({
+                            'type': 'swing_low',
+                            'price': float(df['low'].iloc[i]),
+                            'strength': 3
+                        })
+            
+            # Equal highs
+            if len(df) >= 20:
+                recent_high = float(df['high'].iloc[-20:].max())
+                pools['upside'].append({
+                    'type': 'equal_high',
+                    'price': recent_high,
+                    'strength': 2
+                })
+            
+            # Equal lows
+            if len(df) >= 20:
+                recent_low = float(df['low'].iloc[-20:].min())
+                pools['downside'].append({
+                    'type': 'equal_low',
+                    'price': recent_low,
+                    'strength': 2
+                })
+            
+            # Premium range (62-70% of recent range)
+            if len(df) >= 50:
+                recent_high_max = float(df['high'].iloc[-50:].max())
+                recent_low_min = float(df['low'].iloc[-50:].min())
+                recent_range = recent_high_max - recent_low_min
+                if recent_range > 0:
+                    premium_level = recent_low_min + (recent_range * 0.66)
+                    pools['upside'].append({
+                        'type': 'premium_range',
+                        'price': float(premium_level),
+                        'strength': 1
+                    })
+                    
+                    # Discount range (30-38% of recent range)
+                    discount_level = recent_low_min + (recent_range * 0.34)
+                    pools['downside'].append({
+                        'type': 'discount_range',
+                        'price': float(discount_level),
+                        'strength': 1
+                    })
+                    
+        except Exception as e:
+            log.error(f"Error finding liquidity pools: {e}")
+        
+        return pools
+    
+    @staticmethod
+    def calculate_stop_loss(side: str, structure: Dict, entry_price: float, ob_zone: dict) -> Optional[float]:
+        """
+        Calculate stop loss based on structure invalidation points
+        Follows RomeOPT-P rules strictly
+        """
+        try:
+            if side not in ['BUY', 'SELL']:
+                return None
+            
+            setup_type = 'buy' if side == 'BUY' else 'sell'
+            sl_candidates = []
+            
+            # 1. Check for BOS entry first (highest priority)
+            bos_sl = RomeOPTTPSLSystem._get_bos_sl(setup_type, structure)
+            if bos_sl is not None:
+                sl_candidates.append(bos_sl)
+            
+            # 2. Check origin Order Block
+            ob_sl = RomeOPTTPSLSystem._get_ob_sl(setup_type, structure, ob_zone)
+            if ob_sl is not None:
+                sl_candidates.append(ob_sl)
+            
+            # 3. Check protected levels
+            protected_sl = RomeOPTTPSLSystem._get_protected_sl(setup_type, structure)
+            if protected_sl is not None:
+                sl_candidates.append(protected_sl)
+            
+            # 4. Check origin FVG candle
+            fvg_sl = RomeOPTTPSLSystem._get_fvg_sl(setup_type, structure)
+            if fvg_sl is not None:
+                sl_candidates.append(fvg_sl)
+            
+            # Select the most appropriate SL
+            final_sl = RomeOPTTPSLSystem._select_optimal_sl(setup_type, sl_candidates, entry_price)
+            
+            if final_sl is None:
+                # Fallback: Use structure-based SL
+                if side == 'BUY':
+                    if ob_zone and 'low' in ob_zone:
+                        final_sl = float(ob_zone['low']) * 0.998
+                    else:
+                        final_sl = entry_price * 0.99
+                else:
+                    if ob_zone and 'high' in ob_zone:
+                        final_sl = float(ob_zone['high']) * 1.002
+                    else:
+                        final_sl = entry_price * 1.01
+            
+            return float(final_sl)
+            
+        except Exception as e:
+            log.error(f"Error calculating stop loss: {e}")
+            return None
+    
+    @staticmethod
+    def _get_bos_sl(setup_type: str, structure: Dict) -> Optional[float]:
+        """Get SL from BOS zone"""
+        try:
+            for bos in structure.get('bos_zones', []):
+                if bos.get('type') == setup_type:
+                    if setup_type == 'buy':
+                        return float(bos.get('low', 0)) * 0.999
+                    else:
+                        return float(bos.get('high', 0)) * 1.001
+        except:
+            pass
+        return None
+    
+    @staticmethod
+    def _get_ob_sl(setup_type: str, structure: Dict, ob_zone: dict) -> Optional[float]:
+        """Get SL from origin Order Block"""
+        try:
+            origin_obs = [ob for ob in structure.get('order_blocks', []) 
+                         if ob.get('origin', False) and ob.get('type') == setup_type]
+            
+            if not origin_obs and ob_zone:
+                if setup_type == 'buy' and 'low' in ob_zone:
+                    return float(ob_zone['low']) * 0.998
+                elif setup_type == 'sell' and 'high' in ob_zone:
+                    return float(ob_zone['high']) * 1.002
+            
+            if not origin_obs:
+                return None
+            
+            best_ob = origin_obs[0]
+            if setup_type == 'buy':
+                return float(best_ob.get('low', 0)) * 0.998
+            else:
+                return float(best_ob.get('high', 0)) * 1.002
+        except:
+            return None
+    
+    @staticmethod
+    def _get_protected_sl(setup_type: str, structure: Dict) -> Optional[float]:
+        """Get SL from protected levels"""
+        try:
+            for level in structure.get('protected_levels', []):
+                if setup_type == 'buy' and level.get('type') == 'low':
+                    return float(level.get('price', 0)) * 0.997
+                elif setup_type == 'sell' and level.get('type') == 'high':
+                    return float(level.get('price', 0)) * 1.003
+        except:
+            pass
+        return None
+    
+    @staticmethod
+    def _get_fvg_sl(setup_type: str, structure: Dict) -> Optional[float]:
+        """Get SL from origin FVG candle"""
+        try:
+            for fvg in structure.get('fvgs', []):
+                if fvg.get('type') == setup_type and 'origin_candle' in fvg:
+                    origin_candle = fvg['origin_candle']
+                    if setup_type == 'buy':
+                        return float(origin_candle.get('low', 0)) * 0.996
+                    else:
+                        return float(origin_candle.get('high', 0)) * 1.004
+        except:
+            pass
+        return None
+    
+    @staticmethod
+    def _select_optimal_sl(setup_type: str, sl_candidates: List[float], entry_price: float) -> Optional[float]:
+        """Select optimal SL based on RomeOPT-P criteria"""
+        if not sl_candidates:
+            return None
+        
+        valid_sls = []
+        for sl in sl_candidates:
+            if sl is None:
+                continue
+            if setup_type == 'buy':
+                if sl < entry_price:
+                    valid_sls.append(float(sl))
+            else:
+                if sl > entry_price:
+                    valid_sls.append(float(sl))
+        
+        if not valid_sls:
+            return None
+        
+        if setup_type == 'buy':
+            return max(valid_sls)
+        else:
+            return min(valid_sls)
+    
+    @staticmethod
+    def calculate_take_profit(side: str, structure: Dict, entry_price: float, sl_price: float) -> Tuple[float, float, float]:
+        """
+        Calculate take profit based on liquidity pools
+        Returns: (tp1, tp2, tp3)
+        """
+        try:
+            if side == 'BUY':
+                liquidity_pools = structure.get('liquidity_pools', {}).get('upside', [])
+                liquidity_pools.sort(key=lambda x: x.get('price', 0))
+                
+                valid_pools = []
+                for pool in liquidity_pools:
+                    pool_price = pool.get('price', 0)
+                    if pool_price <= entry_price:
+                        continue
+                    
+                    risk = abs(entry_price - sl_price)
+                    if risk == 0:
+                        continue
+                    
+                    reward = abs(pool_price - entry_price)
+                    rr = reward / risk
+                    
+                    if rr < 0.5:
+                        continue
+                    
+                    tp_price = pool_price * 0.999
+                    valid_pools.append((tp_price, pool.get('strength', 1)))
+                
+                return RomeOPTTPSLSystem._select_tp_levels(valid_pools, entry_price, side)
+            
+            else:  # SELL
+                liquidity_pools = structure.get('liquidity_pools', {}).get('downside', [])
+                liquidity_pools.sort(key=lambda x: x.get('price', 0), reverse=True)
+                
+                valid_pools = []
+                for pool in liquidity_pools:
+                    pool_price = pool.get('price', 0)
+                    if pool_price >= entry_price:
+                        continue
+                    
+                    risk = abs(sl_price - entry_price)
+                    if risk == 0:
+                        continue
+                    
+                    reward = abs(entry_price - pool_price)
+                    rr = reward / risk
+                    
+                    if rr < 0.5:
+                        continue
+                    
+                    tp_price = pool_price * 1.001
+                    valid_pools.append((tp_price, pool.get('strength', 1)))
+                
+                return RomeOPTTPSLSystem._select_tp_levels(valid_pools, entry_price, side)
+                
+        except Exception as e:
+            log.error(f"Error calculating take profit: {e}")
+            # Fallback TPs
+            if side == 'BUY':
+                return entry_price * 1.005, entry_price * 1.01, entry_price * 1.015
+            else:
+                return entry_price * 0.995, entry_price * 0.99, entry_price * 0.985
+    
+    @staticmethod
+    def _select_tp_levels(valid_pools: List[Tuple[float, int]], entry_price: float, side: str) -> Tuple[float, float, float]:
+        """Select TP levels with proper spacing"""
+        try:
+            if not valid_pools:
+                if side == 'BUY':
+                    tp1 = entry_price * 1.005
+                    tp2 = entry_price * 1.01
+                    tp3 = entry_price * 1.015
+                else:
+                    tp1 = entry_price * 0.995
+                    tp2 = entry_price * 0.99
+                    tp3 = entry_price * 0.985
+                return tp1, tp2, tp3
+            
+            valid_pools.sort(key=lambda x: x[1], reverse=True)
+            
+            selected_tps = []
+            min_distance = abs(entry_price * 0.002)
+            
+            for tp_price, strength in valid_pools:
+                if len(selected_tps) >= 3:
+                    break
+                
+                if selected_tps:
+                    too_close = False
+                    for existing_tp in selected_tps:
+                        if abs(tp_price - existing_tp) < min_distance:
+                            too_close = True
+                            break
+                    if too_close:
+                        continue
+                
+                selected_tps.append(tp_price)
+            
+            while len(selected_tps) < 3:
+                if side == 'BUY':
+                    last_tp = selected_tps[-1] if selected_tps else entry_price
+                    selected_tps.append(last_tp * 1.005)
+                else:
+                    last_tp = selected_tps[-1] if selected_tps else entry_price
+                    selected_tps.append(last_tp * 0.995)
+            
+            selected_tps.sort()
+            if side == 'SELL':
+                selected_tps.sort(reverse=True)
+            
+            return selected_tps[0], selected_tps[1], selected_tps[2]
+            
+        except Exception as e:
+            log.error(f"Error selecting TP levels: {e}")
+            if side == 'BUY':
+                return entry_price * 1.005, entry_price * 1.01, entry_price * 1.015
+            else:
+                return entry_price * 0.995, entry_price * 0.99, entry_price * 0.985
 
 # ---------------- TELEGRAM ----------------
 def escape_html(msg: str) -> str:
@@ -82,7 +598,8 @@ async def init_db():
             tp1_hit INTEGER DEFAULT 0,
             tp2_hit INTEGER DEFAULT 0,
             tp3_hit INTEGER DEFAULT 0,
-            latest_ob TEXT
+            latest_ob TEXT,
+            structure_data TEXT
         );
     """)
     await db_conn.commit()
@@ -97,26 +614,35 @@ async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
 
 # ---------------- INDICATORS ----------------
 def atr(df: pd.DataFrame, period=14):
-    high, low, close = df["high"], df["low"], df["close"]
-    tr = pd.DataFrame({
-        "h-l": high - low,
-        "h-pc": (high - close.shift(1)).abs(),
-        "l-pc": (low - close.shift(1)).abs()
-    }).max(axis=1)
-    return tr.rolling(period, min_periods=1).mean()
+    try:
+        high, low, close = df["high"], df["low"], df["close"]
+        tr = pd.DataFrame({
+            "h-l": high - low,
+            "h-pc": (high - close.shift(1)).abs(),
+            "l-pc": (low - close.shift(1)).abs()
+        }).max(axis=1)
+        return tr.rolling(period, min_periods=1).mean()
+    except:
+        return pd.Series([0] * len(df))
 
 # ---------------- MARKET REGIME ----------------
 async def detect_market_regime(df: pd.DataFrame):
-    ma_htf = df["close"].rolling(50).mean().iloc[-1]
-    price = df["close"].iloc[-1]
-    recent_high = df["high"].iloc[-20:].max()
-    recent_low = df["low"].iloc[-20:].min()
-    range_pct = (recent_high - recent_low) / max(1e-8, recent_low)
-    if price > ma_htf and range_pct > 0.02:
-        return "BULL"
-    elif price < ma_htf and range_pct > 0.02:
-        return "BEAR"
-    else:
+    try:
+        if len(df) < 50:
+            return "RANGE"
+        
+        ma_htf = df["close"].rolling(50).mean().iloc[-1]
+        price = df["close"].iloc[-1]
+        recent_high = df["high"].iloc[-20:].max()
+        recent_low = df["low"].iloc[-20:].min()
+        range_pct = (recent_high - recent_low) / max(1e-8, recent_low)
+        if price > ma_htf and range_pct > 0.02:
+            return "BULL"
+        elif price < ma_htf and range_pct > 0.02:
+            return "BEAR"
+        else:
+            return "RANGE"
+    except:
         return "RANGE"
 
 # ---------------- MULTI-TIMEFRAME ELITE CONFIRM ----------------
@@ -207,9 +733,9 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     if critical_score < CRITICAL_FACTORS_MIN: return None
     if score < MIN_SCORE: return None
     if not has_disp: return None
-
+    
     # ---------------- NEW: HTF ALIGNMENT MANDATORY FILTER ----------------
-    if htf_alignment != 1:  # MUST HAVE HTF Alignment = 1
+    if htf_alignment != 1:
         return None
 
     market_regime = await detect_market_regime(df)
@@ -224,259 +750,138 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     reasons.append("Elite MTF Alignment ✅")
 
     sig = {"symbol":symbol,"side":side,"entry":entry,"score":score,"reason":"RomeOPT 6-Step",
-           "reason_list":reasons,"htf_alignment":htf_alignment,"liquidity_sweep":liquidity_sweep}
-    sig = update_tp_sl_live(sig, df)
+           "reason_list":reasons,"htf_alignment":htf_alignment,"liquidity_sweep":liquidity_sweep,
+           "ob_zone": ob_zone, "timeframe": tf}
+    
+    # Try to calculate RomeOPT-P TP/SL - if fails, IGNORE THE SIGNAL
+    sig_with_tpsl = calculate_romeopt_tp_sl(sig, df)
+    if not sig_with_tpsl:
+        log.debug(f"RomeOPT-P TP/SL calculation failed for {symbol}, ignoring signal")
+        return None
+    
+    return sig_with_tpsl
 
-    # ---------------- NEW: TP1 DISTANCE FILTER ----------------
-    if sig and "sl" in sig and "tp1" in sig:
-        risk = abs(sig["entry"] - sig["sl"])
-        tp1_distance = abs(sig["tp1"] - sig["entry"])
-
-        # Reject if TP1 is less than 10% of risk (meaningless profit)
-        if tp1_distance < risk * 0.1:
+# ---------------- ROMEOPT-P TP/SL CALCULATION ----------------
+def calculate_romeopt_tp_sl(sig: dict, df: pd.DataFrame) -> Optional[dict]:
+    """
+    Calculate TP/SL using RomeOPT-P structure-based system
+    Returns None if calculation fails
+    """
+    try:
+        # Ensure ob_zone exists
+        ob_zone = sig.get("ob_zone")
+        if not ob_zone:
+            log.debug(f"No OB zone for {sig['symbol']}")
             return None
+        
+        # Find market structure elements
+        structure = RomeOPTTPSLSystem.find_structure_elements(
+            df, sig["symbol"], sig["side"], ob_zone
+        )
+        
+        # Calculate Stop Loss (structure-based)
+        sl = RomeOPTTPSLSystem.calculate_stop_loss(
+            sig["side"], structure, sig["entry"], ob_zone
+        )
+        
+        if sl is None:
+            log.debug(f"Failed to calculate SL for {sig['symbol']}")
+            return None
+        
+        # Calculate Take Profit (liquidity-based)
+        tp1, tp2, tp3 = RomeOPTTPSLSystem.calculate_take_profit(
+            sig["side"], structure, sig["entry"], sl
+        )
+        
+        # Validate TPs are reasonable
+        if sig["side"] == "BUY":
+            if tp1 <= sig["entry"] or tp2 <= tp1 or tp3 <= tp2:
+                log.debug(f"Invalid TP ordering for BUY {sig['symbol']}")
+                return None
+        else:  # SELL
+            if tp1 >= sig["entry"] or tp2 >= tp1 or tp3 >= tp2:
+                log.debug(f"Invalid TP ordering for SELL {sig['symbol']}")
+                return None
+        
+        # TP1 distance filter
+        risk = abs(sig["entry"] - sl)
+        tp1_distance = abs(tp1 - sig["entry"])
+        
+        # Reject if TP1 is less than 10% of risk
+        if risk > 0 and tp1_distance < risk * 0.1:
+            log.debug(f"TP1 distance too small for {sig['symbol']}")
+            return None
+        
+        # Store structure data for monitoring
+        sig["sl"] = float(sl)
+        sig["tp1"] = float(tp1)
+        sig["tp2"] = float(tp2)
+        sig["tp3"] = float(tp3)
+        sig["latest_ob"] = ob_zone
+        sig["structure_data"] = safe_json_dumps(structure)
+        
+        log.info(f"RomeOPT-P TP/SL calculated for {sig['symbol']}: SL={sl:.6f}, TP1={tp1:.6f}, TP2={tp2:.6f}, TP3={tp3:.6f}")
+        return sig
+        
+    except Exception as e:
+        log.error(f"RomeOPT-P TP/SL calculation failed for {sig['symbol']}: {e}")
+        return None
 
-    return sig
-
-# ---------------- TP/SL HELPERS (REPLACED WITH ROMEOPT-P LOGIC) ----------------
+# ---------------- FIND LATEST OB ----------------
 def find_latest_ob(df: pd.DataFrame):
-    """
-    Returns the most recent Order Block (OB) found in the last candles.
-    This remains your primary structure for SL placement (RomeOPT: origin OB).
-    """
     for i in range(len(df)-5, len(df)-1):
         candle, prev_candle = df.iloc[i], df.iloc[i-1]
-        # Bullish OB: previous bearish then bullish candle (common OB pattern)
         if candle["close"]>candle["open"] and prev_candle["close"]<prev_candle["open"]:
-            return {"type":"bullish","low":min(candle["low"], prev_candle["low"]),"high":candle["close"], "origin_index": i-1}
-        # Bearish OB
+            return {"type":"bullish","low":min(candle["low"], prev_candle["low"]),"high":candle["close"]}
         elif candle["close"]<candle["open"] and prev_candle["close"]>prev_candle["open"]:
-            return {"type":"bearish","low":candle["close"],"high":max(candle["high"], prev_candle["high"]), "origin_index": i-1}
+            return {"type":"bearish","low":candle["close"],"high":max(candle["high"], prev_candle["high"])}
     return None
 
-def find_recent_fvg(df: pd.DataFrame, lookback=60):
-    """
-    Find recent Fair Value Gaps (simple 3-candle imbalance detection).
-    We look for a middle candle that leaves a gap between its high/low relative to neighbors.
-    Returns the most recent FVG dict or None: {type, low, high, origin_index}
-    (This is a conservative heuristic; you can replace with a different detector if you prefer.)
-    """
-    n = len(df)
-    start = max(1, n - lookback)
-    for i in range(start, n-1):
-        prev_c = df.iloc[i-1]
-        mid_c = df.iloc[i]
-        next_c = df.iloc[i+1]
-        # Bullish FVG: previous high < next low (gap/imbalance on the mid candle)
-        if prev_c["high"] < next_c["low"]:
-            # FVG spans from prev_c["high"] to next_c["low"]
-            return {"type":"bullish","low":prev_c["high"], "high":next_c["low"], "origin_index": i}
-        # Bearish FVG
-        if prev_c["low"] > next_c["high"]:
-            return {"type":"bearish","low":next_c["high"], "high":prev_c["low"], "origin_index": i}
-    return None
-
-def collect_swing_levels(df: pd.DataFrame, lookback=120, prominence=0.001):
-    """
-    Collect candidate liquidity levels from historical highs/lows (swing highs/lows)
-    and equal highs/lows. Returns sorted lists for resistance (descending) and support (ascending).
-    Prominence defines how close two levels must be to be considered the same level.
-    """
-    highs = []
-    lows = []
-    n = len(df)
-    start = max(3, n - lookback)
-    for i in range(start, n-2):
-        h = df["high"].iloc[i]
-        if h >= df["high"].iloc[i-1] and h >= df["high"].iloc[i+1]:
-            highs.append(h)
-        l = df["low"].iloc[i]
-        if l <= df["low"].iloc[i-1] and l <= df["low"].iloc[i+1]:
-            lows.append(l)
-    # consolidate close levels (equal highs/lows)
-    def consolidate(levels):
-        levels = sorted(levels)
-        consolidated = []
-        for lv in levels:
-            if not consolidated:
-                consolidated.append(lv)
-            else:
-                if abs(lv - consolidated[-1]) / max(1e-8, consolidated[-1]) <= prominence:
-                    # average
-                    consolidated[-1] = (consolidated[-1] + lv) / 2.0
-                else:
-                    consolidated.append(lv)
-        return consolidated
-    return sorted(consolidate(highs), reverse=True), sorted(consolidate(lows))
-
-def choose_tp_levels(entry, side, risk, resistances, supports, atr_val):
-    """
-    Choose TP1/TP2/TP3 from structure (resistances/supports) and fallback to R multiples.
-    - For BUY: use first resistance above entry; if none, use base multiples of risk.
-    - For SELL: use first support below entry; if none, use base multiples of risk.
-    Ensure ordering tp1 < tp2 < tp3 for BUY, and reversed for SELL.
-    """
-    # base multiples (fallback)
-    mults = [0.8, 1.5, 2.5]
-    if side == "BUY":
-        candidates = [r for r in resistances if r > entry + 1e-12]
-        tp1 = None
-        if candidates:
-            # Place TP just before liquidity: small buffer = 0.2 * ATR
-            tp1 = candidates[0] - (0.2 * atr_val)
-        if tp1 is None:
-            tp1 = entry + risk * mults[0]
-        # TP2: next resistance above tp1
-        tp2 = None
-        if candidates and len(candidates) >= 2:
-            tp2 = candidates[1] - (0.25 * atr_val)
-        else:
-            tp2 = entry + risk * mults[1]
-        tp3 = entry + risk * mults[2]
-        # enforce ordering and minimum gaps
-        min_gap = max(0.15 * risk, 0.5 * atr_val)
-        tp1 = max(tp1, entry + 0.5 * risk)
-        tp2 = max(tp2, tp1 + min_gap)
-        tp3 = max(tp3, tp2 + min_gap)
-        return tp1, tp2, tp3
-    else:
-        candidates = [s for s in supports if s < entry - 1e-12]
-        tp1 = None
-        if candidates:
-            tp1 = candidates[0] + (0.2 * atr_val)
-        if tp1 is None:
-            tp1 = entry - risk * mults[0]
-        if candidates and len(candidates) >= 2:
-            tp2 = candidates[1] + (0.25 * atr_val)
-        else:
-            tp2 = entry - risk * mults[1]
-        tp3 = entry - risk * mults[2]
-        min_gap = max(0.15 * risk, 0.5 * atr_val)
-        tp1 = min(tp1, entry - 0.5 * risk)
-        tp2 = min(tp2, tp1 - min_gap)
-        tp3 = min(tp3, tp2 - min_gap)
-        return tp1, tp2, tp3
-
-def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
-    """
-    ROMEOPT-P style TP/SL placement:
-    - SL: placed at OB origin or FVG origin (whichever is the true invalidation), with ATR buffer.
-      If no OB/FVG, use recent structural low/high.
-    - TP: chosen from nearest opposing liquidity (swing highs/lows, equal highs/lows, FVG fills, OB mitigation).
-      Fall back to structured multiples of risk.
-    Returns sl, tp1, tp2, tp3.
-    """
-    # defensive coercions
-    df = df.copy()
-    for c in ["open","high","low","close","vol"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(method="ffill").fillna(0.0)
-
-    n = len(df)
-    recent_high = df['high'].iloc[-50:].max()
-    recent_low = df['low'].iloc[-50:].min()
-
-    # detect FVG if present
-    fvg = find_recent_fvg(df, lookback=80)
-
-    # 1) Determine SL candidate(s)
-    if side == "BUY":
-        sl_candidates = []
-        # primary: OB origin low (RomeOPT) - origin low is strongest invalidation
-        if ob_zone and ob_zone.get("type") == "bullish":
-            sl_candidates.append(float(ob_zone["low"]))
-        # FVG origin candle low (if bullish FVG exists)
-        if fvg and fvg.get("type") == "bullish":
-            sl_candidates.append(float(fvg["low"]))
-        # structural recent low
-        sl_candidates.append(float(recent_low))
-        # choose the most conservative (lowest) for BUY (so SL is under structure)
-        sl_base = min(sl_candidates)
-        # buffer with ATR (place SL slightly below invalidation)
-        buffer = max(atr_val * 0.25, atr_val * 0.1)
-        sl = sl_base - buffer
-
-        # compute risk, enforce minimum risk
-        risk = entry - sl
-        min_risk = max(atr_val * 0.5, atr_val * 0.25)  # ensure meaningful slot
-        if risk < min_risk:
-            risk = min_risk
-            sl = entry - risk
-
-        # resistance levels for TP selection
-        resistances, supports = collect_swing_levels(df, lookback=240)
-        tp1, tp2, tp3 = choose_tp_levels(entry, side, risk, resistances, supports, atr_val)
-
-    else:  # SELL
-        sl_candidates = []
-        if ob_zone and ob_zone.get("type") == "bearish":
-            sl_candidates.append(float(ob_zone["high"]))
-        if fvg and fvg.get("type") == "bearish":
-            sl_candidates.append(float(fvg["high"]))
-        sl_candidates.append(float(recent_high))
-        # choose the most conservative (highest) for SELL (so SL is above structure)
-        sl_base = max(sl_candidates)
-        buffer = max(atr_val * 0.25, atr_val * 0.1)
-        sl = sl_base + buffer
-
-        # compute risk
-        risk = sl - entry
-        min_risk = max(atr_val * 0.5, atr_val * 0.25)
-        if risk < min_risk:
-            risk = min_risk
-            sl = entry + risk
-
-        resistances, supports = collect_swing_levels(df, lookback=240)
-        tp1, tp2, tp3 = choose_tp_levels(entry, side, risk, resistances, supports, atr_val)
-
-    # final safety checks: ensure tp ordering and not crossing SL
-    try:
-        # Ensure numeric
-        tp1 = float(tp1); tp2 = float(tp2); tp3 = float(tp3); sl = float(sl)
-    except Exception:
-        # Fallback to simple R multiples if something broke
-        if side == "BUY":
-            sl = entry - max(atr_val * 0.5, 0.5 * atr_val)
-            tp1 = entry + (abs(entry - sl) * 0.8)
-            tp2 = entry + (abs(entry - sl) * 1.5)
-            tp3 = entry + (abs(entry - sl) * 2.5)
-        else:
-            sl = entry + max(atr_val * 0.5, 0.5 * atr_val)
-            tp1 = entry - (abs(sl - entry) * 0.8)
-            tp2 = entry - (abs(sl - entry) * 1.5)
-            tp3 = entry - (abs(sl - entry) * 2.5)
-
-    # Ensure meaningful distances (if any TP ends up inside SL due to odd structure, fix)
-    if side == "BUY":
-        if not (entry < tp1 < tp2 < tp3):
-            # rebuild from risk
-            risk = max(abs(entry - sl), atr_val * 0.5)
-            tp1 = entry + risk * 0.8
-            tp2 = entry + risk * 1.5
-            tp3 = entry + risk * 2.5
-    else:
-        if not (entry > tp1 > tp2 > tp3):
-            risk = max(abs(sl - entry), atr_val * 0.5)
-            tp1 = entry - risk * 0.8
-            tp2 = entry - risk * 1.5
-            tp3 = entry - risk * 2.5
-
-    return sl, tp1, tp2, tp3
-
+# ---------------- UPDATE TP/SL LIVE (Original as fallback - NOT USED) ----------------
 def update_tp_sl_live(sig: dict, df: pd.DataFrame):
     """
-    Update signal dict with ROMEOPT-P TP/SL live.
-    This uses latest OB (origin), FVG, ATR and structure levels.
+    Original TP/SL logic - kept but not used when RomeOPT-P fails
     """
-    latest_ob = find_latest_ob(df)
-    # if there's no detected OB, we still proceed using structure levels
-    atr_val = float(atr(df,14).iloc[-1]) if len(df)>=2 else 0.0
-    entry = float(sig.get("entry", 0.0))
-    side = sig.get("side", "BUY")
-    sl,tp1,tp2,tp3 = romeopt_tp_sl(entry, side, atr_val, latest_ob, df)
-    sig["sl"]=sl; sig["tp1"]=tp1; sig["tp2"]=tp2; sig["tp3"]=tp3
-    sig["latest_ob"]=latest_ob
-    return sig
+    try:
+        latest_ob = find_latest_ob(df)
+        if not latest_ob: return sig
+        atr_val = float(atr(df,14).iloc[-1])
+        entry = sig["entry"]
+        side = sig["side"]
+        
+        recent_high = df['high'].iloc[-10:].max()
+        recent_low = df['low'].iloc[-10:].min()
+        
+        if side == "BUY":
+            sl_ob = latest_ob["low"] - (atr_val * 0.3)
+            sl_structure = recent_low - (atr_val * 0.3)
+            sl = min(sl_ob, sl_structure)
+            risk = entry - sl
+            min_risk = atr_val * 0.5
+            if risk < min_risk:
+                risk = min_risk
+                sl = entry - risk
+            tp1 = entry + (risk * 0.8)
+            tp2 = entry + (risk * 1.5)
+            tp3 = entry + (risk * 2.5)
+        else:
+            sl_ob = latest_ob["high"] + (atr_val * 0.3)
+            sl_structure = recent_high + (atr_val * 0.3)
+            sl = max(sl_ob, sl_structure)
+            risk = sl - entry
+            min_risk = atr_val * 0.5
+            if risk < min_risk:
+                risk = min_risk
+                sl = entry + risk
+            tp1 = entry - (risk * 0.8)
+            tp2 = entry - (risk * 1.5)
+            tp3 = entry - (risk * 2.5)
+        
+        sig["sl"]=sl; sig["tp1"]=tp1; sig["tp2"]=tp2; sig["tp3"]=tp3
+        sig["latest_ob"]=latest_ob
+        return sig
+    except:
+        return sig
 
 # ---------------- SL CLUSTER ----------------
 recent_sl = defaultdict(lambda: deque())
@@ -493,10 +898,11 @@ def deprioritized(symbol: str, threshold=3, lookback=30):
 async def log_signal(sig):
     async with db_lock:
         await db_conn.execute("""
-            INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score,latest_ob)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score,latest_ob,structure_data)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (sig["symbol"],sig["side"],sig["entry"],sig.get("sl"),sig.get("tp1"),sig.get("tp2"),sig.get("tp3"),
-              datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"],str(sig.get("latest_ob",""))))
+              datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"],
+              str(sig.get("latest_ob","")), sig.get("structure_data", "")))
         await db_conn.commit()
 
 # ---------------- MONITOR SIGNALS ----------------
@@ -504,41 +910,37 @@ async def monitor_signals():
     while True:
         try:
             async with db_lock:
-                async with db_conn.execute("SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,tp1_hit,tp2_hit,tp3_hit,status FROM signals WHERE status='OPEN'") as cursor:
+                async with db_conn.execute("SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,tp1_hit,tp2_hit,tp3_hit,status,structure_data FROM signals WHERE status='OPEN'") as cursor:
                     async for row in cursor:
-                        sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status = row
-                        ticker = await exchange.fetch_ticker(symbol)
-                        last_price = ticker.get("last")
-                        if last_price is None: continue
+                        sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status, structure_data = row
+                        try:
+                            ticker = await exchange.fetch_ticker(symbol)
+                            last_price = ticker.get("last")
+                            if last_price is None: continue
 
-                        ohlcv = await fetch_ohlcv(exchange, symbol, "1m", 50)
-                        if ohlcv:
-                            df_live = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-                            for c in ["open","high","low","close","vol"]: df_live[c]=pd.to_numeric(df_live[c],errors="coerce")
-                            sig = {"symbol":symbol,"side":side,"entry":entry,"sl":sl,"tp1":tp1,"tp2":tp2,"tp3":tp3}
-                            sig = update_tp_sl_live(sig, df_live)
-                            sl,tp1,tp2,tp3 = sig["sl"], sig["tp1"], sig["tp2"], sig["tp3"]
+                            hits=[]; sl_hit=False
+                            if side=="BUY":
+                                if not tp1_hit and last_price>=tp1: hits.append("TP1"); tp1_hit=1
+                                if not tp2_hit and last_price>=tp2: hits.append("TP2"); tp2_hit=1
+                                if not tp3_hit and last_price>=tp3: hits.append("TP3"); tp3_hit=1
+                                if last_price<=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
+                            else:
+                                if not tp1_hit and last_price<=tp1: hits.append("TP1"); tp1_hit=1
+                                if not tp2_hit and last_price<=tp2: hits.append("TP2"); tp2_hit=1
+                                if not tp3_hit and last_price<=tp3: hits.append("TP3"); tp3_hit=1
+                                if last_price>=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
 
-                        hits=[]; sl_hit=False
-                        if side=="BUY":
-                            if not tp1_hit and tp1 is not None and last_price>=tp1: hits.append("TP1"); tp1_hit=1
-                            if not tp2_hit and tp2 is not None and last_price>=tp2: hits.append("TP2"); tp2_hit=1
-                            if not tp3_hit and tp3 is not None and last_price>=tp3: hits.append("TP3"); tp3_hit=1
-                            if last_price<=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
-                        else:
-                            if not tp1_hit and tp1 is not None and last_price<=tp1: hits.append("TP1"); tp1_hit=1
-                            if not tp2_hit and tp2 is not None and last_price<=tp2: hits.append("TP2"); tp2_hit=1
-                            if not tp3_hit and tp3 is not None and last_price<=tp3: hits.append("TP3"); tp3_hit=1
-                            if last_price>=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
+                            if hits:
+                                await tg(f"🎯 {symbol} {side} update\nEntry:{entry:.6f}\nLast:{last_price:.6f}\nHits:{','.join(hits)}\nSL:{sl:.6f}\nTP1:{tp1:.6f} TP2:{tp2:.6f} TP3:{tp3:.6f}")
 
-                        if hits:
-                            await tg(f"🎯 {symbol} {side} update\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP1:{tp1} TP2:{tp2} TP3:{tp3}")
-
-                        if sl_hit: record_sl_hit(symbol)
-                        await db_conn.execute("UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?",
-                                             (tp1_hit,tp2_hit,tp3_hit,status,sig_id))
+                            if sl_hit: record_sl_hit(symbol)
+                            await db_conn.execute("UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?",
+                                                 (tp1_hit,tp2_hit,tp3_hit,status,sig_id))
+                        except Exception as e:
+                            log.error(f"Error monitoring signal {symbol}: {e}")
                 await db_conn.commit()
-        except Exception as e: log.exception("monitor error: %s", e)
+        except Exception as e: 
+            log.exception("monitor error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
 
 # ---------------- SCAN LOOP ----------------
@@ -551,24 +953,39 @@ async def scan_loop(exchange):
             top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")], key=lambda x:x[1], reverse=True)[:TOP_N]
             signals_found = 0
             for symbol,_ in top:
-                if deprioritized(symbol): continue
+                if deprioritized(symbol): 
+                    continue
                 for tf in TIMEFRAMES:
                     key=f"{symbol}:{tf}"
-                    if key in last_signal_time and time.time()-last_signal_time[key]<60: continue
+                    if key in last_signal_time and time.time()-last_signal_time[key]<60: 
+                        continue
                     ohlcv = await fetch_ohlcv(exchange,symbol,tf,200)
-                    if not ohlcv: continue
+                    if not ohlcv: 
+                        continue
                     df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
-                    for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
+                    for c in ["open","high","low","close","vol"]: 
+                        df[c]=pd.to_numeric(df[c],errors="coerce")
                     sig = await generate_signal_romeopt(exchange,df,symbol,tf)
                     if sig:
                         htf_flag = sig.get("htf_alignment", "N/A")
                         sweep_flag = sig.get("liquidity_sweep", "N/A")
-                        await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig.get('sl')}\nTP1:{sig.get('tp1')} TP2:{sig.get('tp2')} TP3:{sig.get('tp3')}\nScore:{sig['score']}\nHTF:{htf_flag} Sweep:{sweep_flag}\nBreakdown:{', '.join(sig['reason_list'])}")
+                        
+                        tp_sl_info = f"Entry: {sig['entry']:.6f}\n"
+                        tp_sl_info += f"SL: {sig.get('sl', 0):.6f} (RomeOPT-P)\n"
+                        tp_sl_info += f"TP1: {sig.get('tp1', 0):.6f}\n"
+                        tp_sl_info += f"TP2: {sig.get('tp2', 0):.6f}\n"
+                        tp_sl_info += f"TP3: {sig.get('tp3', 0):.6f}\n"
+                        tp_sl_info += f"Score: {sig['score']}\n"
+                        tp_sl_info += f"HTF: {htf_flag} Sweep: {sweep_flag}\n"
+                        tp_sl_info += f"Breakdown: {', '.join(sig['reason_list'])}"
+                        
+                        await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\n{tp_sl_info}")
                         await log_signal(sig)
                         last_signal_time[key]=time.time()
                         signals_found+=1
             log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found")
-        except Exception as e: log.exception("scan error: %s", e)
+        except Exception as e: 
+            log.exception("scan error: %s", e)
         elapsed=time.time()-t0
         await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
 
@@ -577,7 +994,8 @@ app = FastAPI()
 @app.post("/webhook")
 async def webhook(request: Request):
     token = request.headers.get("X-Auth","")
-    if token!=WEBHOOK_SECRET: raise HTTPException(403,"Invalid secret")
+    if token!=WEBHOOK_SECRET: 
+        raise HTTPException(403,"Invalid secret")
     data = await request.json()
     log.info("Webhook received: %s", data)
     return {"ok":True}
@@ -587,7 +1005,8 @@ async def main():
     await init_db()
     global exchange
     exchange = ccxt.okx({"enableRateLimit": True})
-    await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals")
+    await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals with RomeOPT-P TP/SL System")
+    log.info("RomeOPT-P TP/SL System: Signals will be IGNORED if TP/SL calculation fails")
     await asyncio.gather(scan_loop(exchange), monitor_signals())
 
 if __name__=="__main__":
@@ -600,6 +1019,8 @@ if __name__=="__main__":
     else:
         try:
             asyncio.run(main())
+        except KeyboardInterrupt:
+            log.info("Shutting down...")
         finally:
             if db_conn:
                 asyncio.run(db_conn.close())
