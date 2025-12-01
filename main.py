@@ -1088,7 +1088,7 @@ async def log_signal(sig: Dict):
 
 # ---------------- MONITOR SIGNALS ----------------
 async def monitor_signals():
-    """Monitor open signals and update TP/SL - SKIPS LEGACY SIGNALS"""
+    """Monitor open signals and update TP/SL - WITH RECALCULATION FOR ROMEOPT SIGNALS"""
     log.info("Starting signal monitor")
     
     while True:
@@ -1096,22 +1096,10 @@ async def monitor_signals():
             async with db_lock:
                 async with db_conn.execute("""
                     SELECT id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status, tp_sl_type 
-                    FROM signals WHERE status='OPEN' AND tp_sl_type='ROMEOPT'
+                    FROM signals WHERE status='OPEN'
                 """) as cursor:
                     async for row in cursor:
                         sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status, tp_sl_type = row
-                        
-                        # Validate current levels make sense
-                        if side == "BUY":
-                            if sl >= entry or tp1 <= entry:
-                                log.warning(f"Invalid BUY levels for {symbol}, marking as INVALID")
-                                await db_conn.execute("UPDATE signals SET status='INVALID' WHERE id=?", (sig_id,))
-                                continue
-                        else:
-                            if sl <= entry or tp1 >= entry:
-                                log.warning(f"Invalid SELL levels for {symbol}, marking as INVALID")
-                                await db_conn.execute("UPDATE signals SET status='INVALID' WHERE id=?", (sig_id,))
-                                continue
                         
                         # Fetch current price
                         ticker = await exchange.fetch_ticker(symbol)
@@ -1119,11 +1107,79 @@ async def monitor_signals():
                         if last_price is None:
                             continue
                         
-                        # Check for TP/SL hits
+                        # ========== CRITICAL FIX: RECALCULATE TP/SL FOR ROMEOPT SIGNALS ==========
+                        if tp_sl_type == "ROMEOPT":
+                            # Fetch live data for TP/SL recalculation
+                            ohlcv = await fetch_ohlcv(exchange, symbol, "1m", 100)
+                            if ohlcv:
+                                df_live = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
+                                for col in ["open", "high", "low", "close", "vol"]:
+                                    df_live[col] = pd.to_numeric(df_live[col], errors='coerce')
+                                
+                                # Recalculate TP/SL with live data
+                                sig = {
+                                    "symbol": symbol,
+                                    "side": side,
+                                    "entry": entry,
+                                    "sl": sl,
+                                    "tp1": tp1,
+                                    "tp2": tp2,
+                                    "tp3": tp3
+                                }
+                                
+                                sig = calculate_romeopt_tp_sl(sig, df_live, "1m")
+                                new_sl, new_tp1 = sig.get("sl"), sig.get("tp1")
+                                
+                                # VALIDATE new TP/SL before updating
+                                if new_sl and new_tp1:
+                                    is_valid = True
+                                    if side == "BUY":
+                                        if new_sl >= entry or new_tp1 <= entry:
+                                            log.warning(f"Invalid recalc for BUY {symbol}, skipping update")
+                                            is_valid = False
+                                    else:  # SELL
+                                        if new_sl <= entry or new_tp1 >= entry:
+                                            log.warning(f"Invalid recalc for SELL {symbol}, skipping update")
+                                            is_valid = False
+                                    
+                                    # Check if significant change (>0.5%) AND valid
+                                    if is_valid:
+                                        sl_change = abs(new_sl - sl) / entry if sl else 0
+                                        tp_change = abs(new_tp1 - tp1) / entry if tp1 else 0
+                                        
+                                        if sl_change > 0.005 or tp_change > 0.005:  # 0.5% threshold
+                                            # Calculate RRR for validation
+                                            new_risk = abs(entry - new_sl)
+                                            new_reward = abs(new_tp1 - entry)
+                                            new_rrr = new_reward / new_risk if new_risk > 0 else 0
+                                            
+                                            # Only update if RRR is reasonable
+                                            if new_rrr >= 0.8:  # At least 0.8:1 RRR
+                                                old_sl, old_tp1 = sl, tp1
+                                                sl, tp1, tp2, tp3 = new_sl, new_tp1, sig.get("tp2"), sig.get("tp3")
+                                                
+                                                # Update database
+                                                await db_conn.execute(
+                                                    "UPDATE signals SET sl=?, tp1=?, tp2=?, tp3=? WHERE id=?",
+                                                    (sl, tp1, tp2, tp3, sig_id)
+                                                )
+                                                
+                                                # Send update notification
+                                                await tg(f"📈 {symbol} TP/SL Updated\nEntry: {entry:.5f}\nSL: {old_sl:.5f} → {sl:.5f}\nTP1: {old_tp1:.5f} → {tp1:.5f}")
+                                                
+                                                log.info(f"Updated TP/SL for {symbol}: SL {old_sl:.5f}→{sl:.5f}, TP1 {old_tp1:.5f}→{tp1:.5f}")
+                        
+                        # ========== CHECK FOR TP/SL HITS ==========
                         hits = []
                         sl_hit = False
                         
                         if side == "BUY":
+                            # Validate levels first
+                            if sl >= entry or tp1 <= entry:
+                                log.warning(f"Invalid BUY levels for {symbol}, skipping hit detection")
+                                continue
+                            
+                            # Check hits
                             if not tp1_hit and last_price >= tp1:
                                 hits.append("TP1")
                                 tp1_hit = 1
@@ -1138,6 +1194,12 @@ async def monitor_signals():
                                 status = "CLOSED"
                                 sl_hit = True
                         else:  # SELL
+                            # Validate levels first
+                            if sl <= entry or tp1 >= entry:
+                                log.warning(f"Invalid SELL levels for {symbol}, skipping hit detection")
+                                continue
+                            
+                            # Check hits
                             if not tp1_hit and last_price <= tp1:
                                 hits.append("TP1")
                                 tp1_hit = 1
@@ -1158,7 +1220,7 @@ async def monitor_signals():
                         if sl_hit:
                             record_sl_hit(symbol)
                         
-                        # Update database
+                        # Update database with hit status
                         await db_conn.execute(
                             "UPDATE signals SET tp1_hit=?, tp2_hit=?, tp3_hit=?, status=? WHERE id=?",
                             (tp1_hit, tp2_hit, tp3_hit, status, sig_id)
