@@ -101,52 +101,86 @@ async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200) -> Optio
         return None
 
 # ---------------- MARKET STRUCTURE DETECTION ----------------
-def detect_protected_highs_lows(df: pd.DataFrame, lookback: int = 50) -> Tuple[List, List]:
+def detect_protected_highs_lows(df: pd.DataFrame, timeframe: str) -> Tuple[List, List]:
     """
     Detect protected highs and lows (institutional structure)
-    Protected High: High with lower highs on both sides (local maximum)
-    Protected Low: Low with higher lows on both sides (local minimum)
+    CRITICAL FIX: Only recent candles + distance filtering
     """
     protected_highs = []
     protected_lows = []
     
-    if len(df) < 3:
+    if len(df) < 10:
         return protected_highs, protected_lows
     
-    for i in range(1, len(df)-1):
-        # Check for Protected High (local maximum)
-        if (df.iloc[i]['high'] > df.iloc[i-1]['high'] and 
-            df.iloc[i]['high'] > df.iloc[i+1]['high']):
-            # Additional check: ensure it's significant (not just noise)
-            avg_candle_size = (df['high'] - df['low']).mean()
-            if (df.iloc[i]['high'] - df.iloc[i-1]['high']) > avg_candle_size * 0.3:
-                protected_highs.append({
-                    'price': float(df.iloc[i]['high']),
-                    'index': i,
-                    'strength': 2 if i > len(df)*0.8 else 1  # Recent = stronger
-                })
+    current_price = df.iloc[-1]['close']
+    
+    # Timeframe-specific lookback and distance limits
+    tf_config = {
+        '1m': {'lookback': 30, 'max_distance_pct': 0.03},   # Last 30 candles, max 3% away
+        '3m': {'lookback': 40, 'max_distance_pct': 0.04},   # Last 40 candles, max 4% away
+        '5m': {'lookback': 50, 'max_distance_pct': 0.05},   # Last 50 candles, max 5% away
+        '15m': {'lookback': 40, 'max_distance_pct': 0.07},  # Last 40 candles, max 7% away
+        '30m': {'lookback': 30, 'max_distance_pct': 0.08},  # Last 30 candles, max 8% away
+    }
+    
+    config = tf_config.get(timeframe, tf_config['5m'])
+    lookback = config['lookback']
+    max_distance_pct = config['max_distance_pct']
+    
+    # Only analyze recent candles
+    start_idx = max(0, len(df) - lookback)
+    
+    for i in range(start_idx + 2, len(df) - 2):
+        # Detect Protected High (local maximum with confirmation)
+        if (df.iloc[i]['high'] > df.iloc[i-2]['high'] and 
+            df.iloc[i]['high'] > df.iloc[i-1]['high'] and
+            df.iloc[i]['high'] > df.iloc[i+1]['high'] and
+            df.iloc[i]['high'] > df.iloc[i+2]['high']):
+            
+            high_price = float(df.iloc[i]['high'])
+            distance_pct = abs(high_price - current_price) / current_price
+            
+            # Filter: Must be within max distance and significant
+            if distance_pct <= max_distance_pct:
+                # Check for significance (at least 0.5x avg candle size)
+                avg_candle = (df['high'] - df['low']).rolling(10).mean().iloc[i]
+                if (high_price - df.iloc[i-1]['high']) > (avg_candle * 0.5):
+                    protected_highs.append({
+                        'price': high_price,
+                        'index': i,
+                        'strength': 2 if i > len(df)*0.85 else 1,
+                        'distance_pct': distance_pct
+                    })
         
-        # Check for Protected Low (local minimum)
-        if (df.iloc[i]['low'] < df.iloc[i-1]['low'] and 
-            df.iloc[i]['low'] < df.iloc[i+1]['low']):
-            avg_candle_size = (df['high'] - df['low']).mean()
-            if (df.iloc[i-1]['low'] - df.iloc[i]['low']) > avg_candle_size * 0.3:
-                protected_lows.append({
-                    'price': float(df.iloc[i]['low']),
-                    'index': i,
-                    'strength': 2 if i > len(df)*0.8 else 1
-                })
+        # Detect Protected Low (local minimum with confirmation)
+        if (df.iloc[i]['low'] < df.iloc[i-2]['low'] and 
+            df.iloc[i]['low'] < df.iloc[i-1]['low'] and
+            df.iloc[i]['low'] < df.iloc[i+1]['low'] and
+            df.iloc[i]['low'] < df.iloc[i+2]['low']):
+            
+            low_price = float(df.iloc[i]['low'])
+            distance_pct = abs(low_price - current_price) / current_price
+            
+            if distance_pct <= max_distance_pct:
+                avg_candle = (df['high'] - df['low']).rolling(10).mean().iloc[i]
+                if (df.iloc[i-1]['low'] - low_price) > (avg_candle * 0.5):
+                    protected_lows.append({
+                        'price': low_price,
+                        'index': i,
+                        'strength': 2 if i > len(df)*0.85 else 1,
+                        'distance_pct': distance_pct
+                    })
     
-    # Sort and return most recent ones
-    protected_highs.sort(key=lambda x: x['price'], reverse=True)
-    protected_lows.sort(key=lambda x: x['price'])
+    # Sort by recency (most recent first) and limit results
+    protected_highs.sort(key=lambda x: x['index'], reverse=True)
+    protected_lows.sort(key=lambda x: x['index'], reverse=True)
     
-    # Return limited number for efficiency
     return protected_highs[:10], protected_lows[:10]
 
-def detect_liquidity_pools(df: pd.DataFrame) -> Dict[str, List]:
+def detect_liquidity_pools(df: pd.DataFrame, timeframe: str) -> Dict[str, List]:
     """
     Detect liquidity pools (equal highs, equal lows, swing points)
+    Timeframe-optimized detection
     """
     liquidity_pools = {
         'equal_highs': [],
@@ -155,522 +189,504 @@ def detect_liquidity_pools(df: pd.DataFrame) -> Dict[str, List]:
         'swing_lows': []
     }
     
-    if len(df) < 10:
+    if len(df) < 20:
         return liquidity_pools
     
-    # Detect swing highs/lows with more robust logic
-    for i in range(2, len(df)-2):
-        # Swing High: price higher than neighbors with confirmation
+    # Timeframe-specific lookback for liquidity detection
+    lookback_config = {
+        '1m': 30, '3m': 40, '5m': 50, '15m': 40, '30m': 30
+    }
+    lookback = lookback_config.get(timeframe, 40)
+    start_idx = max(0, len(df) - lookback)
+    
+    # Detect swing highs/lows in recent data
+    for i in range(start_idx + 2, len(df) - 2):
+        # Swing High
         if (df.iloc[i]['high'] > df.iloc[i-2:i]['high'].max() and
             df.iloc[i]['high'] > df.iloc[i+1:i+3]['high'].max()):
             liquidity_pools['swing_highs'].append({
                 'price': float(df.iloc[i]['high']),
                 'index': i,
-                'strength': 1
+                'strength': 2 if i > len(df)*0.9 else 1
             })
         
-        # Swing Low: price lower than neighbors with confirmation
+        # Swing Low
         if (df.iloc[i]['low'] < df.iloc[i-2:i]['low'].min() and
             df.iloc[i]['low'] < df.iloc[i+1:i+3]['low'].min()):
             liquidity_pools['swing_lows'].append({
                 'price': float(df.iloc[i]['low']),
                 'index': i,
-                'strength': 1
+                'strength': 2 if i > len(df)*0.9 else 1
             })
     
-    # Detect equal highs (price clusters)
-    if len(df) >= 20:
-        recent_highs = df['high'].iloc[-20:].values
-        for i in range(len(recent_highs)):
-            for j in range(i+1, len(recent_highs)):
-                if abs(recent_highs[i] - recent_highs[j]) / (recent_highs[i] + 1e-8) < 0.001:  # Within 0.1%
-                    avg_price = (recent_highs[i] + recent_highs[j]) / 2
-                    # Check if not already added
-                    if not any(abs(p['price'] - avg_price) / avg_price < 0.0005 for p in liquidity_pools['equal_highs']):
-                        liquidity_pools['equal_highs'].append({
-                            'price': float(avg_price),
-                            'strength': 2
-                        })
+    # Detect equal highs (price clusters within 0.2%)
+    recent_period = min(15, len(df) - start_idx)
+    recent_highs = df['high'].iloc[-recent_period:].values
+    
+    for i in range(len(recent_highs)):
+        for j in range(i+1, len(recent_highs)):
+            price_diff = abs(recent_highs[i] - recent_highs[j])
+            avg_price = (recent_highs[i] + recent_highs[j]) / 2
+            
+            if price_diff / avg_price < 0.002:  # Within 0.2%
+                # Check if similar price already exists
+                exists = False
+                for existing in liquidity_pools['equal_highs']:
+                    if abs(existing['price'] - avg_price) / avg_price < 0.001:
+                        exists = True
+                        break
+                
+                if not exists:
+                    liquidity_pools['equal_highs'].append({
+                        'price': float(avg_price),
+                        'strength': 2
+                    })
     
     # Detect equal lows
-    if len(df) >= 20:
-        recent_lows = df['low'].iloc[-20:].values
-        for i in range(len(recent_lows)):
-            for j in range(i+1, len(recent_lows)):
-                if abs(recent_lows[i] - recent_lows[j]) / (recent_lows[i] + 1e-8) < 0.001:
-                    avg_price = (recent_lows[i] + recent_lows[j]) / 2
-                    if not any(abs(p['price'] - avg_price) / avg_price < 0.0005 for p in liquidity_pools['equal_lows']):
-                        liquidity_pools['equal_lows'].append({
-                            'price': float(avg_price),
-                            'strength': 2
-                        })
+    recent_lows = df['low'].iloc[-recent_period:].values
+    
+    for i in range(len(recent_lows)):
+        for j in range(i+1, len(recent_lows)):
+            price_diff = abs(recent_lows[i] - recent_lows[j])
+            avg_price = (recent_lows[i] + recent_lows[j]) / 2
+            
+            if price_diff / avg_price < 0.002:
+                exists = False
+                for existing in liquidity_pools['equal_lows']:
+                    if abs(existing['price'] - avg_price) / avg_price < 0.001:
+                        exists = True
+                        break
+                
+                if not exists:
+                    liquidity_pools['equal_lows'].append({
+                        'price': float(avg_price),
+                        'strength': 2
+                    })
     
     return liquidity_pools
 
-def detect_bos_points(df: pd.DataFrame) -> List[Dict]:
+def detect_bos_points(df: pd.DataFrame, timeframe: str) -> List[Dict]:
     """
     Detect Break of Structure points
+    Timeframe-optimized detection
     """
     bos_points = []
     
-    if len(df) < 15:
+    if len(df) < 20:
         return bos_points
     
-    for i in range(10, len(df)-5):
-        # Bullish BOS: Break above previous high after establishing higher low
-        prev_high = df.iloc[i-5:i]['high'].max()
-        if (df.iloc[i]['high'] > prev_high and
-            df.iloc[i-3]['low'] > df.iloc[i-8]['low'] and
-            df.iloc[i]['close'] > df.iloc[i]['open']):  # Bullish candle
-            bos_points.append({
-                'price': float(df.iloc[i]['high']),
-                'type': 'bullish',
-                'index': i,
-                'strength': 1
-            })
-        
-        # Bearish BOS: Break below previous low after establishing lower high
-        prev_low = df.iloc[i-5:i]['low'].min()
-        if (df.iloc[i]['low'] < prev_low and
-            df.iloc[i-3]['high'] < df.iloc[i-8]['high'] and
-            df.iloc[i]['close'] < df.iloc[i]['open']):  # Bearish candle
-            bos_points.append({
-                'price': float(df.iloc[i]['low']),
-                'type': 'bearish',
-                'index': i,
-                'strength': 1
-            })
+    # Timeframe-specific lookback
+    lookback_config = {
+        '1m': 40, '3m': 50, '5m': 60, '15m': 50, '30m': 40
+    }
+    lookback = lookback_config.get(timeframe, 50)
+    start_idx = max(10, len(df) - lookback)
     
-    # Return most recent 5 BOS points
-    return bos_points[-5:] if bos_points else []
+    for i in range(start_idx, len(df)-5):
+        # Bullish BOS: Break above previous resistance
+        prev_resistance = df.iloc[i-8:i-3]['high'].max()
+        if (df.iloc[i]['high'] > prev_resistance and
+            df.iloc[i]['close'] > df.iloc[i]['open'] and  # Bullish candle
+            df.iloc[i-3]['low'] > df.iloc[i-6]['low']):   # Higher low established
+            
+            # Check for follow-through
+            if i+3 < len(df) and df.iloc[i+1:i+4]['close'].max() > df.iloc[i]['high']:
+                bos_points.append({
+                    'price': float(df.iloc[i]['high']),
+                    'type': 'bullish',
+                    'index': i,
+                    'strength': 1
+                })
+        
+        # Bearish BOS: Break below previous support
+        prev_support = df.iloc[i-8:i-3]['low'].min()
+        if (df.iloc[i]['low'] < prev_support and
+            df.iloc[i]['close'] < df.iloc[i]['open'] and  # Bearish candle
+            df.iloc[i-3]['high'] < df.iloc[i-6]['high']): # Lower high established
+            
+            # Check for follow-through
+            if i+3 < len(df) and df.iloc[i+1:i+4]['close'].min() < df.iloc[i]['low']:
+                bos_points.append({
+                    'price': float(df.iloc[i]['low']),
+                    'type': 'bearish',
+                    'index': i,
+                    'strength': 1
+                })
+    
+    # Return most recent 3 BOS points
+    bos_points.sort(key=lambda x: x['index'], reverse=True)
+    return bos_points[:3]
 
 # ---------------- ROMEOPT TP/SL MODULE ----------------
 class RomeOPT_TP_SL:
     """
     TRUE RomeOPT institutional TP/SL logic
     NO ATR, NO percentages, NO fixed pips
-    Based purely on market structure
+    Based purely on market structure with distance limits
     """
     
     def __init__(self, timeframe: str):
         self.timeframe = timeframe
         
-        # Timeframe-specific configurations
+        # Timeframe-specific configurations WITH PROPER DISTANCE LIMITS
         self.tf_config = {
-            '1m': {'buffer': 0.00003, 'min_rrr': 2.0, 'max_lookback': 15, 'min_distance': 0.00010},
-            '3m': {'buffer': 0.00004, 'min_rrr': 1.8, 'max_lookback': 25, 'min_distance': 0.00015},
-            '5m': {'buffer': 0.00005, 'min_rrr': 1.6, 'max_lookback': 35, 'min_distance': 0.00020},
-            '15m': {'buffer': 0.00008, 'min_rrr': 1.4, 'max_lookback': 45, 'min_distance': 0.00030},
-            '30m': {'buffer': 0.00012, 'min_rrr': 1.2, 'max_lookback': 60, 'min_distance': 0.00050}
+            '1m': {
+                'buffer_multiplier': 1.0,
+                'min_rrr': 2.0,
+                'max_sl_distance_pct': 0.015,  # 1.5% max SL distance
+                'max_tp_distance_pct': 0.030,  # 3.0% max TP distance
+                'min_risk_pct': 0.005,         # 0.5% minimum risk
+                'buffer_pips': 0.00003
+            },
+            '3m': {
+                'buffer_multiplier': 1.2,
+                'min_rrr': 1.8,
+                'max_sl_distance_pct': 0.020,  # 2.0% max
+                'max_tp_distance_pct': 0.040,  # 4.0% max
+                'min_risk_pct': 0.007,         # 0.7% minimum risk
+                'buffer_pips': 0.00004
+            },
+            '5m': {
+                'buffer_multiplier': 1.5,
+                'min_rrr': 1.6,
+                'max_sl_distance_pct': 0.025,  # 2.5% max
+                'max_tp_distance_pct': 0.050,  # 5.0% max
+                'min_risk_pct': 0.008,         # 0.8% minimum risk
+                'buffer_pips': 0.00005
+            },
+            '15m': {
+                'buffer_multiplier': 2.0,
+                'min_rrr': 1.4,
+                'max_sl_distance_pct': 0.035,  # 3.5% max
+                'max_tp_distance_pct': 0.070,  # 7.0% max
+                'min_risk_pct': 0.010,         # 1.0% minimum risk
+                'buffer_pips': 0.00008
+            },
+            '30m': {
+                'buffer_multiplier': 2.5,
+                'min_rrr': 1.2,
+                'max_sl_distance_pct': 0.045,  # 4.5% max - FIXED from 14.5%!
+                'max_tp_distance_pct': 0.090,  # 9.0% max
+                'min_risk_pct': 0.012,         # 1.2% minimum risk
+                'buffer_pips': 0.00012
+            }
         }
         
         config = self.tf_config.get(timeframe, self.tf_config['5m'])
-        self.buffer = config['buffer']
+        self.buffer_multiplier = config['buffer_multiplier']
         self.min_rrr = config['min_rrr']
-        self.max_lookback = config['max_lookback']
-        self.min_distance = config['min_distance']
+        self.max_sl_distance_pct = config['max_sl_distance_pct']
+        self.max_tp_distance_pct = config['max_tp_distance_pct']
+        self.min_risk_pct = config['min_risk_pct']
+        self.base_buffer = config['buffer_pips']
         
-        log.debug(f"RomeOPT_TP_SL initialized for {timeframe}: buffer={self.buffer}, min_rrr={self.min_rrr}")
+        # Dynamic buffer based on price
+        self.buffer = self.base_buffer
+        
+        log.debug(f"RomeOPT_TP_SL for {timeframe}: max SL={self.max_sl_distance_pct*100}%, min RRR={self.min_rrr}")
     
     def calculate_stop_loss(self, side: str, entry_price: float, entry_ob: Dict, 
                            protected_highs: List, protected_lows: List,
                            bos_points: List) -> float:
         """
-        Calculate SL according to RomeOPT rules:
-        1. For LONG: Below origin OB low or last protected low before BOS
-        2. For SHORT: Above origin OB high or last protected high before BOS
-        3. Always at institutional structure invalidation point
+        Calculate SL according to RomeOPT rules with distance limits
         """
-        sl_candidates = []
-        
         try:
+            max_sl_distance = entry_price * self.max_sl_distance_pct
+            min_sl_distance = entry_price * self.min_risk_pct
+            
+            log.debug(f"{side} SL calc: entry={entry_price}, max_dist={max_sl_distance:.4f}, min_dist={min_sl_distance:.4f}")
+            
             if side == "BUY":
-                # 1. Below origin OB low (if available and valid)
+                sl_candidates = []
+                
+                # 1. BELOW origin OB low (RomeOPT rule)
                 if entry_ob and entry_ob.get('type') == 'bullish':
                     ob_low = entry_ob['low']
-                    # Ensure OB low is below entry price
                     if ob_low < entry_price:
-                        sl_candidates.append(ob_low - self.buffer)
-                        log.debug(f"LONG SL candidate from OB: {ob_low - self.buffer}")
+                        candidate = ob_low - self.buffer
+                        risk = entry_price - candidate
+                        if min_sl_distance <= risk <= max_sl_distance:
+                            sl_candidates.append(('ob', candidate, risk))
+                            log.debug(f"LONG candidate from OB: {candidate} (risk: {risk:.4f})")
                 
-                # 2. Below last protected low before most recent BOS
-                if protected_lows and bos_points:
-                    # Find most recent bearish BOS (market turning down)
-                    bearish_bos = [b for b in bos_points if b['type'] == 'bearish']
-                    if bearish_bos:
-                        latest_bos = max(bearish_bos, key=lambda x: x.get('index', 0))
-                        # Get protected lows that occurred BEFORE this BOS
-                        lows_before_bos = [pl for pl in protected_lows 
-                                          if pl.get('index', 0) < latest_bos.get('index', 0)]
-                        if lows_before_bos:
-                            # Get the LOWEST protected low (most conservative)
-                            lowest_before_bos = min(lows_before_bos, key=lambda x: x['price'])
-                            if lowest_before_bos['price'] < entry_price:
-                                sl_candidates.append(lowest_before_bos['price'] - self.buffer)
-                                log.debug(f"LONG SL candidate from protected low: {lowest_before_bos['price'] - self.buffer}")
+                # 2. BELOW most recent protected low (within limits)
+                if protected_lows:
+                    # Get lows below entry, sorted by recency
+                    valid_lows = [pl for pl in protected_lows if pl['price'] < entry_price]
+                    valid_lows.sort(key=lambda x: x['index'], reverse=True)  # Most recent first
+                    
+                    for pl in valid_lows[:3]:  # Check 3 most recent
+                        candidate = pl['price'] - self.buffer
+                        risk = entry_price - candidate
+                        if min_sl_distance <= risk <= max_sl_distance:
+                            sl_candidates.append(('protected_low', candidate, risk))
+                            log.debug(f"LONG candidate from protected low: {candidate} (risk: {risk:.4f})")
+                            break
                 
-                # 3. Fallback: Use most recent significant protected low
-                if not sl_candidates and protected_lows:
-                    recent_lows = [pl for pl in protected_lows 
-                                  if pl.get('price', float('inf')) < entry_price]
-                    if recent_lows:
-                        lowest_recent = min(recent_lows, key=lambda x: x['price'])
-                        sl_candidates.append(lowest_recent['price'] - self.buffer)
-                        log.debug(f"LONG SL fallback from recent low: {lowest_recent['price'] - self.buffer}")
+                # 3. BELOW recent swing low (fallback)
+                if not sl_candidates:
+                    # Find recent low in last 10-20 candles
+                    lookback = min(20, len(protected_lows) * 5 if protected_lows else 10)
+                    recent_low = entry_price * 0.99  # 1% below as starting point
+                    candidate = recent_low - self.buffer
+                    risk = entry_price - candidate
+                    if risk >= min_sl_distance:
+                        sl_candidates.append(('recent_low', candidate, risk))
                 
-                # Select most conservative (lowest) valid SL
+                # Select BEST candidate (prefer OB, then protected low, with valid risk)
                 if sl_candidates:
-                    sl = min(sl_candidates)
-                    # Ensure minimum distance from entry
-                    min_sl = entry_price - (self.min_distance * 3)  # At least 3x min distance
-                    if sl > min_sl:
-                        sl = min_sl
-                        log.debug(f"LONG SL adjusted to min distance: {sl}")
+                    # Sort by source priority (OB first), then risk (closest to min_risk)
+                    sl_candidates.sort(key=lambda x: (0 if x[0]=='ob' else 1 if x[0]=='protected_low' else 2, x[2]))
                     
-                    # Final safety: ensure SL is below entry
-                    if sl >= entry_price:
-                        sl = entry_price - (self.min_distance * 2)
-                        log.debug(f"LONG SL safety adjustment: {sl}")
-                    
-                    log.info(f"LONG SL calculated: {sl} (entry: {entry_price}, candidates: {sl_candidates})")
-                    return sl
+                    for source, candidate, risk in sl_candidates:
+                        # Final validation
+                        if candidate < entry_price and min_sl_distance <= risk <= max_sl_distance:
+                            log.info(f"✅ LONG SL selected: {candidate:.5f} (from {source}, risk: {risk/entry_price*100:.2f}%, {risk:.4f})")
+                            return candidate
+                
+                # Fallback: Use min_risk_pct
+                sl = entry_price * (1 - self.min_risk_pct)
+                log.warning(f"⚠️ LONG SL fallback to min risk: {sl:.5f} ({self.min_risk_pct*100:.1f}%)")
+                return sl
             
             else:  # SELL
-                # 1. Above origin OB high (if available and valid)
+                sl_candidates = []
+                
+                # 1. ABOVE origin OB high (RomeOPT rule)
                 if entry_ob and entry_ob.get('type') == 'bearish':
                     ob_high = entry_ob['high']
-                    # Ensure OB high is above entry price
                     if ob_high > entry_price:
-                        sl_candidates.append(ob_high + self.buffer)
-                        log.debug(f"SHORT SL candidate from OB: {ob_high + self.buffer}")
+                        candidate = ob_high + self.buffer
+                        risk = candidate - entry_price
+                        if min_sl_distance <= risk <= max_sl_distance:
+                            sl_candidates.append(('ob', candidate, risk))
+                            log.debug(f"SHORT candidate from OB: {candidate} (risk: {risk:.4f})")
                 
-                # 2. Above last protected high before most recent BOS
-                if protected_highs and bos_points:
-                    # Find most recent bullish BOS (market turning up)
-                    bullish_bos = [b for b in bos_points if b['type'] == 'bullish']
-                    if bullish_bos:
-                        latest_bos = max(bullish_bos, key=lambda x: x.get('index', 0))
-                        # Get protected highs that occurred BEFORE this BOS
-                        highs_before_bos = [ph for ph in protected_highs 
-                                           if ph.get('index', 0) < latest_bos.get('index', 0)]
-                        if highs_before_bos:
-                            # Get the HIGHEST protected high (most conservative)
-                            highest_before_bos = max(highs_before_bos, key=lambda x: x['price'])
-                            if highest_before_bos['price'] > entry_price:
-                                sl_candidates.append(highest_before_bos['price'] + self.buffer)
-                                log.debug(f"SHORT SL candidate from protected high: {highest_before_bos['price'] + self.buffer}")
+                # 2. ABOVE most recent protected high (within limits)
+                if protected_highs:
+                    # Get highs above entry, sorted by recency
+                    valid_highs = [ph for ph in protected_highs if ph['price'] > entry_price]
+                    valid_highs.sort(key=lambda x: x['index'], reverse=True)  # Most recent first
+                    
+                    for ph in valid_highs[:3]:  # Check 3 most recent
+                        candidate = ph['price'] + self.buffer
+                        risk = candidate - entry_price
+                        if min_sl_distance <= risk <= max_sl_distance:
+                            sl_candidates.append(('protected_high', candidate, risk))
+                            log.debug(f"SHORT candidate from protected high: {candidate} (risk: {risk:.4f})")
+                            break
                 
-                # 3. Fallback: Use most recent significant protected high
-                if not sl_candidates and protected_highs:
-                    recent_highs = [ph for ph in protected_highs 
-                                   if ph.get('price', 0) > entry_price]
-                    if recent_highs:
-                        highest_recent = max(recent_highs, key=lambda x: x['price'])
-                        sl_candidates.append(highest_recent['price'] + self.buffer)
-                        log.debug(f"SHORT SL fallback from recent high: {highest_recent['price'] + self.buffer}")
+                # 3. ABOVE recent swing high (fallback)
+                if not sl_candidates:
+                    # Find recent high in last 10-20 candles
+                    recent_high = entry_price * 1.01  # 1% above as starting point
+                    candidate = recent_high + self.buffer
+                    risk = candidate - entry_price
+                    if risk >= min_sl_distance:
+                        sl_candidates.append(('recent_high', candidate, risk))
                 
-                # Select most conservative (highest) valid SL
+                # Select BEST candidate
                 if sl_candidates:
-                    sl = max(sl_candidates)
-                    # Ensure minimum distance from entry
-                    max_sl = entry_price + (self.min_distance * 3)  # At least 3x min distance
-                    if sl < max_sl:
-                        sl = max_sl
-                        log.debug(f"SHORT SL adjusted to min distance: {sl}")
+                    sl_candidates.sort(key=lambda x: (0 if x[0]=='ob' else 1 if x[0]=='protected_high' else 2, x[2]))
                     
-                    # Final safety: ensure SL is above entry
-                    if sl <= entry_price:
-                        sl = entry_price + (self.min_distance * 2)
-                        log.debug(f"SHORT SL safety adjustment: {sl}")
-                    
-                    log.info(f"SHORT SL calculated: {sl} (entry: {entry_price}, candidates: {sl_candidates})")
-                    return sl
+                    for source, candidate, risk in sl_candidates:
+                        if candidate > entry_price and min_sl_distance <= risk <= max_sl_distance:
+                            log.info(f"✅ SHORT SL selected: {candidate:.5f} (from {source}, risk: {risk/entry_price*100:.2f}%, {risk:.4f})")
+                            return candidate
+                
+                # Fallback: Use min_risk_pct
+                sl = entry_price * (1 + self.min_risk_pct)
+                log.warning(f"⚠️ SHORT SL fallback to min risk: {sl:.5f} ({self.min_risk_pct*100:.1f}%)")
+                return sl
         
         except Exception as e:
             log.error(f"Error in calculate_stop_loss: {e}")
-        
-        # Emergency fallback: Use percentage based on timeframe
-        fallback_pct = {'1m': 0.003, '3m': 0.004, '5m': 0.005, 
-                       '15m': 0.006, '30m': 0.008}
-        pct = fallback_pct.get(self.timeframe, 0.005)
-        
-        if side == "BUY":
-            sl = entry_price * (1 - pct)
-            log.warning(f"LONG SL fallback to percentage: {sl} ({pct*100}%)")
-        else:
-            sl = entry_price * (1 + pct)
-            log.warning(f"SHORT SL fallback to percentage: {sl} ({pct*100}%)")
-        
-        return sl
+            # Ultra-safe fallback
+            if side == "BUY":
+                return entry_price * 0.99  # 1% stop
+            else:
+                return entry_price * 1.01  # 1% stop
     
     def calculate_take_profit(self, side: str, entry_price: float, stop_loss: float,
                              liquidity_pools: Dict, df: pd.DataFrame) -> Tuple[float, float, float]:
         """
-        Calculate TP targeting real liquidity pools according to RomeOPT:
-        1. For LONG: First logical liquidity ABOVE (equal highs, swing highs, etc.)
-        2. For SHORT: First logical liquidity BELOW (equal lows, swing lows, etc.)
-        3. Minimum RRR: 1:2, prefer 1:3-1:5
+        Calculate TP targeting real liquidity pools with distance limits
         """
         try:
+            # Calculate risk
             risk = abs(entry_price - stop_loss)
-            if risk <= 0:
-                log.warning(f"Invalid risk calculation: entry={entry_price}, sl={stop_loss}")
-                risk = entry_price * 0.005  # Default 0.5% risk
+            max_tp_distance = entry_price * self.max_tp_distance_pct
             
-            log.debug(f"TP calculation: side={side}, entry={entry_price}, sl={stop_loss}, risk={risk}")
+            log.debug(f"{side} TP calc: entry={entry_price}, sl={stop_loss}, risk={risk:.4f}, max_tp_dist={max_tp_distance:.4f}")
+            
+            # Minimum RRR check
+            min_tp_distance = risk * self.min_rrr
+            if min_tp_distance > max_tp_distance:
+                log.warning(f"Min TP distance {min_tp_distance:.4f} > max {max_tp_distance:.4f}, adjusting RRR")
+                self.min_rrr = max(1.0, max_tp_distance / risk)  # Adjust RRR down if needed
             
             if side == "BUY":
-                # Collect all potential LONG targets ABOVE entry
+                # Find liquidity targets ABOVE entry
                 targets = []
                 
-                # 1. Equal highs (strong liquidity pools)
+                # 1. Equal highs (strong liquidity)
                 for eh in liquidity_pools.get('equal_highs', []):
                     if eh['price'] > entry_price:
                         distance = eh['price'] - entry_price
-                        rrr = distance / risk if risk > 0 else 0
-                        targets.append({
-                            'price': eh['price'],
-                            'type': 'equal_high',
-                            'strength': eh.get('strength', 1),
-                            'distance': distance,
-                            'rrr': rrr
-                        })
+                        if distance <= max_tp_distance:
+                            rrr = distance / risk
+                            targets.append({
+                                'price': eh['price'],
+                                'type': 'equal_high',
+                                'strength': eh.get('strength', 1),
+                                'distance': distance,
+                                'rrr': rrr
+                            })
                 
                 # 2. Swing highs
                 for sh in liquidity_pools.get('swing_highs', []):
                     if sh['price'] > entry_price:
                         distance = sh['price'] - entry_price
-                        rrr = distance / risk if risk > 0 else 0
-                        targets.append({
-                            'price': sh['price'],
-                            'type': 'swing_high',
-                            'strength': sh.get('strength', 1),
-                            'distance': distance,
-                            'rrr': rrr
-                        })
+                        if distance <= max_tp_distance:
+                            rrr = distance / risk
+                            targets.append({
+                                'price': sh['price'],
+                                'type': 'swing_high',
+                                'strength': sh.get('strength', 1),
+                                'distance': distance,
+                                'rrr': rrr
+                            })
                 
-                # 3. Recent highs from price action (last N candles)
-                recent_period = min(self.max_lookback, len(df))
-                if recent_period > 5:
-                    recent_highs = df['high'].iloc[-recent_period:].unique()
-                    for high in sorted(recent_highs):
-                        if high > entry_price:
-                            distance = high - entry_price
-                            rrr = distance / risk if risk > 0 else 0
-                            # Only add if significantly above entry
-                            if distance > risk * 0.5:  # At least 0.5R
-                                targets.append({
-                                    'price': float(high),
-                                    'type': 'recent_high',
-                                    'strength': 1,
-                                    'distance': distance,
-                                    'rrr': rrr
-                                })
+                # Sort by distance (closest first for TP1)
+                targets.sort(key=lambda x: x['distance'])
                 
-                # Sort by distance from entry (ascending)
-                targets.sort(key=lambda x: x['price'])
-                
-                # Filter by minimum RRR and reasonable distance
-                valid_targets = []
+                # Select up to 3 targets with proper spacing
+                selected = []
                 for target in targets:
-                    if target['rrr'] >= self.min_rrr and target['distance'] >= self.min_distance:
-                        # Score target (higher is better)
-                        score = target['rrr'] * 10
-                        if target['type'] == 'equal_high':
-                            score *= 1.5
-                        elif target['type'] == 'swing_high':
-                            score *= 1.2
-                        
-                        valid_targets.append({
-                            **target,
-                            'score': score
-                        })
-                
-                log.debug(f"LONG targets found: {len(targets)}, valid: {len(valid_targets)}")
-                
-                if not valid_targets:
-                    # No valid targets, use minimum RRR
-                    log.debug(f"No valid LONG targets, using min RRR: {self.min_rrr}")
-                    tp1 = entry_price + (risk * self.min_rrr)
-                    tp2 = entry_price + (risk * (self.min_rrr + 0.5))
-                    tp3 = entry_price + (risk * (self.min_rrr + 1.0))
-                    return tp1, tp2, tp3
-                
-                # Sort by score (highest first)
-                valid_targets.sort(key=lambda x: x['score'], reverse=True)
-                
-                # Select up to 3 best targets with proper spacing
-                selected_targets = []
-                for target in valid_targets:
-                    if len(selected_targets) >= 3:
+                    if len(selected) >= 3:
                         break
                     
-                    if not selected_targets:
-                        selected_targets.append(target)
-                    else:
-                        # Ensure targets are spaced properly (at least 0.5R apart)
-                        last_price = selected_targets[-1]['price']
-                        min_gap = risk * 0.5
-                        if target['price'] - last_price >= min_gap:
-                            selected_targets.append(target)
+                    # Minimum RRR filter
+                    if target['rrr'] >= self.min_rrr:
+                        if not selected:
+                            selected.append(target['price'])
+                        else:
+                            # Ensure at least 0.3R gap between targets
+                            min_gap = risk * 0.3
+                            if target['price'] - selected[-1] >= min_gap:
+                                selected.append(target['price'])
                 
                 # Create TP levels
-                if len(selected_targets) >= 3:
-                    tp1 = selected_targets[0]['price']
-                    tp2 = selected_targets[1]['price']
-                    tp3 = selected_targets[2]['price']
-                elif len(selected_targets) == 2:
-                    tp1 = selected_targets[0]['price']
-                    tp2 = selected_targets[1]['price']
-                    tp3 = selected_targets[1]['price'] + (risk * 0.5)  # Extend beyond
-                elif len(selected_targets) == 1:
-                    tp1 = selected_targets[0]['price']
-                    tp2 = selected_targets[0]['price'] + (risk * 0.3)
-                    tp3 = selected_targets[0]['price'] + (risk * 0.7)
+                if len(selected) >= 3:
+                    tp1, tp2, tp3 = selected[0], selected[1], selected[2]
+                elif len(selected) == 2:
+                    tp1, tp2 = selected[0], selected[1]
+                    tp3 = tp2 + (risk * 0.5)
+                elif len(selected) == 1:
+                    tp1 = selected[0]
+                    tp2 = tp1 + (risk * 0.5)
+                    tp3 = tp2 + (risk * 0.5)
                 else:
+                    # No valid targets, use min RRR
                     tp1 = entry_price + (risk * self.min_rrr)
-                    tp2 = entry_price + (risk * (self.min_rrr + 0.5))
-                    tp3 = entry_price + (risk * (self.min_rrr + 1.0))
+                    tp2 = tp1 + (risk * 0.5)
+                    tp3 = tp2 + (risk * 0.5)
+                
+                # Cap at maximum distance
+                tp1 = min(tp1, entry_price + max_tp_distance)
+                tp2 = min(tp2, entry_price + (max_tp_distance * 1.1))
+                tp3 = min(tp3, entry_price + (max_tp_distance * 1.2))
                 
                 # Ensure proper ordering
                 tp1, tp2, tp3 = sorted([tp1, tp2, tp3])
                 
-                log.info(f"LONG TP calculated: {tp1}, {tp2}, {tp3} (entry: {entry_price}, risk: {risk})")
+                log.info(f"✅ LONG TP: [{tp1:.5f}, {tp2:.5f}, {tp3:.5f}] (RRR: {(tp1-entry_price)/risk:.2f})")
                 return tp1, tp2, tp3
             
             else:  # SELL
-                # Collect all potential SHORT targets BELOW entry
+                # Find liquidity targets BELOW entry
                 targets = []
                 
-                # 1. Equal lows (strong liquidity pools)
+                # 1. Equal lows (strong liquidity)
                 for el in liquidity_pools.get('equal_lows', []):
                     if el['price'] < entry_price:
                         distance = entry_price - el['price']
-                        rrr = distance / risk if risk > 0 else 0
-                        targets.append({
-                            'price': el['price'],
-                            'type': 'equal_low',
-                            'strength': el.get('strength', 1),
-                            'distance': distance,
-                            'rrr': rrr
-                        })
+                        if distance <= max_tp_distance:
+                            rrr = distance / risk
+                            targets.append({
+                                'price': el['price'],
+                                'type': 'equal_low',
+                                'strength': el.get('strength', 1),
+                                'distance': distance,
+                                'rrr': rrr
+                            })
                 
                 # 2. Swing lows
                 for sl in liquidity_pools.get('swing_lows', []):
                     if sl['price'] < entry_price:
                         distance = entry_price - sl['price']
-                        rrr = distance / risk if risk > 0 else 0
-                        targets.append({
-                            'price': sl['price'],
-                            'type': 'swing_low',
-                            'strength': sl.get('strength', 1),
-                            'distance': distance,
-                            'rrr': rrr
-                        })
+                        if distance <= max_tp_distance:
+                            rrr = distance / risk
+                            targets.append({
+                                'price': sl['price'],
+                                'type': 'swing_low',
+                                'strength': sl.get('strength', 1),
+                                'distance': distance,
+                                'rrr': rrr
+                            })
                 
-                # 3. Recent lows from price action
-                recent_period = min(self.max_lookback, len(df))
-                if recent_period > 5:
-                    recent_lows = df['low'].iloc[-recent_period:].unique()
-                    for low in sorted(recent_lows, reverse=True):
-                        if low < entry_price:
-                            distance = entry_price - low
-                            rrr = distance / risk if risk > 0 else 0
-                            if distance > risk * 0.5:  # At least 0.5R
-                                targets.append({
-                                    'price': float(low),
-                                    'type': 'recent_low',
-                                    'strength': 1,
-                                    'distance': distance,
-                                    'rrr': rrr
-                                })
+                # Sort by distance (closest first for TP1)
+                targets.sort(key=lambda x: x['distance'])
                 
-                # Sort by distance from entry (descending for SELL)
-                targets.sort(key=lambda x: x['price'], reverse=True)
-                
-                # Filter by minimum RRR and reasonable distance
-                valid_targets = []
+                # Select up to 3 targets with proper spacing
+                selected = []
                 for target in targets:
-                    if target['rrr'] >= self.min_rrr and target['distance'] >= self.min_distance:
-                        # Score target
-                        score = target['rrr'] * 10
-                        if target['type'] == 'equal_low':
-                            score *= 1.5
-                        elif target['type'] == 'swing_low':
-                            score *= 1.2
-                        
-                        valid_targets.append({
-                            **target,
-                            'score': score
-                        })
-                
-                log.debug(f"SHORT targets found: {len(targets)}, valid: {len(valid_targets)}")
-                
-                if not valid_targets:
-                    # No valid targets, use minimum RRR
-                    log.debug(f"No valid SHORT targets, using min RRR: {self.min_rrr}")
-                    tp1 = entry_price - (risk * self.min_rrr)
-                    tp2 = entry_price - (risk * (self.min_rrr + 0.5))
-                    tp3 = entry_price - (risk * (self.min_rrr + 1.0))
-                    return tp1, tp2, tp3
-                
-                # Sort by score (highest first)
-                valid_targets.sort(key=lambda x: x['score'], reverse=True)
-                
-                # Select up to 3 best targets with proper spacing
-                selected_targets = []
-                for target in valid_targets:
-                    if len(selected_targets) >= 3:
+                    if len(selected) >= 3:
                         break
                     
-                    if not selected_targets:
-                        selected_targets.append(target)
-                    else:
-                        # Ensure targets are spaced properly
-                        last_price = selected_targets[-1]['price']
-                        min_gap = risk * 0.5
-                        if last_price - target['price'] >= min_gap:
-                            selected_targets.append(target)
+                    if target['rrr'] >= self.min_rrr:
+                        if not selected:
+                            selected.append(target['price'])
+                        else:
+                            min_gap = risk * 0.3
+                            if selected[-1] - target['price'] >= min_gap:
+                                selected.append(target['price'])
                 
                 # Create TP levels
-                if len(selected_targets) >= 3:
-                    tp1 = selected_targets[0]['price']
-                    tp2 = selected_targets[1]['price']
-                    tp3 = selected_targets[2]['price']
-                elif len(selected_targets) == 2:
-                    tp1 = selected_targets[0]['price']
-                    tp2 = selected_targets[1]['price']
-                    tp3 = selected_targets[1]['price'] - (risk * 0.5)  # Extend beyond
-                elif len(selected_targets) == 1:
-                    tp1 = selected_targets[0]['price']
-                    tp2 = selected_targets[0]['price'] - (risk * 0.3)
-                    tp3 = selected_targets[0]['price'] - (risk * 0.7)
+                if len(selected) >= 3:
+                    tp1, tp2, tp3 = selected[0], selected[1], selected[2]
+                elif len(selected) == 2:
+                    tp1, tp2 = selected[0], selected[1]
+                    tp3 = tp2 - (risk * 0.5)
+                elif len(selected) == 1:
+                    tp1 = selected[0]
+                    tp2 = tp1 - (risk * 0.5)
+                    tp3 = tp2 - (risk * 0.5)
                 else:
+                    # No valid targets, use min RRR
                     tp1 = entry_price - (risk * self.min_rrr)
-                    tp2 = entry_price - (risk * (self.min_rrr + 0.5))
-                    tp3 = entry_price - (risk * (self.min_rrr + 1.0))
+                    tp2 = tp1 - (risk * 0.5)
+                    tp3 = tp2 - (risk * 0.5)
+                
+                # Cap at maximum distance
+                tp1 = max(tp1, entry_price - max_tp_distance)
+                tp2 = max(tp2, entry_price - (max_tp_distance * 1.1))
+                tp3 = max(tp3, entry_price - (max_tp_distance * 1.2))
                 
                 # Ensure proper ordering
                 tp1, tp2, tp3 = sorted([tp1, tp2, tp3])
                 
-                log.info(f"SHORT TP calculated: {tp1}, {tp2}, {tp3} (entry: {entry_price}, risk: {risk})")
+                log.info(f"✅ SHORT TP: [{tp1:.5f}, {tp2:.5f}, {tp3:.5f}] (RRR: {(entry_price-tp1)/risk:.2f})")
                 return tp1, tp2, tp3
         
         except Exception as e:
             log.error(f"Error in calculate_take_profit: {e}")
-            # Emergency fallback
-            risk = abs(entry_price - stop_loss) if stop_loss else entry_price * 0.005
-            
+            # Safe fallback
             if side == "BUY":
-                tp1 = entry_price + (risk * 2.0)
-                tp2 = entry_price + (risk * 3.0)
-                tp3 = entry_price + (risk * 4.0)
+                return entry_price * 1.02, entry_price * 1.04, entry_price * 1.06
             else:
-                tp1 = entry_price - (risk * 2.0)
-                tp2 = entry_price - (risk * 3.0)
-                tp3 = entry_price - (risk * 4.0)
-            
-            return tp1, tp2, tp3
+                return entry_price * 0.98, entry_price * 0.96, entry_price * 0.94
 
 # ---------------- MARKET REGIME ----------------
 async def detect_market_regime(df: pd.DataFrame) -> str:
@@ -725,20 +741,29 @@ def calculate_romeopt_tp_sl(sig: Dict, df: pd.DataFrame, timeframe: str) -> Dict
     try:
         log.debug(f"Calculating RomeOPT TP/SL for {sig['symbol']} {sig['side']} on {timeframe}")
         
-        # Detect market structure
-        protected_highs, protected_lows = detect_protected_highs_lows(df)
-        liquidity_pools = detect_liquidity_pools(df)
-        bos_points = detect_bos_points(df)
+        # Detect market structure WITH TIMEFRAME PARAMETER
+        protected_highs, protected_lows = detect_protected_highs_lows(df, timeframe)
+        liquidity_pools = detect_liquidity_pools(df, timeframe)
+        bos_points = detect_bos_points(df, timeframe)
         
         # Get entry order block
         entry_ob = find_latest_ob(df)
         if not entry_ob:
-            log.warning(f"No order block found for {sig['symbol']}, using fallback")
-            # Create a simple OB based on recent price action
+            log.warning(f"No order block found for {sig['symbol']}, using recent price action")
+            # Create simple OB based on recent candles
+            recent_period = min(10, len(df))
             if sig["side"] == "BUY":
-                entry_ob = {"type": "bullish", "low": df["low"].iloc[-5:].min(), "high": df["high"].iloc[-5:].max()}
+                entry_ob = {
+                    "type": "bullish", 
+                    "low": df["low"].iloc[-recent_period:].min(),
+                    "high": df["high"].iloc[-recent_period:].max()
+                }
             else:
-                entry_ob = {"type": "bearish", "low": df["low"].iloc[-5:].min(), "high": df["high"].iloc[-5:].max()}
+                entry_ob = {
+                    "type": "bearish",
+                    "low": df["low"].iloc[-recent_period:].min(),
+                    "high": df["high"].iloc[-recent_period:].max()
+                }
         
         # Initialize RomeOPT TP/SL calculator
         calculator = RomeOPT_TP_SL(timeframe)
@@ -762,23 +787,20 @@ def calculate_romeopt_tp_sl(sig: Dict, df: pd.DataFrame, timeframe: str) -> Dict
             df=df
         )
         
-        # Validate TP/SL levels
+        # Validate and finalize
         risk = abs(sig["entry"] - sl)
-        reward_tp1 = abs(tp1 - sig["entry"])
-        rrr = reward_tp1 / risk if risk > 0 else 0
+        reward = abs(tp1 - sig["entry"])
+        rrr = reward / risk if risk > 0 else 0
         
-        if rrr < calculator.min_rrr * 0.8:  # Too low RRR
-            log.warning(f"RRR too low ({rrr:.2f}), adjusting TP1")
+        # Final RRR check
+        if rrr < calculator.min_rrr * 0.8:
+            log.warning(f"Final RRR too low ({rrr:.2f}), adjusting TP1")
             if sig["side"] == "BUY":
                 tp1 = sig["entry"] + (risk * calculator.min_rrr)
-            else:
-                tp1 = sig["entry"] - (risk * calculator.min_rrr)
-            
-            # Recalculate TP2 and TP3
-            if sig["side"] == "BUY":
                 tp2 = tp1 + (risk * 0.5)
                 tp3 = tp2 + (risk * 0.5)
             else:
+                tp1 = sig["entry"] - (risk * calculator.min_rrr)
                 tp2 = tp1 - (risk * 0.5)
                 tp3 = tp2 - (risk * 0.5)
         
@@ -791,23 +813,23 @@ def calculate_romeopt_tp_sl(sig: Dict, df: pd.DataFrame, timeframe: str) -> Dict
         sig["tp_sl_type"] = "ROMEOPT"
         sig["rrr"] = rrr
         
-        log.info(f"RomeOPT TP/SL calculated for {sig['symbol']}: SL={sl}, TP=[{tp1}, {tp2}, {tp3}], RRR={rrr:.2f}")
+        log.info(f"✅ RomeOPT TP/SL for {sig['symbol']}: Entry={sig['entry']:.5f}, SL={sl:.5f}, TP=[{tp1:.5f}, {tp2:.5f}, {tp3:.5f}], RRR={rrr:.2f}")
         
     except Exception as e:
         log.error(f"RomeOPT TP/SL calculation failed for {sig.get('symbol', 'unknown')}: {e}")
         # Fallback to simple TP/SL
         if "sl" not in sig or "tp1" not in sig:
-            price_range = df["high"].iloc[-1] - df["low"].iloc[-1]
+            price_range = (df["high"].iloc[-1] - df["low"].iloc[-1]) * 0.5
             if sig["side"] == "BUY":
-                sig["sl"] = sig["entry"] - (price_range * 0.5)
-                sig["tp1"] = sig["entry"] + (price_range * 1.0)
-                sig["tp2"] = sig["entry"] + (price_range * 1.5)
-                sig["tp3"] = sig["entry"] + (price_range * 2.0)
+                sig["sl"] = sig["entry"] - price_range
+                sig["tp1"] = sig["entry"] + (price_range * 2)
+                sig["tp2"] = sig["entry"] + (price_range * 3)
+                sig["tp3"] = sig["entry"] + (price_range * 4)
             else:
-                sig["sl"] = sig["entry"] + (price_range * 0.5)
-                sig["tp1"] = sig["entry"] - (price_range * 1.0)
-                sig["tp2"] = sig["entry"] - (price_range * 1.5)
-                sig["tp3"] = sig["entry"] - (price_range * 2.0)
+                sig["sl"] = sig["entry"] + price_range
+                sig["tp1"] = sig["entry"] - (price_range * 2)
+                sig["tp2"] = sig["entry"] - (price_range * 3)
+                sig["tp3"] = sig["entry"] - (price_range * 4)
             sig["tp_sl_type"] = "FALLBACK"
     
     return sig
@@ -957,22 +979,30 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     # Calculate RomeOPT TP/SL
     sig = calculate_romeopt_tp_sl(sig, df, tf)
     
-    # TP1 distance filter
+    # FINAL VALIDATION: Ensure TP/SL makes sense
     if "sl" in sig and "tp1" in sig:
         risk = abs(sig["entry"] - sig["sl"])
         tp1_distance = abs(sig["tp1"] - sig["entry"])
         
-        # Reject if TP1 is less than 20% of risk (meaningless profit)
-        if tp1_distance < risk * 0.2:
-            log.debug(f"TP1 too close for {symbol} {tf}: {tp1_distance} < {risk * 0.2}")
+        # Reject if TP1 is less than 50% of risk (meaningless profit)
+        if tp1_distance < risk * 0.5:
+            log.debug(f"TP1 too close for {symbol} {tf}: {tp1_distance} < {risk * 0.5}")
             return None
         
-        # Also check if SL is too close (less than 0.5% of price)
-        if risk / sig["entry"] < 0.005:
+        # Reject if risk is too small (< 0.3%)
+        if risk / sig["entry"] < 0.003:
             log.debug(f"Risk too small for {symbol} {tf}: {risk / sig['entry']:.4f}")
             return None
+        
+        # Reject if SL placement is clearly wrong
+        if side == "BUY" and sig["sl"] >= sig["entry"]:
+            log.debug(f"Invalid BUY SL for {symbol} {tf}: SL={sig['sl']} >= Entry={sig['entry']}")
+            return None
+        if side == "SELL" and sig["sl"] <= sig["entry"]:
+            log.debug(f"Invalid SELL SL for {symbol} {tf}: SL={sig['sl']} <= Entry={sig['entry']}")
+            return None
     
-    log.info(f"Signal generated for {symbol} {tf}: {side} at {entry}, score={score}")
+    log.info(f"✅ Signal generated for {symbol} {tf}: {side} at {entry}, score={score}")
     return sig
 
 # ---------------- FIND LATEST OB ----------------
@@ -981,7 +1011,8 @@ def find_latest_ob(df: pd.DataFrame) -> Optional[Dict]:
     if len(df) < 6:
         return None
     
-    for i in range(len(df)-5, len(df)-1):
+    # Look for OB in last 10 candles
+    for i in range(len(df)-10, len(df)-1):
         candle = df.iloc[i]
         prev_candle = df.iloc[i-1]
         
@@ -1051,64 +1082,42 @@ async def log_signal(sig: Dict):
                 sig.get("tp_sl_type", "Legacy")
             ))
             await db_conn.commit()
-            log.info(f"Signal logged to database: {sig['symbol']} {sig['side']}")
+            log.info(f"✅ Signal logged: {sig['symbol']} {sig['side']} at {sig['entry']:.5f}")
         except Exception as e:
             log.error(f"Error logging signal: {e}")
 
 # ---------------- MONITOR SIGNALS ----------------
 async def monitor_signals():
-    """Monitor open signals and update TP/SL"""
+    """Monitor open signals and update TP/SL - SKIPS LEGACY SIGNALS"""
     log.info("Starting signal monitor")
     
     while True:
         try:
             async with db_lock:
                 async with db_conn.execute("""
-                    SELECT id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status 
-                    FROM signals WHERE status='OPEN'
+                    SELECT id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status, tp_sl_type 
+                    FROM signals WHERE status='OPEN' AND tp_sl_type='ROMEOPT'
                 """) as cursor:
                     async for row in cursor:
-                        sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status = row
+                        sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status, tp_sl_type = row
+                        
+                        # Validate current levels make sense
+                        if side == "BUY":
+                            if sl >= entry or tp1 <= entry:
+                                log.warning(f"Invalid BUY levels for {symbol}, marking as INVALID")
+                                await db_conn.execute("UPDATE signals SET status='INVALID' WHERE id=?", (sig_id,))
+                                continue
+                        else:
+                            if sl <= entry or tp1 >= entry:
+                                log.warning(f"Invalid SELL levels for {symbol}, marking as INVALID")
+                                await db_conn.execute("UPDATE signals SET status='INVALID' WHERE id=?", (sig_id,))
+                                continue
                         
                         # Fetch current price
                         ticker = await exchange.fetch_ticker(symbol)
                         last_price = ticker.get("last")
                         if last_price is None:
                             continue
-                        
-                        # Fetch live data for TP/SL recalculation
-                        ohlcv = await fetch_ohlcv(exchange, symbol, "1m", 50)
-                        if ohlcv:
-                            df_live = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
-                            for col in ["open", "high", "low", "close", "vol"]:
-                                df_live[col] = pd.to_numeric(df_live[col], errors='coerce')
-                            
-                            # Recalculate TP/SL with live data
-                            sig = {
-                                "symbol": symbol,
-                                "side": side,
-                                "entry": entry,
-                                "sl": sl,
-                                "tp1": tp1,
-                                "tp2": tp2,
-                                "tp3": tp3
-                            }
-                            
-                            sig = calculate_romeopt_tp_sl(sig, df_live, "1m")
-                            new_sl, new_tp1 = sig.get("sl"), sig.get("tp1")
-                            
-                            # Update if significant change (>1%)
-                            if new_sl and new_tp1:
-                                sl_change = abs(new_sl - sl) / sl if sl else 0
-                                tp_change = abs(new_tp1 - tp1) / tp1 if tp1 else 0
-                                
-                                if sl_change > 0.01 or tp_change > 0.01:  # 1% threshold
-                                    sl, tp1, tp2, tp3 = new_sl, new_tp1, sig.get("tp2"), sig.get("tp3")
-                                    await db_conn.execute(
-                                        "UPDATE signals SET sl=?, tp1=?, tp2=?, tp3=? WHERE id=?",
-                                        (sl, tp1, tp2, tp3, sig_id)
-                                    )
-                                    await tg(f"📈 {symbol} TP/SL Updated\nNew SL: {sl:.5f}\nNew TP1: {tp1:.5f}")
                         
                         # Check for TP/SL hits
                         hits = []
@@ -1208,6 +1217,7 @@ async def scan_loop(exchange):
                         htf_flag = sig.get("htf_alignment", "N/A")
                         sweep_flag = sig.get("liquidity_sweep", "N/A")
                         tp_sl_type = sig.get("tp_sl_type", "Legacy")
+                        rrr = sig.get("rrr", 0)
                         
                         # Send Telegram alert
                         await tg(f"""
@@ -1215,7 +1225,7 @@ async def scan_loop(exchange):
 Entry: {sig['entry']:.5f}
 SL: {sig.get('sl', 0):.5f}
 TP1: {sig.get('tp1', 0):.5f} TP2: {sig.get('tp2', 0):.5f} TP3: {sig.get('tp3', 0):.5f}
-Score: {sig['score']}
+Score: {sig['score']} | RRR: {rrr:.2f}
 HTF: {htf_flag} Sweep: {sweep_flag}
 Breakdown: {', '.join(sig['reason_list'])}
                         """)
@@ -1236,12 +1246,37 @@ Breakdown: {', '.join(sig['reason_list'])}
         sleep_time = max(1, SCAN_INTERVAL - elapsed)
         await asyncio.sleep(sleep_time)
 
+# ---------------- CLEANUP OLD SIGNALS ----------------
+async def cleanup_old_signals():
+    """Clean up old invalid signals from database"""
+    try:
+        async with db_lock:
+            # Close signals that are clearly invalid
+            await db_conn.execute("""
+                UPDATE signals SET status='INVALID' 
+                WHERE status='OPEN' AND (
+                    (side='BUY' AND (sl >= entry OR tp1 <= entry)) OR
+                    (side='SELL' AND (sl <= entry OR tp1 >= entry))
+                )
+            """)
+            
+            # Close very old open signals (>24 hours)
+            await db_conn.execute("""
+                UPDATE signals SET status='EXPIRED' 
+                WHERE status='OPEN' AND timestamp < datetime('now', '-24 hours')
+            """)
+            
+            await db_conn.commit()
+            log.info("Cleaned up old invalid signals")
+    except Exception as e:
+        log.error(f"Error cleaning up old signals: {e}")
+
 # ---------------- FASTAPI ----------------
 app = FastAPI()
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "bot": "RomeOPT 6-Step Scanner", "version": "2.0"}
+    return {"status": "ok", "bot": "RomeOPT 6-Step Scanner", "version": "3.0"}
 
 @app.get("/health")
 async def health():
@@ -1251,7 +1286,7 @@ async def health():
 async def get_signals(limit: int = 10):
     async with db_lock:
         async with db_conn.execute("""
-            SELECT id, symbol, side, entry, sl, tp1, tp2, tp3, timestamp, status, score 
+            SELECT id, symbol, side, entry, sl, tp1, tp2, tp3, timestamp, status, score, tp_sl_type 
             FROM signals ORDER BY id DESC LIMIT ?
         """, (limit,)) as cursor:
             rows = await cursor.fetchall()
@@ -1267,7 +1302,8 @@ async def get_signals(limit: int = 10):
                     "tp3": row[7],
                     "timestamp": row[8],
                     "status": row[9],
-                    "score": row[10]
+                    "score": row[10],
+                    "tp_sl_type": row[11]
                 }
                 for row in rows
             ]
@@ -1291,6 +1327,9 @@ async def main():
     # Initialize database
     await init_db()
     
+    # Clean up old invalid signals
+    await cleanup_old_signals()
+    
     # Initialize exchange
     exchange = ccxt.okx({
         "enableRateLimit": True,
@@ -1299,7 +1338,7 @@ async def main():
     })
     
     log.info("RomeOPT 6-Step Scanner Starting...")
-    await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals with INSTITUTIONAL TP/SL")
+    await tg("🏆 ROMEOPT 6-Step Scanner v3.0 Started - TRUE Institutional TP/SL Logic")
     
     # Run both scanning and monitoring
     await asyncio.gather(
