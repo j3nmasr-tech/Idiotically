@@ -5,7 +5,7 @@
 LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features)
 - Fully live early signals
 - RomeOPT 6-step logic
-- Strict TP/SL (1R/2R, SL→BE after TP1, no TP3)
+- Strict TP/SL (0.8R/1.6R, SL→BE after TP1, no TP3)
 - Liquidity path filter
 - Clean traffic / range avoidance
 - Telegram alerts
@@ -33,16 +33,28 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
-TOP_N = int(os.getenv("TOP_N", 10))
+TOP_N = int(os.getenv("TOP_N", 25))
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
-MIN_SCORE = 5
+MIN_SCORE = 6
 CRITICAL_FACTORS_MIN = 2  # HTF Alignment + Liquidity Sweep minimum
 
-# ---------------- LOGGING ----------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
+# Timeframe mapping for TP scaling (RomeOPT-P logic) - YOUR CHOICE
+TP_TIMEFRAME_MAP = {
+    "1m": "5m",    # 1m → 5m ATR (5×) - less aggressive
+    "3m": "15m",   # 3m → 15m ATR (5×)
+    "5m": "15m",   # 5m → 15m ATR (3×) - conservative
+    "15m": "1h",   # 15m → 1h ATR (4×)
+    "30m": "1h"    # 30m → 1h ATR (2×) - minimal scaling
+}
+
+# ---------------- GLOBALS ----------------
 log = logging.getLogger("romeopt_bot")
 db_lock = asyncio.Lock()
 db_conn = None
+exchange = None  # Global exchange instance
+
+# ---------------- LOGGING ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 
 # ---------------- TELEGRAM ----------------
 def escape_html(msg: str) -> str:
@@ -74,6 +86,8 @@ async def init_db():
             sl REAL,
             tp1 REAL,
             tp2 REAL,
+            entry_tf TEXT,
+            tp_tf TEXT,
             timestamp TEXT,
             status TEXT,
             reason TEXT,
@@ -142,36 +156,87 @@ def find_latest_ob(df: pd.DataFrame):
             return {"type":"bearish","low":candle["close"],"high":max(candle["high"], prev_candle["high"])}
     return None
 
-# ---------------- TP/SL CALCULATION (RomeOPT Style) ----------------
-def romeopt_tp_sl(entry, side, atr_val, ob_zone):
+# ---------------- TP/SL CALCULATION (RomeOPT-P Style) ----------------
+async def romeoptp_tp_sl(exchange, entry: float, side: str, entry_tf: str, ob_zone: dict, symbol: str):
     """
-    Calculates SL, TP1, TP2
-    - TP1 = 1R (entry + 1 × risk)
-    - TP2 = 2R (entry + 2 × risk)
-    - SL conservatively below/above OB
+    RomeOPT-P Logic:
+    - SL based on entry timeframe OB (tight)
+    - TP scaled to higher timeframe ATR (meaningful)
+    - TP1 = 0.8R, TP2 = 1.6R
     """
+    if not ob_zone:
+        return None, None, None, entry_tf
+    
+    # Get ATR from higher timeframe for TP scaling
+    tp_tf = TP_TIMEFRAME_MAP.get(entry_tf, "15m")
+    htf_ohlcv = await fetch_ohlcv(exchange, symbol, tp_tf, 100)
+    
+    if not htf_ohlcv:
+        # Fallback to entry timeframe if HTF fails
+        htf_ohlcv = await fetch_ohlcv(exchange, symbol, entry_tf, 100)
+        tp_tf = entry_tf
+    
+    if not htf_ohlcv:
+        return None, None, None, tp_tf
+    
+    df_htf = pd.DataFrame(htf_ohlcv, columns=["ts","open","high","low","close","vol"])
+    for c in ["open","high","low","close","vol"]: 
+        df_htf[c] = pd.to_numeric(df_htf[c], errors="coerce")
+    
+    # Calculate ATR from higher timeframe
+    atr_val = float(atr(df_htf, 14).iloc[-1])
+    
+    # Calculate SL based on entry timeframe OB (tight)
     if side == "BUY":
-        sl = ob_zone['low'] - (atr_val * 0.3)
+        # SL just below bullish OB low
+        sl = ob_zone['low'] - (atr_val * 0.1)  # Very tight (0.1 × HTF ATR)
         risk = entry - sl
-        tp1 = entry + (risk * 1.0)  # 1:1 risk-reward
-        tp2 = entry + (risk * 2.0)  # 2:1 risk-reward
+        # TP scaled to HTF ATR
+        tp1 = entry + (risk * 0.8)  # 0.8R
+        tp2 = entry + (risk * 1.6)  # 1.6R
     else:  # SELL
-        sl = ob_zone['high'] + (atr_val * 0.3)
+        # SL just above bearish OB high  
+        sl = ob_zone['high'] + (atr_val * 0.1)  # Very tight (0.1 × HTF ATR)
         risk = sl - entry
-        tp1 = entry - (risk * 1.0)  # 1:1 risk-reward
-        tp2 = entry - (risk * 2.0)  # 2:1 risk-reward
-    return sl, tp1, tp2
+        # TP scaled to HTF ATR
+        tp1 = entry - (risk * 0.8)  # 0.8R
+        tp2 = entry - (risk * 1.6)  # 1.6R
+    
+    return sl, tp1, tp2, tp_tf
 
 # ---------------- UPDATE SIGNAL TP/SL ----------------
-def update_tp_sl_live(sig: dict, df: pd.DataFrame):
-    latest_ob = find_latest_ob(df)
-    if not latest_ob: return sig
-    atr_val = float(atr(df,14).iloc[-1])
-    entry = sig["entry"]
-    side = sig["side"]
-    sl, tp1, tp2 = romeopt_tp_sl(entry, side, atr_val, latest_ob)
-    sig["sl"]=sl; sig["tp1"]=tp1; sig["tp2"]=tp2
-    sig["latest_ob"]=latest_ob
+async def update_tp_sl_live(sig: dict):
+    """Update TP/SL with current market data"""
+    global exchange
+    
+    if 'entry_tf' not in sig or 'symbol' not in sig or 'side' not in sig:
+        return sig
+    
+    # Fetch current OB from entry timeframe
+    entry_tf_ohlcv = await fetch_ohlcv(exchange, sig["symbol"], sig["entry_tf"], 50)
+    if not entry_tf_ohlcv:
+        return sig
+    
+    df_entry = pd.DataFrame(entry_tf_ohlcv, columns=["ts","open","high","low","close","vol"])
+    for c in ["open","high","low","close","vol"]: 
+        df_entry[c] = pd.to_numeric(df_entry[c], errors="coerce")
+    
+    latest_ob = find_latest_ob(df_entry)
+    if not latest_ob:
+        return sig
+    
+    # Recalculate TP/SL with current data
+    sl, tp1, tp2, tp_tf = await romeoptp_tp_sl(
+        exchange, sig["entry"], sig["side"], sig["entry_tf"], latest_ob, sig["symbol"]
+    )
+    
+    if sl is not None and tp1 is not None and tp2 is not None:
+        sig["sl"] = sl
+        sig["tp1"] = tp1
+        sig["tp2"] = tp2
+        sig["tp_tf"] = tp_tf
+        sig["latest_ob"] = latest_ob
+    
     return sig
 
 # ---------------- ROMEOPT SIGNAL GENERATOR ----------------
@@ -194,8 +259,11 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     # Step2: Displacement
     displacement = abs(last["close"]-last["open"])/(last["high"]-last["low"]+1e-8)
     has_disp = displacement>0.6
-    if has_disp: score+=2; reasons.append("Displacement +2")
-    else: reasons.append("Displacement +0")
+    if has_disp: 
+        score+=2
+        reasons.append("Displacement +2")
+    else: 
+        reasons.append("Displacement +0")
 
     # Step3&4: OB detection
     ob_zone = find_latest_ob(df)
@@ -203,29 +271,58 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
 
     # Step5: HTF alignment
     side = "BUY" if ob_zone['type']=="bullish" else "SELL"
+    
+    # Use mapping consistent with elite_tf_alignment
     tf_map={"1m":"15m","3m":"30m","5m":"1h","15m":"4h","30m":"1h"}
     htf = tf_map.get(tf,"15m")
+    
     ohlcv_htf = await fetch_ohlcv(exchange, symbol, htf, 50)
     htf_alignment = 0
     if ohlcv_htf:
         df_htf = pd.DataFrame(ohlcv_htf, columns=["ts","open","high","low","close","vol"])
         trend = df_htf["close"].iloc[-1]-df_htf["close"].iloc[-5]
         htf_dir = "bullish" if trend>0 else "bearish"
-        if htf_dir==ob_zone['type']: htf_alignment=1; score+=1
+        if htf_dir==ob_zone['type']: 
+            htf_alignment=1
+            score+=1
+            reasons.append(f"HTF Alignment +1 ({htf})")
 
-    if score<MIN_SCORE or htf_alignment!=1: return None
+    if score < MIN_SCORE: return None
     if not has_disp: return None
 
     # Step6: Momentum clean traffic/range avoidance
     momentum_ratio = abs(last["close"]-last["open"])/(last["high"]-last["low"]+1e-8)
-    if momentum_ratio<0.5: return None
+    if momentum_ratio<0.5: 
+        reasons.append("Momentum Failed")
+        return None
 
-    sig = {"symbol":symbol,"side":side,"entry":float(last["close"]),"score":score,"reason":"RomeOPT 6-Step","reason_list":reasons,"ob_zone":ob_zone}
-    sig = update_tp_sl_live(sig, df)
+    # Calculate TP/SL with RomeOPT-P logic
+    sl, tp1, tp2, tp_tf = await romeoptp_tp_sl(exchange, float(last["close"]), side, tf, ob_zone, symbol)
+    if sl is None or tp1 is None or tp2 is None:
+        return None
+    
+    sig = {
+        "symbol": symbol,
+        "side": side,
+        "entry": float(last["close"]),
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "entry_tf": tf,
+        "tp_tf": tp_tf,
+        "score": int(score),  # Ensure integer
+        "reason": "RomeOPT-P 6-Step",
+        "reason_list": reasons,
+        "ob_zone": ob_zone
+    }
 
     # Liquidity path filter: skip blocked trades
-    if side=="BUY" and any(df['high'].iloc[-20:]>=sig['tp1']): return None
-    if side=="SELL" and any(df['low'].iloc[-20:]<=sig['tp1']): return None
+    if side=="BUY" and any(df['high'].iloc[-20:]>=sig['tp1']): 
+        reasons.append("Liquidity Path Blocked")
+        return None
+    if side=="SELL" and any(df['low'].iloc[-20:]<=sig['tp1']): 
+        reasons.append("Liquidity Path Blocked")
+        return None
 
     return sig
 
@@ -233,42 +330,65 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
 async def log_signal(sig):
     async with db_lock:
         await db_conn.execute("""
-            INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,timestamp,status,reason,score,latest_ob)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
-        """, (sig["symbol"],sig["side"],sig["entry"],sig.get("sl"),sig.get("tp1"),sig.get("tp2"),
-              datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"],str(sig.get("latest_ob",""))))
+            INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,entry_tf,tp_tf,timestamp,status,reason,score,latest_ob)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            sig["symbol"], sig["side"], sig["entry"], sig["sl"], sig["tp1"], sig["tp2"],
+            sig.get("entry_tf", ""), sig.get("tp_tf", ""),
+            datetime.datetime.utcnow().isoformat(), "OPEN", sig["reason"], 
+            int(sig["score"]), str(sig.get("latest_ob",""))
+        ))
         await db_conn.commit()
 
 # ---------------- MONITOR SIGNALS ----------------
 async def monitor_signals():
+    global exchange
     while True:
         try:
             async with db_lock:
-                async with db_conn.execute("SELECT id,symbol,side,entry,sl,tp1,tp2,tp1_hit,tp2_hit,status FROM signals WHERE status='OPEN'") as cursor:
+                async with db_conn.execute("SELECT id,symbol,side,entry,sl,tp1,tp2,entry_tf,tp1_hit,tp2_hit,status FROM signals WHERE status='OPEN'") as cursor:
                     async for row in cursor:
-                        sig_id, symbol, side, entry, sl, tp1, tp2, tp1_hit, tp2_hit, status = row
+                        sig_id, symbol, side, entry, sl, tp1, tp2, entry_tf, tp1_hit, tp2_hit, status = row
                         ticker = await exchange.fetch_ticker(symbol)
                         last_price = ticker.get("last")
                         if last_price is None: continue
 
-                        ohlcv = await fetch_ohlcv(exchange, symbol, "1m", 50)
-                        if ohlcv:
-                            df_live = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-                            for c in ["open","high","low","close","vol"]: df_live[c]=pd.to_numeric(df_live[c],errors="coerce")
-                            sig = {"symbol":symbol,"side":side,"entry":entry,"sl":sl,"tp1":tp1,"tp2":tp2}
-                            sig = update_tp_sl_live(sig, df_live)
-                            sl,tp1,tp2 = sig["sl"], sig["tp1"], sig["tp2"]
+                        # Update TP/SL with current market data
+                        sig = {
+                            "symbol": symbol, "side": side, "entry": entry, 
+                            "sl": sl, "tp1": tp1, "tp2": tp2, "entry_tf": entry_tf
+                        }
+                        sig = await update_tp_sl_live(sig)
+                        sl, tp1, tp2 = sig["sl"], sig["tp1"], sig["tp2"]
 
                         hits=[]; sl_hit=False
                         # ---------------- CHECK TP/SL ----------------
                         if side=="BUY":
-                            if not tp1_hit and last_price>=tp1: hits.append("TP1"); tp1_hit=1; sl=entry
-                            if not tp2_hit and last_price>=tp2: hits.append("TP2"); tp2_hit=1; status="CLOSED"
-                            if last_price<=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
+                            if not tp1_hit and last_price>=tp1: 
+                                hits.append("TP1")
+                                tp1_hit=1
+                                sl=entry
+                            if not tp2_hit and last_price>=tp2: 
+                                hits.append("TP2")
+                                tp2_hit=1
+                                status="CLOSED"
+                            if last_price<=sl: 
+                                hits.append("SL")
+                                status="CLOSED"
+                                sl_hit=True
                         else:
-                            if not tp1_hit and last_price<=tp1: hits.append("TP1"); tp1_hit=1; sl=entry
-                            if not tp2_hit and last_price<=tp2: hits.append("TP2"); tp2_hit=1; status="CLOSED"
-                            if last_price>=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
+                            if not tp1_hit and last_price<=tp1: 
+                                hits.append("TP1")
+                                tp1_hit=1
+                                sl=entry
+                            if not tp2_hit and last_price<=tp2: 
+                                hits.append("TP2")
+                                tp2_hit=1
+                                status="CLOSED"
+                            if last_price>=sl: 
+                                hits.append("SL")
+                                status="CLOSED"
+                                sl_hit=True
 
                         if hits:
                             await tg(f"🎯 {symbol} {side} update\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP1:{tp1} TP2:{tp2}")
@@ -276,29 +396,36 @@ async def monitor_signals():
                         await db_conn.execute("UPDATE signals SET tp1_hit=?,tp2_hit=?,sl=?,status=? WHERE id=?",
                                              (tp1_hit,tp2_hit,sl,status,sig_id))
                 await db_conn.commit()
-        except Exception as e: log.exception("monitor error: %s", e)
+        except Exception as e: 
+            log.exception("monitor error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
 
 # ---------------- SCAN LOOP ----------------
 last_signal_time = {}
-async def scan_loop(exchange):
+async def scan_loop():
+    global exchange
     while True:
         t0=time.time()
         try:
             tickers = await exchange.fetch_tickers()
-            top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")], key=lambda x:x[1], reverse=True)[:TOP_N]
+            top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")], 
+                        key=lambda x:x[1], reverse=True)[:TOP_N]
             signals_found = 0
             for symbol,_ in top:
                 for tf in TIMEFRAMES:
                     key=f"{symbol}:{tf}"
-                    if key in last_signal_time and time.time()-last_signal_time[key]<60: continue
+                    if key in last_signal_time and time.time()-last_signal_time[key]<60: 
+                        continue
                     ohlcv = await fetch_ohlcv(exchange,symbol,tf,200)
                     if not ohlcv: continue
                     df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
-                    for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
+                    for c in ["open","high","low","close","vol"]: 
+                        df[c]=pd.to_numeric(df[c],errors="coerce")
                     sig = await generate_signal_romeopt(exchange,df,symbol,tf)
                     if sig:
-                        await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig.get('sl')}\nTP1:{sig.get('tp1')} TP2:{sig.get('tp2')}\nScore:{sig['score']}\nBreakdown:{', '.join(sig['reason_list'])}")
+                        # RESTORED ORIGINAL FORMAT WITH ALL STEPS/DATA
+                        breakdown_str = ", ".join(sig['reason_list'])
+                        await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig.get('sl')}\nTP1:{sig.get('tp1')} TP2:{sig.get('tp2')}\nScore:{sig['score']}\nBreakdown:{breakdown_str}")
                         await log_signal(sig)
                         last_signal_time[key]=time.time()
                         signals_found+=1
@@ -320,11 +447,11 @@ async def webhook(request: Request):
 
 # ---------------- MAIN ----------------
 async def main():
+    global exchange, db_conn
     await init_db()
-    global exchange
     exchange = ccxt.okx({"enableRateLimit": True})
     await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals")
-    await asyncio.gather(scan_loop(exchange), monitor_signals())
+    await asyncio.gather(scan_loop(), monitor_signals())
 
 if __name__=="__main__":
     import argparse
@@ -336,6 +463,8 @@ if __name__=="__main__":
     else:
         try:
             asyncio.run(main())
+        except KeyboardInterrupt:
+            log.info("Shutting down...")
         finally:
             if db_conn:
                 asyncio.run(db_conn.close())
