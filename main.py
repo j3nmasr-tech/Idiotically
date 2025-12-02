@@ -813,19 +813,29 @@ async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
 
 async def get_htf_structure_data(exchange, symbol: str, current_tf: str) -> Optional[pd.DataFrame]:
     """Get appropriate HTF data for structure analysis based on current TF"""
-    # RomeOPT-P: Use higher timeframe for structure analysis
+    # RomeOPT-P: Use CONSISTENT higher timeframe for structure analysis
     tf_to_htf_map = {
-        "1m": "15m",   # 1m signals → use 15m structure
-        "3m": "30m",   # 3m signals → use 30m structure
-        "5m": "1h",    # 5m signals → use 1h structure
-        "15m": "4h",   # 15m signals → use 4h structure
-        "30m": "4h"    # 30m signals → use 4h structure
+        "1m": "15m",   # 1m signals → use 15m structure (15x)
+        "3m": "1h",    # 3m signals → use 1h structure (20x)
+        "5m": "1h",    # 5m signals → use 1h structure (12x)
+        "15m": "4h",   # 15m signals → use 4h structure (16x)
+        "30m": "1d"    # 30m signals → use DAILY structure (48x) - RomeOPT-P standard!
     }
     
     htf = tf_to_htf_map.get(current_tf, "4h")
-    log.debug(f"Fetching HTF structure data for {symbol}: {current_tf} → {htf}")
     
-    ohlcv = await fetch_ohlcv(exchange, symbol, htf, 200)  # 200 candles of HTF
+    # Adjust limit based on HTF for optimal data
+    limit_map = {
+        "15m": 200,   # 200*15m = 50 hours
+        "1h": 168,    # 168*1h = 7 days
+        "4h": 168,    # 168*4h = 28 days
+        "1d": 90      # 90*1d = 90 days (3 months)
+    }
+    
+    limit = limit_map.get(htf, 200)
+    log.debug(f"Fetching HTF structure data for {symbol}: {current_tf} → {htf} (limit: {limit})")
+    
+    ohlcv = await fetch_ohlcv(exchange, symbol, htf, limit)
     if not ohlcv:
         log.debug(f"No HTF data returned for {symbol} {htf}")
         return None
@@ -928,8 +938,16 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         reasons.append("Zone Approach +0"); ob_type=None
 
     # Step 5: HTF Alignment
-    tf_map={"1m":"15m","3m":"30m","5m":"1h","15m":"4h","30m":"1h"}
-    htf=tf_map.get(tf,"15m")
+    # For trend alignment, use slightly lower TF than structure analysis
+    tf_map = {
+        "1m": "15m",   # 1m → check 15m alignment
+        "3m": "1h",    # 3m → check 1h alignment  
+        "5m": "1h",    # 5m → check 1h alignment
+        "15m": "4h",   # 15m → check 4h alignment
+        "30m": "4h"    # 30m → check 4h alignment (for trend, structure uses 1d)
+    }
+    
+    htf = tf_map.get(tf, "15m")
     ohlcv_htf = await fetch_ohlcv(exchange, symbol, htf, 50)
     htf_alignment = 0
     if ohlcv_htf:
@@ -1099,9 +1117,14 @@ def calculate_romeopt_tp_sl_strict(sig: dict, df_htf: pd.DataFrame) -> Optional[
             tp1_distance_pct = (sig["entry"] - tp1) / sig["entry"]
             tp2_distance_pct = (sig["entry"] - tp2) / sig["entry"] if tp2 is not None else None
         
+        # Get current TF and HTF used
+        current_tf = sig.get("timeframe", "unknown")
+        htf_used = "15m" if current_tf == "1m" else "1h" if current_tf in ["3m", "5m"] else "4h" if current_tf == "15m" else "1d"
+        
         sig["structure_data"] = safe_json_dumps({
             **structure,
-            'htf_used': True,
+            'htf_used': htf_used,
+            'current_tf': current_tf,
             'htf_candle_count': len(df_htf),
             'romeoptp_tp_count': 2 if tp2 is not None else 1,
             'romeoptp_tp1_distance_pct': tp1_distance_pct,
@@ -1113,7 +1136,7 @@ def calculate_romeopt_tp_sl_strict(sig: dict, df_htf: pd.DataFrame) -> Optional[
         if tp2 is not None:
             tp_info += f", TP2: {tp2:.6f} ({tp2_distance_pct:.2%})"
         
-        log.info(f"RomeOPT-P TP/SL CALCULATED (HTF STRUCTURE) for {sig['symbol']}: "
+        log.info(f"RomeOPT-P TP/SL CALCULATED ({current_tf}→{htf_used}) for {sig['symbol']}: "
                 f"Entry={sig['entry']:.6f}, SL={sl:.6f}, {tp_info}")
         
         return sig
@@ -1252,22 +1275,32 @@ async def scan_loop(exchange):
                         htf_flag = sig.get("htf_alignment", "N/A")
                         sweep_flag = sig.get("liquidity_sweep", "N/A")
                         
+                        # Get HTF mapping info for display
+                        current_tf = sig.get("timeframe", tf)
+                        htf_map_info = {
+                            "1m": "15m",
+                            "3m": "1h",
+                            "5m": "1h",
+                            "15m": "4h",
+                            "30m": "1d"
+                        }
+                        htf_used = htf_map_info.get(current_tf, "4h")
+                        
                         # Format TP/SL info with RomeOPT-P details
                         tp_sl_info = f"Entry: {sig['entry']:.6f}\n"
-                        tp_sl_info += f"SL: {sig.get('sl', 0):.6f} (RomeOPT-P HTF Structure)\n"
+                        tp_sl_info += f"SL: {sig.get('sl', 0):.6f} (RomeOPT-P Structure)\n"
                         
                         # Show TPs based on what's available
                         if sig.get('tp1'):
-                            tp_sl_info += f"TP1: {sig.get('tp1', 0):.6f} (HTF Liquidity Target)\n"
+                            tp_sl_info += f"TP1: {sig.get('tp1', 0):.6f} (HTF Liquidity)\n"
                         if sig.get('tp2'):
                             tp_sl_info += f"TP2: {sig.get('tp2', 0):.6f} (Next HTF Liquidity)\n"
-                        if sig.get('tp3'):
-                            tp_sl_info += f"TP3: {sig.get('tp3', 0):.6f} (Extended HTF Liquidity)\n"
-                            
+                        
                         tp_sl_info += f"Score: {sig['score']}\n"
-                        tp_sl_info += f"HTF: {htf_flag} Sweep: {sweep_flag}\n"
+                        tp_sl_info += f"HTF Align: {htf_flag} Sweep: {sweep_flag}\n"
+                        tp_sl_info += f"Structure TF: {current_tf}→{htf_used}\n"
                         tp_sl_info += f"Breakdown: {', '.join(sig['reason_list'])}\n"
-                        tp_sl_info += f"STRICT RomeOPT-P HTF TP/SL Applied ✓"
+                        tp_sl_info += f"STRICT RomeOPT-P Rules ✓"
                         
                         await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\n{tp_sl_info}")
                         await log_signal(sig)
@@ -1296,7 +1329,11 @@ async def main():
     global exchange
     exchange = ccxt.okx({"enableRateLimit": True})
     await tg("🏆 ROMEOPT 6-Step Scanner Started - STRICT RomeOPT-P HTF TP/SL Rules")
-    await tg("🔧 FIXED: Now uses 1-2 TPs MAX (RomeOPT-P rules)\n📏 TP1: 0.5-1.5%, TP2: 1.5-3.0%\n❌ No pools >3% away")
+    await tg("🔧 FIXED: Now uses 1-2 TPs MAX (RomeOPT-P rules)")
+    await tg("📏 TP1: 0.5-1.5%, TP2: 1.5-3.0%")
+    await tg("🗺️ HTF Structure Mapping:")
+    await tg("   1m → 15m | 3m → 1h | 5m → 1h")
+    await tg("   15m → 4h | 30m → 1d (RomeOPT-P)")
     log.info("STRICT RomeOPT-P HTF TP/SL System: Uses HIGHER TIMEFRAME structure for TP/SL")
     await asyncio.gather(scan_loop(exchange), monitor_signals())
 
