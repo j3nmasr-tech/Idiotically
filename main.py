@@ -34,7 +34,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
-TOP_N = int(os.getenv("TOP_N", 20))
+TOP_N = int(os.getenv("TOP_N", 60))
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
 MIN_SCORE = 5
 CRITICAL_FACTORS_MIN = 2  # HTF Alignment + Liquidity Sweep minimum
@@ -556,25 +556,38 @@ class RomeOPTTPSLSystem:
             return min(valid_sls)
     
     @staticmethod
-    def calculate_take_profit(side: str, structure: Dict, entry_price: float, sl_price: float) -> Optional[Tuple[float, float, float]]:
+    def calculate_take_profit(side: str, structure: Dict, entry_price: float, sl_price: float) -> Optional[Tuple[float, Optional[float]]]:
         """
         Calculate take profit based on liquidity pools
-        STRICTLY follows RomeOPT-P rules - returns None if rules can't be followed
+        STRICTLY follows RomeOPT-P rules - returns (TP1, TP2) or (TP1, None) for single TP
+        RomeOPT-P: 1-2 TPs MAX, TP1: 0.5-1.5%, TP2: 1.5-3.0% from entry
         """
         try:
+            # RomeOPT-P: Always check risk first
+            if side == 'BUY':
+                risk_pct = (entry_price - sl_price) / entry_price
+            else:
+                risk_pct = (sl_price - entry_price) / entry_price
+            
             if side == 'BUY':
                 liquidity_pools = structure.get('liquidity_pools', {}).get('upside', [])
                 if not liquidity_pools:
                     log.debug("No upside liquidity pools found for BUY")
                     return None
                 
-                # RomeOPT-P: TP is the next upside liquidity pool
-                # Sort by proximity to entry (closest first)
+                # RomeOPT-P: Filter and sort valid pools
                 valid_pools = []
                 for pool in liquidity_pools:
                     pool_price = pool.get('price', 0)
                     if pool_price <= entry_price:
                         continue  # Must be above entry for BUY
+                    
+                    # Calculate distance from entry
+                    distance_pct = (pool_price - entry_price) / entry_price
+                    
+                    # RomeOPT-P CRITICAL FIX: Reject pools >3% away
+                    if distance_pct > 0.03:  # 3% max
+                        continue
                     
                     # RomeOPT-P: Place TP just BEFORE the liquidity (never through)
                     tp_price = pool_price * 0.999  # 0.1% below the liquidity
@@ -584,39 +597,48 @@ class RomeOPTTPSLSystem:
                         'original_price': pool_price,
                         'type': pool.get('type', 'unknown'),
                         'strength': pool.get('strength', 1),
-                        'distance': abs(pool_price - entry_price)
+                        'distance_pct': distance_pct
                     })
                 
                 if not valid_pools:
-                    log.debug("No valid upside liquidity pools above entry")
+                    log.debug("No valid upside liquidity pools above entry (within 3%)")
                     return None
                 
                 # Sort by distance (closest first)
-                valid_pools.sort(key=lambda x: x['distance'])
+                valid_pools.sort(key=lambda x: x['distance_pct'])
                 
-                # RomeOPT-P: If closest liquidity is small, choose the next one
-                # We'll use the closest 3 valid pools with meaningful spacing
+                # RomeOPT-P: Select 1-2 TPs based on distances
                 selected_tps = RomeOPTTPSLSystem._select_romeopt_tps(valid_pools, entry_price, 'BUY')
                 
-                if len(selected_tps) < 3:
-                    log.debug(f"Not enough valid TP levels found for BUY: {len(selected_tps)}")
+                if not selected_tps:  # No valid TPs found
+                    log.debug("No valid TPs found for BUY using RomeOPT-P rules")
                     return None
                 
-                return selected_tps[0], selected_tps[1], selected_tps[2]
-            
+                # Return TPs based on selection
+                if len(selected_tps) == 1:
+                    return (selected_tps[0], None)  # Single TP
+                else:
+                    return (selected_tps[0], selected_tps[1])  # Two TPs
+                
             else:  # SELL
                 liquidity_pools = structure.get('liquidity_pools', {}).get('downside', [])
                 if not liquidity_pools:
                     log.debug("No downside liquidity pools found for SELL")
                     return None
                 
-                # RomeOPT-P: TP is the next downside liquidity pool
-                # Sort by proximity to entry (closest first = highest price for SELL)
+                # RomeOPT-P: Filter and sort valid pools
                 valid_pools = []
                 for pool in liquidity_pools:
                     pool_price = pool.get('price', 0)
                     if pool_price >= entry_price:
                         continue  # Must be below entry for SELL
+                    
+                    # Calculate distance from entry
+                    distance_pct = (entry_price - pool_price) / entry_price
+                    
+                    # RomeOPT-P CRITICAL FIX: Reject pools >3% away
+                    if distance_pct > 0.03:  # 3% max
+                        continue
                     
                     # RomeOPT-P: Place TP just BEFORE the liquidity (never through)
                     tp_price = pool_price * 1.001  # 0.1% above the liquidity
@@ -626,25 +648,29 @@ class RomeOPTTPSLSystem:
                         'original_price': pool_price,
                         'type': pool.get('type', 'unknown'),
                         'strength': pool.get('strength', 1),
-                        'distance': abs(entry_price - pool_price)
+                        'distance_pct': distance_pct
                     })
                 
                 if not valid_pools:
-                    log.debug("No valid downside liquidity pools below entry")
+                    log.debug("No valid downside liquidity pools below entry (within 3%)")
                     return None
                 
                 # Sort by distance (closest first = highest price for SELL)
-                valid_pools.sort(key=lambda x: x['distance'])
+                valid_pools.sort(key=lambda x: x['distance_pct'])
                 
-                # RomeOPT-P: If closest liquidity is small, choose the next one
+                # RomeOPT-P: Select 1-2 TPs based on distances
                 selected_tps = RomeOPTTPSLSystem._select_romeopt_tps(valid_pools, entry_price, 'SELL')
                 
-                if len(selected_tps) < 3:
-                    log.debug(f"Not enough valid TP levels found for SELL: {len(selected_tps)}")
+                if not selected_tps:  # No valid TPs found
+                    log.debug("No valid TPs found for SELL using RomeOPT-P rules")
                     return None
                 
-                return selected_tps[0], selected_tps[1], selected_tps[2]
-                
+                # Return TPs based on selection
+                if len(selected_tps) == 1:
+                    return (selected_tps[0], None)  # Single TP
+                else:
+                    return (selected_tps[0], selected_tps[1])  # Two TPs
+                    
         except Exception as e:
             log.error(f"Error calculating take profit: {e}")
             return None
@@ -653,31 +679,56 @@ class RomeOPTTPSLSystem:
     def _select_romeopt_tps(valid_pools: List[Dict], entry_price: float, side: str) -> List[float]:
         """Select TP levels following RomeOPT-P rules strictly"""
         selected_tps = []
-        min_distance_pct = 0.005  # Minimum 0.5% between TPs
+        
+        # RomeOPT-P distance parameters
+        min_distance_between_tps_pct = 0.005  # Minimum 0.5% between TPs
+        min_tp_distance_from_entry_pct = 0.005  # Minimum 0.5% from entry
+        max_tp_distance_from_entry_pct = 0.03   # Maximum 3% from entry
         
         for pool in valid_pools:
-            if len(selected_tps) >= 3:
+            if len(selected_tps) >= 2:  # RomeOPT-P: MAX 2 TPs (not 3)
                 break
             
             tp_price = pool['price']
+            distance_from_entry_pct = abs(tp_price - entry_price) / entry_price
             
-            # Check if this TP is too close to entry (must be meaningful)
-            distance_pct = abs(tp_price - entry_price) / entry_price
-            if distance_pct < 0.002:  # Less than 0.2% from entry - skip
-                continue
+            # YOUR CRITICAL FIX: Skip pools outside RomeOPT-P range
+            if distance_from_entry_pct < min_tp_distance_from_entry_pct:
+                continue  # Too close to entry (<0.5%)
             
-            # Check if too close to existing TPs
+            if distance_from_entry_pct > max_tp_distance_from_entry_pct:
+                continue  # Too far from entry (>3%)
+            
+            # RomeOPT-P: Check distance from existing TPs
             too_close = False
             for existing_tp in selected_tps:
-                if abs(tp_price - existing_tp) / entry_price < min_distance_pct:
+                distance_between_pct = abs(tp_price - existing_tp) / entry_price
+                if distance_between_pct < min_distance_between_tps_pct:
                     too_close = True
                     break
             
             if not too_close:
-                selected_tps.append(tp_price)
+                # RomeOPT-P: Ensure proper ordering
+                if side == 'BUY' and tp_price > entry_price:
+                    selected_tps.append(tp_price)
+                elif side == 'SELL' and tp_price < entry_price:
+                    selected_tps.append(tp_price)
         
-        # RomeOPT-P: We need exactly 3 TPs based on liquidity
-        # If we don't have 3, we can't follow RomeOPT-P rules
+        # RomeOPT-P: Sort TPs (ascending for BUY, descending for SELL)
+        if side == 'BUY':
+            selected_tps.sort()  # Ascending: TP1 < TP2
+        else:
+            selected_tps.sort(reverse=True)  # Descending: TP1 > TP2
+        
+        # RomeOPT-P: Validate distance rules
+        if len(selected_tps) == 2:
+            tp1, tp2 = selected_tps[0], selected_tps[1]
+            distance_between_pct = abs(tp2 - tp1) / entry_price
+            
+            # Ensure TPs are at least 0.5% apart
+            if distance_between_pct < min_distance_between_tps_pct:
+                return [tp1]  # Keep only TP1 if too close
+        
         return selected_tps
 
 # ---------------- TELEGRAM ----------------
@@ -993,45 +1044,77 @@ def calculate_romeopt_tp_sl_strict(sig: dict, df_htf: pd.DataFrame) -> Optional[
             log.debug(f"No valid TPs found for {sig['symbol']} using HTF RomeOPT-P rules")
             return None
         
-        tp1, tp2, tp3 = tps
+        tp1, tp2 = tps  # Now returns (TP1, TP2) or (TP1, None)
         
-        # Validate RomeOPT-P TP ordering
+        # RomeOPT-P: Validate TP distances
         if sig["side"] == "BUY":
-            if not (tp1 > sig["entry"] and tp2 > tp1 and tp3 > tp2):
-                log.debug(f"Invalid TP ordering for BUY {sig['symbol']}: {tp1}, {tp2}, {tp3}")
+            if not (tp1 > sig["entry"]):
+                log.debug(f"TP1 must be above entry for BUY {sig['symbol']}: {tp1}")
+                return None
+            if tp2 is not None and not (tp2 > tp1):
+                log.debug(f"TP2 must be above TP1 for BUY {sig['symbol']}: {tp1}, {tp2}")
                 return None
         else:  # SELL
-            if not (tp1 < sig["entry"] and tp2 < tp1 and tp3 < tp2):
-                log.debug(f"Invalid TP ordering for SELL {sig['symbol']}: {tp1}, {tp2}, {tp3}")
+            if not (tp1 < sig["entry"]):
+                log.debug(f"TP1 must be below entry for SELL {sig['symbol']}: {tp1}")
+                return None
+            if tp2 is not None and not (tp2 < tp1):
+                log.debug(f"TP2 must be below TP1 for SELL {sig['symbol']}: {tp1}, {tp2}")
                 return None
         
-        # RomeOPT-P: TPs must be meaningful (not too close to entry)
-        min_tp_distance = abs(sig["entry"] * 0.002)  # 0.2% minimum
-        
+        # RomeOPT-P: Check distance ranges
         if sig["side"] == "BUY":
-            if tp1 - sig["entry"] < min_tp_distance:
-                log.debug(f"TP1 too close to entry for BUY {sig['symbol']}")
+            tp1_distance = (tp1 - sig["entry"]) / sig["entry"]
+            if tp1_distance > 0.03:  # TP1 >3% away - too far
+                log.debug(f"TP1 too far for BUY {sig['symbol']}: {tp1_distance:.2%}")
                 return None
+            if tp2 is not None:
+                tp2_distance = (tp2 - sig["entry"]) / sig["entry"]
+                if tp2_distance > 0.03:  # TP2 >3% away - too far
+                    log.debug(f"TP2 too far for BUY {sig['symbol']}: {tp2_distance:.2%}")
+                    return None
         else:
-            if sig["entry"] - tp1 < min_tp_distance:
-                log.debug(f"TP1 too close to entry for SELL {sig['symbol']}")
+            tp1_distance = (sig["entry"] - tp1) / sig["entry"]
+            if tp1_distance > 0.03:  # TP1 >3% away - too far
+                log.debug(f"TP1 too far for SELL {sig['symbol']}: {tp1_distance:.2%}")
                 return None
+            if tp2 is not None:
+                tp2_distance = (sig["entry"] - tp2) / sig["entry"]
+                if tp2_distance > 0.03:  # TP2 >3% away - too far
+                    log.debug(f"TP2 too far for SELL {sig['symbol']}: {tp2_distance:.2%}")
+                    return None
         
         # Store structure data with HTF info
         sig["sl"] = float(sl)
         sig["tp1"] = float(tp1)
-        sig["tp2"] = float(tp2)
-        sig["tp3"] = float(tp3)
+        sig["tp2"] = float(tp2) if tp2 is not None else None
+        sig["tp3"] = None  # RomeOPT-P: No TP3 anymore
         sig["latest_ob"] = ob_zone
+        
+        # Calculate TP distances for logging
+        if sig["side"] == "BUY":
+            tp1_distance_pct = (tp1 - sig["entry"]) / sig["entry"]
+            tp2_distance_pct = (tp2 - sig["entry"]) / sig["entry"] if tp2 is not None else None
+        else:
+            tp1_distance_pct = (sig["entry"] - tp1) / sig["entry"]
+            tp2_distance_pct = (sig["entry"] - tp2) / sig["entry"] if tp2 is not None else None
+        
         sig["structure_data"] = safe_json_dumps({
             **structure,
             'htf_used': True,
-            'htf_candle_count': len(df_htf)
+            'htf_candle_count': len(df_htf),
+            'romeoptp_tp_count': 2 if tp2 is not None else 1,
+            'romeoptp_tp1_distance_pct': tp1_distance_pct,
+            'romeoptp_tp2_distance_pct': tp2_distance_pct,
+            'romeoptp_rule': 'TP1: 0.5-1.5%, TP2: 1.5-3.0% (if used)'
         })
         
+        tp_info = f"TP1: {tp1:.6f} ({tp1_distance_pct:.2%})"
+        if tp2 is not None:
+            tp_info += f", TP2: {tp2:.6f} ({tp2_distance_pct:.2%})"
+        
         log.info(f"RomeOPT-P TP/SL CALCULATED (HTF STRUCTURE) for {sig['symbol']}: "
-                f"Entry={sig['entry']:.6f}, SL={sl:.6f}, "
-                f"TP1={tp1:.6f}, TP2={tp2:.6f}, TP3={tp3:.6f}")
+                f"Entry={sig['entry']:.6f}, SL={sl:.6f}, {tp_info}")
         
         return sig
         
@@ -1117,7 +1200,14 @@ async def monitor_signals():
                                 if last_price>=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
 
                             if hits:
-                                await tg(f"🎯 {symbol} {side} update\nEntry:{entry:.6f}\nLast:{last_price:.6f}\nHits:{','.join(hits)}\nSL:{sl:.6f}\nTP1:{tp1:.6f} TP2:{tp2:.6f} TP3:{tp3:.6f}")
+                                # Format message based on TPs available
+                                tp_info = f"TP1:{tp1:.6f}"
+                                if tp2 is not None and tp2 > 0:
+                                    tp_info += f" TP2:{tp2:.6f}"
+                                if tp3 is not None and tp3 > 0:
+                                    tp_info += f" TP3:{tp3:.6f}"
+                                    
+                                await tg(f"🎯 {symbol} {side} update\nEntry:{entry:.6f}\nLast:{last_price:.6f}\nHits:{','.join(hits)}\nSL:{sl:.6f}\n{tp_info}")
 
                             if sl_hit: record_sl_hit(symbol)
                             
@@ -1165,9 +1255,15 @@ async def scan_loop(exchange):
                         # Format TP/SL info with RomeOPT-P details
                         tp_sl_info = f"Entry: {sig['entry']:.6f}\n"
                         tp_sl_info += f"SL: {sig.get('sl', 0):.6f} (RomeOPT-P HTF Structure)\n"
-                        tp_sl_info += f"TP1: {sig.get('tp1', 0):.6f} (HTF Liquidity Target)\n"
-                        tp_sl_info += f"TP2: {sig.get('tp2', 0):.6f} (Next HTF Liquidity)\n"
-                        tp_sl_info += f"TP3: {sig.get('tp3', 0):.6f} (Extended HTF Liquidity)\n"
+                        
+                        # Show TPs based on what's available
+                        if sig.get('tp1'):
+                            tp_sl_info += f"TP1: {sig.get('tp1', 0):.6f} (HTF Liquidity Target)\n"
+                        if sig.get('tp2'):
+                            tp_sl_info += f"TP2: {sig.get('tp2', 0):.6f} (Next HTF Liquidity)\n"
+                        if sig.get('tp3'):
+                            tp_sl_info += f"TP3: {sig.get('tp3', 0):.6f} (Extended HTF Liquidity)\n"
+                            
                         tp_sl_info += f"Score: {sig['score']}\n"
                         tp_sl_info += f"HTF: {htf_flag} Sweep: {sweep_flag}\n"
                         tp_sl_info += f"Breakdown: {', '.join(sig['reason_list'])}\n"
@@ -1200,6 +1296,7 @@ async def main():
     global exchange
     exchange = ccxt.okx({"enableRateLimit": True})
     await tg("🏆 ROMEOPT 6-Step Scanner Started - STRICT RomeOPT-P HTF TP/SL Rules")
+    await tg("🔧 FIXED: Now uses 1-2 TPs MAX (RomeOPT-P rules)\n📏 TP1: 0.5-1.5%, TP2: 1.5-3.0%\n❌ No pools >3% away")
     log.info("STRICT RomeOPT-P HTF TP/SL System: Uses HIGHER TIMEFRAME structure for TP/SL")
     await asyncio.gather(scan_loop(exchange), monitor_signals())
 
