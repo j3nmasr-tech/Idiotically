@@ -5,7 +5,7 @@
 LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features)
 - Fully live early signals
 - RomeOPT 6-step logic
-- TP/SL tracking with RomeOPT-P structure-based system
+- TP/SL tracking with RomeOPT-P structure-based system (HTF STRUCTURE)
 - Dynamic TP/SL updates (market-structure-based)
 - Telegram alerts
 - Async SQLite logging
@@ -67,18 +67,18 @@ def safe_json_dumps(obj):
             return str(item)
     return json.dumps(_convert(obj))
 
-# ---------------- ROMEOPT-P TP/SL SYSTEM ----------------
+# ---------------- ROMEOPT-P TP/SL SYSTEM (HTF VERSION) ----------------
 class RomeOPTTPSLSystem:
     """
     RomeOPT-P 6-Step TP/SL System
-    Implements structure-based stop loss and liquidity-based take profit logic
+    Uses HIGHER TIMEFRAME structure for TP/SL analysis
     STRICTLY follows RomeOPT-P rules - no arithmetic fallbacks
     """
     
     @staticmethod
-    def find_structure_elements(df: pd.DataFrame, symbol: str, side: str, ob_zone: dict) -> Dict[str, Any]:
+    def find_structure_elements(df_htf: pd.DataFrame, symbol: str, side: str, ob_zone: dict) -> Dict[str, Any]:
         """
-        Find all structure elements for TP/SL calculation
+        Find all structure elements from HTF data for TP/SL calculation
         """
         structure = {
             'order_blocks': [],
@@ -88,39 +88,48 @@ class RomeOPTTPSLSystem:
             'liquidity_pools': {'upside': [], 'downside': []}
         }
         
-        if df is None or len(df) < 50:
+        if df_htf is None or len(df_htf) < 50:
+            log.debug(f"Insufficient HTF data for {symbol}: {len(df_htf) if df_htf is not None else 0} candles")
             return structure
         
         try:
-            # 1. Origin Order Block
+            # 1. Origin Order Block (from current TF, but we still track it)
             if ob_zone and isinstance(ob_zone, dict):
                 structure['order_blocks'].append({
                     'type': 'bullish' if side == 'BUY' else 'bearish',
                     'high': float(ob_zone.get('high', 0)),
                     'low': float(ob_zone.get('low', 0)),
-                    'origin': True
+                    'origin': True,
+                    'tf': 'current'
                 })
             
-            # 2. Protected levels (significant swing highs/lows)
+            # 2. Protected levels from HTF (significant swing highs/lows)
             structure['protected_levels'].extend(
-                RomeOPTTPSLSystem._find_protected_levels(df)
+                RomeOPTTPSLSystem._find_protected_levels(df_htf)
             )
             
-            # 3. FVGs (Fair Value Gaps)
+            # 3. FVGs from HTF (Fair Value Gaps)
             structure['fvgs'].extend(
-                RomeOPTTPSLSystem._find_fvgs(df)
+                RomeOPTTPSLSystem._find_fvgs(df_htf)
             )
             
-            # 4. BOS (Break of Structure) zones
+            # 4. BOS zones from HTF (Break of Structure)
             structure['bos_zones'].extend(
-                RomeOPTTPSLSystem._find_bos_zones(df)
+                RomeOPTTPSLSystem._find_bos_zones(df_htf)
             )
             
-            # 5. Liquidity pools
-            structure['liquidity_pools'] = RomeOPTTPSLSystem._find_liquidity_pools(df)
+            # 5. Liquidity pools from HTF
+            structure['liquidity_pools'] = RomeOPTTPSLSystem._find_liquidity_pools(df_htf)
+            
+            log.debug(f"Found HTF structure for {symbol}: "
+                     f"{len(structure['protected_levels'])} protected levels, "
+                     f"{len(structure['fvgs'])} FVGs, "
+                     f"{len(structure['bos_zones'])} BOS zones, "
+                     f"{len(structure['liquidity_pools']['upside'])} upside pools, "
+                     f"{len(structure['liquidity_pools']['downside'])} downside pools")
             
         except Exception as e:
-            log.error(f"Error finding structure elements for {symbol}: {e}")
+            log.error(f"Error finding HTF structure elements for {symbol}: {e}")
         
         return structure
     
@@ -438,6 +447,7 @@ class RomeOPTTPSLSystem:
             
             if final_sl is None:
                 # NO VALID SL FOUND - REJECT SIGNAL (RomeOPT-P strict)
+                log.debug("No valid SL found using RomeOPT-P rules")
                 return None
             
             return float(final_sl)
@@ -750,6 +760,32 @@ async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
         log.debug("fetch_ohlcv failed for %s %s: %s", symbol, timeframe, e)
         return None
 
+async def get_htf_structure_data(exchange, symbol: str, current_tf: str) -> Optional[pd.DataFrame]:
+    """Get appropriate HTF data for structure analysis based on current TF"""
+    # RomeOPT-P: Use higher timeframe for structure analysis
+    tf_to_htf_map = {
+        "1m": "15m",   # 1m signals → use 15m structure
+        "3m": "30m",   # 3m signals → use 30m structure
+        "5m": "1h",    # 5m signals → use 1h structure
+        "15m": "4h",   # 15m signals → use 4h structure
+        "30m": "4h"    # 30m signals → use 4h structure
+    }
+    
+    htf = tf_to_htf_map.get(current_tf, "4h")
+    log.debug(f"Fetching HTF structure data for {symbol}: {current_tf} → {htf}")
+    
+    ohlcv = await fetch_ohlcv(exchange, symbol, htf, 200)  # 200 candles of HTF
+    if not ohlcv:
+        log.debug(f"No HTF data returned for {symbol} {htf}")
+        return None
+    
+    df_htf = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+    for c in ["open","high","low","close","vol"]:
+        df_htf[c] = pd.to_numeric(df_htf[c], errors="coerce")
+    
+    log.debug(f"HTF structure data for {symbol} {htf}: {len(df_htf)} candles")
+    return df_htf
+
 # ---------------- INDICATORS ----------------
 def atr(df: pd.DataFrame, period=14):
     try:
@@ -798,7 +834,7 @@ async def elite_tf_alignment(exchange, symbol: str, side: str):
 
 # ---------------- ROMEOPT 6-STEP SIGNAL ----------------
 async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
-    if df is None or len(df) < 50:  # Increased minimum for structure analysis
+    if df is None or len(df) < 50:
         log.debug(f"Insufficient data for {symbol} {tf}")
         return None
     
@@ -906,18 +942,25 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
            "reason_list":reasons,"htf_alignment":htf_alignment,"liquidity_sweep":liquidity_sweep,
            "ob_zone": ob_zone, "timeframe": tf}
     
-    # STRICT RomeOPT-P TP/SL calculation - REJECT if rules can't be followed
-    sig_with_tpsl = calculate_romeopt_tp_sl_strict(sig, df)
+    # Get HTF data for structure analysis (RomeOPT-P uses HTF for TP/SL)
+    df_htf_structure = await get_htf_structure_data(exchange, symbol, tf)
+    if df_htf_structure is None:
+        log.debug(f"No HTF structure data available for {symbol} {tf}")
+        return None
+    
+    # STRICT RomeOPT-P TP/SL calculation using HTF structure
+    sig_with_tpsl = calculate_romeopt_tp_sl_strict(sig, df_htf_structure)
     if not sig_with_tpsl:
-        log.debug(f"RomeOPT-P TP/SL rules cannot be applied for {symbol}, rejecting signal")
+        log.debug(f"RomeOPT-P TP/SL rules cannot be applied for {symbol} using HTF structure")
         return None
     
     return sig_with_tpsl
 
 # ---------------- STRICT ROMEOPT-P TP/SL CALCULATION ----------------
-def calculate_romeopt_tp_sl_strict(sig: dict, df: pd.DataFrame) -> Optional[dict]:
+def calculate_romeopt_tp_sl_strict(sig: dict, df_htf: pd.DataFrame) -> Optional[dict]:
     """
     Calculate TP/SL using RomeOPT-P structure-based system
+    Uses HIGHER TIMEFRAME structure for analysis
     STRICTLY follows RomeOPT-P rules - returns None if rules can't be followed
     """
     try:
@@ -927,9 +970,9 @@ def calculate_romeopt_tp_sl_strict(sig: dict, df: pd.DataFrame) -> Optional[dict
             log.debug(f"No OB zone for {sig['symbol']}")
             return None
         
-        # Find market structure elements
+        # Find market structure elements FROM HTF DATA
         structure = RomeOPTTPSLSystem.find_structure_elements(
-            df, sig["symbol"], sig["side"], ob_zone
+            df_htf, sig["symbol"], sig["side"], ob_zone
         )
         
         # Calculate Stop Loss (structure-based) - RomeOPT-P strict
@@ -938,7 +981,7 @@ def calculate_romeopt_tp_sl_strict(sig: dict, df: pd.DataFrame) -> Optional[dict
         )
         
         if sl is None:
-            log.debug(f"No valid SL found for {sig['symbol']} using RomeOPT-P rules")
+            log.debug(f"No valid SL found for {sig['symbol']} using HTF RomeOPT-P rules")
             return None
         
         # Calculate Take Profit (liquidity-based) - RomeOPT-P strict
@@ -947,7 +990,7 @@ def calculate_romeopt_tp_sl_strict(sig: dict, df: pd.DataFrame) -> Optional[dict
         )
         
         if tps is None:
-            log.debug(f"No valid TPs found for {sig['symbol']} using RomeOPT-P rules")
+            log.debug(f"No valid TPs found for {sig['symbol']} using HTF RomeOPT-P rules")
             return None
         
         tp1, tp2, tp3 = tps
@@ -974,15 +1017,19 @@ def calculate_romeopt_tp_sl_strict(sig: dict, df: pd.DataFrame) -> Optional[dict
                 log.debug(f"TP1 too close to entry for SELL {sig['symbol']}")
                 return None
         
-        # Store structure data
+        # Store structure data with HTF info
         sig["sl"] = float(sl)
         sig["tp1"] = float(tp1)
         sig["tp2"] = float(tp2)
         sig["tp3"] = float(tp3)
         sig["latest_ob"] = ob_zone
-        sig["structure_data"] = safe_json_dumps(structure)
+        sig["structure_data"] = safe_json_dumps({
+            **structure,
+            'htf_used': True,
+            'htf_candle_count': len(df_htf)
+        })
         
-        log.info(f"RomeOPT-P TP/SL CALCULATED for {sig['symbol']}: "
+        log.info(f"RomeOPT-P TP/SL CALCULATED (HTF STRUCTURE) for {sig['symbol']}: "
                 f"Entry={sig['entry']:.6f}, SL={sl:.6f}, "
                 f"TP1={tp1:.6f}, TP2={tp2:.6f}, TP3={tp3:.6f}")
         
@@ -1117,20 +1164,20 @@ async def scan_loop(exchange):
                         
                         # Format TP/SL info with RomeOPT-P details
                         tp_sl_info = f"Entry: {sig['entry']:.6f}\n"
-                        tp_sl_info += f"SL: {sig.get('sl', 0):.6f} (RomeOPT-P Structure)\n"
-                        tp_sl_info += f"TP1: {sig.get('tp1', 0):.6f} (Liquidity Target)\n"
-                        tp_sl_info += f"TP2: {sig.get('tp2', 0):.6f} (Next Liquidity)\n"
-                        tp_sl_info += f"TP3: {sig.get('tp3', 0):.6f} (Extended Liquidity)\n"
+                        tp_sl_info += f"SL: {sig.get('sl', 0):.6f} (RomeOPT-P HTF Structure)\n"
+                        tp_sl_info += f"TP1: {sig.get('tp1', 0):.6f} (HTF Liquidity Target)\n"
+                        tp_sl_info += f"TP2: {sig.get('tp2', 0):.6f} (Next HTF Liquidity)\n"
+                        tp_sl_info += f"TP3: {sig.get('tp3', 0):.6f} (Extended HTF Liquidity)\n"
                         tp_sl_info += f"Score: {sig['score']}\n"
                         tp_sl_info += f"HTF: {htf_flag} Sweep: {sweep_flag}\n"
                         tp_sl_info += f"Breakdown: {', '.join(sig['reason_list'])}\n"
-                        tp_sl_info += f"STRICT RomeOPT-P TP/SL Applied ✓"
+                        tp_sl_info += f"STRICT RomeOPT-P HTF TP/SL Applied ✓"
                         
                         await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\n{tp_sl_info}")
                         await log_signal(sig)
                         last_signal_time[key]=time.time()
                         signals_found+=1
-            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found (STRICT TP/SL)")
+            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found (HTF STRUCTURE TP/SL)")
         except Exception as e: 
             log.exception("scan error: %s", e)
         elapsed=time.time()-t0
@@ -1152,8 +1199,8 @@ async def main():
     await init_db()
     global exchange
     exchange = ccxt.okx({"enableRateLimit": True})
-    await tg("🏆 ROMEOPT 6-Step Scanner Started - STRICT RomeOPT-P TP/SL Rules")
-    log.info("STRICT RomeOPT-P TP/SL System: Signals REJECTED if RomeOPT-P rules cannot be applied")
+    await tg("🏆 ROMEOPT 6-Step Scanner Started - STRICT RomeOPT-P HTF TP/SL Rules")
+    log.info("STRICT RomeOPT-P HTF TP/SL System: Uses HIGHER TIMEFRAME structure for TP/SL")
     await asyncio.gather(scan_loop(exchange), monitor_signals())
 
 if __name__=="__main__":
