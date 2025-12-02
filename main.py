@@ -35,7 +35,7 @@ DB_PATH = "/app/data/signals.db"
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
 TOP_N = int(os.getenv("TOP_N", 25))
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
-MIN_SCORE = 5
+MIN_SCORE = 6
 CRITICAL_FACTORS_MIN = 2  # HTF Alignment + Liquidity Sweep minimum
 
 # Timeframe mapping for TP scaling (RomeOPT-P logic) - YOUR CHOICE
