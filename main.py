@@ -35,7 +35,7 @@ DB_PATH = "/app/data/signals.db"
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
 TOP_N = int(os.getenv("TOP_N", 25))
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
-MIN_SCORE = 6
+MIN_SCORE = 5
 CRITICAL_FACTORS_MIN = 2  # HTF Alignment + Liquidity Sweep minimum
 
 # Timeframe mapping for TP scaling (RomeOPT-P logic) - YOUR CHOICE
@@ -71,12 +71,40 @@ async def tg(msg: str):
         except Exception as e:
             log.warning(f"Telegram send failed: {e}")
 
+# ---------------- DATABASE MIGRATION ----------------
+async def migrate_db():
+    """Migrate database schema if needed"""
+    try:
+        # Check if entry_tf column exists
+        cursor = await db_conn.execute("PRAGMA table_info(signals)")
+        columns = await cursor.fetchall()
+        column_names = [col[1] for col in columns]
+        
+        # Add missing columns
+        if 'entry_tf' not in column_names:
+            log.info("Migrating database: adding entry_tf column")
+            await db_conn.execute("ALTER TABLE signals ADD COLUMN entry_tf TEXT DEFAULT ''")
+        
+        if 'tp_tf' not in column_names:
+            log.info("Migrating database: adding tp_tf column")
+            await db_conn.execute("ALTER TABLE signals ADD COLUMN tp_tf TEXT DEFAULT ''")
+        
+        await db_conn.commit()
+        log.info("Database migration complete")
+    except Exception as e:
+        log.error(f"Migration failed: {e}")
+        # If table doesn't exist or migration fails, create fresh
+        await db_conn.execute("DROP TABLE IF EXISTS signals")
+        await db_conn.commit()
+
 # ---------------- DATABASE ----------------
 async def init_db():
     global db_conn
     db_conn = await aiosqlite.connect(DB_PATH)
     await db_conn.execute("PRAGMA journal_mode=WAL;")
     await db_conn.execute("PRAGMA synchronous=NORMAL;")
+    
+    # Create table with full schema
     await db_conn.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,8 +114,8 @@ async def init_db():
             sl REAL,
             tp1 REAL,
             tp2 REAL,
-            entry_tf TEXT,
-            tp_tf TEXT,
+            entry_tf TEXT DEFAULT '',
+            tp_tf TEXT DEFAULT '',
             timestamp TEXT,
             status TEXT,
             reason TEXT,
@@ -98,6 +126,9 @@ async def init_db():
         );
     """)
     await db_conn.commit()
+    
+    # Run migration for existing databases
+    await migrate_db()
 
 # ---------------- OHLCV ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
@@ -346,12 +377,27 @@ async def monitor_signals():
     while True:
         try:
             async with db_lock:
-                async with db_conn.execute("SELECT id,symbol,side,entry,sl,tp1,tp2,entry_tf,tp1_hit,tp2_hit,status FROM signals WHERE status='OPEN'") as cursor:
+                # SAFE QUERY - handles both old and new schema
+                async with db_conn.execute(
+                    "SELECT id,symbol,side,entry,sl,tp1,tp2,tp1_hit,tp2_hit,status FROM signals WHERE status='OPEN'"
+                ) as cursor:
                     async for row in cursor:
-                        sig_id, symbol, side, entry, sl, tp1, tp2, entry_tf, tp1_hit, tp2_hit, status = row
+                        sig_id, symbol, side, entry, sl, tp1, tp2, tp1_hit, tp2_hit, status = row
                         ticker = await exchange.fetch_ticker(symbol)
                         last_price = ticker.get("last")
                         if last_price is None: continue
+
+                        # Try to get entry_tf from database if exists
+                        entry_tf = ""
+                        try:
+                            cursor_tf = await db_conn.execute(
+                                "SELECT entry_tf FROM signals WHERE id=?", (sig_id,)
+                            )
+                            tf_result = await cursor_tf.fetchone()
+                            if tf_result and tf_result[0]:
+                                entry_tf = tf_result[0]
+                        except:
+                            entry_tf = ""
 
                         # Update TP/SL with current market data
                         sig = {
@@ -393,8 +439,10 @@ async def monitor_signals():
                         if hits:
                             await tg(f"🎯 {symbol} {side} update\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP1:{tp1} TP2:{tp2}")
 
-                        await db_conn.execute("UPDATE signals SET tp1_hit=?,tp2_hit=?,sl=?,status=? WHERE id=?",
-                                             (tp1_hit,tp2_hit,sl,status,sig_id))
+                        await db_conn.execute(
+                            "UPDATE signals SET tp1_hit=?,tp2_hit=?,sl=?,status=? WHERE id=?",
+                            (tp1_hit,tp2_hit,sl,status,sig_id)
+                        )
                 await db_conn.commit()
         except Exception as e: 
             log.exception("monitor error: %s", e)
