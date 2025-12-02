@@ -32,8 +32,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 3))
-TOP_N = int(os.getenv("TOP_N", 25))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
+TOP_N = int(os.getenv("TOP_N", 3))
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
 MIN_SCORE = 5
 CRITICAL_FACTORS_MIN = 2  # HTF Alignment + Liquidity Sweep minimum
