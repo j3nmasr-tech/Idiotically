@@ -146,20 +146,20 @@ def find_latest_ob(df: pd.DataFrame):
 def romeopt_tp_sl(entry, side, atr_val, ob_zone):
     """
     Calculates SL, TP1, TP2
-    - TP1 = 0.8R
-    - TP2 = 1.6R
+    - TP1 = 1R (entry + 1 × risk)
+    - TP2 = 2R (entry + 2 × risk)
     - SL conservatively below/above OB
     """
-    if side=="BUY":
-        sl = ob_zone['low'] - atr_val*0.3
+    if side == "BUY":
+        sl = ob_zone['low'] - (atr_val * 0.3)
         risk = entry - sl
-        tp1 = entry + risk*0.8
-        tp2 = entry + risk*1.6
-    else:
-        sl = ob_zone['high'] + atr_val*0.3
+        tp1 = entry + (risk * 1.0)  # 1:1 risk-reward
+        tp2 = entry + (risk * 2.0)  # 2:1 risk-reward
+    else:  # SELL
+        sl = ob_zone['high'] + (atr_val * 0.3)
         risk = sl - entry
-        tp1 = entry - risk*0.8
-        tp2 = entry - risk*1.6
+        tp1 = entry - (risk * 1.0)  # 1:1 risk-reward
+        tp2 = entry - (risk * 2.0)  # 2:1 risk-reward
     return sl, tp1, tp2
 
 # ---------------- UPDATE SIGNAL TP/SL ----------------
