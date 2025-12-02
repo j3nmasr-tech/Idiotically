@@ -1169,12 +1169,29 @@ def deprioritized(symbol: str, threshold=3, lookback=30):
 # ---------------- LOG SIGNAL ----------------
 async def log_signal(sig):
     async with db_lock:
+        # Ensure all TP values are properly set (None for empty)
+        tp1 = sig.get("tp1")
+        tp2 = sig.get("tp2")
+        tp3 = sig.get("tp3") if "tp3" in sig else None  # Always None for RomeOPT-P
+        
         await db_conn.execute("""
             INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score,latest_ob,structure_data)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (sig["symbol"],sig["side"],sig["entry"],sig.get("sl"),sig.get("tp1"),sig.get("tp2"),sig.get("tp3"),
-              datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"],
-              str(sig.get("latest_ob","")), sig.get("structure_data", "")))
+        """, (
+            sig["symbol"], 
+            sig["side"], 
+            sig["entry"], 
+            sig.get("sl"),
+            tp1,
+            tp2,
+            tp3,
+            datetime.datetime.utcnow().isoformat(),
+            "OPEN",
+            sig["reason"],
+            sig["score"],
+            str(sig.get("latest_ob", "")), 
+            sig.get("structure_data", "")
+        ))
         await db_conn.commit()
 
 # ---------------- MONITOR SIGNALS ----------------
@@ -1208,39 +1225,59 @@ async def monitor_signals():
                         try:
                             ticker = await exchange.fetch_ticker(symbol)
                             last_price = ticker.get("last")
-                            if last_price is None: continue
+                            if last_price is None: 
+                                continue
 
                             hits=[]; sl_hit=False
                             if side=="BUY":
-                                if not tp1_hit and last_price>=tp1: hits.append("TP1"); tp1_hit=1
-                                if not tp2_hit and last_price>=tp2: hits.append("TP2"); tp2_hit=1
-                                if not tp3_hit and last_price>=tp3: hits.append("TP3"); tp3_hit=1
-                                if last_price<=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
-                            else:
-                                if not tp1_hit and last_price<=tp1: hits.append("TP1"); tp1_hit=1
-                                if not tp2_hit and last_price<=tp2: hits.append("TP2"); tp2_hit=1
-                                if not tp3_hit and last_price<=tp3: hits.append("TP3"); tp3_hit=1
-                                if last_price>=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
+                                if not tp1_hit and tp1 is not None and last_price>=tp1: 
+                                    hits.append("TP1"); tp1_hit=1
+                                if not tp2_hit and tp2 is not None and last_price>=tp2: 
+                                    hits.append("TP2"); tp2_hit=1
+                                if not tp3_hit and tp3 is not None and last_price>=tp3: 
+                                    hits.append("TP3"); tp3_hit=1
+                                if last_price<=sl: 
+                                    hits.append("SL"); status="CLOSED"; sl_hit=True
+                            else:  # SELL
+                                if not tp1_hit and tp1 is not None and last_price<=tp1: 
+                                    hits.append("TP1"); tp1_hit=1
+                                if not tp2_hit and tp2 is not None and last_price<=tp2: 
+                                    hits.append("TP2"); tp2_hit=1
+                                if not tp3_hit and tp3 is not None and last_price<=tp3: 
+                                    hits.append("TP3"); tp3_hit=1
+                                if last_price>=sl: 
+                                    hits.append("SL"); status="CLOSED"; sl_hit=True
 
                             if hits:
                                 # Format message based on TPs available
-                                tp_info = f"TP1:{tp1:.6f}"
-                                if tp2 is not None and tp2 > 0:
-                                    tp_info += f" TP2:{tp2:.6f}"
-                                if tp3 is not None and tp3 > 0:
-                                    tp_info += f" TP3:{tp3:.6f}"
+                                tp_info_parts = []
+                                if tp1 is not None:
+                                    tp_info_parts.append(f"TP1:{tp1:.6f}")
+                                if tp2 is not None:
+                                    tp_info_parts.append(f"TP2:{tp2:.6f}")
+                                if tp3 is not None:
+                                    tp_info_parts.append(f"TP3:{tp3:.6f}")
+                                
+                                tp_info = " ".join(tp_info_parts)
                                     
                                 await tg(f"🎯 {symbol} {side} update\nEntry:{entry:.6f}\nLast:{last_price:.6f}\nHits:{','.join(hits)}\nSL:{sl:.6f}\n{tp_info}")
 
-                            if sl_hit: record_sl_hit(symbol)
+                            if sl_hit: 
+                                record_sl_hit(symbol)
                             
                             # Update with structure_data only if column exists
                             if column_exists:
-                                await db_conn.execute("UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=?,structure_data=? WHERE id=?",
-                                                     (tp1_hit,tp2_hit,tp3_hit,status,structure_data,sig_id))
+                                await db_conn.execute("""
+                                    UPDATE signals 
+                                    SET tp1_hit=?, tp2_hit=?, tp3_hit=?, status=?, structure_data=?
+                                    WHERE id=?
+                                """, (tp1_hit, tp2_hit, tp3_hit, status, structure_data, sig_id))
                             else:
-                                await db_conn.execute("UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?",
-                                                     (tp1_hit,tp2_hit,tp3_hit,status,sig_id))
+                                await db_conn.execute("""
+                                    UPDATE signals 
+                                    SET tp1_hit=?, tp2_hit=?, tp3_hit=?, status=?
+                                    WHERE id=?
+                                """, (tp1_hit, tp2_hit, tp3_hit, status, sig_id))
                         except Exception as e:
                             log.error(f"Error monitoring signal {symbol}: {e}")
                 await db_conn.commit()
