@@ -5,8 +5,7 @@
 LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features)
 - Fully live early signals
 - RomeOPT 6-step logic (PRACTICAL VERSION with debugging)
-- TP/SL tracking with ATR or OB
-- Dynamic TP/SL updates (market-structure-based)
+- RomeOPT-P TP/SL system (0.8R/1.6R, SL→BE after TP1)
 - Telegram alerts
 - Async SQLite logging (with detailed JSON diagnostics)
 - Filters: Score >=4, realistic conditions
@@ -50,6 +49,17 @@ TF_MIN_SCORES = {
 }
 DEFAULT_MIN_SCORE = 4
 CRITICAL_FACTORS_MIN = 1  # Only require 1 critical factor
+
+# ---------------- ROMEOPT-P TP CONFIG ----------------
+# Timeframe mapping for TP scaling (RomeOPT-P logic)
+TP_TIMEFRAME_MAP = {
+    "1m": "5m",    # 1m → 5m ATR (5×) - less aggressive
+    "3m": "15m",   # 3m → 15m ATR (5×)
+    "5m": "15m",   # 5m → 15m ATR (3×) - conservative
+    "15m": "1h",   # 15m → 1h ATR (4×)
+    "30m": "1h",   # 30m → 1h ATR (2×) - minimal scaling
+    "1h": "4h"     # 1h → 4h ATR (4×)
+}
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -98,7 +108,9 @@ async def init_db():
             tp2_hit INTEGER DEFAULT 0,
             tp3_hit INTEGER DEFAULT 0,
             latest_ob TEXT,
-            details TEXT
+            details TEXT,
+            entry_tf TEXT DEFAULT '',
+            tp_tf TEXT DEFAULT ''
         );
     """)
     await db_conn.commit()
@@ -368,6 +380,20 @@ def find_quality_order_block(df: pd.DataFrame, lookback=50):
     
     return None
 
+# ---------------- SIMPLE ORDER BLOCK DETECTION (RomeOPT version) ----------------
+def find_latest_ob(df: pd.DataFrame):
+    """
+    Simple Order Block detection for RomeOPT TP/SL
+    Returns: {"type": "bullish"/"bearish", "low": price, "high": price}
+    """
+    for i in range(len(df)-5, len(df)-1):
+        candle, prev_candle = df.iloc[i], df.iloc[i-1]
+        if candle["close"]>candle["open"] and prev_candle["close"]<prev_candle["open"]:
+            return {"type":"bullish","low":min(candle["low"], prev_candle["low"]),"high":candle["close"]}
+        elif candle["close"]<candle["open"] and prev_candle["close"]>prev_candle["open"]:
+            return {"type":"bearish","low":candle["close"],"high":max(candle["high"], prev_candle["high"])}
+    return None
+
 # ---------------- MARKET STRUCTURE SHIFT (PRACTICAL) ----------------
 def confirm_market_structure_shift(df: pd.DataFrame, side: str):
     """
@@ -406,105 +432,91 @@ def confirm_market_structure_shift(df: pd.DataFrame, side: str):
     
     return True  # Default to True if can't determine
 
-# ---------------- TP/SL CALCULATION (FIXED VERSION) ----------------
-def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
+# ---------------- ROMEOPT-P TP/SL CALCULATION ----------------
+async def romeoptp_tp_sl(exchange, entry: float, side: str, entry_tf: str, ob_zone: dict, symbol: str):
     """
-    Calculate TP/SL levels - FIXED to ensure TP1 is in correct direction
+    RomeOPT-P Logic:
+    - SL based on entry timeframe OB (tight)
+    - TP scaled to higher timeframe ATR (meaningful)
+    - TP1 = 0.8R, TP2 = 1.6R (NO TP3 in RomeOPT)
     """
-    if atr_val <= 0:
-        atr_val = entry * 0.02  # Default 2% if ATR fails
+    if not ob_zone:
+        return None, None, None, None, entry_tf
     
-    # Get recent price extremes
-    recent_high = df['high'].tail(20).max()
-    recent_low = df['low'].tail(20).min()
+    # Get ATR from higher timeframe for TP scaling
+    tp_tf = TP_TIMEFRAME_MAP.get(entry_tf, "15m")
+    htf_ohlcv = await fetch_ohlcv(exchange, symbol, tp_tf, 100)
     
+    if not htf_ohlcv:
+        # Fallback to entry timeframe if HTF fails
+        htf_ohlcv = await fetch_ohlcv(exchange, symbol, entry_tf, 100)
+        tp_tf = entry_tf
+    
+    if not htf_ohlcv:
+        return None, None, None, None, tp_tf
+    
+    df_htf = pd.DataFrame(htf_ohlcv, columns=["ts","open","high","low","close","vol"])
+    for c in ["open","high","low","close","vol"]: 
+        df_htf[c] = pd.to_numeric(df_htf[c], errors="coerce")
+    
+    # Calculate ATR from higher timeframe
+    atr_val = float(atr(df_htf, 14).iloc[-1])
+    
+    # Calculate SL based on entry timeframe OB (tight)
     if side == "BUY":
-        # Stop Loss BELOW entry
-        if ob_zone and 'low' in ob_zone:
-            sl = ob_zone['low'] - (atr_val * 0.5)
-        else:
-            sl = recent_low - (atr_val * 1.0)
-        
-        # Ensure SL is below entry
-        sl = min(sl, entry * 0.985)  # Max 1.5% risk
-        
-        # Calculate risk (must be positive)
+        # SL just below bullish OB low
+        sl = ob_zone['low'] - (atr_val * 0.1)  # Very tight (0.1 × HTF ATR)
         risk = entry - sl
-        if risk <= 0:
-            risk = atr_val * 0.5
-            sl = entry - risk
-        
-        # Minimum risk
-        min_risk = atr_val * 0.3
-        if risk < min_risk:
-            risk = min_risk
-            sl = entry - risk
-        
-        # Take Profit levels - ALL MUST BE ABOVE ENTRY
-        base_tp1 = entry + (risk * 1.0)   # 1:1 R/R
-        base_tp2 = entry + (risk * 2.0)   # 2:1 R/R  
-        base_tp3 = entry + (risk * 3.0)   # 3:1 R/R
-        
-        # Apply TP1 FIX: Ensure TP1 is above entry
-        tp1 = max(base_tp1, entry * 1.005)  # At least 0.5% above entry
-        tp2 = max(base_tp2, tp1 * 1.01)     # At least 1% above TP1
-        tp3 = max(base_tp3, tp2 * 1.01)     # At least 1% above TP2
-        
-        # Check for nearby resistance (optional adjustment)
-        nearest_resistance = df['high'].tail(20).max()
-        if nearest_resistance > entry and nearest_resistance < tp1:
-            # If resistance is between entry and TP1, adjust TP1 to just below resistance
-            tp1 = nearest_resistance * 0.995
-        
-        # Final sanity check
-        if tp1 <= entry:
-            tp1 = entry * 1.01  # Force 1% above entry
-        
-        return sl, tp1, tp2, tp3
-    
+        # TP scaled to HTF ATR - RomeOPT: 0.8R and 1.6R (NO TP3)
+        tp1 = entry + (risk * 0.8)  # 0.8R
+        tp2 = entry + (risk * 1.6)  # 1.6R
+        tp3 = None  # RomeOPT doesn't use TP3
     else:  # SELL
-        # Stop Loss ABOVE entry
-        if ob_zone and 'high' in ob_zone:
-            sl = ob_zone['high'] + (atr_val * 0.5)
-        else:
-            sl = recent_high + (atr_val * 1.0)
-        
-        # Ensure SL is above entry
-        sl = max(sl, entry * 1.015)  # Max 1.5% risk
-        
-        # Calculate risk (must be positive)
+        # SL just above bearish OB high  
+        sl = ob_zone['high'] + (atr_val * 0.1)  # Very tight (0.1 × HTF ATR)
         risk = sl - entry
-        if risk <= 0:
-            risk = atr_val * 0.5
-            sl = entry + risk
-        
-        # Minimum risk
-        min_risk = atr_val * 0.3
-        if risk < min_risk:
-            risk = min_risk
-            sl = entry + risk
-        
-        # Take Profit levels - ALL MUST BE BELOW ENTRY
-        base_tp1 = entry - (risk * 1.0)   # 1:1 R/R
-        base_tp2 = entry - (risk * 2.0)   # 2:1 R/R  
-        base_tp3 = entry - (risk * 3.0)   # 3:1 R/R
-        
-        # Apply TP1 FIX: Ensure TP1 is below entry
-        tp1 = min(base_tp1, entry * 0.995)  # At least 0.5% below entry
-        tp2 = min(base_tp2, tp1 * 0.99)     # At least 1% below TP1
-        tp3 = min(base_tp3, tp2 * 0.99)     # At least 1% below TP2
-        
-        # Check for nearby support (optional adjustment)
-        nearest_support = df['low'].tail(20).min()
-        if nearest_support < entry and nearest_support > tp1:
-            # If support is between entry and TP1, adjust TP1 to just above support
-            tp1 = nearest_support * 1.005
-        
-        # Final sanity check
-        if tp1 >= entry:
-            tp1 = entry * 0.99  # Force 1% below entry
-        
-        return sl, tp1, tp2, tp3
+        # TP scaled to HTF ATR - RomeOPT: 0.8R and 1.6R (NO TP3)
+        tp1 = entry - (risk * 0.8)  # 0.8R
+        tp2 = entry - (risk * 1.6)  # 1.6R
+        tp3 = None  # RomeOPT doesn't use TP3
+    
+    return sl, tp1, tp2, tp3, tp_tf
+
+# ---------------- UPDATE SIGNAL TP/SL (RomeOPT version) ----------------
+async def update_tp_sl_live_romeopt(sig: dict):
+    """Update TP/SL with current market data using RomeOPT logic"""
+    global exchange
+    
+    if 'entry_tf' not in sig or 'symbol' not in sig or 'side' not in sig:
+        return sig
+    
+    # Fetch current OB from entry timeframe
+    entry_tf_ohlcv = await fetch_ohlcv(exchange, sig["symbol"], sig["entry_tf"], 50)
+    if not entry_tf_ohlcv:
+        return sig
+    
+    df_entry = pd.DataFrame(entry_tf_ohlcv, columns=["ts","open","high","low","close","vol"])
+    for c in ["open","high","low","close","vol"]: 
+        df_entry[c] = pd.to_numeric(df_entry[c], errors="coerce")
+    
+    latest_ob = find_latest_ob(df_entry)
+    if not latest_ob:
+        return sig
+    
+    # Recalculate TP/SL with current data using RomeOPT logic
+    sl, tp1, tp2, tp3, tp_tf = await romeoptp_tp_sl(
+        exchange, sig["entry"], sig["side"], sig["entry_tf"], latest_ob, sig["symbol"]
+    )
+    
+    if sl is not None and tp1 is not None and tp2 is not None:
+        sig["sl"] = sl
+        sig["tp1"] = tp1
+        sig["tp2"] = tp2
+        sig["tp3"] = tp3  # Will be None for RomeOPT
+        sig["tp_tf"] = tp_tf
+        sig["latest_ob"] = latest_ob
+    
+    return sig
 
 # ---------------- SIGNAL GENERATION (PRACTICAL) ----------------
 async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
@@ -578,13 +590,12 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     # Entry price
     entry = df["close"].iloc[-1]
     
-    # Calculate ATR for TP/SL
-    atr_val = float(atr(df, 14).iloc[-1])
-    if atr_val <= 0:
-        atr_val = entry * 0.01
+    # Get TP/SL levels using ROMEOPT-P logic
+    sl, tp1, tp2, tp3, tp_tf = await romeoptp_tp_sl(exchange, entry, side, tf, ob_zone, symbol)
     
-    # Get TP/SL levels (using FIXED function)
-    sl, tp1, tp2, tp3 = romeopt_tp_sl(entry, side, atr_val, ob_zone, df)
+    if sl is None or tp1 is None or tp2 is None:
+        log.debug(f"{symbol} {tf}: RomeOPT TP/SL calculation failed")
+        return None
     
     # Score calculation (more balanced)
     score = 0
@@ -622,9 +633,11 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
-        "tp3": tp3,
+        "tp3": tp3,  # Will be None for RomeOPT
         "score": score,
-        "reason": f"RomeOPT signal on {tf}",
+        "entry_tf": tf,
+        "tp_tf": tp_tf,
+        "reason": f"RomeOPT-P signal on {tf}",
         "detailed": {
             "timeframe": tf,
             "bos": ms_shift.get("has_bos", False),
@@ -634,10 +647,10 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
             "elite_ok": elite_ok,
             "vol_ok": vol_ok,
             "mss_ok": mss_ok,
-            "atr": atr_val,
             "risk_reward": round((tp1 - entry) / (entry - sl), 2) if side == "BUY" else round((entry - tp1) / (sl - entry), 2)
         },
-        "reason_list": []
+        "reason_list": [],
+        "ob_zone": ob_zone
     }
     
     # Build reason list
@@ -657,8 +670,8 @@ async def log_signal(sig):
     async with db_lock:
         details_json = json.dumps(sig.get("detailed", {}), default=str)
         await db_conn.execute("""
-            INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score,latest_ob,details)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score,latest_ob,details,entry_tf,tp_tf)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             sig["symbol"],
             sig["side"],
@@ -666,13 +679,15 @@ async def log_signal(sig):
             sig.get("sl"),
             sig.get("tp1"),
             sig.get("tp2"),
-            sig.get("tp3"),
+            sig.get("tp3"),  # May be None for RomeOPT
             datetime.datetime.utcnow().isoformat(),
             "PENDING",
             sig.get("reason", ""),
             sig.get("score", 0),
             str(sig.get("ob_zone", "")),
-            details_json
+            details_json,
+            sig.get("entry_tf", ""),
+            sig.get("tp_tf", "")
         ))
         await db_conn.commit()
         log.info(f"Logged signal for {sig['symbol']} to database")
@@ -689,46 +704,11 @@ def deprioritized(symbol: str, threshold=3, lookback=30):
     while dq and dq[0]<cutoff: dq.popleft()
     return len(dq)>=threshold
 
-# ---------------- UPDATE TP/SL LIVE ----------------
-def update_tp_sl_live(sig: dict, df: pd.DataFrame):
-    """
-    Update TP/SL based on latest market data
-    """
-    if df is None or len(df) < 20:
-        return sig
-    
-    try:
-        # Find latest order block
-        latest_ob = find_quality_order_block(df)
-        if not latest_ob:
-            return sig
-        
-        # Calculate ATR
-        atr_val = float(atr(df, 14).iloc[-1])
-        if atr_val <= 0:
-            atr_val = sig.get("entry", 0) * 0.01
-        
-        # Recalculate TP/SL using FIXED function
-        entry = sig.get("entry_limit", sig.get("entry"))
-        side = sig["side"]
-        sl, tp1, tp2, tp3 = romeopt_tp_sl(entry, side, atr_val, latest_ob, df)
-        
-        # Update signal
-        sig["sl"] = sl
-        sig["tp1"] = tp1
-        sig["tp2"] = tp2
-        sig["tp3"] = tp3
-        sig["latest_ob"] = latest_ob
-        
-    except Exception as e:
-        log.debug(f"update_tp_sl_live error: {e}")
-    
-    return sig
-
-# ---------------- MONITOR SIGNALS ----------------
+# ---------------- MONITOR SIGNALS (RomeOPT version) ----------------
 async def monitor_signals():
     """
-    Monitor open signals for TP/SL hits
+    Monitor open signals for TP/SL hits - RomeOPT version
+    SL → BE after TP1 hit
     """
     global exchange
     if exchange is None:
@@ -739,15 +719,14 @@ async def monitor_signals():
         try:
             async with db_lock:
                 async with db_conn.execute("""
-                    SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,tp1_hit,tp2_hit,tp3_hit,status,details 
+                    SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,tp1_hit,tp2_hit,status,entry_tf 
                     FROM signals 
                     WHERE status IN ('OPEN','PENDING')
                 """) as cursor:
                     async for row in cursor:
-                        sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status, details = row
+                        sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, status, entry_tf = row
                         tp1_hit = tp1_hit or 0
                         tp2_hit = tp2_hit or 0
-                        tp3_hit = tp3_hit or 0
 
                         # Fetch current price
                         try:
@@ -759,26 +738,21 @@ async def monitor_signals():
                             log.debug(f"fetch_ticker failed for {symbol}: {e}")
                             continue
 
-                        # Update TP/SL based on latest data
-                        ohlcv = await fetch_ohlcv(exchange, symbol, "5m", 50)
-                        if ohlcv:
-                            df_live = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-                            for col in ["open","high","low","close","vol"]:
-                                df_live[col] = pd.to_numeric(df_live[col], errors="coerce")
-                            
-                            sig = {
-                                "symbol": symbol,
-                                "side": side,
-                                "entry": entry,
-                                "sl": sl,
-                                "tp1": tp1,
-                                "tp2": tp2,
-                                "tp3": tp3
-                            }
-                            sig = update_tp_sl_live(sig, df_live)
-                            sl, tp1, tp2, tp3 = sig["sl"], sig["tp1"], sig["tp2"], sig["tp3"]
+                        # Update TP/SL with current data using RomeOPT logic
+                        sig = {
+                            "symbol": symbol,
+                            "side": side,
+                            "entry": entry,
+                            "sl": sl,
+                            "tp1": tp1,
+                            "tp2": tp2,
+                            "tp3": tp3,
+                            "entry_tf": entry_tf if entry_tf else "15m"  # Default
+                        }
+                        sig = await update_tp_sl_live_romeopt(sig)
+                        sl, tp1, tp2, tp3 = sig["sl"], sig["tp1"], sig["tp2"], sig["tp3"]
 
-                        # Check for TP/SL hits
+                        # Check for TP/SL hits - RomeOPT rules
                         hits = []
                         sl_hit = False
                         
@@ -786,46 +760,55 @@ async def monitor_signals():
                             if not tp1_hit and last_price >= tp1:
                                 hits.append("TP1")
                                 tp1_hit = 1
+                                # RomeOPT: Move SL to breakeven after TP1 hit
+                                sl = entry
+                                log.info(f"✅ {symbol}: TP1 hit, moving SL to breakeven at {entry}")
+                            
                             if not tp2_hit and last_price >= tp2:
                                 hits.append("TP2")
                                 tp2_hit = 1
-                            if not tp3_hit and last_price >= tp3:
-                                hits.append("TP3")
-                                tp3_hit = 1
+                                status = "CLOSED"
+                                log.info(f"✅ {symbol}: TP2 hit, closing trade")
+                            
                             if last_price <= sl:
                                 hits.append("SL")
                                 status = "CLOSED"
                                 sl_hit = True
+                                log.info(f"❌ {symbol}: SL hit at {sl}")
+                        
                         else:  # SELL
                             if not tp1_hit and last_price <= tp1:
                                 hits.append("TP1")
                                 tp1_hit = 1
+                                # RomeOPT: Move SL to breakeven after TP1 hit
+                                sl = entry
+                                log.info(f"✅ {symbol}: TP1 hit, moving SL to breakeven at {entry}")
+                            
                             if not tp2_hit and last_price <= tp2:
                                 hits.append("TP2")
                                 tp2_hit = 1
-                            if not tp3_hit and last_price <= tp3:
-                                hits.append("TP3")
-                                tp3_hit = 1
+                                status = "CLOSED"
+                                log.info(f"✅ {symbol}: TP2 hit, closing trade")
+                            
                             if last_price >= sl:
                                 hits.append("SL")
                                 status = "CLOSED"
                                 sl_hit = True
+                                log.info(f"❌ {symbol}: SL hit at {sl}")
 
                         # Send alert if hits
                         if hits:
-                            try:
-                                diag = json.loads(details) if details else {}
-                            except:
-                                diag = {}
-                            
                             alert_msg = (f"🎯 {symbol} {side} Update\n"
                                        f"Entry: {entry:.8f}\n"
                                        f"Last: {last_price:.8f}\n"
                                        f"Hits: {', '.join(hits)}\n"
                                        f"SL: {sl:.8f}\n"
-                                       f"TP1: {tp1:.8f} TP2: {tp2:.8f} TP3: {tp3:.8f}\n"
-                                       f"Status: {status}\n"
-                                       f"Score: {diag.get('score', 'N/A')}")
+                                       f"TP1: {tp1:.8f} TP2: {tp2:.8f}")
+                            
+                            # Add note about SL movement if TP1 hit
+                            if "TP1" in hits:
+                                alert_msg += f"\n📈 SL moved to breakeven at {entry:.8f}"
+                            
                             await tg(alert_msg)
 
                         # Record SL hit
@@ -835,9 +818,9 @@ async def monitor_signals():
                         # Update database
                         await db_conn.execute("""
                             UPDATE signals 
-                            SET tp1_hit=?, tp2_hit=?, tp3_hit=?, status=? 
+                            SET tp1_hit=?, tp2_hit=?, sl=?, status=? 
                             WHERE id=?
-                        """, (tp1_hit, tp2_hit, tp3_hit, status, sig_id))
+                        """, (tp1_hit, tp2_hit, sl, status, sig_id))
                 
                 await db_conn.commit()
                 
@@ -916,14 +899,15 @@ async def scan_loop(exchange):
                         breakdown = ', '.join(sig.get('reason_list', []))
                         risk_reward = sig["detailed"].get("risk_reward", 0)
                         
+                        # RomeOPT alert format (no TP3)
                         alert_msg = (f"🏆 {sig['symbol']} ({tf}) {sig['side']}\n"
                                    f"Entry: {sig['entry']:.8f}\n"
                                    f"SL: {sig.get('sl', 0):.8f}\n"
-                                   f"TP1: {sig.get('tp1', 0):.8f}\n"
-                                   f"TP2: {sig.get('tp2', 0):.8f}\n"
-                                   f"TP3: {sig.get('tp3', 0):.8f}\n"
+                                   f"TP1: {sig.get('tp1', 0):.8f} (0.8R)\n"
+                                   f"TP2: {sig.get('tp2', 0):.8f} (1.6R)\n"
                                    f"Score: {sig['score']} | R:R: {risk_reward}:1\n"
-                                   f"Breakdown: {breakdown}")
+                                   f"Breakdown: {breakdown}\n"
+                                   f"⚠️ RomeOPT-P: SL→BE after TP1")
                         
                         # Send alert and log
                         await tg(alert_msg)
@@ -988,7 +972,8 @@ async def stats():
         "signals_open": open_signals,
         "signals_today": today_signals,
         "scan_interval": SCAN_INTERVAL,
-        "top_pairs": TOP_N
+        "top_pairs": TOP_N,
+        "tp_system": "RomeOPT-P (0.8R/1.6R, SL→BE after TP1)"
     }
 
 # ---------------- CLEANUP FUNCTION ----------------
@@ -1017,7 +1002,7 @@ async def main():
     global exchange, db_conn
     
     # Initialize
-    log.info("Starting RomeOPT Scanner with all timeframes...")
+    log.info("Starting RomeOPT-P Scanner with all timeframes...")
     await init_db()
     
     # Initialize exchange
@@ -1032,13 +1017,17 @@ async def main():
         await exchange.load_markets()
         log.info(f"✅ Connected to {exchange.name}")
         log.info(f"📊 Scanning on timeframes: {', '.join(TIMEFRAMES)}")
+        log.info(f"🎯 RomeOPT-P TP System: 0.8R/1.6R, SL→BE after TP1")
     except Exception as e:
         log.error(f"Failed to connect to exchange: {e}")
         await cleanup()
         return
     
     # Send startup message
-    await tg(f"🏆 ROMEOPT Scanner Started\n📈 Timeframes: {', '.join(TIMEFRAMES)}\n⚙️ Top {TOP_N} pairs | Interval: {SCAN_INTERVAL}s")
+    await tg(f"🏆 ROMEOPT-P Scanner Started\n"
+             f"📈 Timeframes: {', '.join(TIMEFRAMES)}\n"
+             f"⚙️ Top {TOP_N} pairs | Interval: {SCAN_INTERVAL}s\n"
+             f"🎯 TP: 0.8R/1.6R | SL→BE after TP1")
     
     # Run scanner and monitor
     try:
