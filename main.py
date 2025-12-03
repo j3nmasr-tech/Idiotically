@@ -10,6 +10,7 @@ LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features)
 - Telegram alerts
 - Async SQLite logging (with detailed JSON diagnostics)
 - Filters: Score >=4, realistic conditions
+- All timeframes: 1m, 3m, 5m, 15m, 30m, 1h
 """
 
 import os
@@ -36,8 +37,18 @@ DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
 TOP_N = int(os.getenv("TOP_N", 60))
-TIMEFRAMES = ["15m", "30m", "1h"]  # Start with longer timeframes for better signals
-MIN_SCORE = 4  # Reduced from 5 to 4
+# ALL TIMEFRAMES INCLUDING SHORT ONES
+TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h"]
+# Timeframe-specific minimum scores
+TF_MIN_SCORES = {
+    "1m": 3,    # Most lenient for 1m
+    "3m": 3,    # Lenient for 3m
+    "5m": 4,    # Standard for 5m
+    "15m": 4,   # Standard for 15m
+    "30m": 4,   # Standard for 30m
+    "1h": 5     # Strictest for 1h
+}
+DEFAULT_MIN_SCORE = 4
 CRITICAL_FACTORS_MIN = 1  # Only require 1 critical factor
 
 # ---------------- LOGGING ----------------
@@ -395,75 +406,125 @@ def confirm_market_structure_shift(df: pd.DataFrame, side: str):
     
     return True  # Default to True if can't determine
 
-# ---------------- TP/SL CALCULATION ----------------
+# ---------------- TP/SL CALCULATION (FIXED VERSION) ----------------
 def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
     """
-    Calculate TP/SL levels
+    Calculate TP/SL levels - FIXED to ensure TP1 is in correct direction
     """
     if atr_val <= 0:
-        atr_val = entry * 0.01  # Default 1% if ATR fails
+        atr_val = entry * 0.02  # Default 2% if ATR fails
     
     # Get recent price extremes
     recent_high = df['high'].tail(20).max()
     recent_low = df['low'].tail(20).min()
     
     if side == "BUY":
-        # Stop Loss
+        # Stop Loss BELOW entry
         if ob_zone and 'low' in ob_zone:
             sl = ob_zone['low'] - (atr_val * 0.5)
         else:
             sl = recent_low - (atr_val * 1.0)
         
-        # Ensure minimum risk
+        # Ensure SL is below entry
+        sl = min(sl, entry * 0.985)  # Max 1.5% risk
+        
+        # Calculate risk (must be positive)
         risk = entry - sl
-        min_risk = atr_val * 0.5
+        if risk <= 0:
+            risk = atr_val * 0.5
+            sl = entry - risk
+        
+        # Minimum risk
+        min_risk = atr_val * 0.3
         if risk < min_risk:
-            sl = entry - min_risk
             risk = min_risk
+            sl = entry - risk
         
-        # Take Profit levels
-        tp1 = entry + (risk * 1.0)
-        tp2 = entry + (risk * 2.0)
-        tp3 = entry + (risk * 3.0)
+        # Take Profit levels - ALL MUST BE ABOVE ENTRY
+        base_tp1 = entry + (risk * 1.0)   # 1:1 R/R
+        base_tp2 = entry + (risk * 2.0)   # 2:1 R/R  
+        base_tp3 = entry + (risk * 3.0)   # 3:1 R/R
         
-        # Adjust for nearby resistance
-        resistance = df['high'].tail(50).max()
-        if resistance > entry:
-            tp1 = min(tp1, resistance * 0.98)
+        # Apply TP1 FIX: Ensure TP1 is above entry
+        tp1 = max(base_tp1, entry * 1.005)  # At least 0.5% above entry
+        tp2 = max(base_tp2, tp1 * 1.01)     # At least 1% above TP1
+        tp3 = max(base_tp3, tp2 * 1.01)     # At least 1% above TP2
+        
+        # Check for nearby resistance (optional adjustment)
+        nearest_resistance = df['high'].tail(20).max()
+        if nearest_resistance > entry and nearest_resistance < tp1:
+            # If resistance is between entry and TP1, adjust TP1 to just below resistance
+            tp1 = nearest_resistance * 0.995
+        
+        # Final sanity check
+        if tp1 <= entry:
+            tp1 = entry * 1.01  # Force 1% above entry
+        
+        return sl, tp1, tp2, tp3
     
     else:  # SELL
-        # Stop Loss
+        # Stop Loss ABOVE entry
         if ob_zone and 'high' in ob_zone:
             sl = ob_zone['high'] + (atr_val * 0.5)
         else:
             sl = recent_high + (atr_val * 1.0)
         
-        # Ensure minimum risk
+        # Ensure SL is above entry
+        sl = max(sl, entry * 1.015)  # Max 1.5% risk
+        
+        # Calculate risk (must be positive)
         risk = sl - entry
-        min_risk = atr_val * 0.5
+        if risk <= 0:
+            risk = atr_val * 0.5
+            sl = entry + risk
+        
+        # Minimum risk
+        min_risk = atr_val * 0.3
         if risk < min_risk:
-            sl = entry + min_risk
             risk = min_risk
+            sl = entry + risk
         
-        # Take Profit levels
-        tp1 = entry - (risk * 1.0)
-        tp2 = entry - (risk * 2.0)
-        tp3 = entry - (risk * 3.0)
+        # Take Profit levels - ALL MUST BE BELOW ENTRY
+        base_tp1 = entry - (risk * 1.0)   # 1:1 R/R
+        base_tp2 = entry - (risk * 2.0)   # 2:1 R/R  
+        base_tp3 = entry - (risk * 3.0)   # 3:1 R/R
         
-        # Adjust for nearby support
-        support = df['low'].tail(50).min()
-        if support < entry:
-            tp1 = max(tp1, support * 1.02)
-    
-    return sl, tp1, tp2, tp3
+        # Apply TP1 FIX: Ensure TP1 is below entry
+        tp1 = min(base_tp1, entry * 0.995)  # At least 0.5% below entry
+        tp2 = min(base_tp2, tp1 * 0.99)     # At least 1% below TP1
+        tp3 = min(base_tp3, tp2 * 0.99)     # At least 1% below TP2
+        
+        # Check for nearby support (optional adjustment)
+        nearest_support = df['low'].tail(20).min()
+        if nearest_support < entry and nearest_support > tp1:
+            # If support is between entry and TP1, adjust TP1 to just above support
+            tp1 = nearest_support * 1.005
+        
+        # Final sanity check
+        if tp1 >= entry:
+            tp1 = entry * 0.99  # Force 1% below entry
+        
+        return sl, tp1, tp2, tp3
 
 # ---------------- SIGNAL GENERATION (PRACTICAL) ----------------
 async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
     """
     Main function to generate a RomeOPT signal with practical validation
     """
-    if df is None or len(df) < 50:
-        log.debug(f"{symbol} {tf}: Insufficient data ({len(df) if df else 0} candles)")
+    # Timeframe-specific adjustments
+    min_data_required = {
+        "1m": 100,   # Need more candles for 1m
+        "3m": 80,    # Need fewer for 3m
+        "5m": 70,    # Even fewer for 5m
+        "15m": 60,   # Standard for 15m
+        "30m": 50,   # Standard for 30m
+        "1h": 40     # Standard for 1h
+    }.get(tf, 50)
+    
+    min_score_required = TF_MIN_SCORES.get(tf, DEFAULT_MIN_SCORE)
+    
+    if df is None or len(df) < min_data_required:
+        log.debug(f"{symbol} {tf}: Insufficient data ({len(df) if df else 0} candles, need {min_data_required})")
         return None
     
     # Log data quality
@@ -482,14 +543,16 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     
     log.debug(f"{symbol} {tf}: Side determined as {side} from BOS/CHOCH")
     
-    # Step 2: Volume spike (lenient)
-    vol_ok = vol_spike(df)
+    # Step 2: Volume spike (more lenient for shorter timeframes)
+    vol_factor = 1.2 if tf in ["1m", "3m"] else 1.3  # More lenient for 1m/3m
+    vol_ok = vol_spike(df, factor=vol_factor)
     if not vol_ok:
         log.debug(f"{symbol} {tf}: Volume spike check failed")
         # Don't return None, just note it
     
-    # Step 3: Find FVGs
-    fvgs = find_fvgs(df)
+    # Step 3: Find FVGs (adjust lookback for shorter timeframes)
+    fvg_lookback = 150 if tf in ["1m", "3m"] else 100  # More candles for shorter TFs
+    fvgs = find_fvgs(df, lookback=fvg_lookback)
     if not fvgs:
         log.debug(f"{symbol} {tf}: No FVGs found")
         # Don't return None, FVG is nice-to-have
@@ -506,7 +569,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         log.debug(f"{symbol} {tf}: Market structure shift not confirmed")
         # Don't return None, continue
     
-    # Step 6: Higher timeframe alignment (practical)
+    # Step 6: Higher timeframe alignment (more lenient for shorter timeframes)
     elite_ok = await elite_tf_alignment(exchange, symbol, side)
     if not elite_ok:
         log.debug(f"{symbol} {tf}: Higher timeframe alignment failed")
@@ -520,7 +583,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     if atr_val <= 0:
         atr_val = entry * 0.01
     
-    # Get TP/SL levels
+    # Get TP/SL levels (using FIXED function)
     sl, tp1, tp2, tp3 = romeopt_tp_sl(entry, side, atr_val, ob_zone, df)
     
     # Score calculation (more balanced)
@@ -533,9 +596,22 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     if mss_ok: score += 1
     if ob_zone: score += 2
     
-    # Minimum score check
-    if score < MIN_SCORE:
-        log.debug(f"{symbol} {tf}: Score {score} below minimum {MIN_SCORE}")
+    # Additional points for strong signals
+    # Strong volume spike
+    if vol_ok and vol_spike(df, factor=2.0):  # Very high volume
+        score += 1
+    
+    # Strong order block
+    if ob_zone and ob_zone.get("strength", 0) > 0.5:
+        score += 1
+    
+    # Multiple FVGs
+    if fvgs and len(fvgs) >= 2:
+        score += 1
+    
+    # Minimum score check (timeframe-specific)
+    if score < min_score_required:
+        log.debug(f"{symbol} {tf}: Score {score} below minimum {min_score_required} for {tf}")
         return None
     
     # Create signal
@@ -632,7 +708,7 @@ def update_tp_sl_live(sig: dict, df: pd.DataFrame):
         if atr_val <= 0:
             atr_val = sig.get("entry", 0) * 0.01
         
-        # Recalculate TP/SL
+        # Recalculate TP/SL using FIXED function
         entry = sig.get("entry_limit", sig.get("entry"))
         side = sig["side"]
         sl, tp1, tp2, tp3 = romeopt_tp_sl(entry, side, atr_val, latest_ob, df)
@@ -774,8 +850,18 @@ async def monitor_signals():
 last_signal_time = {}
 async def scan_loop(exchange):
     """
-    Main scanning loop
+    Main scanning loop with timeframe-specific cooldowns
     """
+    # Timeframe-specific cooldowns (seconds)
+    cooldown_map = {
+        "1m": 60,    # 1 minute cooldown for 1m signals
+        "3m": 120,   # 2 minutes for 3m
+        "5m": 180,   # 3 minutes for 5m
+        "15m": 300,  # 5 minutes for 15m
+        "30m": 600,  # 10 minutes for 30m
+        "1h": 1800,  # 30 minutes for 1h
+    }
+    
     while True:
         t0 = time.time()
         signals_found = 0
@@ -793,7 +879,7 @@ async def scan_loop(exchange):
                 continue
             
             top = sorted(usdt_pairs, key=lambda x: x[1], reverse=True)[:TOP_N]
-            log.info(f"Scanning top {len(top)} symbols by volume")
+            log.info(f"📈 Scanning top {len(top)} symbols by volume across {len(TIMEFRAMES)} timeframes")
             
             for symbol, volume in top:
                 # Skip if deprioritized
@@ -804,8 +890,9 @@ async def scan_loop(exchange):
                 for tf in TIMEFRAMES:
                     key = f"{symbol}:{tf}"
                     
-                    # Check cooldown
-                    if key in last_signal_time and time.time() - last_signal_time[key] < 300:  # 5 min cooldown
+                    # Check timeframe-specific cooldown
+                    cooldown = cooldown_map.get(tf, 300)
+                    if key in last_signal_time and time.time() - last_signal_time[key] < cooldown:
                         continue
                     
                     log.debug(f"Checking {symbol} on {tf}")
@@ -827,13 +914,15 @@ async def scan_loop(exchange):
                     if sig:
                         # Prepare alert message
                         breakdown = ', '.join(sig.get('reason_list', []))
+                        risk_reward = sig["detailed"].get("risk_reward", 0)
+                        
                         alert_msg = (f"🏆 {sig['symbol']} ({tf}) {sig['side']}\n"
                                    f"Entry: {sig['entry']:.8f}\n"
                                    f"SL: {sig.get('sl', 0):.8f}\n"
-                                   f"TP1: {sig.get('tp1', 0):.8f} "
-                                   f"TP2: {sig.get('tp2', 0):.8f} "
+                                   f"TP1: {sig.get('tp1', 0):.8f}\n"
+                                   f"TP2: {sig.get('tp2', 0):.8f}\n"
                                    f"TP3: {sig.get('tp3', 0):.8f}\n"
-                                   f"Score: {sig['score']}\n"
+                                   f"Score: {sig['score']} | R:R: {risk_reward}:1\n"
                                    f"Breakdown: {breakdown}")
                         
                         # Send alert and log
@@ -844,9 +933,9 @@ async def scan_loop(exchange):
                         last_signal_time[key] = time.time()
                         signals_found += 1
                         
-                        log.info(f"Found signal for {sig['symbol']} on {tf}")
+                        log.info(f"✅ Found {sig['side']} signal for {sig['symbol']} on {tf} (Score: {sig['score']})")
             
-            log.info(f"📊 Scan complete: {signals_found} signals found")
+            log.info(f"📊 Scan complete: {signals_found} signals found across all timeframes")
             
         except Exception as e:
             log.exception(f"Scan error: {e}")
@@ -861,7 +950,7 @@ app = FastAPI()
 
 @app.get("/")
 async def root():
-    return {"status": "RomeOPT Scanner is running"}
+    return {"status": "RomeOPT Scanner is running", "timeframes": TIMEFRAMES}
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -878,6 +967,29 @@ async def webhook(request: Request):
 @app.get("/health")
 async def health():
     return {"status": "healthy", "timestamp": datetime.datetime.utcnow().isoformat()}
+
+@app.get("/stats")
+async def stats():
+    """Get scanner statistics"""
+    async with db_lock:
+        async with db_conn.execute("SELECT COUNT(*) as total, COUNT(CASE WHEN status='OPEN' THEN 1 END) as open FROM signals") as cursor:
+            row = await cursor.fetchone()
+            total_signals = row[0] if row else 0
+            open_signals = row[1] if row else 0
+        
+        async with db_conn.execute("SELECT COUNT(*) as today FROM signals WHERE DATE(timestamp) = DATE('now')") as cursor:
+            row = await cursor.fetchone()
+            today_signals = row[0] if row else 0
+    
+    return {
+        "status": "running",
+        "timeframes_active": TIMEFRAMES,
+        "signals_total": total_signals,
+        "signals_open": open_signals,
+        "signals_today": today_signals,
+        "scan_interval": SCAN_INTERVAL,
+        "top_pairs": TOP_N
+    }
 
 # ---------------- CLEANUP FUNCTION ----------------
 async def cleanup():
@@ -905,7 +1017,7 @@ async def main():
     global exchange, db_conn
     
     # Initialize
-    log.info("Starting RomeOPT Scanner...")
+    log.info("Starting RomeOPT Scanner with all timeframes...")
     await init_db()
     
     # Initialize exchange
@@ -918,14 +1030,15 @@ async def main():
     # Test connection
     try:
         await exchange.load_markets()
-        log.info(f"Connected to {exchange.name}")
+        log.info(f"✅ Connected to {exchange.name}")
+        log.info(f"📊 Scanning on timeframes: {', '.join(TIMEFRAMES)}")
     except Exception as e:
         log.error(f"Failed to connect to exchange: {e}")
         await cleanup()
         return
     
     # Send startup message
-    await tg("🏆 ROMEOPT 6-Step Scanner Started - Practical Version")
+    await tg(f"🏆 ROMEOPT Scanner Started\n📈 Timeframes: {', '.join(TIMEFRAMES)}\n⚙️ Top {TOP_N} pairs | Interval: {SCAN_INTERVAL}s")
     
     # Run scanner and monitor
     try:
