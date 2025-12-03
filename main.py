@@ -311,6 +311,88 @@ def deprioritized(symbol: str, threshold=3, lookback=30):
     while dq and dq[0]<cutoff: dq.popleft()
     return len(dq)>=threshold
 
+# ---------------- GENERATE SIGNAL ROMEOPT ----------------
+async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
+    """
+    Main function to generate a RomeOPT-P signal for a given symbol/timeframe
+    Returns None if no valid signal
+    """
+    if df is None or len(df) < 30:
+        return None
+
+    # Step 1: Detect BOS/CHOCH
+    ms_shift = detect_bos_choch(df)
+    if not ms_shift["has_bos"] and not ms_shift["has_choch"]:
+        return None
+    side = ms_shift["bos_side"] or ("BUY" if ms_shift["choch_info"]["ema20"] > ms_shift["choch_info"]["ema50"] else "SELL")
+
+    # Step 2: Volume spike
+    vol_ok = vol_spike(df)
+    if not vol_ok:
+        return None
+
+    # Step 3: Find FVGs
+    fvgs = find_fvgs(df)
+    if not fvgs:
+        return None
+
+    # Step 4: Quality OB
+    ob_zone = find_quality_order_block(df)
+    if not ob_zone:
+        return None
+
+    # Step 5: Confirm market structure shift
+    mss_ok = confirm_market_structure_shift(df, side)
+    if not mss_ok:
+        return None
+
+    # Step 6: Elite multi-timeframe alignment
+    elite_ok = await elite_tf_alignment(exchange, symbol, side)
+    if not elite_ok:
+        return None
+
+    # Entry price: last close
+    entry = df["close"].iloc[-1]
+
+    # ATR for TP/SL
+    atr_val = float(atr(df, 14).iloc[-1])
+    sl, tp1, tp2, tp3 = romeopt_tp_sl(entry, side, atr_val, ob_zone, df)
+
+    # Score calculation
+    score = 0
+    if ms_shift["has_bos"]: score += 2
+    if ms_shift["has_choch"]: score += 2
+    if vol_ok: score += 1
+    if elite_ok: score += 2
+    if fvgs: score += 1
+
+    # Only return signals above MIN_SCORE
+    if score < MIN_SCORE:
+        return None
+
+    signal = {
+        "symbol": symbol,
+        "side": side,
+        "entry": entry,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "score": score,
+        "reason": "RomeOPT-P signal",
+        "detailed": {
+            "bos": ms_shift,
+            "fvgs": fvgs,
+            "ob_zone": ob_zone,
+            "elite_ok": elite_ok,
+            "htf_alignment": elite_ok,
+            "vol_ok": vol_ok,
+        },
+        "reason_list": ["BOS/CHOCH","Volume","FVG","OB","MSS","Elite TF"]
+    }
+
+    return signal
+
 # ---------------- LOG SIGNAL ----------------
 async def log_signal(sig):
     async with db_lock:
@@ -325,14 +407,12 @@ async def log_signal(sig):
 # ---------------- MONITOR SIGNALS ----------------
 # ... keep rest of your monitor_signals() and scan_loop() as is ...
 async def monitor_signals():
-    # This coroutine checks OPEN/PENDING signals for hits and updates statuses.
     while True:
         try:
             async with db_lock:
                 async with db_conn.execute("SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,tp1_hit,tp2_hit,tp3_hit,status,details FROM signals WHERE status IN ('OPEN','PENDING')") as cursor:
                     async for row in cursor:
                         sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status, details = row
-                        # convert hits from None to 0 if necessary
                         tp1_hit = tp1_hit or 0
                         tp2_hit = tp2_hit or 0
                         tp3_hit = tp3_hit or 0
@@ -366,7 +446,6 @@ async def monitor_signals():
                             if last_price>=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
 
                         if hits:
-                            # include a compact details snippet in alerts for quick triage
                             try:
                                 diag = json.loads(details) if details else {}
                             except Exception:
@@ -405,7 +484,6 @@ async def scan_loop(exchange):
                     if sig:
                         htf_flag = sig.get("htf_alignment", "N/A")
                         sweep_flag = sig.get("liquidity_sweep", "N/A")
-                        # condensed details for alerts; the full diagnostics stored in DB details
                         breakdown = ', '.join(sig.get('reason_list', []))[:700]  # shorten alert if too long
                         await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']} (limit:{sig.get('entry_limit')})\nSL:{sig.get('sl')}\nTP1:{sig.get('tp1')} TP2:{sig.get('tp2')} TP3:{sig.get('tp3')}\nScore:{sig['score']}\nHTF:{htf_flag} Sweep:{sweep_flag}\nBreakdown:{breakdown}")
                         await log_signal(sig)
@@ -432,7 +510,6 @@ async def main():
     global exchange
     exchange = ccxt.okx({"enableRateLimit": True})
     await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals")
-    # run scan and monitor concurrently
     await asyncio.gather(scan_loop(exchange), monitor_signals())
 
 if __name__=="__main__":
@@ -446,10 +523,8 @@ if __name__=="__main__":
         try:
             asyncio.run(main())
         finally:
-            # close DB connection gracefully if exists
             if db_conn:
                 try:
                     asyncio.run(db_conn.close())
                 except Exception:
-                    # if event loop closed, ignore
                     pass
