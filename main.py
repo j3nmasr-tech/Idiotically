@@ -135,6 +135,7 @@ async def init_database():
         await db_conn.execute("PRAGMA journal_mode=WAL;")
         await db_conn.execute("PRAGMA synchronous=NORMAL;")
         
+        # Create main table WITHOUT indexes inside
         await db_conn.execute("""
             CREATE TABLE IF NOT EXISTS romeopt_signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -185,12 +186,29 @@ async def init_database():
                 
                 -- Full Details
                 signal_details TEXT,
-                reasons TEXT,
-                
-                -- Indexes for performance
-                INDEX idx_symbol_status (symbol, status),
-                INDEX idx_opened_at (opened_at)
+                reasons TEXT
             )
+        """)
+        
+        # Create indexes SEPARATELY
+        await db_conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_symbol_status 
+            ON romeopt_signals(symbol, status)
+        """)
+        
+        await db_conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_opened_at 
+            ON romeopt_signals(opened_at)
+        """)
+        
+        await db_conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_score 
+            ON romeopt_signals(score)
+        """)
+        
+        await db_conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_status_score 
+            ON romeopt_signals(status, score)
         """)
         
         await db_conn.commit()
@@ -199,29 +217,6 @@ async def init_database():
     except Exception as e:
         log.error(f"Failed to initialize database: {e}")
         raise
-
-async def cleanup_old_signals():
-    """Clean up old closed signals to prevent database bloat"""
-    while True:
-        try:
-            async with db_lock:
-                # Keep only last 7 days of closed signals
-                cutoff_date = (datetime.datetime.utcnow() - datetime.timedelta(days=7)).isoformat()
-                result = await db_conn.execute("""
-                    DELETE FROM romeopt_signals 
-                    WHERE status = 'CLOSED' AND opened_at < ?
-                """, (cutoff_date,))
-                deleted = result.rowcount
-                await db_conn.commit()
-                
-                if deleted > 0:
-                    log.info(f"Cleaned up {deleted} old signals")
-                    
-        except Exception as e:
-            log.error(f"Cleanup error: {e}")
-        
-        await asyncio.sleep(3600)  # Run every hour
-
 # ==================== DATA FETCHING ====================
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
     """Fetch OHLCV data with error handling and rate limiting"""
