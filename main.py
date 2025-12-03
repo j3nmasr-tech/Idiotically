@@ -22,7 +22,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_PATH = "/app/data/signals.db"
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
-TOP_N = int(os.getenv("TOP_N", 40))
+TOP_N = int(os.getenv("TOP_N", 10))
 
 # RomeOPT-P Timeframe Hierarchy
 TIMEFRAMES = ["5m", "15m", "1h"]  # Clean, focused set
