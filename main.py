@@ -15,6 +15,7 @@ LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features)
 - Adaptive Market Regime detection
 - HTF + Sweep scoring threshold
 - Elite multi-timeframe confirmation (15m,1h,4h)
+- FIXED: Strong trend filter to avoid counter-trend losses
 """
 
 import os, time, asyncio, logging, datetime
@@ -22,6 +23,7 @@ import aiosqlite
 import httpx
 import ccxt.async_support as ccxt
 import pandas as pd
+import numpy as np
 from fastapi import FastAPI, Request, HTTPException
 import uvicorn
 from collections import defaultdict, deque
@@ -33,7 +35,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
-TOP_N = int(os.getenv("TOP_N", 1))
+TOP_N = int(os.getenv("TOP_N", 10))
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
 MIN_SCORE = 5
 CRITICAL_FACTORS_MIN = 2  # HTF Alignment + Liquidity Sweep minimum
@@ -149,6 +151,82 @@ def atr(df: pd.DataFrame, period=14):
     }).max(axis=1)
     return tr.rolling(period, min_periods=1).mean()
 
+def calculate_ema(df, period):
+    """Calculate EMA"""
+    return df['close'].ewm(span=period, adjust=False).mean()
+
+# ---------------- STRONG TREND DETECTION ----------------
+async def check_strong_counter_trend(exchange, symbol: str, timeframe: str, signal_side: str):
+    """
+    Check if higher timeframe is in STRONG trend AGAINST our signal.
+    Returns True if we should REJECT the signal (strong counter-trend).
+    """
+    # Map signal timeframe to trend-check timeframe
+    trend_check_map = {
+        "1m": "15m",   # Check 15m trend for 1m signals
+        "3m": "30m",   # Check 30m trend for 3m signals  
+        "5m": "1h",    # Check 1h trend for 5m signals
+        "15m": "4h",   # Check 4h trend for 15m signals
+        "30m": "4h"    # Check 4h trend for 30m signals
+    }
+    
+    check_tf = trend_check_map.get(timeframe, "15m")
+    
+    # Fetch OHLCV for trend analysis
+    ohlcv = await fetch_ohlcv(exchange, symbol, check_tf, 50)
+    if not ohlcv:
+        return False  # If can't fetch, don't reject
+        
+    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+    for c in ["open","high","low","close","vol"]: 
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    
+    # Calculate EMA for trend direction
+    df['ema20'] = calculate_ema(df, 20)
+    
+    # Get last 10 candles for analysis
+    recent = df.iloc[-10:]
+    
+    # Count candles above/below EMA
+    above_ema = (recent['close'] > recent['ema20']).sum()
+    below_ema = (recent['close'] < recent['ema20']).sum()
+    
+    # Check consecutive candles in same direction
+    recent_trend = []
+    for i in range(len(recent)-1):
+        if recent['close'].iloc[i+1] > recent['close'].iloc[i]:
+            recent_trend.append(1)  # Up
+        else:
+            recent_trend.append(-1)  # Down
+    
+    # Check for strong consecutive moves
+    if len(recent_trend) >= 5:
+        last_5 = recent_trend[-5:]
+        if all(x > 0 for x in last_5):  # 5 consecutive up closes
+            if signal_side == "SELL":  # We want to SELL during strong uptrend
+                log.info(f"🚫 {symbol} {timeframe} {signal_side} rejected: Strong {check_tf} UPTREND")
+                return True
+        elif all(x < 0 for x in last_5):  # 5 consecutive down closes
+            if signal_side == "BUY":  # We want to BUY during strong downtrend
+                log.info(f"🚫 {symbol} {timeframe} {signal_side} rejected: Strong {check_tf} DOWNTREND")
+                return True
+    
+    # Additional check: Price far from EMA (>2 ATR)
+    current_atr = float(atr(df, 14).iloc[-1])
+    ema_distance = abs(df['close'].iloc[-1] - df['ema20'].iloc[-1])
+    
+    if current_atr > 0:
+        distance_in_atr = ema_distance / current_atr
+        if distance_in_atr > 2.0:  # Very far from EMA = strong trend
+            if signal_side == "BUY" and df['close'].iloc[-1] < df['ema20'].iloc[-1]:
+                log.info(f"🚫 {symbol} {timeframe} {signal_side} rejected: Price >2 ATR below {check_tf} EMA")
+                return True
+            elif signal_side == "SELL" and df['close'].iloc[-1] > df['ema20'].iloc[-1]:
+                log.info(f"🚫 {symbol} {timeframe} {signal_side} rejected: Price >2 ATR above {check_tf} EMA")
+                return True
+    
+    return False  # Not a strong counter-trend
+
 # ---------------- MARKET REGIME ----------------
 async def detect_market_regime(df: pd.DataFrame):
     ma_htf = df["close"].rolling(50).mean().iloc[-1]
@@ -171,9 +249,14 @@ async def elite_tf_alignment(exchange, symbol: str, side: str):
         ohlcv = await fetch_ohlcv(exchange, symbol, tf, 50)
         if not ohlcv: return False
         df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-        trend = df["close"].iloc[-1] - df["close"].iloc[-5]
-        trend_side = "BUY" if trend>0 else "SELL"
+        
+        # Better trend detection using EMA slope
+        df['ema20'] = calculate_ema(df, 20)
+        current_slope = df['ema20'].iloc[-1] - df['ema20'].iloc[-3]
+        
+        trend_side = "BUY" if current_slope > 0 else "SELL"
         if trend_side != side:
+            log.debug(f"Elite alignment failed: {tf} trend {trend_side} vs signal {side}")
             return False
     return True
 
@@ -270,10 +353,49 @@ async def update_tp_sl_live(sig: dict):
     
     return sig
 
+# ---------------- IMPROVED HTF ALIGNMENT DETECTION ----------------
+async def get_htf_trend(exchange, symbol: str, timeframe: str):
+    """Get HTF trend direction with better logic"""
+    ohlcv = await fetch_ohlcv(exchange, symbol, timeframe, 50)
+    if not ohlcv:
+        return "neutral"
+    
+    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+    for c in ["open","high","low","close","vol"]: 
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    
+    # Use multiple methods for robust trend detection
+    
+    # 1. EMA slope
+    df['ema20'] = calculate_ema(df, 20)
+    ema_slope = df['ema20'].iloc[-1] - df['ema20'].iloc[-3]
+    
+    # 2. Recent closes direction
+    recent_closes = df['close'].iloc[-6:]
+    direction_sum = 0
+    for i in range(1, len(recent_closes)):
+        if recent_closes.iloc[i] > recent_closes.iloc[i-1]:
+            direction_sum += 1
+        else:
+            direction_sum -= 1
+    
+    # 3. Price position relative to EMA
+    above_ema = df['close'].iloc[-1] > df['ema20'].iloc[-1]
+    
+    # Combine signals
+    if ema_slope > 0 and direction_sum >= 2 and above_ema:
+        return "bullish"
+    elif ema_slope < 0 and direction_sum <= -2 and not above_ema:
+        return "bearish"
+    else:
+        return "neutral"
+
 # ---------------- ROMEOPT SIGNAL GENERATOR ----------------
 async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
-    """Full RomeOPT 6-step signal generator"""
-    if df is None or len(df) < 20: return None
+    """Full RomeOPT 6-step signal generator with trend filter"""
+    if df is None or len(df) < 20: 
+        return None
+    
     last = df.iloc[-1]
     prev5 = df.iloc[-6:-1]
     score = 0
@@ -289,47 +411,67 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
 
     # Step2: Displacement
     displacement = abs(last["close"]-last["open"])/(last["high"]-last["low"]+1e-8)
-    has_disp = displacement>0.6
+    has_disp = displacement > 0.6
     if has_disp: 
-        score+=2
+        score += 2
         reasons.append("Displacement +2")
     else: 
         reasons.append("Displacement +0")
 
     # Step3&4: OB detection
     ob_zone = find_latest_ob(df)
-    if not ob_zone: return None
+    if not ob_zone: 
+        reasons.append("No OB detected")
+        return None
 
-    # Step5: HTF alignment
-    side = "BUY" if ob_zone['type']=="bullish" else "SELL"
+    # Step5: HTF alignment with IMPROVED detection
+    side = "BUY" if ob_zone['type'] == "bullish" else "SELL"
+    
+    # Check for STRONG counter-trend BEFORE proceeding
+    should_reject = await check_strong_counter_trend(exchange, symbol, tf, side)
+    if should_reject:
+        reasons.append(f"Strong HTF trend against {side} → Rejected")
+        return None
     
     # Use mapping consistent with elite_tf_alignment
-    tf_map={"1m":"15m","3m":"30m","5m":"1h","15m":"4h","30m":"1h"}
-    htf = tf_map.get(tf,"15m")
+    tf_map = {"1m":"15m", "3m":"30m", "5m":"1h", "15m":"4h", "30m":"1h"}
+    htf = tf_map.get(tf, "15m")
     
-    ohlcv_htf = await fetch_ohlcv(exchange, symbol, htf, 50)
+    # Get HTF trend with improved logic
+    htf_trend = await get_htf_trend(exchange, symbol, htf)
     htf_alignment = 0
-    if ohlcv_htf:
-        df_htf = pd.DataFrame(ohlcv_htf, columns=["ts","open","high","low","close","vol"])
-        trend = df_htf["close"].iloc[-1]-df_htf["close"].iloc[-5]
-        htf_dir = "bullish" if trend>0 else "bearish"
-        if htf_dir==ob_zone['type']: 
-            htf_alignment=1
-            score+=1
-            reasons.append(f"HTF Alignment +1 ({htf})")
-
-    if score < MIN_SCORE: return None
-    if not has_disp: return None
+    
+    if htf_trend != "neutral":
+        htf_dir = "bullish" if htf_trend == "bullish" else "bearish"
+        if htf_dir == ob_zone['type']: 
+            htf_alignment = 1
+            score += 1
+            reasons.append(f"HTF Alignment +1 ({htf}: {htf_trend})")
+        else:
+            reasons.append(f"HTF Misalignment ({htf}: {htf_trend})")
+            # Don't reject here, just no points
+    else:
+        reasons.append(f"HTF Neutral ({htf})")
+    
+    # CRITICAL: Must have minimum score AND displacement
+    if score < MIN_SCORE: 
+        reasons.append(f"Score {score} < {MIN_SCORE}")
+        return None
+    
+    if not has_disp: 
+        reasons.append("No displacement")
+        return None
 
     # Step6: Momentum clean traffic/range avoidance
     momentum_ratio = abs(last["close"]-last["open"])/(last["high"]-last["low"]+1e-8)
-    if momentum_ratio<0.5: 
+    if momentum_ratio < 0.5: 
         reasons.append("Momentum Failed")
         return None
 
     # Calculate TP/SL with RomeOPT-P logic
     sl, tp1, tp2, tp_tf = await romeoptp_tp_sl(exchange, float(last["close"]), side, tf, ob_zone, symbol)
     if sl is None or tp1 is None or tp2 is None:
+        reasons.append("TP/SL calc failed")
         return None
     
     sig = {
@@ -348,10 +490,10 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     }
 
     # Liquidity path filter: skip blocked trades
-    if side=="BUY" and any(df['high'].iloc[-20:]>=sig['tp1']): 
+    if side == "BUY" and any(df['high'].iloc[-20:] >= sig['tp1']): 
         reasons.append("Liquidity Path Blocked")
         return None
-    if side=="SELL" and any(df['low'].iloc[-20:]<=sig['tp1']): 
+    if side == "SELL" and any(df['low'].iloc[-20:] <= sig['tp1']): 
         reasons.append("Liquidity Path Blocked")
         return None
 
@@ -453,7 +595,7 @@ last_signal_time = {}
 async def scan_loop():
     global exchange
     while True:
-        t0=time.time()
+        t0 = time.time()
         try:
             tickers = await exchange.fetch_tickers()
             top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")], 
@@ -461,34 +603,34 @@ async def scan_loop():
             signals_found = 0
             for symbol,_ in top:
                 for tf in TIMEFRAMES:
-                    key=f"{symbol}:{tf}"
-                    if key in last_signal_time and time.time()-last_signal_time[key]<60: 
+                    key = f"{symbol}:{tf}"
+                    if key in last_signal_time and time.time() - last_signal_time[key] < 60: 
                         continue
-                    ohlcv = await fetch_ohlcv(exchange,symbol,tf,200)
+                    ohlcv = await fetch_ohlcv(exchange, symbol, tf, 200)
                     if not ohlcv: continue
-                    df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
+                    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
                     for c in ["open","high","low","close","vol"]: 
-                        df[c]=pd.to_numeric(df[c],errors="coerce")
-                    sig = await generate_signal_romeopt(exchange,df,symbol,tf)
+                        df[c] = pd.to_numeric(df[c], errors="coerce")
+                    sig = await generate_signal_romeopt(exchange, df, symbol, tf)
                     if sig:
-                        # RESTORED ORIGINAL FORMAT WITH ALL STEPS/DATA
                         breakdown_str = ", ".join(sig['reason_list'])
                         await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig.get('sl')}\nTP1:{sig.get('tp1')} TP2:{sig.get('tp2')}\nScore:{sig['score']}\nBreakdown:{breakdown_str}")
                         await log_signal(sig)
-                        last_signal_time[key]=time.time()
-                        signals_found+=1
+                        last_signal_time[key] = time.time()
+                        signals_found += 1
             log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found")
         except Exception as e:
             log.exception("scan error: %s", e)
-        elapsed=time.time()-t0
-        await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
+        elapsed = time.time() - t0
+        await asyncio.sleep(max(1, SCAN_INTERVAL - elapsed))
 
 # ---------------- FASTAPI ----------------
 app = FastAPI()
 @app.post("/webhook")
 async def webhook(request: Request):
     token = request.headers.get("X-Auth","")
-    if token!=WEBHOOK_SECRET: raise HTTPException(403,"Invalid secret")
+    if token != WEBHOOK_SECRET: 
+        raise HTTPException(403, "Invalid secret")
     data = await request.json()
     log.info("Webhook received: %s", data)
     return {"ok":True}
@@ -498,14 +640,14 @@ async def main():
     global exchange, db_conn
     await init_db()
     exchange = ccxt.okx({"enableRateLimit": True})
-    await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals")
+    await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals\n✅ TREND FILTER ACTIVE: Will reject counter-trend trades")
     await asyncio.gather(scan_loop(), monitor_signals())
 
-if __name__=="__main__":
+if __name__ == "__main__":
     import argparse
-    p=argparse.ArgumentParser()
+    p = argparse.ArgumentParser()
     p.add_argument("--http", action="store_true")
-    args=p.parse_args()
+    args = p.parse_args()
     if args.http:
         uvicorn.run(app, host="0.0.0.0", port=9000)
     else:
