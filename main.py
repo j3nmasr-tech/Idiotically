@@ -879,6 +879,27 @@ async def webhook(request: Request):
 async def health():
     return {"status": "healthy", "timestamp": datetime.datetime.utcnow().isoformat()}
 
+# ---------------- CLEANUP FUNCTION ----------------
+async def cleanup():
+    """Cleanup resources properly"""
+    global exchange, db_conn
+    
+    log.info("Cleaning up resources...")
+    
+    if exchange:
+        try:
+            await exchange.close()
+            log.info("Exchange connection closed")
+        except Exception as e:
+            log.error(f"Error closing exchange: {e}")
+    
+    if db_conn:
+        try:
+            await db_conn.close()
+            log.info("Database connection closed")
+        except Exception as e:
+            log.error(f"Error closing database: {e}")
+
 # ---------------- MAIN ----------------
 async def main():
     global exchange, db_conn
@@ -900,20 +921,29 @@ async def main():
         log.info(f"Connected to {exchange.name}")
     except Exception as e:
         log.error(f"Failed to connect to exchange: {e}")
+        await cleanup()
         return
     
     # Send startup message
     await tg("🏆 ROMEOPT 6-Step Scanner Started - Practical Version")
     
     # Run scanner and monitor
-    await asyncio.gather(
-        scan_loop(exchange),
-        monitor_signals()
-    )
+    try:
+        await asyncio.gather(
+            scan_loop(exchange),
+            monitor_signals()
+        )
+    except asyncio.CancelledError:
+        log.info("Scanner tasks cancelled")
+    except Exception as e:
+        log.exception(f"Unexpected error in main: {e}")
+    finally:
+        await cleanup()
 
 # ---------------- ENTRY POINT ----------------
 if __name__ == "__main__":
     import argparse
+    import signal
     
     parser = argparse.ArgumentParser(description="RomeOPT Scanner")
     parser.add_argument("--http", action="store_true", help="Run HTTP server")
@@ -928,20 +958,34 @@ if __name__ == "__main__":
         log.info("Starting HTTP server on port 9000")
         uvicorn.run(app, host="0.0.0.0", port=9000)
     else:
+        # Setup signal handlers for graceful shutdown
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Create task
+        main_task = loop.create_task(main())
+        
+        # Signal handling
+        def signal_handler(signame):
+            log.info(f"Received signal {signame}, shutting down...")
+            main_task.cancel()
+        
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, lambda s=sig: signal_handler(s.name))
+        
         try:
-            asyncio.run(main())
-        except KeyboardInterrupt:
-            log.info("Shutting down...")
+            loop.run_until_complete(main_task)
+        except asyncio.CancelledError:
+            log.info("Main task cancelled")
         except Exception as e:
             log.exception(f"Fatal error: {e}")
         finally:
-            if db_conn:
-                try:
-                    asyncio.run(db_conn.close())
-                except:
-                    pass
-            if exchange:
-                try:
-                    await exchange.close()
-                except:
-                    pass
+            # Run cleanup one more time
+            try:
+                loop.run_until_complete(cleanup())
+            except:
+                pass
+            
+            # Close loop
+            loop.close()
+            log.info("Scanner shutdown complete")
