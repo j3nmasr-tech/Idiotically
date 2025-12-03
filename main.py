@@ -64,7 +64,7 @@ async def tg(msg: str):
         except Exception as e:
             log.warning(f"Telegram send failed: {e}")
 
-# ---------------- DATABASE (patched: adds details column) ----------------
+# ---------------- DATABASE (patched: adds details column safely) ----------------
 async def init_db():
     global db_conn
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -88,11 +88,18 @@ async def init_db():
             tp1_hit INTEGER DEFAULT 0,
             tp2_hit INTEGER DEFAULT 0,
             tp3_hit INTEGER DEFAULT 0,
-            latest_ob TEXT,
-            details TEXT
+            latest_ob TEXT
         );
     """)
     await db_conn.commit()
+
+    # ---------------- Add 'details' column if missing ----------------
+    try:
+        await db_conn.execute("ALTER TABLE signals ADD COLUMN details TEXT")
+        await db_conn.commit()
+    except aiosqlite.OperationalError:
+        # Column already exists
+        pass
 
 # ---------------- OHLCV ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
@@ -140,41 +147,21 @@ async def elite_tf_alignment(exchange, symbol: str, side: str):
     return True
 
 # ---------------- ROMEOPT 6-STEP SIGNAL (patched & extended with helpers) ----------------
-
 # ---------- Helpers: BOS / CHOCH detection ----------
 def detect_bos_choch(df: pd.DataFrame, swing_lookback=20):
-    """
-    Detect simple BOS and CHOCH.
-    Returns: dict {
-      has_bos: bool,
-      bos_side: "BUY"/"SELL"/None,
-      has_choch: bool,
-      choch_info: {...}
-    }
-    """
     res = {"has_bos": False, "bos_side": None, "has_choch": False, "choch_info": None}
-
-    if len(df) < 10:
-        return res
-
-    # Swing highs / lows over tail window
+    if len(df) < 10: return res
     tail = df.tail(swing_lookback)
     recent_high = tail['high'].max()
     recent_low = tail['low'].min()
     last_close = df['close'].iloc[-1]
-    # momentum condition: last close vs close 3 bars ago
     prev3_close = df['close'].iloc[-4] if len(df) >= 4 else df['close'].iloc[-1]
-
-    # BOS detection
     if last_close > recent_high and last_close > prev3_close:
         res["has_bos"] = True; res["bos_side"] = "BUY"
     elif last_close < recent_low and last_close < prev3_close:
         res["has_bos"] = True; res["bos_side"] = "SELL"
-
-    # CHOCH via EMA crossover on tail
     ema20 = df['close'].ewm(span=20).mean()
     ema50 = df['close'].ewm(span=50).mean()
-    # crossover in last 5 bars
     try:
         ema_now = ema20.iloc[-1] - ema50.iloc[-1]
         ema_prev = ema20.iloc[-6] - ema50.iloc[-6]
@@ -183,13 +170,11 @@ def detect_bos_choch(df: pd.DataFrame, swing_lookback=20):
         res["choch_info"] = {"ema20": float(ema20.iloc[-1]), "ema50": float(ema50.iloc[-1])}
     except Exception:
         res["has_choch"] = False
-
     return res
 
 # ---------- Helpers: volume spike ----------
 def vol_spike(df: pd.DataFrame, idx=-1, factor=1.5, lookback=20):
-    if len(df) < 5:
-        return False
+    if len(df) < 5: return False
     vol_avg = df['vol'].tail(lookback).mean()
     try:
         return float(df['vol'].iloc[idx]) > vol_avg * factor
@@ -198,69 +183,42 @@ def vol_spike(df: pd.DataFrame, idx=-1, factor=1.5, lookback=20):
 
 # ---------- Helpers: find fvgs ----------
 def find_fvgs(df: pd.DataFrame, lookback=200):
-    """
-    Detect recent 3-candle FVGs in tail.
-    Returns list of fvgs [{type, low, high, idx, premium(bool)}] newest first.
-    """
     fvgs = []
     n = len(df)
-    if n < 5:
-        return fvgs
+    if n < 5: return fvgs
     for i in range(2, min(n-1, lookback)):
-        # pick candles by relative position from tail
         j = n - 1 - i
-        if j - 2 < 0:
-            continue
-        c2 = df.iloc[j]     # older
+        if j - 2 < 0: continue
+        c2 = df.iloc[j]
         c1 = df.iloc[j+1]
-        c0 = df.iloc[j+2]   # newer
-        # bullish FVG: older high < newer low (gap up)
+        c0 = df.iloc[j+2]
         if c2['high'] < c0['low']:
             ema50 = df['close'].ewm(span=50).mean().iloc[j+2]
             premium = c0['low'] > ema50
             fvgs.append({"type":"bullish","low":float(c2['high']),"high":float(c0['low']),"idx": j+2,"premium":premium})
-        # bearish FVG: older low > newer high (gap down)
         if c2['low'] > c0['high']:
             ema50 = df['close'].ewm(span=50).mean().iloc[j+2]
             premium = c0['high'] < ema50
             fvgs.append({"type":"bearish","low":float(c0['high']),"high":float(c2['low']),"idx": j+2,"premium":premium})
-    # newest first
     return sorted(fvgs, key=lambda x: x['idx'], reverse=True)
 
 # ---------- Helpers: quality order block detection ----------
 def find_quality_order_block(df: pd.DataFrame, lookback=80):
-    """
-    Stricter OB search. Returns single latest OB dict or None:
-      {"type":"bullish"/"bearish", "low":..., "high":..., "idx":...}
-    """
     n = len(df)
-    if n < 6:
-        return None
+    if n < 6: return None
     for i in range(n-3, max(3, n - lookback), -1):
-        candle = df.iloc[i]
-        prev = df.iloc[i-1]
-        nxt = df.iloc[i+1] if i+1 < n else None
-        body = abs(candle['close'] - candle['open'])
-        rng = candle['high'] - candle['low'] + 1e-9
+        candle = df.iloc[i]; prev = df.iloc[i-1]; nxt = df.iloc[i+1] if i+1 < n else None
+        body = abs(candle['close'] - candle['open']); rng = candle['high'] - candle['low'] + 1e-9
         body_ratio = body / rng if rng > 0 else 0
-        # volume check
         vol_ok = True
-        try:
-            vol_avg = df['vol'].tail(30).mean()
-            vol_ok = float(candle['vol']) >= max(1, vol_avg * 0.6)
-        except Exception:
-            vol_ok = True
-
-        # Bullish OB candidate: prev bearish -> candle bullish + swept low + confirmation next
+        try: vol_avg = df['vol'].tail(30).mean(); vol_ok = float(candle['vol']) >= max(1, vol_avg * 0.6)
+        except Exception: vol_ok = True
         if prev['close'] < prev['open'] and candle['close'] > candle['open'] and body_ratio > 0.25 and vol_ok:
-            # check for swept low (candle low < prev low)
             if candle['low'] < prev['low']:
-                # optional confirmation: next candle closes bullish
                 if nxt is not None and nxt['close'] > candle['close']:
                     low = float(min(candle['low'], prev['low']))
                     high = float(max(candle['close'], prev['close']))
                     return {"type":"bullish","low":low,"high":high,"idx": i-1}
-        # Bearish OB candidate
         if prev['close'] > prev['open'] and candle['close'] < candle['open'] and body_ratio > 0.25 and vol_ok:
             if candle['high'] > prev['high']:
                 if nxt is not None and nxt['close'] < candle['close']:
@@ -271,130 +229,75 @@ def find_quality_order_block(df: pd.DataFrame, lookback=80):
 
 # ---------- Helpers: confirm market structure shift ----------
 def confirm_market_structure_shift(df: pd.DataFrame, side: str):
-    """
-    Quick confirmation: requires at least one HL (for BUY) or LH (for SELL) forming in recent swings.
-    """
-    if len(df) < 20:
-        return False
-    highs = df['high']
-    lows = df['low']
-    # find local swing highs/lows using rolling windows
+    if len(df) < 20: return False
+    highs = df['high']; lows = df['low']
     swing_highs = highs[(highs == highs.rolling(5, center=True).max())].dropna()
     swing_lows = lows[(lows == lows.rolling(5, center=True).min())].dropna()
     recent_highs = swing_highs.tail(3).values if len(swing_highs)>0 else []
     recent_lows = swing_lows.tail(3).values if len(swing_lows)>0 else []
     if side == "BUY":
-        if len(recent_lows) >= 2 and recent_lows[-1] > recent_lows[-2]:
-            return True
+        if len(recent_lows) >= 2 and recent_lows[-1] > recent_lows[-2]: return True
     else:
-        if len(recent_highs) >= 2 and recent_highs[-1] < recent_highs[-2]:
-            return True
+        if len(recent_highs) >= 2 and recent_highs[-1] < recent_highs[-2]: return True
     return False
 
 # ---------- Helpers: liquidity path check ----------
 def check_liquidity_path(df: pd.DataFrame, side: str, entry: float, tp: float):
-    """
-    Return True if path to TP is reasonably clear (no recent touch).
-    """
-    if len(df) < 15:
-        return True
-    tail_highs = df['high'].tail(15)
-    tail_lows = df['low'].tail(15)
+    if len(df) < 15: return True
+    tail_highs = df['high'].tail(15); tail_lows = df['low'].tail(15)
     if side == "BUY":
-        recent_touch = (tail_highs >= tp * 0.995).any()
-        return not bool(recent_touch)
+        recent_touch = (tail_highs >= tp * 0.995).any(); return not bool(recent_touch)
     else:
-        recent_touch = (tail_lows <= tp * 1.005).any()
-        return not bool(recent_touch)
+        recent_touch = (tail_lows <= tp * 1.005).any(); return not bool(recent_touch)
 
 # ---------- Utilities ----------
 def numeric_safe(x):
-    try:
-        return float(x)
-    except Exception:
-        return None
+    try: return float(x)
+    except Exception: return None
 
 # ---------------- TP/SL HELPERS (unchanged) ----------------
 def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
-    """
-    OPTIMIZED TP/SL using market structure + ATR
-    """
-    recent_high = df['high'].iloc[-10:].max()  # Shorter lookback for relevance
+    recent_high = df['high'].iloc[-10:].max()
     recent_low = df['low'].iloc[-10:].min()
-
     if side == "BUY":
         sl_ob = ob_zone["low"] - (atr_val * 0.3)
         sl_structure = recent_low - (atr_val * 0.3)
         sl = min(sl_ob, sl_structure)
-
         risk = entry - sl
-
-        min_risk = atr_val * 0.5  # At least half ATR
-        if risk < min_risk:
-            risk = min_risk
-            sl = entry - risk
-
-        base_tp1 = entry + (risk * 0.8)
-        base_tp2 = entry + (risk * 1.5)
-        base_tp3 = entry + (risk * 2.5)
-
-        nearest_resistance = df['high'].tail(20).max()  # Last 20 candles only
-        major_resistance = df['high'].tail(50).max()    # Last 50 candles
-
+        min_risk = atr_val * 0.5
+        if risk < min_risk: risk = min_risk; sl = entry - risk
+        base_tp1 = entry + (risk * 0.8); base_tp2 = entry + (risk * 1.5); base_tp3 = entry + (risk * 2.5)
+        nearest_resistance = df['high'].tail(20).max(); major_resistance = df['high'].tail(50).max()
         tp1 = min(base_tp1, nearest_resistance) if nearest_resistance > entry else base_tp1
         tp2 = min(base_tp2, major_resistance) if major_resistance > tp1 else base_tp2
-        tp3 = base_tp3  # Extended target
-
-        min_tp_gap = risk * 0.3  # Minimum 30% of risk between TPs
-
-        tp1 = max(tp1, entry + (risk * 0.5))  # At least 0.5R profit
-        tp2 = max(tp2, tp1 + min_tp_gap)      # Meaningful gap from TP1
-        tp3 = max(tp3, tp2 + min_tp_gap)      # Meaningful gap from TP2
-
-    else:  # SELL
+        tp3 = base_tp3
+        min_tp_gap = risk * 0.3
+        tp1 = max(tp1, entry + (risk * 0.5)); tp2 = max(tp2, tp1 + min_tp_gap); tp3 = max(tp3, tp2 + min_tp_gap)
+    else:
         sl_ob = ob_zone["high"] + (atr_val * 0.3)
         sl_structure = recent_high + (atr_val * 0.3)
         sl = max(sl_ob, sl_structure)
-
         risk = sl - entry
-
         min_risk = atr_val * 0.5
-        if risk < min_risk:
-            risk = min_risk
-            sl = entry + risk
-
-        base_tp1 = entry - (risk * 0.8)
-        base_tp2 = entry - (risk * 1.5)
-        base_tp3 = entry - (risk * 2.5)
-
-        nearest_support = df['low'].tail(20).min()
-        major_support = df['low'].tail(50).min()
-
+        if risk < min_risk: risk = min_risk; sl = entry + risk
+        base_tp1 = entry - (risk * 0.8); base_tp2 = entry - (risk * 1.5); base_tp3 = entry - (risk * 2.5)
+        nearest_support = df['low'].tail(20).min(); major_support = df['low'].tail(50).min()
         tp1 = max(base_tp1, nearest_support) if nearest_support < entry else base_tp1
         tp2 = max(base_tp2, major_support) if major_support < tp1 else base_tp2
-        tp3 = base_tp3  # Extended target
-
+        tp3 = base_tp3
         min_tp_gap = risk * 0.3
-
-        tp1 = min(tp1, entry - (risk * 0.5))  # At least 0.5R profit
-        tp2 = min(tp2, tp1 - min_tp_gap)      # Meaningful gap from TP1
-        tp3 = min(tp3, tp2 - min_tp_gap)      # Meaningful gap from TP2
-
+        tp1 = min(tp1, entry - (risk * 0.5)); tp2 = min(tp2, tp1 - min_tp_gap); tp3 = min(tp3, tp2 - min_tp_gap)
     return sl, tp1, tp2, tp3
 
-# ---------- update_tp_sl_live (patched to use quality OB finder) ----------
+# ---------- update_tp_sl_live ----------
 def update_tp_sl_live(sig: dict, df: pd.DataFrame):
     latest_ob = find_quality_order_block(df)
-    if not latest_ob:
-        # preserve existing if no new ob
-        return sig
+    if not latest_ob: return sig
     atr_val = float(atr(df,14).iloc[-1])
-    # use sig entry_limit if present else sig entry
     entry_for_calc = sig.get("entry_limit", sig.get("entry"))
     side = sig["side"]
     sl,tp1,tp2,tp3 = romeopt_tp_sl(entry_for_calc, side, atr_val, latest_ob, df)
-    sig["sl"]=sl; sig["tp1"]=tp1; sig["tp2"]=tp2; sig["tp3"]=tp3
-    sig["latest_ob"]=latest_ob
+    sig["sl"]=sl; sig["tp1"]=tp1; sig["tp2"]=tp2; sig["tp3"]=tp3; sig["latest_ob"]=latest_ob
     return sig
 
 # ---------------- SL CLUSTER ----------------
@@ -408,7 +311,7 @@ def deprioritized(symbol: str, threshold=3, lookback=30):
     while dq and dq[0]<cutoff: dq.popleft()
     return len(dq)>=threshold
 
-# ---------------- LOG SIGNAL (patched to store details) ----------------
+# ---------------- LOG SIGNAL ----------------
 async def log_signal(sig):
     async with db_lock:
         details_json = json.dumps(sig.get("detailed", {}), default=str)
@@ -420,6 +323,7 @@ async def log_signal(sig):
         await db_conn.commit()
 
 # ---------------- MONITOR SIGNALS ----------------
+# ... keep rest of your monitor_signals() and scan_loop() as is ...
 async def monitor_signals():
     # This coroutine checks OPEN/PENDING signals for hits and updates statuses.
     while True:
