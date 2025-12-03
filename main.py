@@ -35,7 +35,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
-TOP_N = int(os.getenv("TOP_N", 60))
+TOP_N = int(os.getenv("TOP_N", 15))
 # ALL TIMEFRAMES INCLUDING SHORT ONES
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h"]
 # Timeframe-specific minimum scores
