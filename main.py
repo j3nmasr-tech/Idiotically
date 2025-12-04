@@ -244,6 +244,7 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
     - Fixes calculation bugs
     - Ensures meaningful profit targets
     - Maintains all your elite logic
+    - Ensures tp3 is NEVER None
     """
     recent_high = df['high'].iloc[-10:].max()  # Shorter lookback for relevance
     recent_low = df['low'].iloc[-10:].min()
@@ -265,7 +266,7 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
         # Calculate TP levels with PROPER spacing
         base_tp1 = entry + (risk * 0.8)
         base_tp2 = entry + (risk * 1.5)
-        base_tp3 = entry + (risk * 2.5)
+        base_tp3 = entry + (risk * 2.5)  # ALWAYS calculate tp3
         
         # Get meaningful market structure levels
         nearest_resistance = df['high'].tail(20).max()  # Last 20 candles only
@@ -274,14 +275,14 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
         # Choose BETTER profit level (calculated vs structure)
         tp1 = min(base_tp1, nearest_resistance) if nearest_resistance > entry else base_tp1
         tp2 = min(base_tp2, major_resistance) if major_resistance > tp1 else base_tp2
-        tp3 = base_tp3  # Extended target
+        tp3 = base_tp3  # Extended target - ALWAYS has a value
         
         # ENSURE PROPER ORDERING with meaningful distances
         min_tp_gap = risk * 0.3  # Minimum 30% of risk between TPs
         
         tp1 = max(tp1, entry + (risk * 0.5))  # At least 0.5R profit
         tp2 = max(tp2, tp1 + min_tp_gap)      # Meaningful gap from TP1
-        tp3 = max(tp3, tp2 + min_tp_gap)      # Meaningful gap from TP2
+        tp3 = max(tp3, tp2 + min_tp_gap)      # Meaningful gap from TP2 - ALWAYS set
         
     else:  # SELL
         # Calculate SL using the MORE CONSERVATIVE approach
@@ -300,7 +301,7 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
         # Calculate TP levels with PROPER spacing
         base_tp1 = entry - (risk * 0.8)
         base_tp2 = entry - (risk * 1.5)
-        base_tp3 = entry - (risk * 2.5)
+        base_tp3 = entry - (risk * 2.5)  # ALWAYS calculate tp3
         
         # Get meaningful market structure levels
         nearest_support = df['low'].tail(20).min()
@@ -309,14 +310,14 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
         # Choose BETTER profit level
         tp1 = max(base_tp1, nearest_support) if nearest_support < entry else base_tp1
         tp2 = max(base_tp2, major_support) if major_support < tp1 else base_tp2
-        tp3 = base_tp3  # Extended target
+        tp3 = base_tp3  # Extended target - ALWAYS has a value
         
         # ENSURE PROPER ORDERING with meaningful distances
         min_tp_gap = risk * 0.3
         
         tp1 = min(tp1, entry - (risk * 0.5))  # At least 0.5R profit
         tp2 = min(tp2, tp1 - min_tp_gap)      # Meaningful gap from TP1
-        tp3 = min(tp3, tp2 - min_tp_gap)      # Meaningful gap from TP2
+        tp3 = min(tp3, tp2 - min_tp_gap)      # Meaningful gap from TP2 - ALWAYS set
 
     return sl, tp1, tp2, tp3
 
@@ -331,13 +332,34 @@ def find_latest_ob(df: pd.DataFrame):
 
 def update_tp_sl_live(sig: dict, df: pd.DataFrame):
     latest_ob = find_latest_ob(df)
-    if not latest_ob: return sig
-    atr_val = float(atr(df,14).iloc[-1])
+    if not latest_ob: 
+        # If no OB found, use basic TP/SL based on entry
+        entry = sig["entry"]
+        side = sig["side"]
+        atr_val = float(atr(df, 14).iloc[-1])
+        
+        if side == "BUY":
+            sig["sl"] = entry * 0.99  # 1% stop loss
+            sig["tp1"] = entry * 1.01  # 1% take profit 1
+            sig["tp2"] = entry * 1.02  # 2% take profit 2
+            sig["tp3"] = entry * 1.03  # 3% take profit 3
+        else:
+            sig["sl"] = entry * 1.01  # 1% stop loss
+            sig["tp1"] = entry * 0.99  # 1% take profit 1
+            sig["tp2"] = entry * 0.98  # 2% take profit 2
+            sig["tp3"] = entry * 0.97  # 3% take profit 3
+        sig["latest_ob"] = "basic"
+        return sig
+    
+    atr_val = float(atr(df, 14).iloc[-1])
     entry = sig["entry"]
     side = sig["side"]
-    sl,tp1,tp2,tp3 = romeopt_tp_sl(entry, side, atr_val, latest_ob, df)
-    sig["sl"]=sl; sig["tp1"]=tp1; sig["tp2"]=tp2; sig["tp3"]=tp3
-    sig["latest_ob"]=latest_ob
+    sl, tp1, tp2, tp3 = romeopt_tp_sl(entry, side, atr_val, latest_ob, df)
+    sig["sl"] = sl
+    sig["tp1"] = tp1
+    sig["tp2"] = tp2
+    sig["tp3"] = tp3  # ALWAYS set tp3
+    sig["latest_ob"] = latest_ob
     return sig
 
 # ---------------- SL CLUSTER ----------------
@@ -354,10 +376,20 @@ def deprioritized(symbol: str, threshold=3, lookback=30):
 # ---------------- LOG SIGNAL ----------------
 async def log_signal(sig):
     async with db_lock:
+        # Ensure tp3 is always a valid float (not None)
+        tp3 = sig.get("tp3")
+        if tp3 is None:
+            # Calculate a default tp3 based on entry if not set
+            entry = sig["entry"]
+            if sig["side"] == "BUY":
+                tp3 = entry * 1.03  # 3% above entry as default
+            else:
+                tp3 = entry * 0.97  # 3% below entry as default
+        
         await db_conn.execute("""
             INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score,latest_ob)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (sig["symbol"],sig["side"],sig["entry"],sig.get("sl"),sig.get("tp1"),sig.get("tp2"),sig.get("tp3"),
+        """, (sig["symbol"],sig["side"],sig["entry"],sig.get("sl"),sig.get("tp1"),sig.get("tp2"),tp3,
               datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"],str(sig.get("latest_ob",""))))
         await db_conn.commit()
 
@@ -373,6 +405,7 @@ async def monitor_signals():
                         last_price = ticker.get("last")
                         if last_price is None: continue
 
+                        # Update TP/SL levels with current market data
                         ohlcv = await fetch_ohlcv(exchange, symbol, "1m", 50)
                         if ohlcv:
                             df_live = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
@@ -383,15 +416,17 @@ async def monitor_signals():
 
                         hits=[]; sl_hit=False
                         if side=="BUY":
-                            if not tp1_hit and last_price>=tp1: hits.append("TP1"); tp1_hit=1
-                            if not tp2_hit and last_price>=tp2: hits.append("TP2"); tp2_hit=1
-                            if not tp3_hit and last_price>=tp3: hits.append("TP3"); tp3_hit=1
-                            if last_price<=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
+                            # FIXED: Add null checks for tp1, tp2, tp3
+                            if not tp1_hit and tp1 is not None and last_price>=tp1: hits.append("TP1"); tp1_hit=1
+                            if not tp2_hit and tp2 is not None and last_price>=tp2: hits.append("TP2"); tp2_hit=1
+                            if not tp3_hit and tp3 is not None and last_price>=tp3: hits.append("TP3"); tp3_hit=1
+                            if sl is not None and last_price<=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
                         else:
-                            if not tp1_hit and last_price<=tp1: hits.append("TP1"); tp1_hit=1
-                            if not tp2_hit and last_price<=tp2: hits.append("TP2"); tp2_hit=1
-                            if not tp3_hit and last_price<=tp3: hits.append("TP3"); tp3_hit=1
-                            if last_price>=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
+                            # FIXED: Add null checks for tp1, tp2, tp3
+                            if not tp1_hit and tp1 is not None and last_price<=tp1: hits.append("TP1"); tp1_hit=1
+                            if not tp2_hit and tp2 is not None and last_price<=tp2: hits.append("TP2"); tp2_hit=1
+                            if not tp3_hit and tp3 is not None and last_price<=tp3: hits.append("TP3"); tp3_hit=1
+                            if sl is not None and last_price>=sl: hits.append("SL"); status="CLOSED"; sl_hit=True
 
                         if hits:
                             await tg(f"🎯 {symbol} {side} update\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP1:{tp1} TP2:{tp2} TP3:{tp3}")
@@ -400,7 +435,8 @@ async def monitor_signals():
                         await db_conn.execute("UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?",
                                              (tp1_hit,tp2_hit,tp3_hit,status,sig_id))
                 await db_conn.commit()
-        except Exception as e: log.exception("monitor error: %s", e)
+        except Exception as e: 
+            log.exception("monitor error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
 
 # ---------------- SCAN LOOP ----------------
