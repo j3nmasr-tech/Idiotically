@@ -4,21 +4,25 @@
 """
 LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features)
 - Fully live early signals
-- RomeOPT 6-step logic (PRACTICAL VERSION with debugging)
-- RomeOPT-P TP/SL system (0.8R/1.6R, SL→BE after TP1)
+- RomeOPT 6-step logic
+- Strict TP/SL (0.8R/1.6R, SL→BE after TP1, no TP3)
+- Liquidity path filter
+- Clean traffic / range avoidance
 - Telegram alerts
-- Async SQLite logging (with detailed JSON diagnostics)
-- Filters: Score >=4, realistic conditions
-- All timeframes: 1m, 3m, 5m, 15m, 30m, 1h
+- Async SQLite logging
+- Filters: Score >=5, Displacement +2, Sweep+2 OR Zone+1, avoid counter-trend
+- Improved Order Block detection
+- Adaptive Market Regime detection
+- HTF + Sweep scoring threshold
+- Elite multi-timeframe confirmation (15m,1h,4h)
+- FIXED: Strong trend filter to avoid counter-trend losses
+- ADDED: BOS/CHOCH detection
+- ADDED: FVG detection
+- ADDED: Winner Pattern Filter (HTF_Align + BOS/CHOCH + FVG)
+- ALL ORIGINAL 6 STEPS PRESERVED
 """
 
-import os
-import time
-import asyncio
-import logging
-import datetime
-import json
-import math
+import os, time, asyncio, logging, datetime
 import aiosqlite
 import httpx
 import ccxt.async_support as ccxt
@@ -35,38 +39,28 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
-TOP_N = int(os.getenv("TOP_N", 15))
-# ALL TIMEFRAMES INCLUDING SHORT ONES
-TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m", "1h"]
-# Timeframe-specific minimum scores
-TF_MIN_SCORES = {
-    "1m": 3,    # Most lenient for 1m
-    "3m": 3,    # Lenient for 3m
-    "5m": 4,    # Standard for 5m
-    "15m": 4,   # Standard for 15m
-    "30m": 4,   # Standard for 30m
-    "1h": 5     # Strictest for 1h
-}
-DEFAULT_MIN_SCORE = 4
-CRITICAL_FACTORS_MIN = 1  # Only require 1 critical factor
+TOP_N = int(os.getenv("TOP_N", 10))
+TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
+MIN_SCORE = 5
+CRITICAL_FACTORS_MIN = 2  # HTF Alignment + Liquidity Sweep minimum
 
-# ---------------- ROMEOPT-P TP CONFIG ----------------
 # Timeframe mapping for TP scaling (RomeOPT-P logic)
 TP_TIMEFRAME_MAP = {
     "1m": "5m",    # 1m → 5m ATR (5×) - less aggressive
     "3m": "15m",   # 3m → 15m ATR (5×)
     "5m": "15m",   # 5m → 15m ATR (3×) - conservative
     "15m": "1h",   # 15m → 1h ATR (4×)
-    "30m": "1h",   # 30m → 1h ATR (2×) - minimal scaling
-    "1h": "4h"     # 1h → 4h ATR (4×)
+    "30m": "1h"    # 30m → 1h ATR (2×) - minimal scaling
 }
 
-# ---------------- LOGGING ----------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
+# ---------------- GLOBALS ----------------
 log = logging.getLogger("romeopt_bot")
 db_lock = asyncio.Lock()
 db_conn = None
-exchange = None  # Global exchange instance
+exchange = None
+
+# ---------------- LOGGING ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 
 # ---------------- TELEGRAM ----------------
 def escape_html(msg: str) -> str:
@@ -83,13 +77,35 @@ async def tg(msg: str):
         except Exception as e:
             log.warning(f"Telegram send failed: {e}")
 
+# ---------------- DATABASE MIGRATION ----------------
+async def migrate_db():
+    try:
+        cursor = await db_conn.execute("PRAGMA table_info(signals)")
+        columns = await cursor.fetchall()
+        column_names = [col[1] for col in columns]
+        
+        if 'entry_tf' not in column_names:
+            log.info("Migrating database: adding entry_tf column")
+            await db_conn.execute("ALTER TABLE signals ADD COLUMN entry_tf TEXT DEFAULT ''")
+        
+        if 'tp_tf' not in column_names:
+            log.info("Migrating database: adding tp_tf column")
+            await db_conn.execute("ALTER TABLE signals ADD COLUMN tp_tf TEXT DEFAULT ''")
+        
+        await db_conn.commit()
+        log.info("Database migration complete")
+    except Exception as e:
+        log.error(f"Migration failed: {e}")
+        await db_conn.execute("DROP TABLE IF EXISTS signals")
+        await db_conn.commit()
+
 # ---------------- DATABASE ----------------
 async def init_db():
     global db_conn
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     db_conn = await aiosqlite.connect(DB_PATH)
     await db_conn.execute("PRAGMA journal_mode=WAL;")
     await db_conn.execute("PRAGMA synchronous=NORMAL;")
+    
     await db_conn.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -99,31 +115,27 @@ async def init_db():
             sl REAL,
             tp1 REAL,
             tp2 REAL,
-            tp3 REAL,
+            entry_tf TEXT DEFAULT '',
+            tp_tf TEXT DEFAULT '',
             timestamp TEXT,
             status TEXT,
             reason TEXT,
             score INTEGER,
             tp1_hit INTEGER DEFAULT 0,
             tp2_hit INTEGER DEFAULT 0,
-            tp3_hit INTEGER DEFAULT 0,
-            latest_ob TEXT,
-            details TEXT,
-            entry_tf TEXT DEFAULT '',
-            tp_tf TEXT DEFAULT ''
+            latest_ob TEXT
         );
     """)
     await db_conn.commit()
+    await migrate_db()
 
 # ---------------- OHLCV ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
     try:
-        ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-        if ohlcv and len(ohlcv) > 0:
-            return ohlcv
+        return await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     except Exception as e:
-        log.debug(f"fetch_ohlcv failed for {symbol} {timeframe}: {e}")
-    return None
+        log.debug("fetch_ohlcv failed for %s %s: %s", symbol, timeframe, e)
+        return None
 
 # ---------------- INDICATORS ----------------
 def atr(df: pd.DataFrame, period=14):
@@ -135,257 +147,89 @@ def atr(df: pd.DataFrame, period=14):
     }).max(axis=1)
     return tr.rolling(period, min_periods=1).mean()
 
-# ---------------- MULTI-TIMEFRAME ALIGNMENT (PRACTICAL) ----------------
-async def elite_tf_alignment(exchange, symbol: str, side: str):
-    """
-    More practical: Require only 2/3 higher timeframes to align
-    """
-    tfs = ["15m", "1h", "4h"]
-    alignments = 0
-    total_checked = 0
-    
-    for tf in tfs:
-        try:
-            ohlcv = await fetch_ohlcv(exchange, symbol, tf, 50)
-            if not ohlcv or len(ohlcv) < 10:
-                continue
-                
-            df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-            for col in ["open","high","low","close","vol"]:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
-            
-            # Simple trend detection
-            if len(df) >= 10:
-                current_price = df["close"].iloc[-1]
-                ma20 = df["close"].rolling(20).mean().iloc[-1]
-                
-                if side == "BUY":
-                    if current_price > ma20:
-                        alignments += 1
-                else:  # SELL
-                    if current_price < ma20:
-                        alignments += 1
-                
-                total_checked += 1
-                
-        except Exception as e:
-            log.debug(f"elite_tf_alignment error for {symbol} {tf}: {e}")
-            continue
-    
-    # Require at least 2/3 alignments if we checked all, otherwise be lenient
-    if total_checked >= 2:
-        return alignments >= max(2, total_checked * 0.6)
-    return True  # Be lenient if we can't check enough timeframes
+def calculate_ema(df, period):
+    return df['close'].ewm(span=period, adjust=False).mean()
 
-# ---------------- BOS/CHOCH DETECTION (PRACTICAL) ----------------
-def detect_bos_choch(df: pd.DataFrame, swing_lookback=15):
-    """
-    More practical BOS/CHOCH detection
-    """
-    res = {"has_bos": False, "bos_side": None, "has_choch": False, "choch_info": None}
+# ---------------- STRONG TREND DETECTION ----------------
+async def check_strong_counter_trend(exchange, symbol: str, timeframe: str, signal_side: str):
+    trend_check_map = {
+        "1m": "15m", "3m": "30m", "5m": "1h", "15m": "4h", "30m": "4h"
+    }
     
-    if len(df) < swing_lookback:
-        return res
-    
-    # Calculate recent swing highs/lows
-    tail = df.tail(swing_lookback)
-    recent_high = tail['high'].max()
-    recent_low = tail['low'].min()
-    last_close = df['close'].iloc[-1]
-    prev_close = df['close'].iloc[-2] if len(df) >= 2 else last_close
-    
-    # Calculate dynamic threshold (1% of range)
-    price_range = recent_high - recent_low
-    if price_range > 0:
-        threshold = price_range * 0.01
-    else:
-        threshold = recent_high * 0.001  # Fallback
-    
-    # BOS Detection (more lenient)
-    if last_close > recent_high - threshold and last_close > prev_close:
-        res["has_bos"] = True
-        res["bos_side"] = "BUY"
-    elif last_close < recent_low + threshold and last_close < prev_close:
-        res["has_bos"] = True
-        res["bos_side"] = "SELL"
-    
-    # CHOCH Detection (EMA crossover)
-    try:
-        ema20 = df['close'].ewm(span=20, min_periods=1).mean()
-        ema50 = df['close'].ewm(span=50, min_periods=1).mean()
+    check_tf = trend_check_map.get(timeframe, "15m")
+    ohlcv = await fetch_ohlcv(exchange, symbol, check_tf, 50)
+    if not ohlcv: return False
         
-        if len(df) >= 10:
-            ema20_now = ema20.iloc[-1]
-            ema50_now = ema50.iloc[-1]
-            ema20_prev = ema20.iloc[-3]
-            ema50_prev = ema50.iloc[-3]
-            
-            # Check for crossover
-            if (ema20_now > ema50_now and ema20_prev <= ema50_prev) or \
-               (ema20_now < ema50_now and ema20_prev >= ema50_prev):
-                res["has_choch"] = True
-                res["choch_info"] = {
-                    "ema20": float(ema20_now),
-                    "ema50": float(ema50_now),
-                    "trend": "BULL" if ema20_now > ema50_now else "BEAR"
-                }
-    except Exception:
-        pass
+    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+    for c in ["open","high","low","close","vol"]: 
+        df[c] = pd.to_numeric(df[c], errors="coerce")
     
-    # If no clear side from BOS, use CHOCH
-    if res["bos_side"] is None and res["has_choch"] and res["choch_info"]:
-        res["bos_side"] = "BUY" if res["choch_info"]["trend"] == "BULL" else "SELL"
+    df['ema20'] = calculate_ema(df, 20)
+    recent = df.iloc[-10:]
+    above_ema = (recent['close'] > recent['ema20']).sum()
+    below_ema = (recent['close'] < recent['ema20']).sum()
     
-    return res
-
-# ---------------- VOLUME SPIKE (PRACTICAL) ----------------
-def vol_spike(df: pd.DataFrame, idx=-1, factor=1.3, lookback=20):
-    """
-    More lenient volume spike detection
-    """
-    if len(df) < lookback:
-        return True  # Not enough data, don't reject
-        
-    try:
-        vol_series = df['vol'].tail(lookback)
-        if vol_series.isnull().all():
-            return True
-            
-        vol_avg = vol_series.mean()
-        current_vol = float(df['vol'].iloc[idx])
-        
-        # Allow if volume is above average or if it's significantly higher than recent low
-        if vol_avg > 0:
-            return current_vol > vol_avg * factor
+    recent_trend = []
+    for i in range(len(recent)-1):
+        if recent['close'].iloc[i+1] > recent['close'].iloc[i]:
+            recent_trend.append(1)
         else:
-            # Check if volume is increasing
-            if len(df) >= 3:
-                prev_vol = float(df['vol'].iloc[idx-1])
-                return current_vol > prev_vol * 1.2
-    except Exception:
-        pass
+            recent_trend.append(-1)
     
-    return True  # Don't reject on error
+    if len(recent_trend) >= 5:
+        last_5 = recent_trend[-5:]
+        if all(x > 0 for x in last_5):
+            if signal_side == "SELL":
+                log.info(f"🚫 {symbol} {timeframe} {signal_side} rejected: Strong {check_tf} UPTREND")
+                return True
+        elif all(x < 0 for x in last_5):
+            if signal_side == "BUY":
+                log.info(f"🚫 {symbol} {timeframe} {signal_side} rejected: Strong {check_tf} DOWNTREND")
+                return True
+    
+    current_atr = float(atr(df, 14).iloc[-1])
+    ema_distance = abs(df['close'].iloc[-1] - df['ema20'].iloc[-1])
+    
+    if current_atr > 0:
+        distance_in_atr = ema_distance / current_atr
+        if distance_in_atr > 2.0:
+            if signal_side == "BUY" and df['close'].iloc[-1] < df['ema20'].iloc[-1]:
+                log.info(f"🚫 {symbol} {timeframe} {signal_side} rejected: Price >2 ATR below {check_tf} EMA")
+                return True
+            elif signal_side == "SELL" and df['close'].iloc[-1] > df['ema20'].iloc[-1]:
+                log.info(f"🚫 {symbol} {timeframe} {signal_side} rejected: Price >2 ATR above {check_tf} EMA")
+                return True
+    
+    return False
 
-# ---------------- FVG DETECTION (PRACTICAL) ----------------
-def find_fvgs(df: pd.DataFrame, lookback=100):
-    """
-    Find Fair Value Gaps with more practical approach
-    """
-    fvgs = []
-    n = len(df)
-    if n < 10:
-        return fvgs
-    
-    # Check last 50 candles for FVGs
-    start_idx = max(0, n - min(lookback, n))
-    
-    for i in range(start_idx, n-2):
-        if i+2 >= n:
-            break
-            
-        c0 = df.iloc[i]    # First candle
-        c1 = df.iloc[i+1]  # Gap candle
-        c2 = df.iloc[i+2]  # Confirmation candle
-        
-        # Bullish FVG: c2 high < c0 low (gap up)
-        if c2['high'] < c0['low']:
-            # Verify it's not just a small gap
-            gap_size = abs(c0['low'] - c2['high'])
-            if gap_size > (c0['high'] - c0['low']) * 0.1:  # At least 10% of candle size
-                fvgs.append({
-                    "type": "bullish",
-                    "low": float(c2['high']),
-                    "high": float(c0['low']),
-                    "idx": i,
-                    "size": float(gap_size)
-                })
-        
-        # Bearish FVG: c2 low > c0 high (gap down)
-        elif c2['low'] > c0['high']:
-            gap_size = abs(c2['low'] - c0['high'])
-            if gap_size > (c0['high'] - c0['low']) * 0.1:
-                fvgs.append({
-                    "type": "bearish",
-                    "low": float(c0['high']),
-                    "high": float(c2['low']),
-                    "idx": i,
-                    "size": float(gap_size)
-                })
-    
-    # Return only recent FVGs (last 20)
-    return sorted(fvgs, key=lambda x: x['idx'], reverse=True)[:20]
+# ---------------- MARKET REGIME ----------------
+async def detect_market_regime(df: pd.DataFrame):
+    ma_htf = df["close"].rolling(50).mean().iloc[-1]
+    price = df["close"].iloc[-1]
+    recent_high = df["high"].iloc[-20:].max()
+    recent_low = df["low"].iloc[-20:].min()
+    range_pct = (recent_high - recent_low) / max(1e-8, recent_low)
+    if price > ma_htf and range_pct > 0.02: return "BULL"
+    elif price < ma_htf and range_pct > 0.02: return "BEAR"
+    else: return "RANGE"
 
-# ---------------- ORDER BLOCK DETECTION (PRACTICAL) ----------------
-def find_quality_order_block(df: pd.DataFrame, lookback=50):
-    """
-    Find quality order blocks with more practical approach
-    """
-    n = len(df)
-    if n < 10:
-        return None
-    
-    # Start from recent candles
-    for i in range(n-3, max(1, n - lookback), -1):
-        if i < 1 or i+1 >= n:
-            continue
-            
-        candle = df.iloc[i]
-        prev_candle = df.iloc[i-1]
-        
-        # Calculate candle properties
-        candle_body = abs(candle['close'] - candle['open'])
-        candle_range = candle['high'] - candle['low']
-        
-        if candle_range <= 0:
-            continue
-            
-        body_ratio = candle_body / candle_range
-        
-        # Bullish Order Block: Strong bear candle followed by bullish reaction
-        if (prev_candle['close'] < prev_candle['open'] and  # Prev was bearish
-            candle['close'] > candle['open'] and             # Current is bullish
-            body_ratio > 0.3 and                             # Has decent body
-            candle['low'] <= prev_candle['low']):            # Takes out previous low
-            
-            # Check if next candle confirms (price moves up)
-            if i+1 < n:
-                next_candle = df.iloc[i+1]
-                if next_candle['close'] > candle['close']:
-                    return {
-                        "type": "bullish",
-                        "low": float(min(candle['low'], prev_candle['low'])),
-                        "high": float(max(candle['close'], prev_candle['close'])),
-                        "idx": i,
-                        "strength": float(body_ratio)
-                    }
-        
-        # Bearish Order Block: Strong bull candle followed by bearish reaction
-        elif (prev_candle['close'] > prev_candle['open'] and  # Prev was bullish
-              candle['close'] < candle['open'] and             # Current is bearish
-              body_ratio > 0.3 and                             # Has decent body
-              candle['high'] >= prev_candle['high']):          # Takes out previous high
-            
-            # Check if next candle confirms (price moves down)
-            if i+1 < n:
-                next_candle = df.iloc[i+1]
-                if next_candle['close'] < candle['close']:
-                    return {
-                        "type": "bearish",
-                        "low": float(min(candle['close'], prev_candle['close'])),
-                        "high": float(max(candle['high'], prev_candle['high'])),
-                        "idx": i,
-                        "strength": float(body_ratio)
-                    }
-    
-    return None
+# ---------------- MULTI-TIMEFRAME ELITE CONFIRM ----------------
+async def elite_tf_alignment(exchange, symbol: str, side: str):
+    tfs = ["15m","1h","4h"]
+    for tf in tfs:
+        ohlcv = await fetch_ohlcv(exchange, symbol, tf, 50)
+        if not ohlcv: return False
+        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+        df['ema20'] = calculate_ema(df, 20)
+        current_slope = df['ema20'].iloc[-1] - df['ema20'].iloc[-3]
+        trend_side = "BUY" if current_slope > 0 else "SELL"
+        if trend_side != side:
+            log.debug(f"Elite alignment failed: {tf} trend {trend_side} vs signal {side}")
+            return False
+    return True
 
-# ---------------- SIMPLE ORDER BLOCK DETECTION (RomeOPT version) ----------------
+# ---------------- ORDER BLOCK DETECTION ----------------
 def find_latest_ob(df: pd.DataFrame):
-    """
-    Simple Order Block detection for RomeOPT TP/SL
-    Returns: {"type": "bullish"/"bearish", "low": price, "high": price}
-    """
     for i in range(len(df)-5, len(df)-1):
         candle, prev_candle = df.iloc[i], df.iloc[i-1]
         if candle["close"]>candle["open"] and prev_candle["close"]<prev_candle["open"]:
@@ -394,748 +238,402 @@ def find_latest_ob(df: pd.DataFrame):
             return {"type":"bearish","low":candle["close"],"high":max(candle["high"], prev_candle["high"])}
     return None
 
+# ---------------- BOS/CHOCH DETECTION ----------------
+def detect_bos_choch(df: pd.DataFrame, swing_lookback=15):
+    res = {"has_bos": False, "bos_side": None, "has_choch": False}
+    if len(df) < swing_lookback: return res
+    
+    tail = df.tail(swing_lookback)
+    recent_high = tail['high'].max()
+    recent_low = tail['low'].min()
+    last_close = df['close'].iloc[-1]
+    prev_close = df['close'].iloc[-2] if len(df) >= 2 else last_close
+    
+    price_range = recent_high - recent_low
+    if price_range > 0: threshold = price_range * 0.01
+    else: threshold = recent_high * 0.001
+    
+    if last_close > recent_high - threshold and last_close > prev_close:
+        res["has_bos"] = True
+        res["bos_side"] = "BUY"
+    elif last_close < recent_low + threshold and last_close < prev_close:
+        res["has_bos"] = True
+        res["bos_side"] = "SELL"
+    
+    try:
+        ema20 = df['close'].ewm(span=20, min_periods=1).mean()
+        ema50 = df['close'].ewm(span=50, min_periods=1).mean()
+        if len(df) >= 10:
+            ema20_now = ema20.iloc[-1]
+            ema50_now = ema50.iloc[-1]
+            ema20_prev = ema20.iloc[-3]
+            ema50_prev = ema50.iloc[-3]
+            if (ema20_now > ema50_now and ema20_prev <= ema50_prev) or \
+               (ema20_now < ema50_now and ema20_prev >= ema50_prev):
+                res["has_choch"] = True
+    except: pass
+    return res
+
+# ---------------- FVG DETECTION ----------------
+def find_fvgs(df: pd.DataFrame, lookback=100):
+    fvgs = []
+    n = len(df)
+    if n < 10: return fvgs
+    start_idx = max(0, n - min(lookback, n))
+    for i in range(start_idx, n-2):
+        if i+2 >= n: break
+        c0, c1, c2 = df.iloc[i], df.iloc[i+1], df.iloc[i+2]
+        if c2['high'] < c0['low']:
+            gap_size = abs(c0['low'] - c2['high'])
+            if gap_size > (c0['high'] - c0['low']) * 0.1:
+                fvgs.append({"type": "bullish", "low": float(c2['high']), "high": float(c0['low']), "idx": i, "size": float(gap_size)})
+        elif c2['low'] > c0['high']:
+            gap_size = abs(c2['low'] - c0['high'])
+            if gap_size > (c0['high'] - c0['low']) * 0.1:
+                fvgs.append({"type": "bearish", "low": float(c0['high']), "high": float(c2['low']), "idx": i, "size": float(gap_size)})
+    return sorted(fvgs, key=lambda x: x['idx'], reverse=True)[:20]
+
 # ===== WINNER PATTERN FILTER =====
 def filter_winner_patterns(signal: dict) -> tuple:
-    """
-    Filter signals based on winner patterns analysis
-    Returns: (should_reject, rejection_reason)
-    
-    Criteria from analysis:
-    1. HTF_Align present (91% of winners had this)
-    2. Either BOS or CHOCH (not both missing)
-    3. FVG almost always present (98% of winners)
-    """
     reason_list = signal.get("reason_list", [])
-    if not reason_list:
-        return True, "No breakdown data"
-    
-    # Criterion 1: HTF_Align must be present
-    has_htf_align = "HTF_Align" in reason_list
-    
-    # Criterion 2: Either BOS or CHOCH must be present (not both missing)
-    has_bos = "BOS" in reason_list
-    has_choch = "CHOCH" in reason_list
-    
-    # Criterion 3: FVG must be present
-    has_fvg = "FVG" in reason_list
-    
-    # Check all criteria
-    if not has_htf_align:
-        return True, "Missing HTF_Alignment"
-    
-    if not has_bos and not has_choch:
-        return True, "Missing both BOS and CHOCH"
-    
-    if not has_fvg:
-        return True, "Missing FVG"
-    
-    return False, ""  # Signal passes all filters
+    if not reason_list: return True, "No breakdown data"
+    has_htf_align = any("HTF Alignment +1" in reason for reason in reason_list)
+    has_bos = signal.get("has_bos", False)
+    has_choch = signal.get("has_choch", False)
+    has_fvg = signal.get("has_fvg", False)
+    if not has_htf_align: return True, "Missing HTF_Alignment"
+    if not has_bos and not has_choch: return True, "Missing both BOS and CHOCH"
+    if not has_fvg: return True, "Missing FVG"
+    return False, ""
 # ===========================================
 
-# ---------------- MARKET STRUCTURE SHIFT (PRACTICAL) ----------------
-def confirm_market_structure_shift(df: pd.DataFrame, side: str):
-    """
-    More practical market structure shift detection
-    """
-    if len(df) < 15:
-        return True  # Not enough data, don't reject
-        
-    # Simple structure detection using swing points
-    highs = df['high'].values
-    lows = df['low'].values
-    
-    # Find local highs and lows (simplified)
-    local_highs = []
-    local_lows = []
-    
-    for i in range(2, len(df)-2):
-        if highs[i] >= highs[i-2] and highs[i] >= highs[i-1] and highs[i] >= highs[i+1] and highs[i] >= highs[i+2]:
-            local_highs.append((i, highs[i]))
-        if lows[i] <= lows[i-2] and lows[i] <= lows[i-1] and lows[i] <= lows[i+1] and lows[i] <= lows[i+2]:
-            local_lows.append((i, lows[i]))
-    
-    # Check last 3 swing points
-    if len(local_highs) >= 3 and len(local_lows) >= 3:
-        recent_highs = sorted(local_highs[-3:], key=lambda x: x[0])
-        recent_lows = sorted(local_lows[-3:], key=lambda x: x[0])
-        
-        if side == "BUY":
-            # Check for higher lows
-            if recent_lows[-1][1] > recent_lows[-2][1]:
-                return True
-        else:  # SELL
-            # Check for lower highs
-            if recent_highs[-1][1] < recent_highs[-2][1]:
-                return True
-    
-    return True  # Default to True if can't determine
-
-# ---------------- ROMEOPT-P TP/SL CALCULATION ----------------
+# ---------------- TP/SL CALCULATION ----------------
 async def romeoptp_tp_sl(exchange, entry: float, side: str, entry_tf: str, ob_zone: dict, symbol: str):
-    """
-    RomeOPT-P Logic:
-    - SL based on entry timeframe OB (tight)
-    - TP scaled to higher timeframe ATR (meaningful)
-    - TP1 = 0.8R, TP2 = 1.6R (NO TP3 in RomeOPT)
-    """
-    if not ob_zone:
-        return None, None, None, None, entry_tf
-    
-    # Get ATR from higher timeframe for TP scaling
+    if not ob_zone: return None, None, None, entry_tf
     tp_tf = TP_TIMEFRAME_MAP.get(entry_tf, "15m")
     htf_ohlcv = await fetch_ohlcv(exchange, symbol, tp_tf, 100)
-    
     if not htf_ohlcv:
-        # Fallback to entry timeframe if HTF fails
         htf_ohlcv = await fetch_ohlcv(exchange, symbol, entry_tf, 100)
         tp_tf = entry_tf
-    
-    if not htf_ohlcv:
-        return None, None, None, None, tp_tf
+    if not htf_ohlcv: return None, None, None, tp_tf
     
     df_htf = pd.DataFrame(htf_ohlcv, columns=["ts","open","high","low","close","vol"])
-    for c in ["open","high","low","close","vol"]: 
-        df_htf[c] = pd.to_numeric(df_htf[c], errors="coerce")
-    
-    # Calculate ATR from higher timeframe
+    for c in ["open","high","low","close","vol"]: df_htf[c] = pd.to_numeric(df_htf[c], errors="coerce")
     atr_val = float(atr(df_htf, 14).iloc[-1])
     
-    # Calculate SL based on entry timeframe OB (tight)
     if side == "BUY":
-        # SL just below bullish OB low
-        sl = ob_zone['low'] - (atr_val * 0.1)  # Very tight (0.1 × HTF ATR)
+        sl = ob_zone['low'] - (atr_val * 0.1)
         risk = entry - sl
-        # TP scaled to HTF ATR - RomeOPT: 0.8R and 1.6R (NO TP3)
-        tp1 = entry + (risk * 0.8)  # 0.8R
-        tp2 = entry + (risk * 1.6)  # 1.6R
-        tp3 = None  # RomeOPT doesn't use TP3
-    else:  # SELL
-        # SL just above bearish OB high  
-        sl = ob_zone['high'] + (atr_val * 0.1)  # Very tight (0.1 × HTF ATR)
+        tp1 = entry + (risk * 0.8)
+        tp2 = entry + (risk * 1.6)
+    else:
+        sl = ob_zone['high'] + (atr_val * 0.1)
         risk = sl - entry
-        # TP scaled to HTF ATR - RomeOPT: 0.8R and 1.6R (NO TP3)
-        tp1 = entry - (risk * 0.8)  # 0.8R
-        tp2 = entry - (risk * 1.6)  # 1.6R
-        tp3 = None  # RomeOPT doesn't use TP3
-    
-    return sl, tp1, tp2, tp3, tp_tf
+        tp1 = entry - (risk * 0.8)
+        tp2 = entry - (risk * 1.6)
+    return sl, tp1, tp2, tp_tf
 
-# ---------------- UPDATE SIGNAL TP/SL (RomeOPT version) ----------------
-async def update_tp_sl_live_romeopt(sig: dict):
-    """Update TP/SL with current market data using RomeOPT logic"""
+# ---------------- UPDATE SIGNAL TP/SL ----------------
+async def update_tp_sl_live(sig: dict):
     global exchange
-    
-    if 'entry_tf' not in sig or 'symbol' not in sig or 'side' not in sig:
-        return sig
-    
-    # Fetch current OB from entry timeframe
+    if 'entry_tf' not in sig or 'symbol' not in sig or 'side' not in sig: return sig
     entry_tf_ohlcv = await fetch_ohlcv(exchange, sig["symbol"], sig["entry_tf"], 50)
-    if not entry_tf_ohlcv:
-        return sig
-    
+    if not entry_tf_ohlcv: return sig
     df_entry = pd.DataFrame(entry_tf_ohlcv, columns=["ts","open","high","low","close","vol"])
-    for c in ["open","high","low","close","vol"]: 
-        df_entry[c] = pd.to_numeric(df_entry[c], errors="coerce")
-    
+    for c in ["open","high","low","close","vol"]: df_entry[c] = pd.to_numeric(df_entry[c], errors="coerce")
     latest_ob = find_latest_ob(df_entry)
-    if not latest_ob:
-        return sig
-    
-    # Recalculate TP/SL with current data using RomeOPT logic
-    sl, tp1, tp2, tp3, tp_tf = await romeoptp_tp_sl(
-        exchange, sig["entry"], sig["side"], sig["entry_tf"], latest_ob, sig["symbol"]
-    )
-    
+    if not latest_ob: return sig
+    sl, tp1, tp2, tp_tf = await romeoptp_tp_sl(exchange, sig["entry"], sig["side"], sig["entry_tf"], latest_ob, sig["symbol"])
     if sl is not None and tp1 is not None and tp2 is not None:
-        sig["sl"] = sl
-        sig["tp1"] = tp1
-        sig["tp2"] = tp2
-        sig["tp3"] = tp3  # Will be None for RomeOPT
-        sig["tp_tf"] = tp_tf
-        sig["latest_ob"] = latest_ob
-    
+        sig["sl"] = sl; sig["tp1"] = tp1; sig["tp2"] = tp2; sig["tp_tf"] = tp_tf; sig["latest_ob"] = latest_ob
     return sig
 
-# ---------------- SIGNAL GENERATION (PRACTICAL) ----------------
+# ---------------- IMPROVED HTF ALIGNMENT DETECTION ----------------
+async def get_htf_trend(exchange, symbol: str, timeframe: str):
+    ohlcv = await fetch_ohlcv(exchange, symbol, timeframe, 50)
+    if not ohlcv: return "neutral"
+    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+    for c in ["open","high","low","close","vol"]: df[c] = pd.to_numeric(df[c], errors="coerce")
+    df['ema20'] = calculate_ema(df, 20)
+    ema_slope = df['ema20'].iloc[-1] - df['ema20'].iloc[-3]
+    recent_closes = df['close'].iloc[-6:]
+    direction_sum = 0
+    for i in range(1, len(recent_closes)):
+        if recent_closes.iloc[i] > recent_closes.iloc[i-1]: direction_sum += 1
+        else: direction_sum -= 1
+    above_ema = df['close'].iloc[-1] > df['ema20'].iloc[-1]
+    if ema_slope > 0 and direction_sum >= 2 and above_ema: return "bullish"
+    elif ema_slope < 0 and direction_sum <= -2 and not above_ema: return "bearish"
+    else: return "neutral"
+
+# ---------------- ROMEOPT SIGNAL GENERATOR ----------------
 async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
-    """
-    Main function to generate a RomeOPT signal with practical validation
-    """
-    # Timeframe-specific adjustments
-    min_data_required = {
-        "1m": 100,   # Need more candles for 1m
-        "3m": 80,    # Need fewer for 3m
-        "5m": 70,    # Even fewer for 5m
-        "15m": 60,   # Standard for 15m
-        "30m": 50,   # Standard for 30m
-        "1h": 40     # Standard for 1h
-    }.get(tf, 50)
-    
-    min_score_required = TF_MIN_SCORES.get(tf, DEFAULT_MIN_SCORE)
-    
-    if df is None or len(df) < min_data_required:
-        log.debug(f"{symbol} {tf}: Insufficient data ({len(df) if df else 0} candles, need {min_data_required})")
-        return None
-    
-    # Log data quality
-    log.debug(f"{symbol} {tf}: Checking with {len(df)} candles, latest price: {df['close'].iloc[-1]}")
-    
-    # Step 1: Detect BOS/CHOCH (relaxed)
-    ms_shift = detect_bos_choch(df)
-    if not ms_shift["has_bos"] and not ms_shift["has_choch"]:
-        log.debug(f"{symbol} {tf}: No BOS/CHOCH detected")
-        return None
-    
-    side = ms_shift["bos_side"]
-    if side is None:
-        log.debug(f"{symbol} {tf}: Could not determine side from BOS/CHOCH")
-        return None
-    
-    log.debug(f"{symbol} {tf}: Side determined as {side} from BOS/CHOCH")
-    
-    # Step 2: Volume spike (more lenient for shorter timeframes)
-    vol_factor = 1.2 if tf in ["1m", "3m"] else 1.3  # More lenient for 1m/3m
-    vol_ok = vol_spike(df, factor=vol_factor)
-    if not vol_ok:
-        log.debug(f"{symbol} {tf}: Volume spike check failed")
-        # Don't return None, just note it
-    
-    # Step 3: Find FVGs (adjust lookback for shorter timeframes)
-    fvg_lookback = 150 if tf in ["1m", "3m"] else 100  # More candles for shorter TFs
-    fvgs = find_fvgs(df, lookback=fvg_lookback)
-    if not fvgs:
-        log.debug(f"{symbol} {tf}: No FVGs found")
-        # Don't return None, FVG is nice-to-have
-    
-    # Step 4: Quality OB (important but not mandatory)
-    ob_zone = find_quality_order_block(df)
-    if not ob_zone:
-        log.debug(f"{symbol} {tf}: No quality OB found")
-        # Don't return None, continue
-    
-    # Step 5: Market structure shift (lenient)
-    mss_ok = confirm_market_structure_shift(df, side)
-    if not mss_ok:
-        log.debug(f"{symbol} {tf}: Market structure shift not confirmed")
-        # Don't return None, continue
-    
-    # Step 6: Higher timeframe alignment (more lenient for shorter timeframes)
-    elite_ok = await elite_tf_alignment(exchange, symbol, side)
-    if not elite_ok:
-        log.debug(f"{symbol} {tf}: Higher timeframe alignment failed")
-        # Don't return None, continue
-    
-    # Entry price
-    entry = df["close"].iloc[-1]
-    
-    # Get TP/SL levels using ROMEOPT-P logic
-    sl, tp1, tp2, tp3, tp_tf = await romeoptp_tp_sl(exchange, entry, side, tf, ob_zone, symbol)
-    
-    if sl is None or tp1 is None or tp2 is None:
-        log.debug(f"{symbol} {tf}: RomeOPT TP/SL calculation failed")
-        return None
-    
-    # Score calculation (more balanced)
+    if df is None or len(df) < 20: return None
+    last = df.iloc[-1]
+    prev5 = df.iloc[-6:-1]
     score = 0
-    if ms_shift["has_bos"]: score += 2
-    if ms_shift["has_choch"]: score += 1
-    if vol_ok: score += 1
-    if elite_ok: score += 2
-    if fvgs: score += 1
-    if mss_ok: score += 1
-    if ob_zone: score += 2
+    reasons = []
     
-    # Additional points for strong signals
-    # Strong volume spike
-    if vol_ok and vol_spike(df, factor=2.0):  # Very high volume
-        score += 1
+    ms_shift = detect_bos_choch(df)
+    has_bos = ms_shift["has_bos"]
+    has_choch = ms_shift["has_choch"]
+    bos_side = ms_shift["bos_side"]
+    fvgs = find_fvgs(df)
+    has_fvg = len(fvgs) > 0
     
-    # Strong order block
-    if ob_zone and ob_zone.get("strength", 0) > 0.5:
-        score += 1
+    # Step1: Liquidity Sweep
+    sweep_high = last["high"] > prev5["high"].max()
+    sweep_low = last["low"] < prev5["low"].min()
+    has_sweep = sweep_high or sweep_low
+    liquidity_sweep = 2 if has_sweep else 0
+    score += liquidity_sweep
+    reasons.append(f"Liquidity Sweep +{liquidity_sweep}")
     
-    # Multiple FVGs
-    if fvgs and len(fvgs) >= 2:
-        score += 1
+    # Step2: Displacement
+    displacement = abs(last["close"]-last["open"])/(last["high"]-last["low"]+1e-8)
+    has_disp = displacement > 0.6
+    if has_disp: 
+        score += 2
+        reasons.append("Displacement +2")
+    else: 
+        reasons.append("Displacement +0")
     
-    # Minimum score check (timeframe-specific)
-    if score < min_score_required:
-        log.debug(f"{symbol} {tf}: Score {score} below minimum {min_score_required} for {tf}")
+    # Step3&4: OB detection
+    ob_zone = find_latest_ob(df)
+    if not ob_zone: 
+        reasons.append("No OB detected")
         return None
     
-    # Create signal
-    signal = {
-        "symbol": symbol,
-        "side": side,
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,  # Will be None for RomeOPT
-        "score": score,
-        "entry_tf": tf,
-        "tp_tf": tp_tf,
-        "reason": f"RomeOPT-P signal on {tf}",
-        "detailed": {
-            "timeframe": tf,
-            "bos": ms_shift.get("has_bos", False),
-            "choch": ms_shift.get("has_choch", False),
-            "fvgs": len(fvgs) if fvgs else 0,
-            "ob_zone": bool(ob_zone),
-            "elite_ok": elite_ok,
-            "vol_ok": vol_ok,
-            "mss_ok": mss_ok,
-            "risk_reward": round((tp1 - entry) / (entry - sl), 2) if side == "BUY" else round((entry - tp1) / (sl - entry), 2)
-        },
-        "reason_list": [],
-        "ob_zone": ob_zone
+    # ZONE APPROACH (+1 point) - ORIGINAL STEP
+    ob_type = ob_zone['type']
+    side = "BUY" if ob_type == "bullish" else "SELL"
+    
+    if ob_zone:
+        if ob_type == "bullish" and last["close"] <= ob_zone["high"]: 
+            score += 1
+            reasons.append("Zone Approach +1")
+        elif ob_type == "bearish" and last["close"] >= ob_zone["low"]: 
+            score += 1
+            reasons.append("Zone Approach +1")
+        else: 
+            reasons.append("Zone Approach +0")
+    else:
+        reasons.append("Zone Approach +0")
+    
+    # Check strong counter-trend
+    should_reject = await check_strong_counter_trend(exchange, symbol, tf, side)
+    if should_reject:
+        reasons.append(f"Strong HTF trend against {side} → Rejected")
+        return None
+    
+    # HTF Alignment
+    tf_map = {"1m":"15m", "3m":"30m", "5m":"1h", "15m":"4h", "30m":"1h"}
+    htf = tf_map.get(tf, "15m")
+    htf_trend = await get_htf_trend(exchange, symbol, htf)
+    htf_alignment = 0
+    
+    if htf_trend != "neutral":
+        htf_dir = "bullish" if htf_trend == "bullish" else "bearish"
+        if htf_dir == ob_zone['type']: 
+            htf_alignment = 1
+            score += 1
+            reasons.append(f"HTF Alignment +1 ({htf}: {htf_trend})")
+        else:
+            reasons.append(f"HTF Misalignment ({htf}: {htf_trend})")
+    else:
+        reasons.append(f"HTF Neutral ({htf})")
+    
+    # BOS/CHOCH/FVG status
+    if has_bos: reasons.append("BOS✅")
+    else: reasons.append("BOS❌")
+    if has_choch: reasons.append("CHOCH✅")
+    else: reasons.append("CHOCH❌")
+    if has_fvg: reasons.append("FVG✅")
+    else: reasons.append("FVG❌")
+    
+    # ELITE MTF ALIGNMENT - ORIGINAL STEP
+    elite_alignment = await elite_tf_alignment(exchange, symbol, side)
+    if elite_alignment: reasons.append("Elite MTF Alignment ✅")
+    else: reasons.append("Elite MTF Alignment ❌")
+    
+    # Critical filters
+    if score < MIN_SCORE: 
+        reasons.append(f"Score {score} < {MIN_SCORE}")
+        return None
+    if not has_disp: 
+        reasons.append("No displacement")
+        return None
+
+    # Momentum
+    momentum_ratio = abs(last["close"]-last["open"])/(last["high"]-last["low"]+1e-8)
+    if momentum_ratio < 0.5: 
+        reasons.append("Momentum Failed")
+        return None
+
+    # TP/SL calculation
+    sl, tp1, tp2, tp_tf = await romeoptp_tp_sl(exchange, float(last["close"]), side, tf, ob_zone, symbol)
+    if sl is None or tp1 is None or tp2 is None:
+        reasons.append("TP/SL calc failed")
+        return None
+    
+    sig = {
+        "symbol": symbol, "side": side, "entry": float(last["close"]), "sl": sl, "tp1": tp1, "tp2": tp2,
+        "entry_tf": tf, "tp_tf": tp_tf, "score": int(score), "reason": "RomeOPT-P 6-Step",
+        "reason_list": reasons, "ob_zone": ob_zone, "has_bos": has_bos, "has_choch": has_choch,
+        "has_fvg": has_fvg, "bos_side": bos_side
     }
-    
-    # Build reason list
-    if ms_shift["has_bos"]: signal["reason_list"].append("BOS")
-    if ms_shift["has_choch"]: signal["reason_list"].append("CHOCH")
-    if vol_ok: signal["reason_list"].append("Volume")
-    if fvgs: signal["reason_list"].append("FVG")
-    if ob_zone: signal["reason_list"].append("OB")
-    if mss_ok: signal["reason_list"].append("MSS")
-    if elite_ok: signal["reason_list"].append("HTF_Align")
-    
-    # ===== WINNER PATTERN FILTER =====
-    should_reject, reject_reason = filter_winner_patterns(signal)
+
+    # Winner Pattern Filter
+    should_reject, reject_reason = filter_winner_patterns(sig)
     if should_reject:
         log.debug(f"❌ Winner pattern filter REJECTED {symbol} {side} on {tf}: {reject_reason}")
         return None
-    
-    # Add filter info to reason list
-    signal["reason_list"].append("WinnerFilter✅")
-    # ==================================
-    
-    log.info(f"✓ {symbol} {tf}: Generated {side} signal with score {score}")
-    return signal
+    sig["reason_list"].append("WinnerFilter✅")
 
-# ---------------- LOG SIGNAL ----------------
+    # Liquidity path filter
+    if side == "BUY" and any(df['high'].iloc[-20:] >= sig['tp1']): 
+        reasons.append("Liquidity Path Blocked")
+        return None
+    if side == "SELL" and any(df['low'].iloc[-20:] <= sig['tp1']): 
+        reasons.append("Liquidity Path Blocked")
+        return None
+
+    return sig
+
+# ---------------- DATABASE LOGGING ----------------
 async def log_signal(sig):
     async with db_lock:
-        details_json = json.dumps(sig.get("detailed", {}), default=str)
         await db_conn.execute("""
-            INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score,latest_ob,details,entry_tf,tp_tf)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,entry_tf,tp_tf,timestamp,status,reason,score,latest_ob)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
-            sig["symbol"],
-            sig["side"],
-            sig["entry"],
-            sig.get("sl"),
-            sig.get("tp1"),
-            sig.get("tp2"),
-            sig.get("tp3"),  # May be None for RomeOPT
-            datetime.datetime.utcnow().isoformat(),
-            "PENDING",
-            sig.get("reason", ""),
-            sig.get("score", 0),
-            str(sig.get("ob_zone", "")),
-            details_json,
-            sig.get("entry_tf", ""),
-            sig.get("tp_tf", "")
+            sig["symbol"], sig["side"], sig["entry"], sig["sl"], sig["tp1"], sig["tp2"],
+            sig.get("entry_tf", ""), sig.get("tp_tf", ""),
+            datetime.datetime.utcnow().isoformat(), "OPEN", sig["reason"], 
+            int(sig["score"]), str(sig.get("latest_ob",""))
         ))
         await db_conn.commit()
-        log.info(f"Logged signal for {sig['symbol']} to database")
 
-# ---------------- SL CLUSTER ----------------
-recent_sl = defaultdict(lambda: deque())
-def record_sl_hit(symbol: str, lookback_minutes=30):
-    now = time.time(); dq = recent_sl[symbol]; dq.append(now)
-    cutoff = now - lookback_minutes*60
-    while dq and dq[0]<cutoff: dq.popleft()
-
-def deprioritized(symbol: str, threshold=3, lookback=30):
-    dq = recent_sl[symbol]; now=time.time(); cutoff=now-lookback*60
-    while dq and dq[0]<cutoff: dq.popleft()
-    return len(dq)>=threshold
-
-# ---------------- MONITOR SIGNALS (RomeOPT version) ----------------
+# ---------------- MONITOR SIGNALS ----------------
 async def monitor_signals():
-    """
-    Monitor open signals for TP/SL hits - RomeOPT version
-    SL → BE after TP1 hit
-    """
     global exchange
-    if exchange is None:
-        log.error("Exchange not initialized in monitor_signals")
-        return
-        
     while True:
         try:
             async with db_lock:
-                async with db_conn.execute("""
-                    SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,tp1_hit,tp2_hit,status,entry_tf 
-                    FROM signals 
-                    WHERE status IN ('OPEN','PENDING')
-                """) as cursor:
+                async with db_conn.execute(
+                    "SELECT id,symbol,side,entry,sl,tp1,tp2,tp1_hit,tp2_hit,status FROM signals WHERE status='OPEN'"
+                ) as cursor:
                     async for row in cursor:
-                        sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, status, entry_tf = row
-                        tp1_hit = tp1_hit or 0
-                        tp2_hit = tp2_hit or 0
+                        sig_id, symbol, side, entry, sl, tp1, tp2, tp1_hit, tp2_hit, status = row
+                        ticker = await exchange.fetch_ticker(symbol)
+                        last_price = ticker.get("last")
+                        if last_price is None: continue
 
-                        # Fetch current price
+                        entry_tf = ""
                         try:
-                            ticker = await exchange.fetch_ticker(symbol)
-                            last_price = ticker.get("last")
-                            if last_price is None:
-                                continue
-                        except Exception as e:
-                            log.debug(f"fetch_ticker failed for {symbol}: {e}")
-                            continue
+                            cursor_tf = await db_conn.execute("SELECT entry_tf FROM signals WHERE id=?", (sig_id,))
+                            tf_result = await cursor_tf.fetchone()
+                            if tf_result and tf_result[0]: entry_tf = tf_result[0]
+                        except: entry_tf = ""
 
-                        # Update TP/SL with current data using RomeOPT logic
-                        sig = {
-                            "symbol": symbol,
-                            "side": side,
-                            "entry": entry,
-                            "sl": sl,
-                            "tp1": tp1,
-                            "tp2": tp2,
-                            "tp3": tp3,
-                            "entry_tf": entry_tf if entry_tf else "15m"  # Default
-                        }
-                        sig = await update_tp_sl_live_romeopt(sig)
-                        sl, tp1, tp2, tp3 = sig["sl"], sig["tp1"], sig["tp2"], sig["tp3"]
+                        sig = {"symbol": symbol, "side": side, "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "entry_tf": entry_tf}
+                        sig = await update_tp_sl_live(sig)
+                        sl, tp1, tp2 = sig["sl"], sig["tp1"], sig["tp2"]
 
-                        # Check for TP/SL hits - RomeOPT rules
-                        hits = []
-                        sl_hit = False
-                        
-                        if side == "BUY":
-                            if not tp1_hit and last_price >= tp1:
-                                hits.append("TP1")
-                                tp1_hit = 1
-                                # RomeOPT: Move SL to breakeven after TP1 hit
-                                sl = entry
-                                log.info(f"✅ {symbol}: TP1 hit, moving SL to breakeven at {entry}")
-                            
-                            if not tp2_hit and last_price >= tp2:
-                                hits.append("TP2")
-                                tp2_hit = 1
-                                status = "CLOSED"
-                                log.info(f"✅ {symbol}: TP2 hit, closing trade")
-                            
-                            if last_price <= sl:
-                                hits.append("SL")
-                                status = "CLOSED"
-                                sl_hit = True
-                                log.info(f"❌ {symbol}: SL hit at {sl}")
-                        
-                        else:  # SELL
-                            if not tp1_hit and last_price <= tp1:
-                                hits.append("TP1")
-                                tp1_hit = 1
-                                # RomeOPT: Move SL to breakeven after TP1 hit
-                                sl = entry
-                                log.info(f"✅ {symbol}: TP1 hit, moving SL to breakeven at {entry}")
-                            
-                            if not tp2_hit and last_price <= tp2:
-                                hits.append("TP2")
-                                tp2_hit = 1
-                                status = "CLOSED"
-                                log.info(f"✅ {symbol}: TP2 hit, closing trade")
-                            
-                            if last_price >= sl:
-                                hits.append("SL")
-                                status = "CLOSED"
-                                sl_hit = True
-                                log.info(f"❌ {symbol}: SL hit at {sl}")
+                        hits=[]; sl_hit=False
+                        if side=="BUY":
+                            if not tp1_hit and last_price>=tp1: 
+                                hits.append("TP1"); tp1_hit=1; sl=entry
+                            if not tp2_hit and last_price>=tp2: 
+                                hits.append("TP2"); tp2_hit=1; status="CLOSED"
+                            if last_price<=sl: 
+                                hits.append("SL"); status="CLOSED"; sl_hit=True
+                        else:
+                            if not tp1_hit and last_price<=tp1: 
+                                hits.append("TP1"); tp1_hit=1; sl=entry
+                            if not tp2_hit and last_price<=tp2: 
+                                hits.append("TP2"); tp2_hit=1; status="CLOSED"
+                            if last_price>=sl: 
+                                hits.append("SL"); status="CLOSED"; sl_hit=True
 
-                        # Send alert if hits
                         if hits:
-                            alert_msg = (f"🎯 {symbol} {side} Update\n"
-                                       f"Entry: {entry:.8f}\n"
-                                       f"Last: {last_price:.8f}\n"
-                                       f"Hits: {', '.join(hits)}\n"
-                                       f"SL: {sl:.8f}\n"
-                                       f"TP1: {tp1:.8f} TP2: {tp2:.8f}")
-                            
-                            # Add note about SL movement if TP1 hit
-                            if "TP1" in hits:
-                                alert_msg += f"\n📈 SL moved to breakeven at {entry:.8f}"
-                            
-                            await tg(alert_msg)
+                            await tg(f"🎯 {symbol} {side} update\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP1:{tp1} TP2:{tp2}")
 
-                        # Record SL hit
-                        if sl_hit:
-                            record_sl_hit(symbol)
-
-                        # Update database
-                        await db_conn.execute("""
-                            UPDATE signals 
-                            SET tp1_hit=?, tp2_hit=?, sl=?, status=? 
-                            WHERE id=?
-                        """, (tp1_hit, tp2_hit, sl, status, sig_id))
-                
+                        await db_conn.execute("UPDATE signals SET tp1_hit=?,tp2_hit=?,sl=?,status=? WHERE id=?", (tp1_hit,tp2_hit,sl,status,sig_id))
                 await db_conn.commit()
-                
-        except Exception as e:
-            log.exception(f"Monitor error: {e}")
-        
+        except Exception as e: log.exception("monitor error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
 
 # ---------------- SCAN LOOP ----------------
 last_signal_time = {}
-async def scan_loop(exchange):
-    """
-    Main scanning loop with timeframe-specific cooldowns
-    """
-    # Timeframe-specific cooldowns (seconds)
-    cooldown_map = {
-        "1m": 60,    # 1 minute cooldown for 1m signals
-        "3m": 120,   # 2 minutes for 3m
-        "5m": 180,   # 3 minutes for 5m
-        "15m": 300,  # 5 minutes for 15m
-        "30m": 600,  # 10 minutes for 30m
-        "1h": 1800,  # 30 minutes for 1h
-    }
-    
+async def scan_loop():
+    global exchange
     while True:
         t0 = time.time()
-        signals_found = 0
-        
         try:
-            # Fetch top volume symbols
             tickers = await exchange.fetch_tickers()
-            usdt_pairs = [(s, v.get("quoteVolume", 0)) 
-                         for s, v in tickers.items() 
-                         if s.endswith("/USDT") or s.endswith("USDT")]
-            
-            if not usdt_pairs:
-                log.warning("No USDT pairs found")
-                await asyncio.sleep(SCAN_INTERVAL)
-                continue
-            
-            top = sorted(usdt_pairs, key=lambda x: x[1], reverse=True)[:TOP_N]
-            log.info(f"📈 Scanning top {len(top)} symbols by volume across {len(TIMEFRAMES)} timeframes")
-            
-            for symbol, volume in top:
-                # Skip if deprioritized
-                if deprioritized(symbol):
-                    log.debug(f"Skipping deprioritized {symbol}")
-                    continue
-                
+            top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")], 
+                        key=lambda x:x[1], reverse=True)[:TOP_N]
+            signals_found = 0
+            for symbol,_ in top:
                 for tf in TIMEFRAMES:
                     key = f"{symbol}:{tf}"
-                    
-                    # Check timeframe-specific cooldown
-                    cooldown = cooldown_map.get(tf, 300)
-                    if key in last_signal_time and time.time() - last_signal_time[key] < cooldown:
-                        continue
-                    
-                    log.debug(f"Checking {symbol} on {tf}")
-                    
-                    # Fetch OHLCV data
+                    if key in last_signal_time and time.time() - last_signal_time[key] < 60: continue
                     ohlcv = await fetch_ohlcv(exchange, symbol, tf, 200)
-                    if not ohlcv or len(ohlcv) < 100:
-                        log.debug(f"Insufficient data for {symbol} {tf}")
-                        continue
-                    
-                    # Create DataFrame
+                    if not ohlcv: continue
                     df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-                    for col in ["open","high","low","close","vol"]:
-                        df[col] = pd.to_numeric(df[col], errors="coerce")
-                    
-                    # Generate signal
+                    for c in ["open","high","low","close","vol"]: df[c] = pd.to_numeric(df[c], errors="coerce")
                     sig = await generate_signal_romeopt(exchange, df, symbol, tf)
-                    
                     if sig:
-                        # Prepare alert message
-                        breakdown = ', '.join(sig.get('reason_list', []))
-                        risk_reward = sig["detailed"].get("risk_reward", 0)
-                        
-                        # RomeOPT alert format (no TP3)
-                        alert_msg = (f"🏆 {sig['symbol']} ({tf}) {sig['side']}\n"
-                                   f"Entry: {sig['entry']:.8f}\n"
-                                   f"SL: {sig.get('sl', 0):.8f}\n"
-                                   f"TP1: {sig.get('tp1', 0):.8f} (0.8R)\n"
-                                   f"TP2: {sig.get('tp2', 0):.8f} (1.6R)\n"
-                                   f"Score: {sig['score']} | R:R: {risk_reward}:1\n"
-                                   f"Breakdown: {breakdown}\n"
-                                   f"⚠️ RomeOPT-P: SL→BE after TP1")
-                        
-                        # Send alert and log
-                        await tg(alert_msg)
+                        breakdown_str = ", ".join(sig['reason_list'])
+                        risk = abs(sig['entry'] - sig['sl'])
+                        reward1 = abs(sig['tp1'] - sig['entry'])
+                        rr_ratio = round(reward1 / risk, 2) if risk > 0 else 0
+                        await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\n"
+                                 f"Entry: {sig['entry']:.8f}\n"
+                                 f"SL: {sig.get('sl', 0):.8f}\n"
+                                 f"TP1: {sig.get('tp1', 0):.8f} (0.8R)\n"
+                                 f"TP2: {sig.get('tp2', 0):.8f} (1.6R)\n"
+                                 f"Score: {sig['score']} | R:R: {rr_ratio}:1\n"
+                                 f"Breakdown: {breakdown_str}\n"
+                                 f"⚠️ RomeOPT-P: SL→BE after TP1")
                         await log_signal(sig)
-                        
-                        # Update last signal time
                         last_signal_time[key] = time.time()
                         signals_found += 1
-                        
-                        log.info(f"✅ Found {sig['side']} signal for {sig['symbol']} on {tf} (Score: {sig['score']})")
-            
-            log.info(f"📊 Scan complete: {signals_found} signals found across all timeframes")
-            
-        except Exception as e:
-            log.exception(f"Scan error: {e}")
-        
-        # Sleep for remaining interval
+            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found")
+        except Exception as e: log.exception("scan error: %s", e)
         elapsed = time.time() - t0
-        sleep_time = max(1, SCAN_INTERVAL - elapsed)
-        await asyncio.sleep(sleep_time)
+        await asyncio.sleep(max(1, SCAN_INTERVAL - elapsed))
 
 # ---------------- FASTAPI ----------------
 app = FastAPI()
-
-@app.get("/")
-async def root():
-    return {"status": "RomeOPT Scanner is running", "timeframes": TIMEFRAMES}
-
 @app.post("/webhook")
 async def webhook(request: Request):
-    token = request.headers.get("X-Auth", "")
-    if token != WEBHOOK_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid secret")
-    
+    token = request.headers.get("X-Auth","")
+    if token != WEBHOOK_SECRET: raise HTTPException(403, "Invalid secret")
     data = await request.json()
-    log.info(f"Webhook received: {data}")
-    
-    # Process webhook data if needed
-    return {"ok": True}
-
-@app.get("/health")
-async def health():
-    return {"status": "healthy", "timestamp": datetime.datetime.utcnow().isoformat()}
-
-@app.get("/stats")
-async def stats():
-    """Get scanner statistics"""
-    async with db_lock:
-        async with db_conn.execute("SELECT COUNT(*) as total, COUNT(CASE WHEN status='OPEN' THEN 1 END) as open FROM signals") as cursor:
-            row = await cursor.fetchone()
-            total_signals = row[0] if row else 0
-            open_signals = row[1] if row else 0
-        
-        async with db_conn.execute("SELECT COUNT(*) as today FROM signals WHERE DATE(timestamp) = DATE('now')") as cursor:
-            row = await cursor.fetchone()
-            today_signals = row[0] if row else 0
-    
-    return {
-        "status": "running",
-        "timeframes_active": TIMEFRAMES,
-        "signals_total": total_signals,
-        "signals_open": open_signals,
-        "signals_today": today_signals,
-        "scan_interval": SCAN_INTERVAL,
-        "top_pairs": TOP_N,
-        "tp_system": "RomeOPT-P (0.8R/1.6R, SL→BE after TP1)"
-    }
-
-# ---------------- CLEANUP FUNCTION ----------------
-async def cleanup():
-    """Cleanup resources properly"""
-    global exchange, db_conn
-    
-    log.info("Cleaning up resources...")
-    
-    if exchange:
-        try:
-            await exchange.close()
-            log.info("Exchange connection closed")
-        except Exception as e:
-            log.error(f"Error closing exchange: {e}")
-    
-    if db_conn:
-        try:
-            await db_conn.close()
-            log.info("Database connection closed")
-        except Exception as e:
-            log.error(f"Error closing database: {e}")
+    log.info("Webhook received: %s", data)
+    return {"ok":True}
 
 # ---------------- MAIN ----------------
 async def main():
     global exchange, db_conn
-    
-    # Initialize
-    log.info("Starting RomeOPT-P Scanner with all timeframes...")
     await init_db()
-    
-    # Initialize exchange
-    exchange = ccxt.okx({
-        "enableRateLimit": True,
-        "timeout": 30000,
-        "rateLimit": 1000,
-    })
-    
-    # Test connection
-    try:
-        await exchange.load_markets()
-        log.info(f"✅ Connected to {exchange.name}")
-        log.info(f"📊 Scanning on timeframes: {', '.join(TIMEFRAMES)}")
-        log.info(f"🎯 RomeOPT-P TP System: 0.8R/1.6R, SL→BE after TP1")
-    except Exception as e:
-        log.error(f"Failed to connect to exchange: {e}")
-        await cleanup()
-        return
-    
-    # Send startup message
-    await tg(f"🏆 ROMEOPT-P Scanner Started\n"
-             f"📈 Timeframes: {', '.join(TIMEFRAMES)}\n"
-             f"⚙️ Top {TOP_N} pairs | Interval: {SCAN_INTERVAL}s\n"
-             f"🎯 TP: 0.8R/1.6R | SL→BE after TP1")
-    
-    # Run scanner and monitor
-    try:
-        await asyncio.gather(
-            scan_loop(exchange),
-            monitor_signals()
-        )
-    except asyncio.CancelledError:
-        log.info("Scanner tasks cancelled")
-    except Exception as e:
-        log.exception(f"Unexpected error in main: {e}")
-    finally:
-        await cleanup()
+    exchange = ccxt.okx({"enableRateLimit": True})
+    await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals\n"
+             "✅ ALL 6 ORIGINAL STEPS ACTIVE\n"
+             "✅ WINNER PATTERN FILTER: HTF_Align + (BOS or CHOCH) + FVG")
+    await asyncio.gather(scan_loop(), monitor_signals())
 
-# ---------------- ENTRY POINT ----------------
 if __name__ == "__main__":
     import argparse
-    import signal
-    
-    parser = argparse.ArgumentParser(description="RomeOPT Scanner")
-    parser.add_argument("--http", action="store_true", help="Run HTTP server")
-    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
-    args = parser.parse_args()
-    
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-        log.debug("Debug logging enabled")
-    
+    p = argparse.ArgumentParser()
+    p.add_argument("--http", action="store_true")
+    args = p.parse_args()
     if args.http:
-        log.info("Starting HTTP server on port 9000")
         uvicorn.run(app, host="0.0.0.0", port=9000)
     else:
-        # Setup signal handlers for graceful shutdown
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        # Create task
-        main_task = loop.create_task(main())
-        
-        # Signal handling
-        def signal_handler(signame):
-            log.info(f"Received signal {signame}, shutting down...")
-            main_task.cancel()
-        
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            loop.add_signal_handler(sig, lambda s=sig: signal_handler(s.name))
-        
-        try:
-            loop.run_until_complete(main_task)
-        except asyncio.CancelledError:
-            log.info("Main task cancelled")
-        except Exception as e:
-            log.exception(f"Fatal error: {e}")
+        try: asyncio.run(main())
+        except KeyboardInterrupt: log.info("Shutting down...")
         finally:
-            # Run cleanup one more time
-            try:
-                loop.run_until_complete(cleanup())
-            except:
-                pass
-            
-            # Close loop
-            loop.close()
-            log.info("Scanner shutdown complete")
+            if db_conn: asyncio.run(db_conn.close())
