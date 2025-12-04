@@ -421,10 +421,10 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         reasons.append("Zone Approach +0")
     
     # Check strong counter-trend
-    should_reject = await check_strong_counter_trend(exchange, symbol, tf, side)
-    if should_reject:
-        reasons.append(f"Strong HTF trend against {side} → Rejected")
-        return None
+    #should_reject = await check_strong_counter_trend(exchange, symbol, tf, side)
+    #if should_reject:
+        #reasons.append(f"Strong HTF trend against {side} → Rejected")
+        #return None
     
     # HTF Alignment
     tf_map = {"1m":"15m", "3m":"30m", "5m":"1h", "15m":"4h", "30m":"1h"}
