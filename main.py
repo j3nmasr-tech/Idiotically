@@ -394,6 +394,44 @@ def find_latest_ob(df: pd.DataFrame):
             return {"type":"bearish","low":candle["close"],"high":max(candle["high"], prev_candle["high"])}
     return None
 
+# ===== WINNER PATTERN FILTER =====
+def filter_winner_patterns(signal: dict) -> tuple:
+    """
+    Filter signals based on winner patterns analysis
+    Returns: (should_reject, rejection_reason)
+    
+    Criteria from analysis:
+    1. HTF_Align present (91% of winners had this)
+    2. Either BOS or CHOCH (not both missing)
+    3. FVG almost always present (98% of winners)
+    """
+    reason_list = signal.get("reason_list", [])
+    if not reason_list:
+        return True, "No breakdown data"
+    
+    # Criterion 1: HTF_Align must be present
+    has_htf_align = "HTF_Align" in reason_list
+    
+    # Criterion 2: Either BOS or CHOCH must be present (not both missing)
+    has_bos = "BOS" in reason_list
+    has_choch = "CHOCH" in reason_list
+    
+    # Criterion 3: FVG must be present
+    has_fvg = "FVG" in reason_list
+    
+    # Check all criteria
+    if not has_htf_align:
+        return True, "Missing HTF_Alignment"
+    
+    if not has_bos and not has_choch:
+        return True, "Missing both BOS and CHOCH"
+    
+    if not has_fvg:
+        return True, "Missing FVG"
+    
+    return False, ""  # Signal passes all filters
+# ===========================================
+
 # ---------------- MARKET STRUCTURE SHIFT (PRACTICAL) ----------------
 def confirm_market_structure_shift(df: pd.DataFrame, side: str):
     """
@@ -661,6 +699,16 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     if ob_zone: signal["reason_list"].append("OB")
     if mss_ok: signal["reason_list"].append("MSS")
     if elite_ok: signal["reason_list"].append("HTF_Align")
+    
+    # ===== WINNER PATTERN FILTER =====
+    should_reject, reject_reason = filter_winner_patterns(signal)
+    if should_reject:
+        log.debug(f"❌ Winner pattern filter REJECTED {symbol} {side} on {tf}: {reject_reason}")
+        return None
+    
+    # Add filter info to reason list
+    signal["reason_list"].append("WinnerFilter✅")
+    # ==================================
     
     log.info(f"✓ {symbol} {tf}: Generated {side} signal with score {score}")
     return signal
