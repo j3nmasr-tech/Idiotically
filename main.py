@@ -529,28 +529,18 @@ async def monitor_signals():
                         last_price = ticker.get("last")
                         if last_price is None: continue
 
-                        entry_tf = ""
-                        try:
-                            cursor_tf = await db_conn.execute("SELECT entry_tf FROM signals WHERE id=?", (sig_id,))
-                            tf_result = await cursor_tf.fetchone()
-                            if tf_result and tf_result[0]: entry_tf = tf_result[0]
-                        except: entry_tf = ""
-
-                        sig = {"symbol": symbol, "side": side, "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2, "entry_tf": entry_tf}
-                        sig = await update_tp_sl_live(sig)
-                        sl, tp1, tp2 = sig["sl"], sig["tp1"], sig["tp2"]
-
+                        # TP/SL NEVER CHANGE - USE ORIGINAL VALUES
                         hits=[]; sl_hit=False
                         if side=="BUY":
                             if not tp1_hit and last_price>=tp1: 
-                                hits.append("TP1"); tp1_hit=1; sl=entry
+                                hits.append("TP1"); tp1_hit=1
                             if not tp2_hit and last_price>=tp2: 
                                 hits.append("TP2"); tp2_hit=1; status="CLOSED"
                             if last_price<=sl: 
                                 hits.append("SL"); status="CLOSED"; sl_hit=True
                         else:
                             if not tp1_hit and last_price<=tp1: 
-                                hits.append("TP1"); tp1_hit=1; sl=entry
+                                hits.append("TP1"); tp1_hit=1
                             if not tp2_hit and last_price<=tp2: 
                                 hits.append("TP2"); tp2_hit=1; status="CLOSED"
                             if last_price>=sl: 
@@ -559,9 +549,10 @@ async def monitor_signals():
                         if hits:
                             await tg(f"🎯 {symbol} {side} update\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP1:{tp1} TP2:{tp2}")
 
-                        await db_conn.execute("UPDATE signals SET tp1_hit=?,tp2_hit=?,sl=?,status=? WHERE id=?", (tp1_hit,tp2_hit,sl,status,sig_id))
+                        await db_conn.execute("UPDATE signals SET tp1_hit=?,tp2_hit=?,status=? WHERE id=?", (tp1_hit,tp2_hit,status,sig_id))
                 await db_conn.commit()
-        except Exception as e: log.exception("monitor error: %s", e)
+        except Exception as e: 
+            log.exception("monitor error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
 
 # ---------------- SCAN LOOP ----------------
@@ -596,7 +587,7 @@ async def scan_loop():
                                  f"TP2: {sig.get('tp2', 0):.8f} (1.6R)\n"
                                  f"Score: {sig['score']} | R:R: {rr_ratio}:1\n"
                                  f"Breakdown: {breakdown_str}\n"
-                                 f"⚠️ RomeOPT-P: SL→BE after TP1")
+                                 f"⚠️ RomeOPT-P: Fixed TP/SL (No SL→BE)")
                         await log_signal(sig)
                         last_signal_time[key] = time.time()
                         signals_found += 1
@@ -622,7 +613,8 @@ async def main():
     exchange = ccxt.okx({"enableRateLimit": True})
     await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals\n"
              "✅ ALL 6 ORIGINAL STEPS ACTIVE\n"
-             "✅ WINNER PATTERN FILTER: HTF_Align + (BOS or CHOCH) + FVG")
+             "✅ WINNER PATTERN FILTER: HTF_Align + (BOS or CHOCH) + FVG\n"
+             "✅ FIXED: TP/SL never change after signal generation")
     await asyncio.gather(scan_loop(), monitor_signals())
 
 if __name__ == "__main__":
