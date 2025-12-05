@@ -162,6 +162,9 @@ async def check_strong_counter_trend(exchange, symbol: str, timeframe: str, sign
     Check if higher timeframe is in STRONG trend AGAINST our signal.
     Returns True if we should REJECT the signal (strong counter-trend).
     """
+    # DISABLED - Return False to allow all signals
+    return False
+    
     # Map signal timeframe to trend-check timeframe
     trend_check_map = {
         "1m": "15m",   # Check 15m trend for 1m signals
@@ -463,11 +466,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     calc_values["signal_side"] = side
     
     # Check for STRONG counter-trend BEFORE proceeding
-    should_reject = await check_strong_counter_trend(exchange, symbol, tf, side)
-    if should_reject:
-        reasons.append(f"Strong HTF trend against {side} → Rejected")
-        calc_values["strong_counter_trend"] = True
-        return None
+    should_reject = False  # DISABLED - Allow all signals
     
     calc_values["strong_counter_trend"] = False
     
@@ -710,7 +709,7 @@ async def scan_loop():
                             f"• Zone Approach: +{calc.get('zone_approach', 0)}",
                             f"• HTF ({calc.get('htf_timeframe', '?')}): {calc.get('htf_trend_direction', '?')} (+{calc.get('htf_alignment', 0)})",
                             f"• Momentum: {calc.get('momentum_value', 0):.3f} {'✅' if calc.get('momentum_score', 0) == 1 else '❌'}",
-                            f"• Counter-trend: {'🚫 BLOCKED' if calc.get('strong_counter_trend', False) else '✅ CLEAR'}",
+                            f"• Counter-trend: {'🚫 BLOCKED' if calc.get('strong_counter_trend', False) else '✅ ALLOWED (FILTER DISABLED)'}",
                             f"• Liquidity Path: {'🚫 BLOCKED' if calc.get('liquidity_path_blocked', False) else '✅ CLEAR'}",
                             f"",
                             f"🎯 RISK/REWARD:",
@@ -750,7 +749,7 @@ async def main():
     global exchange, db_conn
     await init_db()
     exchange = ccxt.okx({"enableRateLimit": True})
-    await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals\n✅ TREND FILTER ACTIVE: Will reject counter-trend trades\n📊 ENHANCED BREAKDOWN: All numerical values visible")
+    await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals\n🚫 TREND FILTER DISABLED: Will allow both trend and counter-trend trades\n📊 ENHANCED BREAKDOWN: All numerical values visible")
     await asyncio.gather(scan_loop(), monitor_signals())
 
 if __name__ == "__main__":
