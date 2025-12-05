@@ -14,6 +14,8 @@ LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features)
 - Adaptive Market Regime detection
 - HTF + Sweep scoring threshold
 - Elite multi-timeframe confirmation (15m,1h,4h)
+- 🎯 MOMENTUM FILTER: 0.8 threshold (was 0.5)
+- 📊 ENHANCED BREAKDOWN: Shows all numerical values
 """
 
 import os, time, asyncio, logging, datetime
@@ -138,6 +140,9 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     prev5 = df.iloc[-6:-1]
     score = 0
     reasons = []
+    
+    # Store all calculation values for breakdown
+    calc_values = {}
 
     # Step 1: Liquidity Sweep
     sweep_high = last["high"] > prev5["high"].max()
@@ -145,15 +150,19 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     has_sweep = sweep_high or sweep_low
     liquidity_sweep = 2 if has_sweep else 0
     score += liquidity_sweep
+    sweep_type = "HIGH" if sweep_high else ("LOW" if sweep_low else "NONE")
     reasons.append(f"Liquidity Sweep +{liquidity_sweep}")
+    calc_values["sweep_type"] = sweep_type
+    calc_values["sweep_score"] = liquidity_sweep
 
     # Step 2: Displacement
     displacement = abs(last["close"] - last["open"]) / (last["high"] - last["low"] + 1e-8)
+    calc_values["displacement_value"] = round(displacement, 2)
     has_disp = displacement > 0.6
     if has_disp:
-        score += 2; reasons.append("Displacement +2")
+        score += 2; reasons.append(f"Displacement +2 ({displacement:.2f})")
     else:
-        reasons.append("Displacement +0")
+        reasons.append(f"Displacement +0 ({displacement:.2f})")
 
     # Step 3 & 4: Order Block & Zone
     ob_zone = None
@@ -166,36 +175,57 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
 
     if ob_zone:
         ob_type = ob_zone["type"]
-        if ob_type=="bullish" and last["close"] <= ob_zone["high"]: score+=1; reasons.append("Zone Approach +1")
-        elif ob_type=="bearish" and last["close"] >= ob_zone["low"]: score+=1; reasons.append("Zone Approach +1")
-        else: reasons.append("Zone Approach +0")
+        zone_approach = 0
+        if ob_type=="bullish" and last["close"] <= ob_zone["high"]: 
+            score+=1; zone_approach=1; reasons.append("Zone Approach +1")
+        elif ob_type=="bearish" and last["close"] >= ob_zone["low"]: 
+            score+=1; zone_approach=1; reasons.append("Zone Approach +1")
+        else: 
+            reasons.append("Zone Approach +0")
+        calc_values["zone_approach"] = zone_approach
+        calc_values["ob_type"] = ob_type
+        calc_values["ob_low"] = round(ob_zone["low"], 6)
+        calc_values["ob_high"] = round(ob_zone["high"], 6)
     else:
         reasons.append("Zone Approach +0"); ob_type=None
+        calc_values["zone_approach"] = 0
+        calc_values["ob_type"] = "NONE"
 
     # Step 5: HTF Alignment
     tf_map={"1m":"15m","3m":"30m","5m":"1h","15m":"4h","30m":"1h"}
     htf=tf_map.get(tf,"15m")
     ohlcv_htf = await fetch_ohlcv(exchange, symbol, htf, 50)
     htf_alignment = 0
+    htf_trend_value = 0
     if ohlcv_htf:
         df_htf = pd.DataFrame(ohlcv_htf, columns=["ts","open","high","low","close","vol"])
         trend = df_htf["close"].iloc[-1] - df_htf["close"].iloc[-5]
+        htf_trend_value = round(trend, 6)
         htf_dir = "bullish" if trend>0 else "bearish"
         if ob_type and htf_dir==ob_type:
-            score+=1; htf_alignment=1; reasons.append("HTF Alignment +1")
+            score+=1; htf_alignment=1; reasons.append(f"HTF Alignment +1 ({htf_dir} {trend:+.6f})")
         else:
-            reasons.append("HTF Alignment +0")
+            reasons.append(f"HTF Alignment +0 ({htf_dir} {trend:+.6f})")
+        calc_values["htf_trend"] = htf_trend_value
+        calc_values["htf_direction"] = htf_dir
     else:
         reasons.append("HTF Alignment ?")
+        calc_values["htf_trend"] = 0
+        calc_values["htf_direction"] = "UNKNOWN"
 
-    # Step 6: Momentum
+    # 🎯 STEP 6: MOMENTUM (CHANGED FROM 0.5 to 0.8 THRESHOLD)
     momentum_ratio = abs(last["close"]-last["open"])/(last["high"]-last["low"]+1e-8)
-    if ob_type=="bullish" and momentum_ratio>0.5 and last["close"]>last["open"]:
-        score+=1; reasons.append("Momentum +1")
-    elif ob_type=="bearish" and momentum_ratio>0.5 and last["close"]<last["open"]:
-        score+=1; reasons.append("Momentum +1")
+    calc_values["momentum_value"] = round(momentum_ratio, 2)
+    
+    if ob_type=="bullish" and momentum_ratio>=0.8 and last["close"]>last["open"]:  # CHANGED >0.5 to >=0.8
+        score+=1; reasons.append(f"Momentum +1 ({momentum_ratio:.2f})")
+        calc_values["momentum_score"] = 1
+    elif ob_type=="bearish" and momentum_ratio>=0.8 and last["close"]<last["open"]:  # CHANGED >0.5 to >=0.8
+        score+=1; reasons.append(f"Momentum +1 ({momentum_ratio:.2f})")
+        calc_values["momentum_score"] = 1
     else:
-        reasons.append("Momentum +0")
+        reasons.append(f"Momentum +0 ({momentum_ratio:.2f})")
+        calc_values["momentum_score"] = 0
 
     if not ob_type: return None
     side = "BUY" if ob_type=="bullish" else "SELL"
@@ -222,8 +252,19 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         return None
     reasons.append("Elite MTF Alignment ✅")
 
-    sig = {"symbol":symbol,"side":side,"entry":entry,"score":score,"reason":"RomeOPT 6-Step",
-           "reason_list":reasons,"htf_alignment":htf_alignment,"liquidity_sweep":liquidity_sweep}
+    sig = {
+        "symbol": symbol,
+        "side": side,
+        "entry": entry,
+        "score": score,
+        "reason": "RomeOPT 6-Step",
+        "reason_list": reasons,
+        "htf_alignment": htf_alignment,
+        "liquidity_sweep": liquidity_sweep,
+        "momentum_ratio": momentum_ratio,  # Store actual momentum value
+        "calc_values": calc_values  # Store all calculation values
+    }
+    
     sig = update_tp_sl_live(sig, df)
     
     # ---------------- NEW: TP1 DISTANCE FILTER ----------------
@@ -459,9 +500,31 @@ async def scan_loop(exchange):
                     for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
                     sig = await generate_signal_romeopt(exchange,df,symbol,tf)
                     if sig:
-                        htf_flag = sig.get("htf_alignment", "N/A")
-                        sweep_flag = sig.get("liquidity_sweep", "N/A")
-                        await tg(f"🏆 {sig['symbol']} ({tf}) {sig['side']}\nEntry:{sig['entry']}\nSL:{sig.get('sl')}\nTP1:{sig.get('tp1')} TP2:{sig.get('tp2')} TP3:{sig.get('tp3')}\nScore:{sig['score']}\nHTF:{htf_flag} Sweep:{sweep_flag}\nBreakdown:{', '.join(sig['reason_list'])}")
+                        # ENHANCED BREAKDOWN FORMAT
+                        calc = sig.get("calc_values", {})
+                        breakdown_lines = [
+                            f"🏆 {sig['symbol']} ({tf}) {sig['side']}",
+                            f"Entry: {sig['entry']:.6f}",
+                            f"Score: {sig['score']}/6",
+                            f"",
+                            f"📊 BREAKDOWN VALUES:",
+                            f"• Sweep: {calc.get('sweep_type', 'NONE')} (+{calc.get('sweep_score', 0)})",
+                            f"• Displacement: {calc.get('displacement_value', 0):.2f}",
+                            f"• OB Type: {calc.get('ob_type', 'NONE')}",
+                            f"• Zone Approach: +{calc.get('zone_approach', 0)}",
+                            f"• HTF: {calc.get('htf_direction', '?')} ({calc.get('htf_trend', 0):+.6f})",
+                            f"• Momentum: {calc.get('momentum_value', 0):.2f} (+{calc.get('momentum_score', 0)})",
+                            f"",
+                            f"🎯 TARGETS:",
+                            f"SL: {sig.get('sl'):.6f}",
+                            f"TP1: {sig.get('tp1'):.6f}",
+                            f"TP2: {sig.get('tp2'):.6f}",
+                            f"TP3: {sig.get('tp3'):.6f}",
+                            f"",
+                            f"💎 MOMENTUM: {sig.get('momentum_ratio', 0):.2f} {'✅ PASS' if sig.get('momentum_ratio', 0) >= 0.8 else '❌ FAIL'}"
+                        ]
+                        
+                        await tg("\n".join(breakdown_lines))
                         await log_signal(sig)
                         last_signal_time[key]=time.time()
                         signals_found+=1
@@ -486,6 +549,8 @@ async def main():
     global exchange
     exchange = ccxt.okx({"enableRateLimit": True})
     await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals")
+    await tg("🎯 MOMENTUM FILTER: 0.8 threshold activated (was 0.5)")
+    await tg("📊 ENHANCED BREAKDOWN: All values now visible")
     await asyncio.gather(scan_loop(exchange), monitor_signals())
 
 if __name__=="__main__":
