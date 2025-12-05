@@ -17,6 +17,7 @@ LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features)
 - Elite multi-timeframe confirmation (15m,1h,4h)
 - FIXED: Strong trend filter to avoid counter-trend losses
 - 📊 ENHANCED BREAKDOWN: Shows all numerical values
+- 🚨 ADDED: SWEEP FILTER + MOMENTUM FILTER (CRITICAL)
 """
 
 import os, time, asyncio, logging, datetime
@@ -36,10 +37,22 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
-TOP_N = int(os.getenv("TOP_N", 3))
+TOP_N = int(os.getenv("TOP_N", 15))
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
 MIN_SCORE = 5
 CRITICAL_FACTORS_MIN = 2  # HTF Alignment + Liquidity Sweep minimum
+
+# SWEEP + MOMENTUM FILTER SETTINGS
+SWEEP_FILTER_ENABLED = True  # Enable sweep validation filter
+MOMENTUM_FILTER_ENABLED = True  # Enable momentum range filter
+SWEEP_VOLUME_MULTIPLIER = 1.8  # Volume must be > 1.8x average
+SWEEP_MIN_SIGNIFICANCE = 2  # 0=minor, 1=swing, 2=daily, 3=weekly
+
+# Momentum ranges (from historical analysis)
+MOMENTUM_RANGES = {
+    "SELL": {"min": 0.78, "max": 0.88},
+    "BUY": {"min": 0.82, "max": 0.91}
+}
 
 # Timeframe mapping for TP scaling (RomeOPT-P logic) - YOUR CHOICE
 TP_TIMEFRAME_MAP = {
@@ -155,6 +168,100 @@ def atr(df: pd.DataFrame, period=14):
 def calculate_ema(df, period):
     """Calculate EMA"""
     return df['close'].ewm(span=period, adjust=False).mean()
+
+# ---------------- SWEEP VALIDATION FILTER ----------------
+def validate_sweep(df: pd.DataFrame, sweep_type: str, calc_values: dict) -> tuple:
+    """
+    SWEEP FILTER: Validate if sweep is genuine
+    Returns: (is_valid, rejection_reason)
+    """
+    if not SWEEP_FILTER_ENABLED:
+        return True, None
+    
+    if sweep_type == "NONE":
+        return False, "No sweep detected"
+    
+    # Get last 2 candles
+    if len(df) < 2:
+        return False, "Not enough data for sweep validation"
+    
+    last_candle = df.iloc[-1]
+    prev_candle = df.iloc[-2]
+    
+    # Rule 1: Sweep candle must CLOSE beyond liquidity level
+    if sweep_type == "HIGH":
+        if not (last_candle["close"] > calc_values.get("prev_high", 0)):
+            return False, f"Sweep failed: Close {last_candle['close']:.6f} ≤ Prev High {calc_values.get('prev_high', 0):.6f}"
+    else:  # LOW sweep
+        if not (last_candle["close"] < calc_values.get("prev_low", float('inf'))):
+            return False, f"Sweep failed: Close {last_candle['close']:.6f} ≥ Prev Low {calc_values.get('prev_low', float('inf')):.6f}"
+    
+    # Rule 2: Next candle must reverse (close back through level)
+    # Note: We only have current candle, so we'll check intra-candle reversal
+    # For HIGH sweep: candle should close below its high (showing rejection)
+    # For LOW sweep: candle should close above its low (showing rejection)
+    if sweep_type == "HIGH":
+        if last_candle["close"] >= last_candle["high"]:  # Closed at high = continuation
+            return False, "Sweep failed: Candle closed at high (no rejection)"
+    else:  # LOW sweep
+        if last_candle["close"] <= last_candle["low"]:  # Closed at low = continuation
+            return False, "Sweep failed: Candle closed at low (no rejection)"
+    
+    # Rule 3: Volume check (must be significantly higher)
+    avg_volume_20 = df["vol"].iloc[-20:].mean()
+    current_volume = last_candle["vol"]
+    volume_ratio = current_volume / (avg_volume_20 + 1e-8)
+    
+    calc_values["sweep_volume_ratio"] = round(volume_ratio, 2)
+    calc_values["avg_volume_20"] = avg_volume_20
+    
+    if volume_ratio < SWEEP_VOLUME_MULTIPLIER:
+        return False, f"Sweep failed: Volume ratio {volume_ratio:.2f} < {SWEEP_VOLUME_MULTIPLIER}"
+    
+    # Rule 4: Significance check (simplified - check if near round number)
+    if sweep_type == "HIGH":
+        level = calc_values.get("prev_high", 0)
+    else:
+        level = calc_values.get("prev_low", 0)
+    
+    # Check if level is near round number (psychological level)
+    level_significance = 0
+    rounded = round(level, 2)  # Check if near 2-decimal round number
+    if abs(level - rounded) / (level + 1e-8) < 0.001:
+        level_significance = 2  # Daily level
+    
+    calc_values["level_significance"] = level_significance
+    
+    if level_significance < SWEEP_MIN_SIGNIFICANCE:
+        # Not a major level, but we'll allow with warning
+        calc_values["sweep_warning"] = f"Minor level (sig={level_significance})"
+    
+    return True, None
+
+# ---------------- MOMENTUM VALIDATION FILTER ----------------
+def validate_momentum(momentum_value: float, side: str, calc_values: dict) -> tuple:
+    """
+    MOMENTUM FILTER: Validate momentum is in optimal range
+    Returns: (is_valid, rejection_reason)
+    """
+    if not MOMENTUM_FILTER_ENABLED:
+        return True, None
+    
+    ranges = MOMENTUM_RANGES.get(side)
+    if not ranges:
+        return False, f"No momentum range defined for {side}"
+    
+    min_val, max_val = ranges["min"], ranges["max"]
+    
+    calc_values["momentum_min"] = min_val
+    calc_values["momentum_max"] = max_val
+    
+    if momentum_value < min_val:
+        return False, f"Momentum {momentum_value:.3f} < min {min_val:.3f}"
+    elif momentum_value > max_val:
+        return False, f"Momentum {momentum_value:.3f} > max {max_val:.3f}"
+    
+    return True, None
 
 # ---------------- STRONG TREND DETECTION ----------------
 async def check_strong_counter_trend(exchange, symbol: str, timeframe: str, signal_side: str):
@@ -396,7 +503,7 @@ async def get_htf_trend(exchange, symbol: str, timeframe: str):
 
 # ---------------- ROMEOPT SIGNAL GENERATOR ----------------
 async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
-    """Full RomeOPT 6-step signal generator with trend filter"""
+    """Full RomeOPT 6-step signal generator with SWEEP + MOMENTUM filters"""
     if df is None or len(df) < 20: 
         return None
     
@@ -422,6 +529,15 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     calc_values["prev_low"] = round(float(prev5["low"].min()), 6)
     calc_values["current_high"] = round(float(last["high"]), 6)
     calc_values["current_low"] = round(float(last["low"]), 6)
+
+    # 🚨 SWEEP FILTER: Validate sweep quality
+    sweep_valid, sweep_rejection = validate_sweep(df, sweep_type, calc_values)
+    if not sweep_valid and SWEEP_FILTER_ENABLED:
+        reasons.append(f"Sweep Filter: {sweep_rejection}")
+        calc_values["sweep_filter_passed"] = False
+        calc_values["sweep_rejection"] = sweep_rejection
+        return None
+    calc_values["sweep_filter_passed"] = True
 
     # Step2: Displacement
     displacement = abs(last["close"]-last["open"])/(last["high"]-last["low"]+1e-8)
@@ -500,6 +616,16 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     calc_values["momentum_value"] = round(momentum_ratio, 3)
     calc_values["momentum_threshold"] = 0.5
     
+    # 🚨 MOMENTUM FILTER: Check optimal range
+    momentum_valid, momentum_rejection = validate_momentum(momentum_ratio, side, calc_values)
+    if not momentum_valid and MOMENTUM_FILTER_ENABLED:
+        reasons.append(f"Momentum Filter: {momentum_rejection}")
+        calc_values["momentum_filter_passed"] = False
+        calc_values["momentum_rejection"] = momentum_rejection
+        return None
+    calc_values["momentum_filter_passed"] = True
+    
+    # Original momentum check (still needed for basic validation)
     if momentum_ratio < 0.5: 
         reasons.append(f"Momentum Failed ({momentum_ratio:.3f} < 0.5)")
         calc_values["momentum_score"] = 0
@@ -695,6 +821,16 @@ async def scan_loop():
                         # ENHANCED BREAKDOWN WITH ALL VALUES
                         calc = sig.get("calc_values", {})
                         
+                        # Add sweep filter status
+                        sweep_status = "✅ STRONG" if calc.get("sweep_filter_passed") else "❌ WEAK"
+                        sweep_details = calc.get("sweep_rejection", "PASSED")
+                        if "sweep_volume_ratio" in calc:
+                            sweep_details += f" | Vol: {calc['sweep_volume_ratio']:.2f}x"
+                        
+                        # Add momentum filter status
+                        momentum_status = "✅ OPTIMAL" if calc.get("momentum_filter_passed") else "❌ OUTSIDE RANGE"
+                        momentum_range = f"[{calc.get('momentum_min', 0):.2f}-{calc.get('momentum_max', 0):.2f}]"
+                        
                         breakdown_lines = [
                             f"🏆 {sig['symbol']} ({tf}) {sig['side']}",
                             f"Entry: {sig['entry']:.6f}",
@@ -702,13 +838,14 @@ async def scan_loop():
                             f"",
                             f"📊 DETAILED BREAKDOWN:",
                             f"• Sweep: {calc.get('sweep_type', 'NONE')} (+{calc.get('sweep_score', 0)})",
+                            f"  {sweep_status}: {sweep_details}",
                             f"  High: {calc.get('current_high', 0):.6f} > {calc.get('prev_high', 0):.6f}",
                             f"  Low: {calc.get('current_low', 0):.6f} < {calc.get('prev_low', 0):.6f}",
                             f"• Displacement: {calc.get('displacement_value', 0):.3f}",
                             f"• OB: {calc.get('ob_type', 'NONE')} [{calc.get('ob_low', 0):.6f}-{calc.get('ob_high', 0):.6f}]",
                             f"• Zone Approach: +{calc.get('zone_approach', 0)}",
                             f"• HTF ({calc.get('htf_timeframe', '?')}): {calc.get('htf_trend_direction', '?')} (+{calc.get('htf_alignment', 0)})",
-                            f"• Momentum: {calc.get('momentum_value', 0):.3f} {'✅' if calc.get('momentum_score', 0) == 1 else '❌'}",
+                            f"• Momentum: {calc.get('momentum_value', 0):.3f} {momentum_status} {momentum_range}",
                             f"• Counter-trend: {'🚫 BLOCKED' if calc.get('strong_counter_trend', False) else '✅ ALLOWED (FILTER DISABLED)'}",
                             f"• Liquidity Path: {'🚫 BLOCKED' if calc.get('liquidity_path_blocked', False) else '✅ CLEAR'}",
                             f"",
@@ -749,7 +886,7 @@ async def main():
     global exchange, db_conn
     await init_db()
     exchange = ccxt.okx({"enableRateLimit": True})
-    await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals\n🚫 TREND FILTER DISABLED: Will allow both trend and counter-trend trades\n📊 ENHANCED BREAKDOWN: All numerical values visible")
+    await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals\n🚫 TREND FILTER DISABLED: Will allow both trend and counter-trend trades\n📊 ENHANCED BREAKDOWN: All numerical values visible\n🚨 SWEEP+MOMENTUM FILTERS ACTIVE: Only optimal signals")
     await asyncio.gather(scan_loop(), monitor_signals())
 
 if __name__ == "__main__":
