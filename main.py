@@ -43,12 +43,12 @@ MIN_SCORE = 5
 CRITICAL_FACTORS_MIN = 2  # HTF Alignment + Liquidity Sweep minimum
 
 # MOMENTUM FILTER SETTINGS (ONLY ADDITION)
-MOMENTUM_FILTER_ENABLED = False  # Enable momentum range filter
+MOMENTUM_FILTER_ENABLED = True  # Enable momentum range filter
 
 # Momentum ranges (from historical analysis - OPTIMAL RANGES)
 MOMENTUM_RANGES = {
-    "SELL": {"min": 0.78, "max": 0.88},
-    "BUY": {"min": 0.82, "max": 0.91}
+    "SELL": {"min": 0.825, "max": 0.91},  # Changed from 0.78-0.88
+    "BUY": {"min": 0.825, "max": 0.93}    # Changed from 0.82-0.91
 }
 
 # Timeframe mapping for TP scaling (RomeOPT-P logic) - YOUR CHOICE
@@ -188,6 +188,23 @@ def validate_momentum(momentum_value: float, side: str, calc_values: dict) -> tu
         return False, f"Momentum {momentum_value:.3f} < min {min_val:.3f}"
     elif momentum_value > max_val:
         return False, f"Momentum {momentum_value:.3f} > max {max_val:.3f}"
+    
+    return True, None
+
+# ---------------- MOMENTUM-DISPLACEMENT COHERENCE FILTER ----------------
+def validate_momentum_displacement_coherence(momentum_value: float, displacement_value: float, calc_values: dict) -> tuple:
+    """
+    MOMENTUM-DISPLACEMENT COHERENCE FILTER: Ensure Momentum and Displacement are close
+    Returns: (is_valid, rejection_reason)
+    """
+    coherence_threshold = 0.02  # Maximum allowed difference
+    
+    diff = abs(momentum_value - displacement_value)
+    calc_values["momentum_displacement_diff"] = round(diff, 4)
+    calc_values["coherence_threshold"] = coherence_threshold
+    
+    if diff > coherence_threshold:
+        return False, f"Momentum-Displacement mismatch ({diff:.3f} > {coherence_threshold})"
     
     return True, None
 
@@ -467,6 +484,30 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         reasons.append(f"Displacement +2 ({displacement:.3f})")
     else: 
         reasons.append(f"Displacement +0 ({displacement:.3f})")
+    
+    # 🚨 FILTER 1: Momentum ≥ 0.825
+    momentum_ratio = abs(last["close"]-last["open"])/(last["high"]-last["low"]+1e-8)
+    calc_values["momentum_value"] = round(momentum_ratio, 3)
+    calc_values["momentum_threshold"] = 0.5
+    
+    momentum_valid, momentum_rejection = validate_momentum(momentum_ratio, side, calc_values)
+    if not momentum_valid:
+        reasons.append(f"Momentum Filter: {momentum_rejection}")
+        calc_values["momentum_filter_passed"] = False
+        calc_values["momentum_rejection"] = momentum_rejection
+        return None
+    calc_values["momentum_filter_passed"] = True
+    
+    # 🚨 FILTER 2: Momentum-Displacement Coherence ≤ 0.02
+    coherence_valid, coherence_rejection = validate_momentum_displacement_coherence(
+        momentum_ratio, displacement, calc_values
+    )
+    if not coherence_valid:
+        reasons.append(f"Coherence Filter: {coherence_rejection}")
+        calc_values["coherence_filter_passed"] = False
+        calc_values["coherence_rejection"] = coherence_rejection
+        return None
+    calc_values["coherence_filter_passed"] = True
 
     # Step3&4: OB detection
     ob_zone = find_latest_ob(df)
@@ -529,20 +570,6 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     else:
         reasons.append(f"HTF Neutral ({htf})")
         calc_values["htf_alignment"] = 0
-    
-    # Step6: Momentum clean traffic/range avoidance
-    momentum_ratio = abs(last["close"]-last["open"])/(last["high"]-last["low"]+1e-8)
-    calc_values["momentum_value"] = round(momentum_ratio, 3)
-    calc_values["momentum_threshold"] = 0.5
-    
-    # 🚨 MOMENTUM FILTER: Check optimal range
-    momentum_valid, momentum_rejection = validate_momentum(momentum_ratio, side, calc_values)
-    if not momentum_valid and MOMENTUM_FILTER_ENABLED:
-        reasons.append(f"Momentum Filter: {momentum_rejection}")
-        calc_values["momentum_filter_passed"] = False
-        calc_values["momentum_rejection"] = momentum_rejection
-        return None
-    calc_values["momentum_filter_passed"] = True
     
     # Original momentum check (still needed for basic validation)
     if momentum_ratio < 0.5: 
@@ -740,9 +767,13 @@ async def scan_loop():
                         # ENHANCED BREAKDOWN WITH ALL VALUES
                         calc = sig.get("calc_values", {})
                         
-                        # Add momentum filter status
+                        # Add momentum and coherence filter status
                         momentum_status = "✅ OPTIMAL" if calc.get("momentum_filter_passed") else "❌ OUTSIDE RANGE"
-                        momentum_range = f"[{calc.get('momentum_min', 0):.2f}-{calc.get('momentum_max', 0):.2f}]"
+                        momentum_range = f"[{calc.get('momentum_min', 0):.3f}-{calc.get('momentum_max', 0):.3f}]"
+                        
+                        coherence_status = "✅ COHERENT" if calc.get("coherence_filter_passed") else "❌ INCOHERENT"
+                        coherence_diff = calc.get("momentum_displacement_diff", 0)
+                        coherence_threshold = calc.get("coherence_threshold", 0.02)
                         
                         breakdown_lines = [
                             f"🏆 {sig['symbol']} ({tf}) {sig['side']}",
@@ -758,6 +789,7 @@ async def scan_loop():
                             f"• Zone Approach: +{calc.get('zone_approach', 0)}",
                             f"• HTF ({calc.get('htf_timeframe', '?')}): {calc.get('htf_trend_direction', '?')} (+{calc.get('htf_alignment', 0)})",
                             f"• Momentum: {calc.get('momentum_value', 0):.3f} {momentum_status} {momentum_range}",
+                            f"• Coherence: Diff={coherence_diff:.3f} {coherence_status} (≤{coherence_threshold})",
                             f"• Counter-trend: {'🚫 BLOCKED' if calc.get('strong_counter_trend', False) else '✅ ALLOWED (FILTER DISABLED)'}",
                             f"• Liquidity Path: {'🚫 BLOCKED' if calc.get('liquidity_path_blocked', False) else '✅ CLEAR'}",
                             f"",
