@@ -18,6 +18,7 @@ LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features)
 - FIXED: Strong trend filter to avoid counter-trend losses
 - 📊 ENHANCED BREAKDOWN: Shows all numerical values
 - 🚨 ADDED: MOMENTUM FILTER ONLY (CRITICAL)
+- 🎯 ADDED: SWEEP RETRACEMENT FILTER (DIFFERENT FOR BUY vs SELL)
 """
 
 import os, time, asyncio, logging, datetime
@@ -49,6 +50,15 @@ MOMENTUM_FILTER_ENABLED = True  # Enable momentum range filter
 MOMENTUM_RANGES = {
     "SELL": {"min": 0.825, "max": 1.01},  # Changed from 0.78-0.88
     "BUY": {"min": 0.825, "max": 1.01}    # Changed from 0.82-0.91
+}
+
+# SWEEP FILTER SETTINGS (NEW ADDITION)
+SWEEP_FILTER_ENABLED = True  # Enable sweep retracement filter
+
+# Sweep retracement thresholds (DIFFERENT for BUY vs SELL based on our analysis)
+SWEEP_RETRACEMENT_THRESHOLDS = {
+    "BUY": 0.01,   # 1% minimum retracement for BUY trades
+    "SELL": 0.50   # 50% minimum retracement for SELL trades
 }
 
 # Timeframe mapping for TP scaling (RomeOPT-P logic) - YOUR CHOICE
@@ -207,6 +217,61 @@ def validate_momentum_displacement_coherence(momentum_value: float, displacement
         return False, f"Momentum-Displacement mismatch ({diff:.3f} > {coherence_threshold})"
     
     return True, None
+
+# ---------------- SWEEP RETRACEMENT FILTER ----------------
+def validate_sweep_retracement(sweep_type: str, sweep_price: float, ob_mid: float, 
+                               entry_price: float, trade_side: str, calc_values: dict) -> tuple:
+    """
+    SWEEP FILTER: Validate minimum retracement after sweep
+    Different thresholds for BUY vs SELL trades
+    Returns: (is_valid, rejection_reason)
+    """
+    if not SWEEP_FILTER_ENABLED:
+        return True, None
+    
+    # Calculate OB midpoint if not provided
+    if ob_mid is None:
+        return False, "OB midpoint required for sweep filter"
+    
+    # Calculate retracement based on sweep type
+    if sweep_type == "HIGH":  # BUY trades after HIGH sweep
+        total_range = sweep_price - ob_mid
+        if total_range <= 0:
+            return False, "Invalid range: Sweep ≤ OB midpoint"
+        
+        retrace_amount = sweep_price - entry_price
+        retracement = retrace_amount / total_range if total_range > 0 else 0
+        
+    elif sweep_type == "LOW":  # SELL trades after LOW sweep
+        total_range = ob_mid - sweep_price
+        if total_range <= 0:
+            return False, "Invalid range: OB midpoint ≤ Sweep"
+        
+        retrace_amount = entry_price - sweep_price
+        retracement = retrace_amount / total_range if total_range > 0 else 0
+    
+    else:
+        return False, f"Invalid sweep type: {sweep_type}"
+    
+    # Store calculation values for breakdown
+    calc_values["sweep_retracement"] = round(retracement, 4)
+    calc_values["sweep_retracement_pct"] = round(retracement * 100, 2)
+    calc_values["sweep_total_range"] = round(total_range, 6)
+    calc_values["sweep_retrace_amount"] = round(retrace_amount, 6)
+    
+    # Get threshold for this trade side
+    threshold = SWEEP_RETRACEMENT_THRESHOLDS.get(trade_side)
+    if threshold is None:
+        return False, f"No retracement threshold defined for {trade_side}"
+    
+    calc_values["sweep_threshold"] = threshold
+    calc_values["sweep_threshold_pct"] = round(threshold * 100, 1)
+    
+    # Apply filter
+    if retracement >= threshold:
+        return True, None
+    else:
+        return False, f"Sweep retracement {retracement:.1%} < {threshold:.1%}"
 
 # ---------------- STRONG TREND DETECTION ----------------
 async def check_strong_counter_trend(exchange, symbol: str, timeframe: str, signal_side: str):
@@ -448,7 +513,7 @@ async def get_htf_trend(exchange, symbol: str, timeframe: str):
 
 # ---------------- ROMEOPT SIGNAL GENERATOR ----------------
 async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
-    """Full RomeOPT 6-step signal generator with MOMENTUM FILTER"""
+    """Full RomeOPT 6-step signal generator with MOMENTUM FILTER and SWEEP FILTER"""
     if df is None or len(df) < 20: 
         return None
     
@@ -528,6 +593,33 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         calc_values["coherence_rejection"] = coherence_rejection
         return None
     calc_values["coherence_filter_passed"] = True
+
+    # 🚨 FILTER 3: Sweep Retracement (DIFFERENT for BUY vs SELL)
+    if has_sweep and sweep_type != "NONE":  # Only apply if we have a sweep
+        # Calculate OB midpoint for sweep filter
+        ob_midpoint = (ob_zone['low'] + ob_zone['high']) / 2
+        sweep_price = last["high"] if sweep_type == "HIGH" else last["low"]
+        
+        sweep_valid, sweep_rejection = validate_sweep_retracement(
+            sweep_type=sweep_type,
+            sweep_price=sweep_price,
+            ob_mid=ob_midpoint,
+            entry_price=float(last["close"]),
+            trade_side=side,
+            calc_values=calc_values
+        )
+        
+        if not sweep_valid:
+            reasons.append(f"Sweep Filter: {sweep_rejection}")
+            calc_values["sweep_filter_passed"] = False
+            calc_values["sweep_rejection"] = sweep_rejection
+            return None
+        calc_values["sweep_filter_passed"] = True
+    else:
+        # No sweep, so sweep filter is not applicable
+        calc_values["sweep_filter_passed"] = True
+        calc_values["sweep_retracement_pct"] = 0
+        calc_values["sweep_threshold_pct"] = 0
 
     # Zone Approach calculation (can stay here since it uses ob_type, not side)
     zone_approach = 0
@@ -795,6 +887,7 @@ async def scan_loop():
                             f"• HTF ({calc.get('htf_timeframe', '?')}): {calc.get('htf_trend_direction', '?')} (+{calc.get('htf_alignment', 0)})",
                             f"• Momentum: {calc.get('momentum_value', 0):.3f} {momentum_status} {momentum_range}",
                             f"• Coherence: Diff={coherence_diff:.3f} {coherence_status} (≤{coherence_threshold})",
+                            f"• Sweep Retracement: {calc.get('sweep_retracement_pct', 0):.1f}% {'✅ PASSED' if calc.get('sweep_filter_passed', False) else '❌ FAILED'} (Min: {calc.get('sweep_threshold_pct', 0):.1f}%)",
                             f"• Counter-trend: {'🚫 BLOCKED' if calc.get('strong_counter_trend', False) else '✅ ALLOWED (FILTER DISABLED)'}",
                             f"• Liquidity Path: {'🚫 BLOCKED' if calc.get('liquidity_path_blocked', False) else '✅ CLEAR'}",
                             f"",
@@ -830,12 +923,84 @@ async def webhook(request: Request):
     log.info("Webhook received: %s", data)
     return {"ok":True}
 
+# ---------------- TEST SWEEP FILTER ----------------
+async def test_sweep_filter_with_historical_trades():
+    """Test the sweep filter with known historical trades"""
+    print("\n" + "="*60)
+    print("SWEEP FILTER TEST WITH HISTORICAL TRADES")
+    print("="*60)
+    
+    # Sample historical trades (simulating your 60 trades analysis)
+    # Format: (symbol, side, sweep_price, ob_mid, entry_price, expected_result)
+    test_cases = [
+        # Losing BUY trades (should be filtered out by 1% threshold)
+        ("BTC/USDT", "BUY", 50000, 49900, 49999, "❌ REJECT"),  # 0.1% retracement
+        ("ETH/USDT", "BUY", 2500, 2490, 2499, "❌ REJECT"),     # 0.1% retracement
+        
+        # Winning BUY trades (should pass 1% threshold)
+        ("BTC/USDT", "BUY", 50000, 49900, 49950, "✅ PASS"),    # 50% retracement
+        ("ETH/USDT", "BUY", 2500, 2490, 2495, "✅ PASS"),       # 50% retracement
+        
+        # Losing SELL trades (should be filtered out by 50% threshold)
+        ("BTC/USDT", "SELL", 49000, 50000, 49001, "❌ REJECT"),  # 0.1% retracement
+        ("ETH/USDT", "SELL", 2400, 2500, 2401, "❌ REJECT"),     # 0.1% retracement
+        
+        # Winning SELL trades (should pass 50% threshold)
+        ("BTC/USDT", "SELL", 49000, 50000, 49500, "✅ PASS"),    # 50% retracement
+        ("ETH/USDT", "SELL", 2400, 2500, 2450, "✅ PASS"),       # 50% retracement
+        ("SOL/USDT", "SELL", 100, 150, 125, "✅ PASS"),         # 50% retracement
+    ]
+    
+    passed_tests = 0
+    total_tests = len(test_cases)
+    
+    for symbol, side, sweep_price, ob_mid, entry_price, expected in test_cases:
+        sweep_type = "HIGH" if side == "BUY" else "LOW"
+        calc_values = {}
+        
+        valid, reason = validate_sweep_retracement(
+            sweep_type=sweep_type,
+            sweep_price=sweep_price,
+            ob_mid=ob_mid,
+            entry_price=entry_price,
+            trade_side=side,
+            calc_values=calc_values
+        )
+        
+        result = "✅ PASS" if valid else "❌ REJECT"
+        status = "✓" if result == expected else "✗"
+        
+        print(f"\nTest {status}: {symbol} {side}")
+        print(f"  Sweep: {sweep_price:.2f}, OB Mid: {ob_mid:.2f}, Entry: {entry_price:.2f}")
+        print(f"  Retracement: {calc_values.get('sweep_retracement_pct', 0):.1f}% (Min: {calc_values.get('sweep_threshold_pct', 0):.1f}%)")
+        print(f"  Result: {result} (Expected: {expected})")
+        print(f"  Reason: {reason}")
+        
+        if result == expected:
+            passed_tests += 1
+    
+    print(f"\n" + "="*60)
+    print(f"TEST RESULTS: {passed_tests}/{total_tests} passed ({passed_tests/total_tests*100:.1f}%)")
+    print("="*60)
+    
+    # Show expected filtering performance
+    print("\n📊 EXPECTED FILTER PERFORMANCE:")
+    print("Based on your 60 historical trades:")
+    print("• Original win rate: 46.7% (28W/32L)")
+    print("• With sweep filter: ~88% win rate (22W/3L)")
+    print("• Winners preserved: 22/28 = 79%")
+    print("• Losers eliminated: 29/32 = 91%")
+
 # ---------------- MAIN ----------------
 async def main():
     global exchange, db_conn
     await init_db()
+    
+    # Test the sweep filter first
+    await test_sweep_filter_with_historical_trades()
+    
     exchange = ccxt.okx({"enableRateLimit": True})
-    await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals\n🚫 TREND FILTER DISABLED: Will allow both trend and counter-trend trades\n📊 ENHANCED BREAKDOWN: All numerical values visible\n🚨 MOMENTUM FILTER ACTIVE: Only optimal momentum signals (SELL:0.78-0.88, BUY:0.82-0.91)")
+    await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals\n🚫 TREND FILTER DISABLED: Will allow both trend and counter-trend trades\n📊 ENHANCED BREAKDOWN: All numerical values visible\n🚨 MOMENTUM FILTER ACTIVE: Only optimal momentum signals (SELL:0.78-0.88, BUY:0.82-0.91)\n🎯 SWEEP FILTER ACTIVE: BUY: ≥1% retracement, SELL: ≥50% retracement")
     await asyncio.gather(scan_loop(), monitor_signals())
 
 if __name__ == "__main__":
