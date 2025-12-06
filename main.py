@@ -58,7 +58,7 @@ SWEEP_FILTER_ENABLED = True  # Enable sweep retracement filter
 # Sweep retracement thresholds (DIFFERENT for BUY vs SELL based on our analysis)
 SWEEP_RETRACEMENT_THRESHOLDS = {
     "BUY": 0.01,   # 1% minimum retracement for BUY trades
-    "SELL": 0.50   # 50% minimum retracement for SELL trades
+    "SELL": 0.01   # 50% minimum retracement for SELL trades
 }
 
 # Timeframe mapping for TP scaling (RomeOPT-P logic) - YOUR CHOICE
