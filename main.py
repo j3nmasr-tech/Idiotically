@@ -485,11 +485,31 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     else: 
         reasons.append(f"Displacement +0 ({displacement:.3f})")
     
+    # ========== CRITICAL FIX: DETECT OB AND SIDE BEFORE FILTERS ==========
+    # Step3&4: OB detection (MUST HAPPEN BEFORE FILTERS THAT NEED side)
+    ob_zone = find_latest_ob(df)
+    if not ob_zone: 
+        reasons.append("No OB detected")
+        calc_values["ob_type"] = "NONE"
+        calc_values["zone_approach"] = 0
+        return None
+    
+    ob_type = ob_zone['type']
+    calc_values["ob_type"] = ob_type
+    calc_values["ob_low"] = round(ob_zone['low'], 6)
+    calc_values["ob_high"] = round(ob_zone['high'], 6)
+    
+    # Determine side from OB type
+    side = "BUY" if ob_type == "bullish" else "SELL"
+    calc_values["signal_side"] = side
+    # ========== END FIX ==========
+    
     # 🚨 FILTER 1: Momentum ≥ 0.825
     momentum_ratio = abs(last["close"]-last["open"])/(last["high"]-last["low"]+1e-8)
     calc_values["momentum_value"] = round(momentum_ratio, 3)
     calc_values["momentum_threshold"] = 0.5
     
+    # NOW side is defined before this call
     momentum_valid, momentum_rejection = validate_momentum(momentum_ratio, side, calc_values)
     if not momentum_valid:
         reasons.append(f"Momentum Filter: {momentum_rejection}")
@@ -509,20 +529,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         return None
     calc_values["coherence_filter_passed"] = True
 
-    # Step3&4: OB detection
-    ob_zone = find_latest_ob(df)
-    if not ob_zone: 
-        reasons.append("No OB detected")
-        calc_values["ob_type"] = "NONE"
-        calc_values["zone_approach"] = 0
-        return None
-    
-    ob_type = ob_zone['type']
-    calc_values["ob_type"] = ob_type
-    calc_values["ob_low"] = round(ob_zone['low'], 6)
-    calc_values["ob_high"] = round(ob_zone['high'], 6)
-    
-    # Zone Approach calculation
+    # Zone Approach calculation (can stay here since it uses ob_type, not side)
     zone_approach = 0
     if ob_type == "bullish" and last["close"] <= ob_zone['high']:
         zone_approach = 1
@@ -538,9 +545,6 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     calc_values["zone_approach"] = zone_approach
 
     # Step5: HTF alignment with IMPROVED detection
-    side = "BUY" if ob_type == "bullish" else "SELL"
-    calc_values["signal_side"] = side
-    
     # Check for STRONG counter-trend BEFORE proceeding
     should_reject = False  # DISABLED - Allow all signals
     
@@ -572,6 +576,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         calc_values["htf_alignment"] = 0
     
     # Original momentum check (still needed for basic validation)
+    # NOTE: This is redundant with the momentum filter above, but keeping it for backward compatibility
     if momentum_ratio < 0.5: 
         reasons.append(f"Momentum Failed ({momentum_ratio:.3f} < 0.5)")
         calc_values["momentum_score"] = 0
