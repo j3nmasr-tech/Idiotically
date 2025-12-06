@@ -47,8 +47,8 @@ MOMENTUM_FILTER_ENABLED = True  # Enable momentum range filter
 
 # Momentum ranges (from historical analysis - OPTIMAL RANGES)
 MOMENTUM_RANGES = {
-    "SELL": {"min": 0.825, "max": 0.91},  # Changed from 0.78-0.88
-    "BUY": {"min": 0.825, "max": 0.93}    # Changed from 0.82-0.91
+    "SELL": {"min": 0.825, "max": 1.01},  # Changed from 0.78-0.88
+    "BUY": {"min": 0.825, "max": 1.01}    # Changed from 0.82-0.91
 }
 
 # Timeframe mapping for TP scaling (RomeOPT-P logic) - YOUR CHOICE
