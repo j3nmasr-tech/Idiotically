@@ -62,17 +62,17 @@ SWEEP_RETRACEMENT_THRESHOLDS = {
     "SELL": 0.01   # 1% minimum retracement for SELL trades (changed from 50%)
 }
 
-# OB FILTER SETTINGS (VERY TIGHT - Level 2)
-OB_FILTER_ENABLED = True  # Enable OB quality filter
-OB_MIN_SCORE = 5  # Must pass ALL 5 criteria (5/5 rule)
+# OB FILTER SETTINGS (LOOSE - Level 4)
+OB_FILTER_ENABLED = True
+OB_MIN_SCORE = 3  # Pass 3 out of 5 criteria
 
-# OB Filter Parameters (VERY TIGHT from analysis)
-OB_RANGE_MIN = 0.10    # Minimum OB range % of price (was 0.07)
-OB_RANGE_MAX = 0.35    # Maximum OB range % of price (was 0.50)
-OB_AGE_MAX = 2         # Maximum candles since OB formed (was 4)
-OB_DISTANCE_MAX = 0.45 # Maximum distance from entry % (was 0.65)
-OB_TESTS_MAX = 1       # Maximum number of tests (was 2)
-OB_REACTION_MIN = 1.5  # Minimum previous reaction % (was 1.0)
+# OB Filter Parameters (LOOSE but still effective)
+OB_RANGE_MIN = 0.05    # Minimum OB range % (0.05-1.0%)
+OB_RANGE_MAX = 1.0     # Maximum OB range % 
+OB_AGE_MAX = 5         # ≤5 candles old
+OB_DISTANCE_MAX = 1.0  # ≤1.0% from entry
+OB_TESTS_MAX = 3       # ≤3 tests
+OB_REACTION_MIN = 0.8  # ≥0.8% reaction
 
 # Timeframe mapping for TP scaling (RomeOPT-P logic) - YOUR CHOICE
 TP_TIMEFRAME_MAP = {
