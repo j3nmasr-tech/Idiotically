@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features + OB FILTER)
+LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features + OB FILTER + TREND FILTER)
 - Fully live early signals
 - RomeOPT 6-step logic
 - Strict TP/SL (0.8R/1.6R, SL→BE after TP1, no TP3)
@@ -15,7 +15,7 @@ LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features + OB FILTER)
 - Adaptive Market Regime detection
 - HTF + Sweep scoring threshold
 - Elite multi-timeframe confirmation (15m,1h,4h)
-- FIXED: Strong trend filter to avoid counter-trend losses
+- ✅ ENABLED: Strong trend filter to avoid counter-trend losses
 - 📊 ENHANCED BREAKDOWN: Shows all numerical values
 - 🚨 ADDED: MOMENTUM FILTER ONLY (CRITICAL)
 - 🎯 ADDED: SWEEP RETRACEMENT FILTER (DIFFERENT FOR BUY vs SELL)
@@ -481,8 +481,69 @@ async def check_strong_counter_trend(exchange, symbol: str, timeframe: str, sign
     Check if higher timeframe is in STRONG trend AGAINST our signal.
     Returns True if we should REJECT the signal (strong counter-trend).
     """
-    # DISABLED - Return False to allow all signals
-    return False
+    # ENABLED TREND FILTER - Check higher timeframe trends
+    
+    # Define HTF mapping for strong trend detection
+    htf_mapping = {
+        "1m": "15m",
+        "3m": "30m", 
+        "5m": "1h",
+        "15m": "4h",
+        "30m": "4h"
+    }
+    
+    # Get the higher timeframe for trend analysis
+    htf = htf_mapping.get(timeframe, "15m")
+    
+    # Fetch HTF data
+    ohlcv = await fetch_ohlcv(exchange, symbol, htf, 100)
+    if not ohlcv:
+        return False  # If we can't get data, don't reject
+        
+    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+    for c in ["open","high","low","close","vol"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    
+    # Calculate indicators for trend detection
+    df['ema20'] = calculate_ema(df, 20)
+    df['ema50'] = calculate_ema(df, 50)
+    
+    # Get current values
+    current_price = df['close'].iloc[-1]
+    ema20 = df['ema20'].iloc[-1]
+    ema50 = df['ema50'].iloc[-1]
+    
+    # Check for STRONG trend conditions
+    # Strong Bullish Trend:
+    # 1. Price > EMA20 > EMA50
+    # 2. EMAs are aligned bullish
+    # 3. Recent price action shows consistent higher highs/lows
+    strong_bullish = (
+        current_price > ema20 > ema50 and
+        ema20 > df['ema20'].iloc[-5] and  # EMA20 sloping up
+        df['high'].iloc[-5:].max() > df['high'].iloc[-10:-5].max()  # Higher highs
+    )
+    
+    # Strong Bearish Trend:
+    # 1. Price < EMA20 < EMA50  
+    # 2. EMAs are aligned bearish
+    # 3. Recent price action shows consistent lower highs/lows
+    strong_bearish = (
+        current_price < ema20 < ema50 and
+        ema20 < df['ema20'].iloc[-5] and  # EMA20 sloping down
+        df['low'].iloc[-5:].min() < df['low'].iloc[-10:-5].min()  # Lower lows
+    )
+    
+    # Determine if we should reject based on counter-trend
+    if strong_bullish and signal_side == "SELL":
+        log.debug(f"🚫 Trend Filter: STRONG BULLISH trend on {htf}, rejecting SELL signal")
+        return True  # Reject SELL in strong bullish trend
+        
+    if strong_bearish and signal_side == "BUY":
+        log.debug(f"🚫 Trend Filter: STRONG BEARISH trend on {htf}, rejecting BUY signal")
+        return True  # Reject BUY in strong bearish trend
+    
+    return False  # Allow the signal (either no strong trend or trend aligns with signal)
 
 # ---------------- MARKET REGIME ----------------
 async def detect_market_regime(df: pd.DataFrame):
@@ -791,9 +852,12 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
 
     # Step5: HTF alignment with IMPROVED detection
     # Check for STRONG counter-trend BEFORE proceeding
-    should_reject = False  # DISABLED - Allow all signals
+    should_reject = await check_strong_counter_trend(exchange, symbol, tf, side)
+    calc_values["strong_counter_trend"] = should_reject
     
-    calc_values["strong_counter_trend"] = False
+    if should_reject:
+        reasons.append(f"🚫 Strong counter-trend detected on HTF")
+        return None
     
     # Use mapping consistent with elite_tf_alignment
     tf_map = {"1m":"15m", "3m":"30m", "5m":"1h", "15m":"4h", "30m":"1h"}
@@ -1028,6 +1092,9 @@ async def scan_loop():
                         ob_score = calc.get("ob_score", 0)
                         ob_required = OB_MIN_SCORE
                         
+                        # Trend filter status
+                        trend_status = "✅ ALLOWED" if not calc.get("strong_counter_trend", False) else "🚫 REJECTED"
+                        
                         breakdown_lines = [
                             f"🏆 {sig['symbol']} ({tf}) {sig['side']}",
                             f"Entry: {sig['entry']:.6f}",
@@ -1050,7 +1117,7 @@ async def scan_loop():
                             f"• Momentum: {calc.get('momentum_value', 0):.3f} {momentum_status} {momentum_range}",
                             f"• Coherence: Diff={coherence_diff:.3f} {coherence_status} (≤{coherence_threshold})",
                             f"• Sweep Retracement: {calc.get('sweep_retracement_pct', 0):.1f}% {'✅ PASSED' if calc.get('sweep_filter_passed', False) else '❌ FAILED'} (Min: {calc.get('sweep_threshold_pct', 0):.1f}%)",
-                            f"• Counter-trend: {'🚫 BLOCKED' if calc.get('strong_counter_trend', False) else '✅ ALLOWED (FILTER DISABLED)'}",
+                            f"• Trend Filter: {trend_status}",
                             f"• Liquidity Path: {'🚫 BLOCKED' if calc.get('liquidity_path_blocked', False) else '✅ CLEAR'}",
                             f"",
                             f"🎯 RISK/REWARD:",
@@ -1122,7 +1189,10 @@ async def main():
     
     exchange = ccxt.okx({"enableRateLimit": True})
     await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals")
-    await tg("🚫 TREND FILTER DISABLED: Will allow both trend and counter-trend trades")
+    await tg("✅ TREND FILTER ENABLED: Will reject signals against strong HTF trends")
+    await tg("   - Rejects SELL signals in STRONG BULLISH trends")
+    await tg("   - Rejects BUY signals in STRONG BEARISH trends")
+    await tg("   - Uses EMA20/EMA50 alignment + price structure")
     await tg("📊 ENHANCED BREAKDOWN: All numerical values visible")
     await tg("🚨 MOMENTUM FILTER ACTIVE: Only optimal momentum signals (SELL:0.78-0.88, BUY:0.82-0.91)")
     await tg("🎯 SWEEP FILTER ACTIVE: BUY: ≥1% retracement, SELL: ≥1% retracement")
