@@ -15,7 +15,7 @@ LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features)
 - HTF + Sweep scoring threshold
 - Elite multi-timeframe confirmation (15m,1h,4h)
 - 🎯 MOMENTUM FILTER: 0.8 threshold (was 0.5)
-- 📊 COMPLETE 6-STEP BREAKDOWN: Shows all numerical values for each step
+- 📊 COMPACT BREAKDOWN: All numbers, minimal text
 """
 
 import os, time, asyncio, logging, datetime
@@ -141,10 +141,10 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     score = 0
     reasons = []
     
-    # Store all calculation values for COMPLETE breakdown
+    # Store all calculation values for breakdown
     calc_values = {}
 
-    # STEP 1: Liquidity Sweep
+    # Step 1: Liquidity Sweep
     prev5_high_max = float(prev5["high"].max())
     prev5_low_min = float(prev5["low"].min())
     last_high = float(last["high"])
@@ -158,27 +158,24 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     sweep_type = "HIGH" if sweep_high else ("LOW" if sweep_low else "NONE")
     reasons.append(f"Liquidity Sweep +{liquidity_sweep}")
     
-    # Store STEP 1 details
     calc_values["step1"] = {
         "type": sweep_type,
         "score": liquidity_sweep,
-        "prev5_high_max": prev5_high_max,
-        "prev5_low_min": prev5_low_min,
+        "prev_high": prev5_high_max,
+        "prev_low": prev5_low_min,
         "last_high": last_high,
-        "last_low": last_low,
-        "condition": f"{last_high:.6f} > {prev5_high_max:.6f}" if sweep_high else f"{last_low:.6f} < {prev5_low_min:.6f}"
+        "last_low": last_low
     }
 
-    # STEP 2: Displacement
+    # Step 2: Displacement
     candle_size = float(last["high"] - last["low"])
     body_size = float(abs(last["close"] - last["open"]))
     displacement = body_size / (candle_size + 1e-8)
     calc_values["step2"] = {
-        "displacement_value": round(displacement, 2),
+        "displacement": round(displacement, 3),
         "candle_size": round(candle_size, 6),
         "body_size": round(body_size, 6),
-        "threshold": 0.6,
-        "condition": f"{displacement:.2f} > 0.6"
+        "threshold": 0.6
     }
     
     has_disp = displacement > 0.6
@@ -189,50 +186,45 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         reasons.append(f"Displacement +0 ({displacement:.2f})")
         calc_values["step2"]["score"] = 0
 
-    # STEP 3 & 4: Order Block & Zone
+    # Step 3 & 4: Order Block & Zone
     ob_zone = None
     for i in range(len(df)-5, len(df)-1):
         candle, prev_candle = df.iloc[i], df.iloc[i-1]
         if candle["close"]>candle["open"] and prev_candle["close"]<prev_candle["open"]:
-            ob_zone={"type":"bullish","low":min(candle["low"], prev_candle["low"]),"high":candle["close"], "candle_index": i}; break
+            ob_zone={"type":"bullish","low":min(candle["low"], prev_candle["low"]),"high":candle["close"], "idx": i}; break
         elif candle["close"]<candle["open"] and prev_candle["close"]>prev_candle["open"]:
-            ob_zone={"type":"bearish","low":candle["close"],"high":max(candle["high"], prev_candle["high"]), "candle_index": i}; break
+            ob_zone={"type":"bearish","low":candle["close"],"high":max(candle["high"], prev_candle["high"]), "idx": i}; break
 
     zone_approach = 0
     if ob_zone:
         ob_type = ob_zone["type"]
-        zone_condition = ""
-        if ob_type=="bullish" and last["close"] <= ob_zone["high"]: 
+        last_close = float(last["close"])
+        
+        if ob_type=="bullish" and last_close <= ob_zone["high"]: 
             score+=1; zone_approach=1; reasons.append("Zone Approach +1")
-            zone_condition = f"Price({last['close']:.6f}) <= OB High({ob_zone['high']:.6f})"
-        elif ob_type=="bearish" and last["close"] >= ob_zone["low"]: 
+        elif ob_type=="bearish" and last_close >= ob_zone["low"]: 
             score+=1; zone_approach=1; reasons.append("Zone Approach +1")
-            zone_condition = f"Price({last['close']:.6f}) >= OB Low({ob_zone['low']:.6f})"
         else: 
             reasons.append("Zone Approach +0")
-            zone_condition = "Not in zone"
         
-        # Store STEP 3/4 details
         calc_values["step3_4"] = {
-            "ob_type": ob_type,
-            "ob_low": round(ob_zone["low"], 6),
-            "ob_high": round(ob_zone["high"], 6),
-            "candle_index": ob_zone.get("candle_index", -1),
-            "current_price": round(float(last["close"]), 6),
-            "zone_approach": zone_approach,
-            "condition": zone_condition,
-            "score": zone_approach
+            "type": ob_type,
+            "low": round(ob_zone["low"], 6),
+            "high": round(ob_zone["high"], 6),
+            "price": round(last_close, 6),
+            "zone_score": zone_approach,
+            "in_zone": zone_approach == 1
         }
     else:
         reasons.append("Zone Approach +0")
         ob_type=None
         calc_values["step3_4"] = {
-            "ob_type": "NONE",
-            "score": 0,
-            "condition": "No OB found"
+            "type": "NONE",
+            "zone_score": 0,
+            "in_zone": False
         }
 
-    # STEP 5: HTF Alignment
+    # Step 5: HTF Alignment
     tf_map={"1m":"15m","3m":"30m","5m":"1h","15m":"4h","30m":"1h"}
     htf=tf_map.get(tf,"15m")
     ohlcv_htf = await fetch_ohlcv(exchange, symbol, htf, 50)
@@ -249,59 +241,52 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         htf_dir = "bullish" if trend>0 else "bearish"
         if ob_type and htf_dir==ob_type:
             score+=1; htf_alignment=1; reasons.append(f"HTF Alignment +1 ({htf_dir} {trend:+.6f})")
-            condition = f"HTF({htf_dir}) matches OB({ob_type})"
         else:
             reasons.append(f"HTF Alignment +0 ({htf_dir} {trend:+.6f})")
-            condition = f"HTF({htf_dir}) ≠ OB({ob_type})" if ob_type else "No OB"
         
-        # Store STEP 5 details
         calc_values["step5"] = {
-            "htf_timeframe": htf,
-            "direction": htf_dir,
+            "tf": htf,
+            "dir": htf_dir,
             "trend": htf_trend_value,
-            "price_now": price_now,
-            "price_5bars_ago": price_5bars_ago,
-            "alignment": htf_alignment,
-            "condition": condition,
-            "score": htf_alignment
+            "price_now": round(price_now, 6),
+            "price_old": round(price_5bars_ago, 6),
+            "score": htf_alignment,
+            "aligned": htf_alignment == 1
         }
     else:
         reasons.append("HTF Alignment ?")
         calc_values["step5"] = {
-            "htf_timeframe": htf,
-            "direction": "NO_DATA",
-            "trend": 0,
-            "alignment": 0,
+            "tf": htf,
+            "dir": "NO_DATA",
             "score": 0,
-            "condition": "No HTF data"
+            "aligned": False
         }
 
-    # STEP 6: MOMENTUM (0.8 THRESHOLD)
+    # Step 6: Momentum (0.8 THRESHOLD)
     momentum_ratio = abs(last["close"]-last["open"])/(last["high"]-last["low"]+1e-8)
     
-    # Store STEP 6 details
     calc_values["step6"] = {
-        "momentum_value": round(momentum_ratio, 2),
+        "ratio": round(momentum_ratio, 3),
         "threshold": 0.8,
-        "body_size": round(float(abs(last["close"] - last["open"])), 6),
-        "candle_size": round(float(last["high"] - last["low"]), 6)
+        "body": round(float(abs(last["close"] - last["open"])), 6),
+        "candle": round(float(last["high"] - last["low"]), 6)
     }
     
     momentum_score = 0
     if ob_type=="bullish" and momentum_ratio>=0.8 and last["close"]>last["open"]:
         score+=1; momentum_score=1
         reasons.append(f"Momentum +1 ({momentum_ratio:.2f})")
-        calc_values["step6"]["condition"] = f"Bullish candle & ratio({momentum_ratio:.2f}) ≥ 0.8"
         calc_values["step6"]["score"] = 1
+        calc_values["step6"]["passed"] = True
     elif ob_type=="bearish" and momentum_ratio>=0.8 and last["close"]<last["open"]:
         score+=1; momentum_score=1
         reasons.append(f"Momentum +1 ({momentum_ratio:.2f})")
-        calc_values["step6"]["condition"] = f"Bearish candle & ratio({momentum_ratio:.2f}) ≥ 0.8"
         calc_values["step6"]["score"] = 1
+        calc_values["step6"]["passed"] = True
     else:
         reasons.append(f"Momentum +0 ({momentum_ratio:.2f})")
-        calc_values["step6"]["condition"] = f"Ratio({momentum_ratio:.2f}) < 0.8 or wrong candle"
         calc_values["step6"]["score"] = 0
+        calc_values["step6"]["passed"] = False
 
     if not ob_type: return None
     side = "BUY" if ob_type=="bullish" else "SELL"
@@ -338,7 +323,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         "htf_alignment": htf_alignment,
         "liquidity_sweep": liquidity_sweep,
         "momentum_ratio": momentum_ratio,
-        "calc_values": calc_values  # Store all calculation values
+        "calc_values": calc_values
     }
     
     sig = update_tp_sl_live(sig, df)
@@ -552,10 +537,9 @@ async def scan_loop(exchange):
                     for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
                     sig = await generate_signal_romeopt(exchange,df,symbol,tf)
                     if sig:
-                        # COMPLETE 6-STEP BREAKDOWN FOR TELEGRAM
+                        # COMPACT BUT COMPLETE BREAKDOWN
                         calc = sig.get("calc_values", {})
                         
-                        # Get step details
                         step1 = calc.get("step1", {})
                         step2 = calc.get("step2", {})
                         step3_4 = calc.get("step3_4", {})
@@ -563,53 +547,35 @@ async def scan_loop(exchange):
                         step6 = calc.get("step6", {})
                         
                         breakdown_lines = [
-                            f"🏆 ROMEOPT 6-STEP SIGNAL 🏆",
-                            f"Symbol: {sig['symbol']} ({tf})",
-                            f"Direction: {sig['side']}",
-                            f"Entry: {sig['entry']:.6f}",
-                            f"Total Score: {sig['score']}/6",
+                            f"🏆 {sig['symbol']} {sig['side']} ({tf})",
+                            f"Entry: {sig['entry']:.6f} | Score: {sig['score']}/6",
                             f"",
-                            f"📊 STEP-BY-STEP BREAKDOWN:",
+                            f"1️⃣ Sweep: +{step1.get('score',0)} {step1.get('type','-')}",
+                            f"   • High: {step1.get('last_high',0):.6f} > {step1.get('prev_high',0):.6f}",
+                            f"   • Low: {step1.get('last_low',0):.6f} vs {step1.get('prev_low',0):.6f}",
                             f"",
-                            f"1️⃣ LIQUIDITY SWEEP (+{step1.get('score',0)})",
-                            f"   Type: {step1.get('type', 'NONE')}",
-                            f"   Condition: {step1.get('condition', 'N/A')}",
-                            f"   Prev High: {step1.get('prev5_high_max', 0):.6f}",
-                            f"   Prev Low: {step1.get('prev5_low_min', 0):.6f}",
+                            f"2️⃣ Disp: +{step2.get('score',0)} {step2.get('displacement',0):.3f}",
+                            f"   • Body: {step2.get('body_size',0):.3f} | Candle: {step2.get('candle_size',0):.3f}",
+                            f"   • Thresh: >{step2.get('threshold',0.6)}",
                             f"",
-                            f"2️⃣ DISPLACEMENT (+{step2.get('score',0)})",
-                            f"   Ratio: {step2.get('displacement_value',0):.2f}",
-                            f"   Candle Size: {step2.get('candle_size',0):.6f}",
-                            f"   Body Size: {step2.get('body_size',0):.6f}",
-                            f"   Threshold: >0.6",
-                            f"   Condition: {step2.get('condition', 'N/A')}",
+                            f"3️⃣4️⃣ Zone: +{step3_4.get('zone_score',0)} {step3_4.get('type','-')}",
+                            f"   • OB: {step3_4.get('low',0):.6f}-{step3_4.get('high',0):.6f}",
+                            f"   • Price: {step3_4.get('price',0):.6f} | In zone: {'✓' if step3_4.get('in_zone') else '✗'}",
                             f"",
-                            f"3️⃣4️⃣ ORDER BLOCK & ZONE (+{step3_4.get('score',0)})",
-                            f"   Type: {step3_4.get('ob_type', 'NONE')}",
-                            f"   OB Range: {step3_4.get('ob_low',0):.6f} - {step3_4.get('ob_high',0):.6f}",
-                            f"   Current Price: {step3_4.get('current_price',0):.6f}",
-                            f"   Condition: {step3_4.get('condition', 'N/A')}",
+                            f"5️⃣ HTF: +{step5.get('score',0)} {step5.get('dir','-')} ({step5.get('tf','-')})",
+                            f"   • Trend: {step5.get('trend',0):+.6f}",
+                            f"   • Aligned: {'✓' if step5.get('aligned') else '✗'}",
                             f"",
-                            f"5️⃣ HTF ALIGNMENT (+{step5.get('score',0)})",
-                            f"   HTF Timeframe: {step5.get('htf_timeframe', '?')}",
-                            f"   Direction: {step5.get('direction', '?')}",
-                            f"   Trend: {step5.get('trend',0):+.6f}",
-                            f"   Condition: {step5.get('condition', 'N/A')}",
+                            f"6️⃣ Mom: +{step6.get('score',0)} {step6.get('ratio',0):.3f}",
+                            f"   • Body/Candle: {step6.get('body',0):.3f}/{step6.get('candle',0):.3f}",
+                            f"   • Thresh: ≥{step6.get('threshold',0.8)} | Passed: {'✓' if step6.get('passed') else '✗'}",
                             f"",
-                            f"6️⃣ MOMENTUM (+{step6.get('score',0)})",
-                            f"   Ratio: {step6.get('momentum_value',0):.2f}",
-                            f"   Threshold: ≥0.8",
-                            f"   Condition: {step6.get('condition', 'N/A')}",
-                            f"",
-                            f"🎯 TRADE SETUP:",
-                            f"   SL: {sig.get('sl',0):.6f}",
-                            f"   TP1: {sig.get('tp1',0):.6f}",
-                            f"   TP2: {sig.get('tp2',0):.6f}",
-                            f"   TP3: {sig.get('tp3',0):.6f}",
-                            f"",
-                            f"📈 RISK/REWARD:",
-                            f"   Risk: {abs(sig.get('entry',0) - sig.get('sl',0)):.6f}",
-                            f"   R:R (TP1): {abs(sig.get('tp1',0) - sig.get('entry',0))/max(abs(sig.get('entry',0) - sig.get('sl',0)), 0.000001):.2f}:1"
+                            f"🎯 Setup:",
+                            f"   • SL: {sig.get('sl',0):.6f}",
+                            f"   • TP1: {sig.get('tp1',0):.6f}",
+                            f"   • TP2: {sig.get('tp2',0):.6f}",
+                            f"   • TP3: {sig.get('tp3',0):.6f}",
+                            f"   • R:R: {(abs(sig.get('tp1',0) - sig['entry']) / max(abs(sig['entry'] - sig.get('sl',0)), 0.000001)):.2f}:1"
                         ]
                         
                         await tg("\n".join(breakdown_lines))
@@ -637,8 +603,7 @@ async def main():
     global exchange
     exchange = ccxt.okx({"enableRateLimit": True})
     await tg("🏆 ROMEOPT 6-Step Scanner Started")
-    await tg("📊 COMPLETE 6-STEP BREAKDOWN ENABLED")
-    await tg("🎯 MOMENTUM FILTER: 0.8 threshold")
+    await tg("📊 Compact breakdown enabled - all numbers shown")
     await asyncio.gather(scan_loop(exchange), monitor_signals())
 
 if __name__=="__main__":
