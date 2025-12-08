@@ -64,7 +64,7 @@ SWEEP_RETRACEMENT_THRESHOLDS = {
 
 # OB FILTER SETTINGS (LOOSE - Level 4)
 OB_FILTER_ENABLED = True
-OB_MIN_SCORE = 2  # Pass 3 out of 5 criteria
+OB_MIN_SCORE = 3  # Pass 3 out of 5 criteria
 
 # OB Filter Parameters (LOOSE but still effective)
 OB_RANGE_MIN = 0.05    # Minimum OB range % (0.05-1.0%)
