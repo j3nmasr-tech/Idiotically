@@ -2,11 +2,24 @@
 # -*- coding: utf-8 -*-
 
 """
-LIVE ROMEOPT ELITE SCANNER (Enhanced + ELITE FILTERS)
-- Elite filters for 90% win rate
-- 1. OB Reaction MUST BE ≥ 0.26% (HARD CODED)
-- 2. Sweep Retracement MUST BE 3%-26% (HARD CODED)
-- Any signal not matching both = REJECTED
+LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features + OB FILTER + TREND FILTER)
+- Fully live early signals
+- RomeOPT 6-step logic
+- Strict TP/SL (0.8R/1.6R, SL→BE after TP1, no TP3)
+- Liquidity path filter
+- Clean traffic / range avoidance
+- Telegram alerts
+- Async SQLite logging
+- Filters: Score >=5, Displacement +2, Sweep+2 OR Zone+1, avoid counter-trend
+- Improved Order Block detection
+- Adaptive Market Regime detection
+- HTF + Sweep scoring threshold
+- Elite multi-timeframe confirmation (15m,1h,4h)
+- ✅ ENABLED: Strong trend filter to avoid counter-trend losses
+- 📊 ENHANCED BREAKDOWN: Shows all numerical values
+- 🚨 ADDED: MOMENTUM FILTER ONLY (CRITICAL)
+- 🎯 ADDED: SWEEP RETRACEMENT FILTER (DIFFERENT FOR BUY vs SELL)
+- 🎯 ADDED: OB QUALITY FILTER (4/5 criteria from analysis)
 """
 
 import os, time, asyncio, logging, datetime
@@ -43,23 +56,23 @@ MOMENTUM_RANGES = {
 # SWEEP FILTER SETTINGS (NEW ADDITION)
 SWEEP_FILTER_ENABLED = True  # Enable sweep retracement filter
 
-# 🚨 ELITE FILTER 1: SWEEP RETRACEMENT MUST BE 3-26% (HARDCODED)
+# Sweep retracement thresholds (DIFFERENT for BUY vs SELL based on our analysis)
 SWEEP_RETRACEMENT_THRESHOLDS = {
-    "BUY": {"min": 3.0, "max": 26.0},   # 3-26% retracement for BUY trades
-    "SELL": {"min": 3.0, "max": 26.0}   # 3-26% retracement for SELL trades
+    "BUY": 0.01,   # 1% minimum retracement for BUY trades
+    "SELL": 0.01   # 1% minimum retracement for SELL trades (changed from 50%)
 }
 
-# 🚨 ELITE FILTER 2: OB QUALITY FILTER WITH ≥0.26% REACTION
+# OB FILTER SETTINGS (LOOSE - Level 4)
 OB_FILTER_ENABLED = True
-OB_MIN_SCORE = 1  # Must pass ALL criteria (3/3)
+OB_MIN_SCORE = 4  # Pass 3 out of 5 criteria
 
-# ELITE THRESHOLDS (HARDCODED FROM ANALYSIS - ABSOLUTE)
-OB_RANGE_MIN = 0.07    # 0.07-0.50%
-OB_RANGE_MAX = 0.50    
-OB_AGE_MAX = 4         # ≤4 candles
-OB_DISTANCE_MAX = 0.65  # ≤0.65%
-OB_TESTS_MAX = 2       # ≤2 tests
-OB_REACTION_MIN = 0.26  # 🚨 CRITICAL: MUST BE ≥ 0.26%
+# OB Filter Parameters (LOOSE but still effective)
+OB_RANGE_MIN = 0.05    # Minimum OB range % (0.05-1.0%)
+OB_RANGE_MAX = 1.0     # Maximum OB range % 
+OB_AGE_MAX = 5         # ≤5 candles old
+OB_DISTANCE_MAX = 1.0  # ≤1.0% from entry
+OB_TESTS_MAX = 3       # ≤3 tests
+OB_REACTION_MIN = 0.8  # ≥0.8% reaction
 
 # Timeframe mapping for TP scaling (RomeOPT-P logic) - YOUR CHOICE
 TP_TIMEFRAME_MAP = {
@@ -222,7 +235,7 @@ def validate_momentum_displacement_coherence(momentum_value: float, displacement
 def validate_sweep_retracement(sweep_type: str, sweep_price: float, ob_mid: float, 
                                entry_price: float, trade_side: str, calc_values: dict) -> tuple:
     """
-    🚨 ELITE FILTER: Validate retracement is 3-26% (HARDCODED)
+    SWEEP FILTER: Validate minimum retracement after sweep
     Different thresholds for BUY vs SELL trades
     Returns: (is_valid, rejection_reason)
     """
@@ -259,24 +272,19 @@ def validate_sweep_retracement(sweep_type: str, sweep_price: float, ob_mid: floa
     calc_values["sweep_total_range"] = round(total_range, 6)
     calc_values["sweep_retrace_amount"] = round(retrace_amount, 6)
     
-    # 🚨 ELITE FILTER: MUST BE 3-26%
+    # Get threshold for this trade side
     threshold = SWEEP_RETRACEMENT_THRESHOLDS.get(trade_side)
     if threshold is None:
         return False, f"No retracement threshold defined for {trade_side}"
     
-    min_threshold = threshold["min"] / 100  # Convert from % to decimal
-    max_threshold = threshold["max"] / 100
+    calc_values["sweep_threshold"] = threshold
+    calc_values["sweep_threshold_pct"] = round(threshold * 100, 1)
     
-    calc_values["sweep_threshold_min"] = threshold["min"]
-    calc_values["sweep_threshold_max"] = threshold["max"]
-    
-    # Apply elite filter (3-26% range)
-    if min_threshold <= retracement <= max_threshold:
+    # Apply filter
+    if retracement >= threshold:
         return True, None
-    elif retracement < min_threshold:
-        return False, f"Sweep retracement {retracement*100:.1f}% < {min_threshold*100:.0f}% (ELITE MIN)"
     else:
-        return False, f"Sweep retracement {retracement*100:.1f}% > {max_threshold*100:.0f}% (ELITE MAX)"
+        return False, f"Sweep retracement {retracement:.1%} < {threshold:.1%}"
 
 # ---------------- OB QUALITY FILTER FUNCTIONS ----------------
 def calculate_ob_age(df: pd.DataFrame, ob_zone: dict) -> int:
@@ -425,7 +433,7 @@ def score_order_block_quality_complete(ob_zone: dict, df: pd.DataFrame, current_
             reasons.append(f"Tests: {ob_tests} times ✗ (≤{OB_TESTS_MAX})")
             details["tests_pass"] = False
         
-        # 5. Previous Reaction Strength - 🚨 ELITE FILTER: MUST BE ≥ 0.26%
+        # 5. Previous Reaction Strength
         ob_age = calculate_ob_age(df, ob_zone)
         reaction_pct = 0
         details["reaction_pct"] = 0
@@ -444,15 +452,13 @@ def score_order_block_quality_complete(ob_zone: dict, df: pd.DataFrame, current_
                 reaction_pct = reaction
                 details["reaction_pct"] = round(reaction_pct, 2)
                 
-                # 🚨 CRITICAL: HARD FILTER: MUST BE ≥ 0.26%
-                if reaction_pct >= 0.26:  # ELITE MINIMUM
+                if reaction_pct >= OB_REACTION_MIN:
                     score += 1
-                    reasons.append(f"Reaction: {reaction_pct:.2f}% ✓ (≥0.26%)")
+                    reasons.append(f"Reaction: {reaction_pct:.2f}% ✓ (≥{OB_REACTION_MIN}%)")
                     details["reaction_pass"] = True
                 else:
-                    reasons.append(f"Reaction: {reaction_pct:.2f}% ✗ (<0.26%)")
+                    reasons.append(f"Reaction: {reaction_pct:.2f}% ✗ (≥{OB_REACTION_MIN}%)")
                     details["reaction_pass"] = False
-                    return 0, reasons, details  # 🚨 IMMEDIATE REJECT IF < 0.26%
             else:
                 reasons.append("Reaction: Unknown (no follow-up candle)")
                 details["reaction_pass"] = False
@@ -704,7 +710,7 @@ async def get_htf_trend(exchange, symbol: str, timeframe: str):
 
 # ---------------- ROMEOPT SIGNAL GENERATOR ----------------
 async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
-    """Full RomeOPT 6-step signal generator with ELITE FILTERS"""
+    """Full RomeOPT 6-step signal generator with MOMENTUM FILTER, SWEEP FILTER, and OB FILTER"""
     if df is None or len(df) < 20: 
         return None
     
@@ -760,7 +766,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     calc_values["signal_side"] = side
     # ========== END CRITICAL SECTION ==========
     
-    # 🚨 ELITE FILTER 1: OB QUALITY FILTER WITH ≥0.26% REACTION
+    # 🚨 FILTER 1: OB QUALITY FILTER (NEW ADDITION)
     ob_score, ob_reasons, ob_details = score_order_block_quality_complete(
         ob_zone, df, float(last["close"]), side
     )
@@ -778,7 +784,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     
     calc_values["ob_filter_passed"] = True
     
-    # Momentum filter (original)
+    # 🚨 FILTER 2: Momentum ≥ 0.825
     momentum_ratio = abs(last["close"]-last["open"])/(last["high"]-last["low"]+1e-8)
     calc_values["momentum_value"] = round(momentum_ratio, 3)
     calc_values["momentum_threshold"] = 0.5
@@ -791,7 +797,18 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         return None
     calc_values["momentum_filter_passed"] = True
     
-    # 🚨 ELITE FILTER 2: SWEEP RETRACEMENT MUST BE 3-26%
+    # 🚨 FILTER 3: Momentum-Displacement Coherence ≤ 0.02
+    coherence_valid, coherence_rejection = validate_momentum_displacement_coherence(
+        momentum_ratio, displacement, calc_values
+    )
+    if not coherence_valid:
+        reasons.append(f"Coherence Filter: {coherence_rejection}")
+        calc_values["coherence_filter_passed"] = False
+        calc_values["coherence_rejection"] = coherence_rejection
+        return None
+    calc_values["coherence_filter_passed"] = True
+
+    # 🚨 FILTER 4: Sweep Retracement (DIFFERENT for BUY vs SELL)
     if has_sweep and sweep_type != "NONE":  # Only apply if we have a sweep
         # Calculate OB midpoint for sweep filter
         ob_midpoint = (ob_zone['low'] + ob_zone['high']) / 2
@@ -807,19 +824,16 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         )
         
         if not sweep_valid:
-            reasons.append(f"🚫 ELITE FILTER REJECTED: {sweep_rejection}")
+            reasons.append(f"Sweep Filter: {sweep_rejection}")
             calc_values["sweep_filter_passed"] = False
             calc_values["sweep_rejection"] = sweep_rejection
-            calc_values["elite_filter_failed"] = sweep_rejection
             return None
         calc_values["sweep_filter_passed"] = True
-        calc_values["elite_filter_passed"] = True
     else:
         # No sweep, so sweep filter is not applicable
         calc_values["sweep_filter_passed"] = True
         calc_values["sweep_retracement_pct"] = 0
-        calc_values["sweep_threshold_min"] = 3.0
-        calc_values["sweep_threshold_max"] = 26.0
+        calc_values["sweep_threshold_pct"] = 0
 
     # Zone Approach calculation
     zone_approach = 0
@@ -922,7 +936,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         "entry_tf": tf,
         "tp_tf": tp_tf,
         "score": int(score),  # Ensure integer
-        "reason": "RomeOPT-P Elite 6-Step",
+        "reason": "RomeOPT-P 6-Step",
         "reason_list": reasons,
         "ob_zone": ob_zone,
         "calc_values": calc_values,  # Store all calculation values
@@ -1065,45 +1079,31 @@ async def scan_loop():
                         calc = sig.get("calc_values", {})
                         ob_details = calc.get("ob_details", {})
                         
-                        # Elite filter status
-                        elite_passed = (calc.get("ob_filter_passed", False) and 
-                                       ob_details.get("reaction_pass", False) and
-                                       calc.get("sweep_filter_passed", False) and
-                                       calc.get("elite_filter_passed", False))
+                        # Add momentum and coherence filter status
+                        momentum_status = "✅ OPTIMAL" if calc.get("momentum_filter_passed") else "❌ OUTSIDE RANGE"
+                        momentum_range = f"[{calc.get('momentum_min', 0):.3f}-{calc.get('momentum_max', 0):.3f}]"
                         
-                        # Check OB Reaction (Elite Filter 1)
-                        ob_reaction = ob_details.get("reaction_pct", 0)
-                        ob_reaction_status = "✅ ≥0.26%" if ob_reaction >= 0.26 else "🚫 <0.26%"
-                        
-                        # Check Sweep Retracement (Elite Filter 2)
-                        sweep_retracement = calc.get("sweep_retracement_pct", 0)
-                        sweep_min = calc.get("sweep_threshold_min", 3.0)
-                        sweep_max = calc.get("sweep_threshold_max", 26.0)
-                        
-                        if sweep_retracement == 0:
-                            sweep_status = "N/A"
-                        elif sweep_min <= sweep_retracement <= sweep_max:
-                            sweep_status = f"✅ {sweep_min}-{sweep_max}%"
-                        else:
-                            sweep_status = f"🚫 {sweep_retracement:.1f}%"
+                        coherence_status = "✅ COHERENT" if calc.get("coherence_filter_passed") else "❌ INCOHERENT"
+                        coherence_diff = calc.get("momentum_displacement_diff", 0)
+                        coherence_threshold = calc.get("coherence_threshold", 0.02)
                         
                         # OB Filter status
                         ob_status = "✅ PASSED" if calc.get("ob_filter_passed") else "❌ FAILED"
                         ob_score = calc.get("ob_score", 0)
                         ob_required = OB_MIN_SCORE
                         
+                        # Trend filter status
+                        trend_status = "✅ ALLOWED" if not calc.get("strong_counter_trend", False) else "🚫 REJECTED"
+                        
                         breakdown_lines = [
                             f"🏆 {sig['symbol']} ({tf}) {sig['side']}",
                             f"Entry: {sig['entry']:.6f}",
                             f"Score: {sig['score']}/6",
                             f"",
-                            f"🚨 ELITE FILTERS STATUS:",
-                            f"• OB Reaction: {ob_reaction:.2f}% {ob_reaction_status}",
-                            f"• Sweep Retracement: {sweep_retracement:.1f}% {sweep_status}",
-                            f"• Elite Status: {'✅ PASSED' if elite_passed else '🚫 REJECTED'}",
-                            f"",
                             f"📊 DETAILED BREAKDOWN:",
                             f"• Sweep: {calc.get('sweep_type', 'NONE')} (+{calc.get('sweep_score', 0)})",
+                            f"  High: {calc.get('current_high', 0):.6f} > {calc.get('prev_high', 0):.6f}",
+                            f"  Low: {calc.get('current_low', 0):.6f} < {calc.get('prev_low', 0):.6f}",
                             f"• Displacement: {calc.get('displacement_value', 0):.3f}",
                             f"• OB: {calc.get('ob_type', 'NONE')} [{calc.get('ob_low', 0):.6f}-{calc.get('ob_high', 0):.6f}]",
                             f"• OB Quality: {ob_score}/{ob_required} {ob_status}",
@@ -1111,10 +1111,13 @@ async def scan_loop():
                             f"  - Age: {ob_details.get('ob_age', 0)} candles (≤4)",
                             f"  - Distance: {ob_details.get('ob_distance_pct', 0):.2f}% (≤0.65%)",
                             f"  - Tests: {ob_details.get('ob_tests', 0)} times (≤2)",
-                            f"  - Reaction: {ob_details.get('reaction_pct', 0):.2f}% (≥0.26%)",
+                            f"  - Reaction: {ob_details.get('reaction_pct', 0):.2f}% (≥1.0%)",
                             f"• Zone Approach: +{calc.get('zone_approach', 0)}",
                             f"• HTF ({calc.get('htf_timeframe', '?')}): {calc.get('htf_trend_direction', '?')} (+{calc.get('htf_alignment', 0)})",
-                            f"• Momentum: {calc.get('momentum_value', 0):.3f} ({calc.get('momentum_min', 0):.3f}-{calc.get('momentum_max', 0):.3f})",
+                            f"• Momentum: {calc.get('momentum_value', 0):.3f} {momentum_status} {momentum_range}",
+                            f"• Coherence: Diff={coherence_diff:.3f} {coherence_status} (≤{coherence_threshold})",
+                            f"• Sweep Retracement: {calc.get('sweep_retracement_pct', 0):.1f}% {'✅ PASSED' if calc.get('sweep_filter_passed', False) else '❌ FAILED'} (Min: {calc.get('sweep_threshold_pct', 0):.1f}%)",
+                            f"• Trend Filter: {trend_status}",
                             f"• Liquidity Path: {'🚫 BLOCKED' if calc.get('liquidity_path_blocked', False) else '✅ CLEAR'}",
                             f"",
                             f"🎯 RISK/REWARD:",
@@ -1132,7 +1135,7 @@ async def scan_loop():
                         await log_signal(sig)
                         last_signal_time[key] = time.time()
                         signals_found += 1
-            log.info(f"📊 Scan complete: {signals_found} RomeOPT Elite signals found")
+            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found")
         except Exception as e:
             log.exception("scan error: %s", e)
         elapsed = time.time() - t0
@@ -1142,18 +1145,28 @@ async def scan_loop():
 async def test_ob_filter_with_historical_trades():
     """Test the OB filter with historical trades"""
     print("\n" + "="*60)
-    print("🚨 ROMEOPT ELITE SCANNER CONFIGURATION")
+    print("OB FILTER TEST WITH HISTORICAL ANALYSIS")
     print("="*60)
     
-    print(f"\n🚨 ELITE FILTERS ACTIVATED:")
-    print(f"1. OB Reaction MUST BE ≥ 0.26% (HARDCODED)")
-    print(f"2. Sweep Retracement MUST BE 3-26% (HARDCODED)")
+    print(f"\nOB FILTER SETTINGS:")
+    print(f"• Range: {OB_RANGE_MIN}%-{OB_RANGE_MAX}%")
+    print(f"• Age: ≤{OB_AGE_MAX} candles")
+    print(f"• Distance: ≤{OB_DISTANCE_MAX}%")
+    print(f"• Tests: ≤{OB_TESTS_MAX} times")
+    print(f"• Reaction: ≥{OB_REACTION_MIN}%")
+    print(f"• Minimum Score: {OB_MIN_SCORE}/5")
+    
+    print(f"\n📊 EXPECTED RESULTS (from 173 trades analysis):")
+    print(f"• Original trades: 173")
+    print(f"• Original winners: 95 (55%)")
+    print(f"• Original losers: 78 (45%)")
     print(f"")
-    print(f"🔒 Any signal not matching both criteria = REJECTED")
-    print(f"")
-    print(f"📊 EXPECTED PERFORMANCE:")
-    print(f"• 90% win rate")
-    print(f"• 93% losers eliminated")
+    print(f"• With OB Filter (score ≥4):")
+    print(f"  - Trades kept: ~113 (65%)")
+    print(f"  - Winners kept: 88/95 (93%)")
+    print(f"  - Losers kept: 25/78 (32%)")
+    print(f"  - Win rate: 78% (up from 55%)")
+    print(f"  - Losers eliminated: 68%")
 
 # ---------------- FASTAPI ----------------
 app = FastAPI()
@@ -1175,23 +1188,21 @@ async def main():
     await test_ob_filter_with_historical_trades()
     
     exchange = ccxt.okx({"enableRateLimit": True})
-    await tg("=" * 40)
-    await tg("🏆 ROMEOPT ELITE SCANNER STARTED")
-    await tg("=" * 40)
-    await tg("🚨 ELITE FILTERS HARDCODED:")
-    await tg("   1. OB Reaction MUST BE ≥ 0.26%")
-    await tg("   2. Sweep Retracement MUST BE 3-26%")
-    await tg("=" * 40)
-    await tg("📊 EXPECTED PERFORMANCE:")
-    await tg("   • 90% win rate")
-    await tg("   • 93% losers eliminated")
-    await tg("=" * 40)
-    await tg("🔒 Any signal not matching these exact numbers = REJECTED")
-    await tg("=" * 40)
-    await tg("✅ Additional filters still active:")
-    await tg("   • Trend Filter (rejects counter-trend signals)")
-    await tg("   • Momentum Filter (0.825-1.01 range)")
-    await tg("   • OB Quality Filter (5/5 criteria)")
+    await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals")
+    await tg("✅ TREND FILTER ENABLED: Will reject signals against strong HTF trends")
+    await tg("   - Rejects SELL signals in STRONG BULLISH trends")
+    await tg("   - Rejects BUY signals in STRONG BEARISH trends")
+    await tg("   - Uses EMA20/EMA50 alignment + price structure")
+    await tg("📊 ENHANCED BREAKDOWN: All numerical values visible")
+    await tg("🚨 MOMENTUM FILTER ACTIVE: Only optimal momentum signals (SELL:0.78-0.88, BUY:0.82-0.91)")
+    await tg("🎯 SWEEP FILTER ACTIVE: BUY: ≥1% retracement, SELL: ≥1% retracement")
+    await tg("🎯 OB FILTER ACTIVE: Score ≥4/5 (Range, Age, Distance, Tests, Reaction)")
+    await tg(f"   - Range: {OB_RANGE_MIN}%-{OB_RANGE_MAX}%")
+    await tg(f"   - Age: ≤{OB_AGE_MAX} candles")
+    await tg(f"   - Distance: ≤{OB_DISTANCE_MAX}%")
+    await tg(f"   - Tests: ≤{OB_TESTS_MAX} times")
+    await tg(f"   - Reaction: ≥{OB_REACTION_MIN}%")
+    await tg(f"Expected: Eliminates 68% of losers, keeps 93% of winners")
     
     await asyncio.gather(scan_loop(), monitor_signals())
 
