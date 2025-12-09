@@ -146,6 +146,8 @@ def should_take_trade_optimized(htf_trend_abs: float, displacement_value: float,
 
 # ---------------- MARKET REGIME ----------------
 async def detect_market_regime(df: pd.DataFrame):
+    if len(df) < 50:
+        return "RANGE"
     ma_htf = df["close"].rolling(50).mean().iloc[-1]
     price = df["close"].iloc[-1]
     recent_high = df["high"].iloc[-20:].max()
@@ -163,8 +165,9 @@ async def elite_tf_alignment(exchange, symbol: str, side: str):
     tfs = ["15m","1h","4h"]
     for tf in tfs:
         ohlcv = await fetch_ohlcv(exchange, symbol, tf, 50)
-        if not ohlcv: return False
+        if not ohlcv or len(ohlcv) < 10: return False
         df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+        if len(df) < 5: return False
         trend = df["close"].iloc[-1] - df["close"].iloc[-5]
         trend_side = "BUY" if trend>0 else "SELL"
         if trend_side != side:
@@ -235,19 +238,24 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     ohlcv_htf = await fetch_ohlcv(exchange, symbol, htf, 50)
     htf_alignment = 0
     htf_trend_value = 0
-    if ohlcv_htf:
+    if ohlcv_htf and len(ohlcv_htf) >= 5:  # FIX: Check minimum length
         df_htf = pd.DataFrame(ohlcv_htf, columns=["ts","open","high","low","close","vol"])
-        trend = df_htf["close"].iloc[-1] - df_htf["close"].iloc[-5]
-        htf_trend_value = round(trend, 6)
-        htf_dir = "bullish" if trend>0 else "bearish"
-        if ob_type and htf_dir==ob_type:
-            score+=1; htf_alignment=1; reasons.append(f"HTF Alignment +1 ({htf_dir} {trend:+.6f})")
+        if len(df_htf) >= 5:  # FIX: Additional check for DataFrame length
+            trend = df_htf["close"].iloc[-1] - df_htf["close"].iloc[-5]
+            htf_trend_value = round(trend, 6)
+            htf_dir = "bullish" if trend>0 else "bearish"
+            if ob_type and htf_dir==ob_type:
+                score+=1; htf_alignment=1; reasons.append(f"HTF Alignment +1 ({htf_dir} {trend:+.6f})")
+            else:
+                reasons.append(f"HTF Alignment +0 ({htf_dir} {trend:+.6f})")
+            calc_values["htf_trend"] = htf_trend_value
+            calc_values["htf_direction"] = htf_dir
         else:
-            reasons.append(f"HTF Alignment +0 ({htf_dir} {trend:+.6f})")
-        calc_values["htf_trend"] = htf_trend_value
-        calc_values["htf_direction"] = htf_dir
+            reasons.append("HTF Alignment ? (insufficient data)")
+            calc_values["htf_trend"] = 0
+            calc_values["htf_direction"] = "UNKNOWN"
     else:
-        reasons.append("HTF Alignment ?")
+        reasons.append("HTF Alignment ? (no data)")
         calc_values["htf_trend"] = 0
         calc_values["htf_direction"] = "UNKNOWN"
 
@@ -295,8 +303,9 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     market_regime = await detect_market_regime(df)
     if (market_regime=="BULL" and side=="SELL") or (market_regime=="BEAR" and side=="BUY"): return None
 
-    trend_ma = df["close"].rolling(20).mean().iloc[-1]
-    if (side=="BUY" and last["close"]<trend_ma) or (side=="SELL" and last["close"]>trend_ma): return None
+    if len(df) >= 20:
+        trend_ma = df["close"].rolling(20).mean().iloc[-1]
+        if (side=="BUY" and last["close"]<trend_ma) or (side=="SELL" and last["close"]>trend_ma): return None
 
     # ---------------- ELITE MTF CONFIRMATION ----------------
     if not await elite_tf_alignment(exchange, symbol, side):
