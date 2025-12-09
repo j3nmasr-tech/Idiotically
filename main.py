@@ -17,7 +17,6 @@ LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features + OPTIMIZED FILTER)
 - 🎯 MOMENTUM FILTER: 0.8 threshold (was 0.5)
 - 📊 ENHANCED BREAKDOWN: Shows all numerical values
 - 🔥 OPTIMIZED FILTER: Keeps 100% winners, eliminates 70% losers
-- 📈 BTC TREND FILTER: Aligns trades with BTC market direction
 """
 
 import os, time, asyncio, logging, datetime
@@ -36,7 +35,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
-TOP_N = int(os.getenv("TOP_N", 60))
+TOP_N = int(os.getenv("TOP_N", 35))
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
 MIN_SCORE = 5
 CRITICAL_FACTORS_MIN = 2  # HTF Alignment + Liquidity Sweep minimum
@@ -47,13 +46,6 @@ HTF_WEAK_THRESHOLD = 0.01  # Below this is considered weak HTF
 HTF_VERY_WEAK_THRESHOLD = 0.005  # Below this is very weak
 DISPLACEMENT_STRONG_THRESHOLD = 0.87  # Above this is strong displacement
 DISPLACEMENT_WEAK_THRESHOLD = 0.75  # Below this is weak displacement
-
-# ---------------- BTC TREND FILTER CONFIG ----------------
-BTC_TREND_TIMEFRAMES = ["15m", "1h"]  # Check both
-BTC_TREND_REQUIREMENT = 2  # How many timeframes must agree (1 or 2)
-BTC_TREND_SYMBOL = "BTC/USDT"
-BTC_TREND_CACHE_SECONDS = 30  # Update every 30 seconds
-btc_trend_cache = {"data": None, "timestamp": 0, "last_trend": None}
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -121,195 +113,6 @@ def atr(df: pd.DataFrame, period=14):
         "l-pc": (low - close.shift(1)).abs()
     }).max(axis=1)
     return tr.rolling(period, min_periods=1).mean()
-
-def calculate_rsi(prices: pd.Series, period=14):
-    delta = prices.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-# ---------------- BTC TREND FILTER FUNCTIONS ----------------
-async def get_btc_trend_strength(exchange):
-    """
-    Get BTC trend strength across multiple timeframes
-    Enhanced with RSI and volume confirmation
-    """
-    trend_results = {}
-    
-    for tf in BTC_TREND_TIMEFRAMES:
-        try:
-            ohlcv = await fetch_ohlcv(exchange, BTC_TREND_SYMBOL, tf, 100)
-            if not ohlcv or len(ohlcv) < 50:
-                trend_results[tf] = "UNKNOWN"
-                continue
-                
-            df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-            
-            # Multiple trend indicators
-            price = df["close"].iloc[-1]
-            
-            # 1. EMA alignment (9, 21, 50)
-            ema_9 = df["close"].ewm(span=9).mean().iloc[-1]
-            ema_21 = df["close"].ewm(span=21).mean().iloc[-1]
-            ema_50 = df["close"].ewm(span=50).mean().iloc[-1]
-            ema_200 = df["close"].ewm(span=200).mean().iloc[-50]  # Historical for trend
-            
-            # 2. RSI trend
-            rsi = calculate_rsi(df["close"], period=14)
-            rsi_value = rsi.iloc[-1] if len(rsi) > 0 else 50
-            
-            # 3. Recent price action
-            recent_trend = df["close"].iloc[-1] - df["close"].iloc[-10]
-            
-            # 4. Volume trend (increasing on rallies?)
-            volume_avg = df["vol"].rolling(20).mean().iloc[-1]
-            recent_volume = df["vol"].iloc[-5:].mean()
-            volume_up = recent_volume > volume_avg * 1.2
-            
-            # Score-based system
-            bull_score = 0
-            bear_score = 0
-            
-            # EMA alignment (2 points if perfect alignment)
-            if price > ema_9 > ema_21 > ema_50:
-                bull_score += 2
-            elif price < ema_9 < ema_21 < ema_50:
-                bear_score += 2
-            
-            # RSI position
-            if rsi_value > 55:
-                bull_score += 1
-            elif rsi_value < 45:
-                bear_score += 1
-            elif 45 <= rsi_value <= 55:
-                bull_score += 0.5
-                bear_score += 0.5
-            
-            # Recent price trend
-            if recent_trend > 0:
-                bull_score += 1
-            elif recent_trend < 0:
-                bear_score += 1
-            
-            # Volume confirmation
-            if volume_up and bull_score > bear_score:
-                bull_score += 0.5
-            elif volume_up and bear_score > bull_score:
-                bear_score += 0.5
-            
-            # Determine trend
-            if bull_score > bear_score + 0.5:
-                trend_results[tf] = "BULL"
-            elif bear_score > bull_score + 0.5:
-                trend_results[tf] = "BEAR"
-            else:
-                trend_results[tf] = "NEUTRAL"
-                
-        except Exception as e:
-            log.debug(f"BTC trend check failed for {tf}: {e}")
-            trend_results[tf] = "UNKNOWN"
-    
-    # Analyze results
-    bull_tfs = [tf for tf, trend in trend_results.items() if trend == "BULL"]
-    bear_tfs = [tf for tf, trend in trend_results.items() if trend == "BEAR"]
-    neutral_tfs = [tf for tf, trend in trend_results.items() if trend == "NEUTRAL"]
-    
-    total_known = len([v for v in trend_results.values() if v != "UNKNOWN"])
-    if total_known == 0:
-        return {"trend": "UNKNOWN", "strength": 0.0, "details": trend_results}
-    
-    # Calculate strength based on agreement
-    if len(bull_tfs) >= BTC_TREND_REQUIREMENT:
-        strength = len(bull_tfs) / total_known
-        return {"trend": "BULL", "strength": strength, "details": trend_results}
-    elif len(bear_tfs) >= BTC_TREND_REQUIREMENT:
-        strength = len(bear_tfs) / total_known
-        return {"trend": "BEAR", "strength": strength, "details": trend_results}
-    else:
-        # Mixed signals
-        bull_ratio = len(bull_tfs) / total_known if total_known > 0 else 0
-        bear_ratio = len(bear_tfs) / total_known if total_known > 0 else 0
-        
-        if bull_ratio > bear_ratio:
-            return {"trend": "BULL_WEAK", "strength": bull_ratio * 0.7, "details": trend_results}
-        elif bear_ratio > bull_ratio:
-            return {"trend": "BEAR_WEAK", "strength": bear_ratio * 0.7, "details": trend_results}
-        else:
-            return {"trend": "NEUTRAL", "strength": 0.3, "details": trend_results}
-
-async def get_cached_btc_trend(exchange):
-    """Cache BTC trend to avoid too many API calls"""
-    global btc_trend_cache
-    
-    now = time.time()
-    if (btc_trend_cache["data"] is None or 
-        now - btc_trend_cache["timestamp"] > BTC_TREND_CACHE_SECONDS):
-        
-        btc_trend_cache["data"] = await get_btc_trend_strength(exchange)
-        btc_trend_cache["timestamp"] = now
-        
-        # Log significant trend changes
-        old_trend = btc_trend_cache.get("last_trend")
-        new_trend = btc_trend_cache["data"]["trend"]
-        new_strength = btc_trend_cache["data"]["strength"]
-        
-        if old_trend != new_trend and new_strength >= 0.7:
-            trend_emoji = "📈" if "BULL" in new_trend else "📉" if "BEAR" in new_trend else "➡️"
-            await tg(f"{trend_emoji} BTC Trend Changed: {old_trend or 'N/A'} → {new_trend} ({new_strength:.0%})")
-            btc_trend_cache["last_trend"] = new_trend
-    
-    return btc_trend_cache["data"]
-
-async def should_trade_with_btc_trend(exchange, trade_side, symbol):
-    """
-    Main BTC trend filter decision with intelligent exceptions
-    """
-    # Skip BTC itself and VERY low caps (they may decouple)
-    if symbol == BTC_TREND_SYMBOL:
-        return True
-    
-    # Get BTC trend
-    btc_trend = await get_cached_btc_trend(exchange)
-    trend = btc_trend["trend"]
-    strength = btc_trend["strength"]
-    
-    # Define correlation levels
-    high_correlation = ["ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT", "ADA/USDT", "DOT/USDT", "AVAX/USDT", "MATIC/USDT"]
-    medium_correlation = ["LINK/USDT", "UNI/USDT", "ATOM/USDT", "NEAR/USDT", "APT/USDT", "FIL/USDT"]
-    
-    # STRONG TREND RULES (strength >= 0.8)
-    if strength >= 0.8:
-        if trend == "BULL" and trade_side == "SELL":
-            log.debug(f"BTC Trend Filter ❌: STRONG BULL ({strength:.1%}) - Rejecting SELL on {symbol}")
-            return False
-        if trend == "BEAR" and trade_side == "BUY":
-            log.debug(f"BTC Trend Filter ❌: STRONG BEAR ({strength:.1%}) - Rejecting BUY on {symbol}")
-            return False
-    
-    # MODERATE TREND RULES (strength 0.6-0.8)
-    elif strength >= 0.6:
-        # High correlation coins - be strict
-        if symbol in high_correlation:
-            if trend.startswith("BULL") and trade_side == "SELL":
-                log.debug(f"BTC Trend Filter ⚠️: BULL on high-correlation {symbol} - Rejecting SELL")
-                return False
-            if trend.startswith("BEAR") and trade_side == "BUY":
-                log.debug(f"BTC Trend Filter ⚠️: BEAR on high-correlation {symbol} - Rejecting BUY")
-                return False
-    
-    # WEAK TREND (strength 0.4-0.6) - Medium correlation coins only
-    elif strength >= 0.4:
-        if symbol in high_correlation:
-            # Allow but with caution
-            log.debug(f"BTC Trend Filter 🔸: Weak {trend} on {symbol} - Proceed with caution")
-    
-    # NEUTRAL or VERY WEAK - Allow all trades
-    else:
-        log.debug(f"BTC Trend Filter ✅: Neutral/Weak trend ({trend}, {strength:.1%}) - Allowing {trade_side}")
-    
-    return True
 
 # ---------------- OPTIMIZED FILTER FUNCTION ----------------
 def should_take_trade_optimized(htf_trend_abs: float, displacement_value: float, momentum_value: float) -> bool:
@@ -489,14 +292,6 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     else:
         reasons.append("Advanced Filter ✅ PASSED")
 
-    # ---------------- NEW: BTC TREND FILTER ----------------
-    btc_filter_passed = await should_trade_with_btc_trend(exchange, side, symbol)
-    if not btc_filter_passed:
-        reasons.append("BTC Trend Filter ❌ REJECTED")
-        return None
-    else:
-        reasons.append("BTC Trend Filter ✅ PASSED")
-
     market_regime = await detect_market_regime(df)
     if (market_regime=="BULL" and side=="SELL") or (market_regime=="BEAR" and side=="BUY"): return None
 
@@ -518,8 +313,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         "htf_alignment": htf_alignment,
         "liquidity_sweep": liquidity_sweep,
         "momentum_ratio": momentum_ratio,  # Store actual momentum value
-        "calc_values": calc_values,  # Store all calculation values
-        "btc_filter": "PASSED" if btc_filter_passed else "REJECTED"  # Flag for monitoring
+        "calc_values": calc_values  # Store all calculation values
     }
     
     sig = update_tp_sl_live(sig, df)
@@ -739,38 +533,10 @@ async def monitor_signals():
 
 # ---------------- SCAN LOOP ----------------
 last_signal_time = {}
-last_btc_report = 0
-
 async def scan_loop(exchange):
-    global last_btc_report
-    
     while True:
         t0=time.time()
         try:
-            # Periodic BTC trend report (every 5 minutes)
-            current_time = time.time()
-            if current_time - last_btc_report > 300:  # 5 minutes
-                btc_trend = await get_cached_btc_trend(exchange)
-                if btc_trend["strength"] >= 0.7:  # Only report strong trends
-                    trend = btc_trend["trend"]
-                    strength = btc_trend["strength"]
-                    details = btc_trend["details"]
-                    
-                    report = f"""
-📊 BTC TREND UPDATE
-Overall: {trend} ({strength:.0%})
-Timeframes:
-15m: {details.get('15m', '?')}
-1h: {details.get('1h', '?')}
-
-Trading Implications:
-- Strong {trend.split('_')[0] if '_' in trend else trend} trend detected
-- {'' if 'BULL' in trend else 'Counter-'}trend trades restricted
-- High correlation coins affected most
-"""
-                    await tg(report)
-                    last_btc_report = current_time
-            
             tickers = await exchange.fetch_tickers()
             top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")], key=lambda x:x[1], reverse=True)[:TOP_N]
             signals_found = 0
@@ -785,7 +551,7 @@ Trading Implications:
                     for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
                     sig = await generate_signal_romeopt(exchange,df,symbol,tf)
                     if sig:
-                        # ENHANCED BREAKDOWN FORMAT WITH OPTIMIZED FILTER INFO AND BTC TREND
+                        # ENHANCED BREAKDOWN FORMAT WITH OPTIMIZED FILTER INFO
                         calc = sig.get("calc_values", {})
                         htf_trend_abs = abs(calc.get("htf_trend", 0))
                         displacement_val = calc.get("displacement_value", 0)
@@ -793,17 +559,6 @@ Trading Implications:
                         
                         # Check if it passes the optimized filter
                         filter_passed = should_take_trade_optimized(htf_trend_abs, displacement_val, momentum_val)
-                        
-                        # Get BTC trend info for display
-                        btc_trend_info = await get_cached_btc_trend(exchange)
-                        btc_trend = btc_trend_info["trend"]
-                        btc_strength = btc_trend_info["strength"]
-                        
-                        trend_emoji = {
-                            "BULL": "📈", "BULL_WEAK": "↗️",
-                            "BEAR": "📉", "BEAR_WEAK": "↘️",
-                            "NEUTRAL": "➡️", "UNKNOWN": "❓"
-                        }.get(btc_trend, "➡️")
                         
                         breakdown_lines = [
                             f"🏆 {sig['symbol']} ({tf}) {sig['side']}",
@@ -819,9 +574,6 @@ Trading Implications:
                             f"• Momentum: {calc.get('momentum_value', 0):.2f} (+{calc.get('momentum_score', 0)})",
                             f"• HTF Strength: {htf_trend_abs:.6f}",
                             f"• Optimized Filter: {'✅ PASS' if filter_passed else '❌ REJECT'}",
-                            f"",
-                            f"{trend_emoji} BTC TREND: {btc_trend} ({btc_strength:.0%})",
-                            f"• BTC Filter: {'✅ PASS' if sig.get('btc_filter') == 'PASSED' else '❌ REJECTED'}",
                             f"",
                             f"🎯 TARGETS:",
                             f"SL: {sig.get('sl'):.6f}",
@@ -860,18 +612,8 @@ async def main():
     await tg("🎯 MOMENTUM FILTER: 0.8 threshold activated (was 0.5)")
     await tg("📊 ENHANCED BREAKDOWN: All values now visible")
     await tg("🔥 OPTIMIZED FILTER: Keeps 100% winners, eliminates 70% losers")
-    await tg("📈 BTC TREND FILTER: Active (15m+1h alignment)")
-    await tg("📈 Trend Logic:")
-    await tg("• STRONG trends (>80%): No counter-trend trades")
-    await tg("• MODERATE trends (60-80%): Restricted on majors")
-    await tg("• WEAK trends (<60%): All trades allowed")
-    await tg("• Real-time BTC monitoring (15m+1h)")
-    await tg("• Smart caching for performance")
-    
-    # Get initial BTC trend
-    btc_trend = await get_cached_btc_trend(exchange)
-    await tg(f"📊 Initial BTC Trend: {btc_trend['trend']} ({btc_trend['strength']:.0%})")
-    
+    await tg(f"📈 Filter parameters: HTF<{HTF_WEAK_THRESHOLD} & Displacement>={DISPLACEMENT_STRONG_THRESHOLD} → REJECT")
+    await tg(f"📉 Filter parameters: HTF<{HTF_VERY_WEAK_THRESHOLD} & Displacement<{DISPLACEMENT_WEAK_THRESHOLD} → REJECT")
     await asyncio.gather(scan_loop(exchange), monitor_signals())
 
 if __name__=="__main__":
