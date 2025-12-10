@@ -165,63 +165,96 @@ async def elite_tf_alignment(exchange, symbol: str, side: str):
             return False
     return True
 
-# ---------------- DETAILED ORDER BLOCK DETECTION ----------------
-def find_detailed_order_blocks(df: pd.DataFrame, lookback=10):
-    """Find order blocks with detailed information"""
+# ---------------- ENHANCED ORDER BLOCK ANALYSIS ----------------
+def analyze_order_blocks(df: pd.DataFrame):
+    """Enhanced order block analysis - finds multiple recent OBs with details"""
     order_blocks = []
-    for i in range(2, min(len(df), lookback)):
+    current_price = df["close"].iloc[-1]
+    
+    # Look at recent candles (last 20 candles max)
+    lookback = min(20, len(df) - 5)
+    start_idx = max(2, len(df) - lookback)
+    
+    for i in range(start_idx, len(df) - 1):
         candle = df.iloc[i]
         prev_candle = df.iloc[i-1]
         
-        # Bullish OB: Bearish candle followed by bullish candle (reversal)
+        # Bullish OB: Bearish candle followed by bullish candle
         if (prev_candle["close"] < prev_candle["open"] and 
             candle["close"] > candle["open"]):
             ob_low = min(candle["low"], prev_candle["low"])
             ob_high = candle["close"]
+            ob_mid = (ob_low + ob_high) / 2
+            
+            # Calculate metrics
+            candles_ago = len(df) - i - 1
+            distance_to_price = abs(current_price - ob_mid)
+            distance_pct = (distance_to_price / current_price * 100) if current_price > 0 else 100
+            
+            # Strength calculation
+            candle_body = abs(candle["close"] - candle["open"])
+            candle_range = candle["high"] - candle["low"]
+            strength = candle_body / candle_range if candle_range > 0 else 0
+            
             ob = {
                 "type": "bullish",
                 "low": ob_low,
                 "high": ob_high,
+                "midpoint": ob_mid,
                 "range": ob_high - ob_low,
-                "midpoint": (ob_high + ob_low) / 2,
-                "position": i,  # Position in dataframe
-                "candle_index": len(df) - i,  # How many candles ago
-                "strength": abs(candle["close"] - prev_candle["open"]) / (candle["high"] - candle["low"] + 1e-8),
+                "candles_ago": candles_ago,
+                "distance_to_price": distance_to_price,
+                "distance_pct": distance_pct,
+                "strength": strength,
                 "volume": candle["vol"] + prev_candle["vol"],
-                "timestamp": datetime.datetime.fromtimestamp(candle.name if hasattr(candle, 'name') else df.index[i])
+                "candle_index": i
             }
             order_blocks.append(ob)
         
-        # Bearish OB: Bullish candle followed by bearish candle (reversal)
+        # Bearish OB: Bullish candle followed by bearish candle
         elif (prev_candle["close"] > prev_candle["open"] and 
               candle["close"] < candle["open"]):
             ob_low = candle["close"]
             ob_high = max(candle["high"], prev_candle["high"])
+            ob_mid = (ob_low + ob_high) / 2
+            
+            # Calculate metrics
+            candles_ago = len(df) - i - 1
+            distance_to_price = abs(current_price - ob_mid)
+            distance_pct = (distance_to_price / current_price * 100) if current_price > 0 else 100
+            
+            # Strength calculation
+            candle_body = abs(candle["close"] - candle["open"])
+            candle_range = candle["high"] - candle["low"]
+            strength = candle_body / candle_range if candle_range > 0 else 0
+            
             ob = {
                 "type": "bearish",
                 "low": ob_low,
                 "high": ob_high,
+                "midpoint": ob_mid,
                 "range": ob_high - ob_low,
-                "midpoint": (ob_high + ob_low) / 2,
-                "position": i,
-                "candle_index": len(df) - i,
-                "strength": abs(prev_candle["close"] - candle["open"]) / (candle["high"] - candle["low"] + 1e-8),
+                "candles_ago": candles_ago,
+                "distance_to_price": distance_to_price,
+                "distance_pct": distance_pct,
+                "strength": strength,
                 "volume": candle["vol"] + prev_candle["vol"],
-                "timestamp": datetime.datetime.fromtimestamp(candle.name if hasattr(candle, 'name') else df.index[i])
+                "candle_index": i
             }
             order_blocks.append(ob)
     
-    # Return the most recent order blocks (up to 3)
-    return order_blocks[-3:] if order_blocks else []
+    # Sort by most recent first
+    order_blocks.sort(key=lambda x: x["candles_ago"])
+    return order_blocks
 
-# ---------------- DETAILED SWEEP ANALYSIS ----------------
+# ---------------- ENHANCED SWEEP ANALYSIS ----------------
 def analyze_sweep_details(df: pd.DataFrame, lookback=5):
     """Analyze sweep with detailed information"""
     if len(df) < lookback + 1:
         return {"type": "NONE", "details": {}}
     
     current_candle = df.iloc[-1]
-    lookback_candles = df.iloc[-(lookback+1):-1]  # Previous candles
+    lookback_candles = df.iloc[-(lookback+1):-1]
     
     current_high = current_candle["high"]
     current_low = current_candle["low"]
@@ -233,35 +266,37 @@ def analyze_sweep_details(df: pd.DataFrame, lookback=5):
     
     # Check for high sweep
     if current_high > max_prev_high:
+        extension = current_high - max_prev_high
         return {
             "type": "HIGH",
             "details": {
                 "current_high": current_high,
                 "previous_high": max_prev_high,
-                "extension": current_high - max_prev_high,
-                "extension_pct": ((current_high - max_prev_high) / max_prev_high * 100) if max_prev_high > 0 else 0,
-                "strength": "STRONG" if (current_high - max_prev_high) > (current_high * 0.001) else "MODERATE",
-                "candle_body": current_candle["close"] - current_candle["open"],
-                "candle_range": current_candle["high"] - current_candle["low"],
+                "extension": extension,
+                "extension_pct": (extension / max_prev_high * 100) if max_prev_high > 0 else 0,
+                "strength": "STRONG" if extension > (current_high * 0.001) else "MODERATE",
+                "wick_size": current_high - max(current_candle["open"], current_candle["close"]),
                 "volume": current_candle["vol"],
-                "wick_size": current_high - max(current_candle["open"], current_candle["close"])
+                "candle_body": current_candle["close"] - current_candle["open"],
+                "candle_range": current_candle["high"] - current_candle["low"]
             }
         }
     
     # Check for low sweep
     elif current_low < min_prev_low:
+        extension = min_prev_low - current_low
         return {
             "type": "LOW",
             "details": {
                 "current_low": current_low,
                 "previous_low": min_prev_low,
-                "extension": min_prev_low - current_low,
-                "extension_pct": ((min_prev_low - current_low) / min_prev_low * 100) if min_prev_low > 0 else 0,
-                "strength": "STRONG" if (min_prev_low - current_low) > (current_low * 0.001) else "MODERATE",
-                "candle_body": current_candle["open"] - current_candle["close"],
-                "candle_range": current_candle["high"] - current_candle["low"],
+                "extension": extension,
+                "extension_pct": (extension / min_prev_low * 100) if min_prev_low > 0 else 0,
+                "strength": "STRONG" if extension > (current_low * 0.001) else "MODERATE",
+                "wick_size": min(current_candle["open"], current_candle["close"]) - current_low,
                 "volume": current_candle["vol"],
-                "wick_size": min(current_candle["open"], current_candle["close"]) - current_low
+                "candle_body": current_candle["open"] - current_candle["close"],
+                "candle_range": current_candle["high"] - current_candle["low"]
             }
         }
     
@@ -278,7 +313,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     # Store all calculation values for breakdown
     calc_values = {}
 
-    # Step 1: Detailed Liquidity Sweep Analysis
+    # Step 1: Enhanced Liquidity Sweep Analysis
     sweep_analysis = analyze_sweep_details(df)
     sweep_type = sweep_analysis["type"]
     sweep_details = sweep_analysis["details"]
@@ -301,20 +336,30 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     else:
         reasons.append(f"Displacement +0 ({displacement:.2f})")
 
-    # Step 3 & 4: Detailed Order Block Analysis
-    order_blocks = find_detailed_order_blocks(df)
+    # Step 3 & 4: Enhanced Order Block Analysis (ORIGINAL LOGIC)
     ob_zone = None
     ob_details = {}
+    order_blocks = analyze_order_blocks(df)
     
-    if order_blocks:
-        # Use the most recent order block
-        latest_ob = order_blocks[-1]
-        ob_zone = {
-            "type": latest_ob["type"],
-            "low": latest_ob["low"],
-            "high": latest_ob["high"]
-        }
-        ob_details = latest_ob
+    # Original logic: Find most recent OB in last 4 candles
+    for i in range(len(df)-5, len(df)-1):
+        candle, prev_candle = df.iloc[i], df.iloc[i-1]
+        if candle["close"]>candle["open"] and prev_candle["close"]<prev_candle["open"]:
+            ob_zone={"type":"bullish","low":min(candle["low"], prev_candle["low"]),"high":candle["close"]}
+            # Find matching OB in detailed analysis
+            for ob in order_blocks:
+                if abs(ob["low"] - ob_zone["low"]) < 0.0001 and ob["type"] == "bullish":
+                    ob_details = ob
+                    break
+            break
+        elif candle["close"]<candle["open"] and prev_candle["close"]>prev_candle["open"]:
+            ob_zone={"type":"bearish","low":candle["close"],"high":max(candle["high"], prev_candle["high"])}
+            # Find matching OB in detailed analysis
+            for ob in order_blocks:
+                if abs(ob["high"] - ob_zone["high"]) < 0.0001 and ob["type"] == "bearish":
+                    ob_details = ob
+                    break
+            break
     
     if ob_zone:
         ob_type = ob_zone["type"]
@@ -331,13 +376,13 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         calc_values["ob_low"] = round(ob_zone["low"], 6)
         calc_values["ob_high"] = round(ob_zone["high"], 6)
         calc_values["ob_details"] = ob_details
-        calc_values["order_blocks_count"] = len(order_blocks)
+        calc_values["order_blocks_found"] = len(order_blocks)
     else:
         reasons.append("Zone Approach +0")
         ob_type = None
         calc_values["zone_approach"] = 0
         calc_values["ob_type"] = "NONE"
-        calc_values["order_blocks_count"] = 0
+        calc_values["order_blocks_found"] = len(order_blocks)
 
     # Step 5: HTF Alignment
     tf_map={"1m":"15m","3m":"30m","5m":"1h","15m":"4h","30m":"1h"}
@@ -516,15 +561,23 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
     return sl, tp1, tp2, tp3
 
 def find_latest_ob(df: pd.DataFrame):
-    order_blocks = find_detailed_order_blocks(df, lookback=10)
-    if order_blocks:
-        latest_ob = order_blocks[-1]
-        return {
-            "type": latest_ob["type"],
-            "low": latest_ob["low"],
-            "high": latest_ob["high"],
-            "details": latest_ob
-        }
+    """Find the latest order block using original logic"""
+    for i in range(len(df)-5, len(df)-1):
+        candle, prev_candle = df.iloc[i], df.iloc[i-1]
+        if candle["close"]>candle["open"] and prev_candle["close"]<prev_candle["open"]:
+            return {
+                "type": "bullish",
+                "low": min(candle["low"], prev_candle["low"]),
+                "high": candle["close"],
+                "candle_index": i
+            }
+        elif candle["close"]<candle["open"] and prev_candle["close"]>prev_candle["open"]:
+            return {
+                "type": "bearish",
+                "low": candle["close"],
+                "high": max(candle["high"], prev_candle["high"]),
+                "candle_index": i
+            }
     return None
 
 def update_tp_sl_live(sig: dict, df: pd.DataFrame):
@@ -728,12 +781,13 @@ async def scan_loop(exchange):
                         ob_type = calc.get('ob_type', 'NONE')
                         ob_details = calc.get('ob_details', {})
                         
-                        if ob_type != 'NONE':
+                        if ob_type != 'NONE' and ob_details:
                             ob_low = calc.get('ob_low', 0)
                             ob_high = calc.get('ob_high', 0)
                             ob_range = ob_high - ob_low
                             ob_mid = (ob_high + ob_low) / 2
                             distance_to_entry = abs(sig['entry'] - ob_mid)
+                            distance_pct = (distance_to_entry / sig['entry'] * 100) if sig['entry'] > 0 else 0
                             in_zone = True if (ob_type == 'bullish' and sig['entry'] <= ob_high) or (ob_type == 'bearish' and sig['entry'] >= ob_low) else False
                             
                             breakdown_lines.extend([
@@ -742,12 +796,31 @@ async def scan_loop(exchange):
                                 f"  • OB Range: {format_number(ob_low)} - {format_number(ob_high)}",
                                 f"  • Range Size: {format_number(ob_range)}",
                                 f"  • Midpoint: {format_number(ob_mid)}",
-                                f"  • Distance to Entry: {format_number(distance_to_entry)}",
+                                f"  • Distance to Entry: {format_number(distance_to_entry)} ({distance_pct:.2f}%)",
                                 f"  • In Zone: {'✅ YES' if in_zone else '❌ NO'}",
                                 f"  • Strength: {ob_details.get('strength', 0):.2f}",
-                                f"  • Age: {ob_details.get('candle_index', 0)} candles ago",
+                                f"  • Age: {ob_details.get('candles_ago', 0)} candles ago",
                                 f"  • Volume: {format_number(ob_details.get('volume', 0))}",
-                                f"  • Total OBs Found: {calc.get('order_blocks_count', 0)}"
+                                f"  • OBs Found in Lookback: {calc.get('order_blocks_found', 0)}"
+                            ])
+                        elif ob_type != 'NONE':
+                            # Basic OB info if detailed not available
+                            ob_low = calc.get('ob_low', 0)
+                            ob_high = calc.get('ob_high', 0)
+                            ob_range = ob_high - ob_low
+                            ob_mid = (ob_high + ob_low) / 2
+                            distance_to_entry = abs(sig['entry'] - ob_mid)
+                            distance_pct = (distance_to_entry / sig['entry'] * 100) if sig['entry'] > 0 else 0
+                            in_zone = True if (ob_type == 'bullish' and sig['entry'] <= ob_high) or (ob_type == 'bearish' and sig['entry'] >= ob_low) else False
+                            
+                            breakdown_lines.extend([
+                                f"  • Type: {ob_type.upper()} OB",
+                                f"  • Zone Approach: +{calc.get('zone_approach', 0)}",
+                                f"  • OB Range: {format_number(ob_low)} - {format_number(ob_high)}",
+                                f"  • Range Size: {format_number(ob_range)}",
+                                f"  • Midpoint: {format_number(ob_mid)}",
+                                f"  • Distance to Entry: {format_number(distance_to_entry)} ({distance_pct:.2f}%)",
+                                f"  • In Zone: {'✅ YES' if in_zone else '❌ NO'}"
                             ])
                         else:
                             breakdown_lines.append(f"  • No order block detected")
