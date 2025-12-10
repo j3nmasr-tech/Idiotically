@@ -42,9 +42,9 @@ MIN_SCORE = 5
 CRITICAL_FACTORS_MIN = 2  # HTF Alignment + Liquidity Sweep minimum
 
 # ---------------- FORCED FILTER PARAMETERS ----------------
-MOMENTUM_STRONG_THRESHOLD = 0.87  # Rule 1: Momentum ≥ 0.87 → ACCEPT
-MOMENTUM_GOOD_THRESHOLD = 0.85    # Rule 2: Momentum ≥ 0.85 → Check displacement
-DISPLACEMENT_MIN_THRESHOLD = 0.80 # Rule 2: Displacement ≥ 0.80
+MOMENTUM_STRONG_THRESHOLD = 0.70  # Rule 1: Momentum ≥ 0.87 → ACCEPT
+MOMENTUM_GOOD_THRESHOLD = 0.65    # Rule 2: Momentum ≥ 0.85 → Check displacement
+DISPLACEMENT_MIN_THRESHOLD = 0.60 # Rule 2: Displacement ≥ 0.80
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
