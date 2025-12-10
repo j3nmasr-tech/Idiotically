@@ -108,41 +108,6 @@ async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
         log.debug("fetch_ohlcv failed for %s %s: %s", symbol, timeframe, e)
         return None
 
-# ---------------- ORDER BOOK DETAILS ----------------
-async def get_order_book_details(exchange, symbol: str, limit=10):
-    """Fetch actual order book data for detailed breakdown"""
-    try:
-        ob = await exchange.fetch_order_book(symbol, limit=limit)
-        if ob and len(ob['bids']) > 0 and len(ob['asks']) > 0:
-            best_bid = ob['bids'][0][0] if ob['bids'] else 0
-            best_ask = ob['asks'][0][0] if ob['asks'] else 0
-            spread = best_ask - best_bid if best_bid > 0 and best_ask > 0 else 0
-            
-            # Top 5 levels
-            top_bids = ob['bids'][:5]
-            top_asks = ob['asks'][:5]
-            
-            bid_volume = sum(bid[1] for bid in top_bids)
-            ask_volume = sum(ask[1] for ask in top_asks)
-            total_volume = bid_volume + ask_volume
-            imbalance = (bid_volume - ask_volume) / total_volume if total_volume > 0 else 0
-            
-            return {
-                'bids': top_bids,
-                'asks': top_asks,
-                'best_bid': best_bid,
-                'best_ask': best_ask,
-                'spread': spread,
-                'spread_pct': (spread / best_bid * 100) if best_bid > 0 else 0,
-                'bid_volume': bid_volume,
-                'ask_volume': ask_volume,
-                'imbalance': imbalance,
-                'total_volume': total_volume
-            }
-    except Exception as e:
-        log.debug(f"Failed to fetch order book for {symbol}: {e}")
-    return None
-
 # ---------------- INDICATORS ----------------
 def atr(df: pd.DataFrame, period=14):
     high, low, close = df["high"], df["low"], df["close"]
@@ -458,10 +423,6 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         return None
     reasons.append("Elite MTF Alignment ✅")
 
-    # Fetch Order Book details
-    order_book_data = await get_order_book_details(exchange, symbol)
-    calc_values["order_book"] = order_book_data
-    
     sig = {
         "symbol": symbol,
         "side": side,
@@ -472,8 +433,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         "htf_alignment": htf_alignment,
         "liquidity_sweep": liquidity_sweep,
         "momentum_ratio": momentum_ratio,
-        "calc_values": calc_values,
-        "order_book": order_book_data
+        "calc_values": calc_values
     }
     
     sig = update_tp_sl_live(sig, df)
@@ -659,29 +619,6 @@ def format_number(value, decimals=6):
             return f"{value:.{decimals}f}"
     return str(value)
 
-def format_order_book_details(ob_data):
-    """Format order book details for display"""
-    if not ob_data:
-        return ["  • Order Book: Data unavailable"]
-    
-    lines = ["  • Order Book Details:"]
-    lines.append(f"    - Best Bid: {format_number(ob_data['best_bid'])}")
-    lines.append(f"    - Best Ask: {format_number(ob_data['best_ask'])}")
-    lines.append(f"    - Spread: {format_number(ob_data['spread'])} ({ob_data['spread_pct']:.2f}%)")
-    lines.append(f"    - Bid/Ask Volume: {format_number(ob_data['bid_volume'])} / {format_number(ob_data['ask_volume'])}")
-    lines.append(f"    - Imbalance: {ob_data['imbalance']:+.3f}")
-    
-    # Top 3 bids and asks
-    lines.append("    - Top 3 Bids:")
-    for price, volume in ob_data['bids'][:3]:
-        lines.append(f"      {format_number(price)} × {format_number(volume)}")
-    
-    lines.append("    - Top 3 Asks:")
-    for price, volume in ob_data['asks'][:3]:
-        lines.append(f"      {format_number(price)} × {format_number(volume)}")
-    
-    return lines
-
 # ---------------- MONITOR SIGNALS ----------------
 async def monitor_signals():
     while True:
@@ -809,19 +746,13 @@ async def scan_loop(exchange):
                                 f"  • In Zone: {'✅ YES' if in_zone else '❌ NO'}",
                                 f"  • Strength: {ob_details.get('strength', 0):.2f}",
                                 f"  • Age: {ob_details.get('candle_index', 0)} candles ago",
+                                f"  • Volume: {format_number(ob_details.get('volume', 0))}",
                                 f"  • Total OBs Found: {calc.get('order_blocks_count', 0)}"
                             ])
                         else:
                             breakdown_lines.append(f"  • No order block detected")
                         
                         breakdown_lines.append(f"")
-                        
-                        # 📊 ORDER BOOK SECTION (if available)
-                        order_book_data = sig.get('order_book')
-                        if order_book_data:
-                            breakdown_lines.append(f"📈 ORDER BOOK DETAILS:")
-                            breakdown_lines.extend(format_order_book_details(order_book_data))
-                            breakdown_lines.append(f"")
                         
                         # 📊 KEY METRICS SECTION
                         breakdown_lines.append(f"📊 KEY METRICS:")
@@ -838,15 +769,15 @@ async def scan_loop(exchange):
                         breakdown_lines.append(f"🔒 FORCED FILTER STATUS:")
                         if filter_passed:
                             if momentum_val >= MOMENTUM_STRONG_THRESHOLD:
-                                breakdown_lines.append(f"  • RULE 1 PASSED ✅: Momentum ≥ 0.87 ({momentum_val:.2f})")
+                                breakdown_lines.append(f"  • RULE 1 PASSED ✅: Momentum ≥ {MOMENTUM_STRONG_THRESHOLD} ({momentum_val:.2f})")
                             else:
-                                breakdown_lines.append(f"  • RULE 2 PASSED ✅: Momentum ≥ 0.85 & Disp ≥ 0.80")
+                                breakdown_lines.append(f"  • RULE 2 PASSED ✅: Momentum ≥ {MOMENTUM_GOOD_THRESHOLD} & Disp ≥ {DISPLACEMENT_MIN_THRESHOLD}")
                                 breakdown_lines.append(f"    → Momentum: {momentum_val:.2f}")
                                 breakdown_lines.append(f"    → Displacement: {displacement_val:.2f}")
                         else:
                             breakdown_lines.append(f"  • REJECTED ❌")
-                            breakdown_lines.append(f"    → Momentum: {momentum_val:.2f} {'≥ 0.87?'} {momentum_val >= 0.87}")
-                            breakdown_lines.append(f"    → Displacement: {displacement_val:.2f} {'≥ 0.80?'} {displacement_val >= 0.80}")
+                            breakdown_lines.append(f"    → Momentum: {momentum_val:.2f} {'≥' if momentum_val >= MOMENTUM_STRONG_THRESHOLD else '<'} {MOMENTUM_STRONG_THRESHOLD}")
+                            breakdown_lines.append(f"    → Displacement: {displacement_val:.2f} {'≥' if displacement_val >= DISPLACEMENT_MIN_THRESHOLD else '<'} {DISPLACEMENT_MIN_THRESHOLD}")
                         
                         breakdown_lines.append(f"")
                         
@@ -924,10 +855,9 @@ async def main():
     await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals")
     await tg("📊 ENHANCED BREAKDOWN ACTIVATED - Full OB & Sweep Details")
     await tg("🔒 FORCED FILTER ACTIVATED - NO EXCEPTIONS")
-    await tg("⚡ RULE 1: Momentum ≥ 0.87 → ENTER")
-    await tg("⚡ RULE 2: Momentum ≥ 0.85 AND Displacement ≥ 0.80 → ENTER")
+    await tg(f"⚡ RULE 1: Momentum ≥ {MOMENTUM_STRONG_THRESHOLD} → ENTER")
+    await tg(f"⚡ RULE 2: Momentum ≥ {MOMENTUM_GOOD_THRESHOLD} AND Displacement ≥ {DISPLACEMENT_MIN_THRESHOLD} → ENTER")
     await tg("🚫 RULE 3: EVERYTHING ELSE → REJECTED")
-    await tg("📈 Order Book & Sweep Analytics ENABLED")
     
     # Start main loops
     await asyncio.gather(
