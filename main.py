@@ -74,6 +74,8 @@ async def init_db():
     db_conn = await aiosqlite.connect(DB_PATH)
     await db_conn.execute("PRAGMA journal_mode=WAL;")
     await db_conn.execute("PRAGMA synchronous=NORMAL;")
+    
+    # Create table with all columns
     await db_conn.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,14 +93,40 @@ async def init_db():
             tp1_hit INTEGER DEFAULT 0,
             tp2_hit INTEGER DEFAULT 0,
             tp3_hit INTEGER DEFAULT 0,
-            latest_ob TEXT,
-            ob_type TEXT,
-            sweep_type TEXT,
-            momentum_value REAL,
-            displacement_value REAL
+            latest_ob TEXT
         );
     """)
+    
+    # Check and add any missing columns (for existing databases)
+    await check_and_add_columns()
+    
     await db_conn.commit()
+
+async def check_and_add_columns():
+    """Check for missing columns and add them if needed"""
+    try:
+        # List of additional columns that should exist
+        additional_columns = [
+            ("ob_type", "TEXT"),
+            ("sweep_type", "TEXT"),
+            ("momentum_value", "REAL"),
+            ("displacement_value", "REAL")
+        ]
+        
+        # Get current table schema
+        async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
+            existing_columns = {row[1] for row in await cursor.fetchall()}
+        
+        # Add missing columns
+        for column_name, column_type in additional_columns:
+            if column_name not in existing_columns:
+                try:
+                    await db_conn.execute(f"ALTER TABLE signals ADD COLUMN {column_name} {column_type}")
+                    log.info(f"Added missing column: {column_name} ({column_type})")
+                except Exception as e:
+                    log.warning(f"Could not add column {column_name}: {e}")
+    except Exception as e:
+        log.error(f"Error checking/adding columns: {e}")
 
 # ---------------- OHLCV ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
@@ -569,6 +597,7 @@ async def log_signal(sig):
         
         calc = sig.get("calc_values", {})
         
+        # Insert with all columns (including new ones if they exist)
         await db_conn.execute("""
             INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score,latest_ob,ob_type,sweep_type,momentum_value,displacement_value)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
