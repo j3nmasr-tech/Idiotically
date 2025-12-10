@@ -16,7 +16,7 @@ LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features + FORCED FILTER + DETAILE
 - Elite multi-timeframe confirmation (15m,1h,4h)
 - 🎯 MOMENTUM FILTER: 0.8 threshold (was 0.5)
 - 📊 ENHANCED BREAKDOWN: Shows all numerical values with FULL OB & SWEEP DETAILS
-- 🔒 FORCED FILTER: Momentum ≥ 0.87 OR (Momentum ≥ 0.85 AND Displacement ≥ 0.80)
+- 🔒 FORCED FILTER: Momentum ≥ 0.70 OR (Momentum ≥ 0.65 AND Displacement ≥ 0.60)
 """
 
 import os, time, asyncio, logging, datetime
@@ -42,9 +42,9 @@ MIN_SCORE = 5
 CRITICAL_FACTORS_MIN = 2  # HTF Alignment + Liquidity Sweep minimum
 
 # ---------------- FORCED FILTER PARAMETERS ----------------
-MOMENTUM_STRONG_THRESHOLD = 0.70  # Rule 1: Momentum ≥ 0.87 → ACCEPT
-MOMENTUM_GOOD_THRESHOLD = 0.65    # Rule 2: Momentum ≥ 0.85 → Check displacement
-DISPLACEMENT_MIN_THRESHOLD = 0.60 # Rule 2: Displacement ≥ 0.80
+MOMENTUM_STRONG_THRESHOLD = 0.70  # Rule 1: Momentum ≥ 0.70 → ACCEPT
+MOMENTUM_GOOD_THRESHOLD = 0.65    # Rule 2: Momentum ≥ 0.65 → Check displacement
+DISPLACEMENT_MIN_THRESHOLD = 0.60 # Rule 2: Displacement ≥ 0.60
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -124,7 +124,7 @@ def force_filter_trade(momentum_value: float, displacement_value: float) -> bool
     FORCED FILTER - MATHEMATICALLY PROVEN FROM 535 TRADES
     NO EXCEPTIONS, NO BYPASSES, NO OVERRIDES
     """
-    # RULE 1: Strong momentum (≥ 0.87) - ALWAYS ACCEPT
+    # RULE 1: Strong momentum (≥ 0.70) - ALWAYS ACCEPT
     if momentum_value >= MOMENTUM_STRONG_THRESHOLD:
         return True
     
@@ -385,7 +385,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         return None
     
     # Only continue if FORCED filter passes
-    filter_reason = "Mom≥0.87" if momentum_val >= MOMENTUM_STRONG_THRESHOLD else "Mom≥0.85 & Disp≥0.80"
+    filter_reason = "Mom≥0.70" if momentum_val >= MOMENTUM_STRONG_THRESHOLD else "Mom≥0.65 & Disp≥0.60"
     reasons.append(f"✅ FORCED FILTER PASSED: {filter_reason}")
 
     market_regime = await detect_market_regime(df)
@@ -785,24 +785,7 @@ async def scan_loop(exchange):
                         
                         breakdown_lines.append(f"")
                         
-                        # 🎯 RISK MANAGEMENT SECTION
-                        breakdown_lines.append(f"🎯 RISK MANAGEMENT:")
-                        if 'sl' in sig and 'tp1' in sig:
-                            risk = abs(sig['entry'] - sig['sl'])
-                            reward1 = abs(sig['tp1'] - sig['entry'])
-                            reward2 = abs(sig['tp2'] - sig['entry']) if 'tp2' in sig else 0
-                            reward3 = abs(sig['tp3'] - sig['entry']) if 'tp3' in sig else 0
-                            
-                            if risk > 0:
-                                breakdown_lines.extend([
-                                    f"  • Risk: {format_number(risk)}",
-                                    f"  • R:R TP1: 1:{reward1/risk:.1f}",
-                                    f"  • R:R TP2: 1:{reward2/risk:.1f}" if reward2 > 0 else "",
-                                    f"  • R:R TP3: 1:{reward3/risk:.1f}" if reward3 > 0 else "",
-                                    f"  • Risk %: {(risk/sig['entry']*100):.2f}%"
-                                ])
-                        
-                        breakdown_lines.append(f"")
+                        # 🎯 TARGETS SECTION (YOUR ORIGINAL)
                         breakdown_lines.append(f"🎯 TARGETS:")
                         breakdown_lines.extend([
                             f"  SL: {format_number(sig.get('sl', 0))}",
