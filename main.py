@@ -78,6 +78,32 @@ async def tg(msg: str):
             log.warning(f"Telegram send failed: {e}")
 
 # ---------------- DATABASE ----------------
+async def check_and_add_missing_columns():
+    """Check for missing columns and add them if needed"""
+    try:
+        # List of additional columns that should exist
+        additional_columns = [
+            ("htf_strength", "REAL"),
+            ("winning_formula_passed", "INTEGER DEFAULT 0")
+        ]
+        
+        # Get current table schema
+        async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
+            existing_columns = {row[1] for row in await cursor.fetchall()}
+        
+        # Add missing columns
+        for column_name, column_type in additional_columns:
+            if column_name not in existing_columns:
+                try:
+                    await db_conn.execute(f"ALTER TABLE signals ADD COLUMN {column_name} {column_type}")
+                    log.info(f"Added missing column: {column_name} ({column_type})")
+                except Exception as e:
+                    log.warning(f"Could not add column {column_name}: {e}")
+        
+        await db_conn.commit()
+    except Exception as e:
+        log.error(f"Error checking/adding columns: {e}")
+
 async def init_db():
     global db_conn
     db_conn = await aiosqlite.connect(DB_PATH)
@@ -113,6 +139,9 @@ async def init_db():
     """)
     
     await db_conn.commit()
+    
+    # Check and add any missing columns for existing databases
+    await check_and_add_missing_columns()
 
 # ---------------- OHLCV ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
