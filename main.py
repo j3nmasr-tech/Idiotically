@@ -17,7 +17,6 @@ LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features + FORCED FILTER + DETAILE
 - 🎯 MOMENTUM FILTER: 0.8 threshold (was 0.5)
 - 📊 ENHANCED BREAKDOWN: Shows all numerical values with FULL OB & SWEEP DETAILS
 - 🔒 FORCED FILTER: Momentum ≥ 0.70 OR (Momentum ≥ 0.65 AND Displacement ≥ 0.60)
-- 🏆 WINNING FORMULA FILTER: Mathematically proven from 422 trades analysis - 100% win rate filter
 """
 
 import os, time, asyncio, logging, datetime
@@ -47,14 +46,6 @@ MOMENTUM_STRONG_THRESHOLD = 0.70  # Rule 1: Momentum ≥ 0.70 → ACCEPT
 MOMENTUM_GOOD_THRESHOLD = 0.65    # Rule 2: Momentum ≥ 0.65 → Check displacement
 DISPLACEMENT_MIN_THRESHOLD = 0.60 # Rule 2: Displacement ≥ 0.60
 
-# ---------------- WINNING FORMULA PARAMETERS (FROM 422 TRADES ANALYSIS) ----------------
-WINNING_HTF_STRONG_THRESHOLD = 0.5    # Rule 1: HTF ≥ 0.5 = Strong trend
-WINNING_HTF_MIN_THRESHOLD = 0.1       # Rule 2/3: Minimum HTF for quality setups
-WINNING_OB_STRONG_THRESHOLD = 0.65    # Rule 2: Quality setup threshold
-WINNING_OB_GOOD_THRESHOLD = 0.60      # Rule 3: Good OB for pullbacks
-WINNING_MOMENTUM_STRONG = 0.70        # Rule 2: Strong momentum
-WINNING_MOMENTUM_PULLBACK = 0.65      # Rule 3: Pullback momentum (< this value)
-
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger("romeopt_bot")
@@ -78,32 +69,6 @@ async def tg(msg: str):
             log.warning(f"Telegram send failed: {e}")
 
 # ---------------- DATABASE ----------------
-async def check_and_add_missing_columns():
-    """Check for missing columns and add them if needed"""
-    try:
-        # List of additional columns that should exist
-        additional_columns = [
-            ("htf_strength", "REAL"),
-            ("winning_formula_passed", "INTEGER DEFAULT 0")
-        ]
-        
-        # Get current table schema
-        async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
-            existing_columns = {row[1] for row in await cursor.fetchall()}
-        
-        # Add missing columns
-        for column_name, column_type in additional_columns:
-            if column_name not in existing_columns:
-                try:
-                    await db_conn.execute(f"ALTER TABLE signals ADD COLUMN {column_name} {column_type}")
-                    log.info(f"Added missing column: {column_name} ({column_type})")
-                except Exception as e:
-                    log.warning(f"Could not add column {column_name}: {e}")
-        
-        await db_conn.commit()
-    except Exception as e:
-        log.error(f"Error checking/adding columns: {e}")
-
 async def init_db():
     global db_conn
     db_conn = await aiosqlite.connect(DB_PATH)
@@ -128,20 +93,40 @@ async def init_db():
             tp1_hit INTEGER DEFAULT 0,
             tp2_hit INTEGER DEFAULT 0,
             tp3_hit INTEGER DEFAULT 0,
-            latest_ob TEXT,
-            ob_type TEXT,
-            sweep_type TEXT,
-            momentum_value REAL,
-            displacement_value REAL,
-            htf_strength REAL,
-            winning_formula_passed INTEGER DEFAULT 0
+            latest_ob TEXT
         );
     """)
     
-    await db_conn.commit()
+    # Check and add any missing columns (for existing databases)
+    await check_and_add_columns()
     
-    # Check and add any missing columns for existing databases
-    await check_and_add_missing_columns()
+    await db_conn.commit()
+
+async def check_and_add_columns():
+    """Check for missing columns and add them if needed"""
+    try:
+        # List of additional columns that should exist
+        additional_columns = [
+            ("ob_type", "TEXT"),
+            ("sweep_type", "TEXT"),
+            ("momentum_value", "REAL"),
+            ("displacement_value", "REAL")
+        ]
+        
+        # Get current table schema
+        async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
+            existing_columns = {row[1] for row in await cursor.fetchall()}
+        
+        # Add missing columns
+        for column_name, column_type in additional_columns:
+            if column_name not in existing_columns:
+                try:
+                    await db_conn.execute(f"ALTER TABLE signals ADD COLUMN {column_name} {column_type}")
+                    log.info(f"Added missing column: {column_name} ({column_type})")
+                except Exception as e:
+                    log.warning(f"Could not add column {column_name}: {e}")
+    except Exception as e:
+        log.error(f"Error checking/adding columns: {e}")
 
 # ---------------- OHLCV ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
@@ -160,38 +145,6 @@ def atr(df: pd.DataFrame, period=14):
         "l-pc": (low - close.shift(1)).abs()
     }).max(axis=1)
     return tr.rolling(period, min_periods=1).mean()
-
-# ---------------- WINNING FORMULA FILTER (PROVEN FROM 422 TRADES) ----------------
-def winning_formula_filter(htf_strength: float, ob_strength: float, momentum: float) -> bool:
-    """
-    WINNING FORMULA - MATHEMATICALLY PROVEN FROM 422 TRADES ANALYSIS
-    315 WINNERS PASS, 94 LOSERS FAIL - 100% ACCURACY
-    
-    Every winning trade has AT LEAST ONE of these:
-    1. Strong trend (HTF ≥ 0.5)
-    2. Quality setup (OB ≥ 0.65 + Momentum ≥ 0.70 + HTF ≥ 0.1)
-    3. Clean pullback (OB ≥ 0.60 + Momentum < 0.65 + HTF ≥ 0.1)
-    
-    Every losing trade has NONE of these.
-    """
-    # Rule 1: Strong trend - HTF ≥ 0.5
-    if htf_strength >= WINNING_HTF_STRONG_THRESHOLD:
-        return True
-    
-    # Rule 2: Quality setup - Strong OB + Strong Momentum + Some trend
-    if (ob_strength >= WINNING_OB_STRONG_THRESHOLD and 
-        momentum >= WINNING_MOMENTUM_STRONG and 
-        htf_strength >= WINNING_HTF_MIN_THRESHOLD):
-        return True
-    
-    # Rule 3: Clean pullback - Good OB + Low Momentum (pullback) + Some trend
-    if (ob_strength >= WINNING_OB_GOOD_THRESHOLD and 
-        momentum < WINNING_MOMENTUM_PULLBACK and 
-        htf_strength >= WINNING_HTF_MIN_THRESHOLD):
-        return True
-    
-    # If none of the above, it's a LOSER signal
-    return False
 
 # ---------------- FORCED FILTER FUNCTION ----------------
 def force_filter_trade(momentum_value: float, displacement_value: float) -> bool:
@@ -368,7 +321,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
             # Calculate OB strength
             candle_body = abs(ob_candle["close"] - ob_candle["open"])
             candle_range = ob_candle["high"] - ob_candle["low"]
-            ob_strength = candle_body / candle_range if candle_range > 0 else 0
+            strength = candle_body / candle_range if candle_range > 0 else 0
             
             ob_details = {
                 "type": ob_type,
@@ -379,12 +332,11 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
                 "candles_ago": candles_ago,
                 "distance_to_price": distance_to_price,
                 "distance_pct": distance_pct,
-                "strength": ob_strength,
+                "strength": strength,
                 "volume": ob_candle["vol"] + prev_ob_candle["vol"],
                 "candle_index": ob_candle_index
             }
             calc_values["ob_details"] = ob_details
-            calc_values["ob_strength"] = round(ob_strength, 2)
         
         calc_values["zone_approach"] = zone_approach
         calc_values["ob_type"] = ob_type
@@ -395,7 +347,6 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         ob_type = None
         calc_values["zone_approach"] = 0
         calc_values["ob_type"] = "NONE"
-        calc_values["ob_strength"] = 0.0
 
     # Step 5: HTF Alignment (ORIGINAL LOGIC)
     tf_map={"1m":"15m","3m":"30m","5m":"1h","15m":"4h","30m":"1h"}
@@ -408,7 +359,6 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         if len(df_htf) >= 5:
             trend = df_htf["close"].iloc[-1] - df_htf["close"].iloc[-5]
             htf_trend_value = round(trend, 6)
-            htf_strength_abs = abs(htf_trend_value)
             htf_dir = "bullish" if trend>0 else "bearish"
             if ob_type and htf_dir==ob_type:
                 score+=1; htf_alignment=1; reasons.append(f"HTF Alignment +1 ({htf_dir} {trend:+.6f})")
@@ -416,17 +366,14 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
                 reasons.append(f"HTF Alignment +0 ({htf_dir} {trend:+.6f})")
             calc_values["htf_trend"] = htf_trend_value
             calc_values["htf_direction"] = htf_dir
-            calc_values["htf_strength"] = htf_strength_abs
         else:
             reasons.append("HTF Alignment ? (insufficient data)")
             calc_values["htf_trend"] = 0
             calc_values["htf_direction"] = "UNKNOWN"
-            calc_values["htf_strength"] = 0.0
     else:
         reasons.append("HTF Alignment ? (no data)")
         calc_values["htf_trend"] = 0
         calc_values["htf_direction"] = "UNKNOWN"
-        calc_values["htf_strength"] = 0.0
 
     # 🎯 STEP 6: MOMENTUM (0.8 THRESHOLD) (ORIGINAL LOGIC)
     momentum_ratio = abs(last["close"]-last["open"])/(last["high"]-last["low"]+1e-8)
@@ -481,24 +428,6 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         return None
     reasons.append("Elite MTF Alignment ✅")
 
-    # ---------------- WINNING FORMULA FILTER (NEW) ----------------
-    htf_strength = calc_values.get("htf_strength", 0.0)
-    ob_strength = calc_values.get("ob_strength", 0.0)
-    momentum = momentum_val
-    
-    # Apply winning formula filter
-    winning_formula_passed = winning_formula_filter(htf_strength, ob_strength, momentum)
-    calc_values["winning_formula_passed"] = winning_formula_passed
-    
-    if not winning_formula_passed:
-        reasons.append(f"❌ WINNING FORMULA REJECTED: HTF={htf_strength:.3f}, OB={ob_strength:.2f}, Mom={momentum:.2f}")
-        reasons.append(f"   • Rule 1 (HTF≥0.5): {htf_strength >= WINNING_HTF_STRONG_THRESHOLD}")
-        reasons.append(f"   • Rule 2 (OB≥0.65+Mom≥0.70+HTF≥0.1): {(ob_strength >= WINNING_OB_STRONG_THRESHOLD and momentum >= WINNING_MOMENTUM_STRONG and htf_strength >= WINNING_HTF_MIN_THRESHOLD)}")
-        reasons.append(f"   • Rule 3 (OB≥0.60+Mom<0.65+HTF≥0.1): {(ob_strength >= WINNING_OB_GOOD_THRESHOLD and momentum < WINNING_MOMENTUM_PULLBACK and htf_strength >= WINNING_HTF_MIN_THRESHOLD)}")
-        return None
-    
-    reasons.append(f"🏆 WINNING FORMULA PASSED: HTF={htf_strength:.3f}, OB={ob_strength:.2f}, Mom={momentum:.2f}")
-
     sig = {
         "symbol": symbol,
         "side": side,
@@ -509,8 +438,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         "htf_alignment": htf_alignment,
         "liquidity_sweep": liquidity_sweep,
         "momentum_ratio": momentum_ratio,
-        "calc_values": calc_values,
-        "winning_formula_passed": winning_formula_passed
+        "calc_values": calc_values
     }
     
     sig = update_tp_sl_live(sig, df)
@@ -528,12 +456,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         log.error(f"🚨 SECURITY VIOLATION: Signal {sig['symbol']} bypassed forced filter!")
         return None
     
-    # ---------------- FINAL WINNING FORMULA VALIDATION ----------------
-    if not winning_formula_passed:
-        log.error(f"🚨 SECURITY VIOLATION: Signal {sig['symbol']} bypassed winning formula filter!")
-        return None
-    
-    log.info(f"✅ Signal {sig['symbol']} passed ALL filters: Mom={momentum_val:.2f}, Disp={displacement_val:.2f}, HTF={htf_strength:.3f}, OB={ob_strength:.2f}")
+    log.info(f"✅ Signal {sig['symbol']} passed forced filter: Mom={momentum_val:.2f}, Disp={displacement_val:.2f}")
     return sig
 
 # ---------------- TP/SL HELPERS ----------------
@@ -674,10 +597,10 @@ async def log_signal(sig):
         
         calc = sig.get("calc_values", {})
         
-        # Insert with all columns
+        # Insert with all columns (including new ones if they exist)
         await db_conn.execute("""
-            INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score,latest_ob,ob_type,sweep_type,momentum_value,displacement_value,htf_strength,winning_formula_passed)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score,latest_ob,ob_type,sweep_type,momentum_value,displacement_value)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             sig["symbol"],
             sig["side"],
@@ -694,9 +617,7 @@ async def log_signal(sig):
             calc.get("ob_type", ""),
             calc.get("sweep_type", ""),
             calc.get("momentum_value", 0),
-            calc.get("displacement_value", 0),
-            calc.get("htf_strength", 0),
-            calc.get("winning_formula_passed", 0)
+            calc.get("displacement_value", 0)
         ))
         await db_conn.commit()
 
@@ -783,9 +704,7 @@ async def scan_loop(exchange):
                         calc = sig.get("calc_values", {})
                         momentum_val = calc.get("momentum_value", 0)
                         displacement_val = calc.get("displacement_value", 0)
-                        htf_strength = calc.get("htf_strength", 0)
-                        ob_strength = calc.get("ob_strength", 0)
-                        winning_formula_passed = calc.get("winning_formula_passed", 0)
+                        htf_trend_abs = abs(calc.get("htf_trend", 0))
                         
                         filter_passed = force_filter_trade(momentum_val, displacement_val)
                         
@@ -875,28 +794,8 @@ async def scan_loop(exchange):
                             f"  • Momentum: {momentum_val:.2f} {'✅ PASS' if momentum_val >= 0.8 else '❌ FAIL'}",
                             f"  • HTF Trend: {calc.get('htf_trend', 0):+.6f}",
                             f"  • HTF Direction: {calc.get('htf_direction', '?')}",
-                            f"  • HTF Strength: {htf_strength:.6f}",
-                            f"  • OB Strength: {ob_strength:.2f}",
+                            f"  • HTF Strength: {htf_trend_abs:.6f}",
                         ])
-                        
-                        # 🏆 WINNING FORMULA STATUS
-                        breakdown_lines.append(f"")
-                        breakdown_lines.append(f"🏆 WINNING FORMULA STATUS:")
-                        if winning_formula_passed:
-                            if htf_strength >= WINNING_HTF_STRONG_THRESHOLD:
-                                breakdown_lines.append(f"  • RULE 1 PASSED ✅: HTF ≥ {WINNING_HTF_STRONG_THRESHOLD} ({htf_strength:.3f})")
-                            elif ob_strength >= WINNING_OB_STRONG_THRESHOLD and momentum_val >= WINNING_MOMENTUM_STRONG and htf_strength >= WINNING_HTF_MIN_THRESHOLD:
-                                breakdown_lines.append(f"  • RULE 2 PASSED ✅: Quality Setup")
-                                breakdown_lines.append(f"    → OB ≥ {WINNING_OB_STRONG_THRESHOLD}: {ob_strength:.2f}")
-                                breakdown_lines.append(f"    → Mom ≥ {WINNING_MOMENTUM_STRONG}: {momentum_val:.2f}")
-                                breakdown_lines.append(f"    → HTF ≥ {WINNING_HTF_MIN_THRESHOLD}: {htf_strength:.3f}")
-                            elif ob_strength >= WINNING_OB_GOOD_THRESHOLD and momentum_val < WINNING_MOMENTUM_PULLBACK and htf_strength >= WINNING_HTF_MIN_THRESHOLD:
-                                breakdown_lines.append(f"  • RULE 3 PASSED ✅: Clean Pullback")
-                                breakdown_lines.append(f"    → OB ≥ {WINNING_OB_GOOD_THRESHOLD}: {ob_strength:.2f}")
-                                breakdown_lines.append(f"    → Mom < {WINNING_MOMENTUM_PULLBACK}: {momentum_val:.2f}")
-                                breakdown_lines.append(f"    → HTF ≥ {WINNING_HTF_MIN_THRESHOLD}: {htf_strength:.3f}")
-                        else:
-                            breakdown_lines.append(f"  • REJECTED ❌")
                         
                         # 🔒 FORCED FILTER STATUS
                         breakdown_lines.append(f"")
@@ -915,7 +814,7 @@ async def scan_loop(exchange):
                         
                         breakdown_lines.append(f"")
                         
-                        # 🎯 TARGETS SECTION
+                        # 🎯 TARGETS SECTION (YOUR ORIGINAL)
                         breakdown_lines.append(f"🎯 TARGETS:")
                         breakdown_lines.extend([
                             f"  SL: {format_number(sig.get('sl', 0))}",
@@ -937,7 +836,7 @@ async def scan_loop(exchange):
                         last_signal_time[key]=time.time()
                         signals_found+=1
             
-            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found (Winning Formula + Forced Filter Active)")
+            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found (Forced Filter Active)")
         
         except Exception as e: 
             log.exception("scan error: %s", e)
@@ -975,12 +874,6 @@ async def main():
     await tg(f"⚡ RULE 1: Momentum ≥ {MOMENTUM_STRONG_THRESHOLD} → ENTER")
     await tg(f"⚡ RULE 2: Momentum ≥ {MOMENTUM_GOOD_THRESHOLD} AND Displacement ≥ {DISPLACEMENT_MIN_THRESHOLD} → ENTER")
     await tg("🚫 RULE 3: EVERYTHING ELSE → REJECTED")
-    await tg("")
-    await tg("🏆 WINNING FORMULA ACTIVATED - PROVEN FROM 422 TRADES ANALYSIS")
-    await tg(f"📊 RULE 1: HTF ≥ {WINNING_HTF_STRONG_THRESHOLD} (Strong trend)")
-    await tg(f"📊 RULE 2: OB ≥ {WINNING_OB_STRONG_THRESHOLD} + Mom ≥ {WINNING_MOMENTUM_STRONG} + HTF ≥ {WINNING_HTF_MIN_THRESHOLD} (Quality setup)")
-    await tg(f"📊 RULE 3: OB ≥ {WINNING_OB_GOOD_THRESHOLD} + Mom < {WINNING_MOMENTUM_PULLBACK} + HTF ≥ {WINNING_HTF_MIN_THRESHOLD} (Clean pullback)")
-    await tg("✅ 315 WINNERS PASS, 94 LOSERS REJECTED - 100% ACCURACY")
     
     # Start main loops
     await asyncio.gather(
