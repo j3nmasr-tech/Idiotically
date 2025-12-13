@@ -17,6 +17,7 @@ LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features + FORCED FILTER + DETAILE
 - 🎯 MOMENTUM FILTER: 0.8 threshold (was 0.5)
 - 📊 ENHANCED BREAKDOWN: Shows all numerical values with FULL OB & SWEEP DETAILS
 - 🔒 FORCED FILTER: Momentum ≥ 0.70 OR (Momentum ≥ 0.65 AND Displacement ≥ 0.60)
+- 🆕 OB DISTANCE FILTER: Reject trades where OB distance > 0.70% (Premium Entry Filter)
 """
 
 import os, time, asyncio, logging, datetime
@@ -45,6 +46,10 @@ CRITICAL_FACTORS_MIN = 2  # HTF Alignment + Liquidity Sweep minimum
 MOMENTUM_STRONG_THRESHOLD = 0.70  # Rule 1: Momentum ≥ 0.70 → ACCEPT
 MOMENTUM_GOOD_THRESHOLD = 0.65    # Rule 2: Momentum ≥ 0.65 → Check displacement
 DISPLACEMENT_MIN_THRESHOLD = 0.60 # Rule 2: Displacement ≥ 0.60
+
+# ---------------- NEW OB DISTANCE FILTER PARAMETERS ----------------
+OB_DISTANCE_MAX_THRESHOLD = 0.70  # Maximum OB distance allowed (in percentage)
+OB_DISTANCE_OPTIMAL_MAX = 0.50    # Optimal maximum distance (better entries)
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -110,7 +115,9 @@ async def check_and_add_columns():
             ("ob_type", "TEXT"),
             ("sweep_type", "TEXT"),
             ("momentum_value", "REAL"),
-            ("displacement_value", "REAL")
+            ("displacement_value", "REAL"),
+            ("ob_distance_pct", "REAL"),   # New column for OB distance percentage
+            ("ob_distance_filter", "TEXT") # PASS/FAIL status
         ]
         
         # Get current table schema
@@ -162,6 +169,53 @@ def force_filter_trade(momentum_value: float, displacement_value: float) -> bool
     
     # RULE 3: REJECT EVERYTHING ELSE - NO EXCEPTIONS
     return False
+
+# ---------------- OB DISTANCE FILTER FUNCTION ----------------
+def check_ob_distance_filter(entry_price: float, ob_midpoint: float, ob_low: float = None, ob_high: float = None) -> dict:
+    """
+    OB DISTANCE FILTER - Premium Entry Filter
+    Rejects trades where price is too far from Order Block (> 0.70%)
+    
+    Returns: {
+        "passed": bool,
+        "distance_pct": float,
+        "distance_abs": float,
+        "status": str,
+        "quality": str (PREMIUM/GOOD/EXTENDED/REJECTED)
+    }
+    """
+    if ob_midpoint is None or entry_price == 0:
+        return {"passed": False, "distance_pct": 100, "distance_abs": 0, "status": "NO_OB", "quality": "REJECTED"}
+    
+    # Calculate absolute and percentage distance
+    distance_abs = abs(entry_price - ob_midpoint)
+    distance_pct = (distance_abs / entry_price) * 100
+    
+    # Determine entry quality
+    if distance_pct <= OB_DISTANCE_OPTIMAL_MAX:
+        quality = "PREMIUM"
+        passed = True
+    elif distance_pct <= OB_DISTANCE_MAX_THRESHOLD:
+        quality = "GOOD"
+        passed = True
+    else:
+        quality = "EXTENDED"
+        passed = False
+    
+    # Additional check: If OB range is very small, be more strict
+    if ob_low is not None and ob_high is not None:
+        ob_range_pct = ((ob_high - ob_low) / ob_low) * 100
+        if ob_range_pct < 0.1 and distance_pct > 0.3:  # Very tight OB
+            quality = "EXTENDED_TIGHT_OB"
+            passed = False
+    
+    return {
+        "passed": passed,
+        "distance_pct": distance_pct,
+        "distance_abs": distance_abs,
+        "status": "PASS" if passed else "FAIL",
+        "quality": quality
+    }
 
 # ---------------- MARKET REGIME ----------------
 async def detect_market_regime(df: pd.DataFrame):
@@ -286,6 +340,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     # Step 3 & 4: Order Block & Zone (ORIGINAL LOGIC - EXACTLY AS YOURS)
     ob_zone = None
     ob_candle_index = None  # Track which candle created the OB
+    ob_midpoint = None  # Store OB midpoint for distance calculation
     
     # ORIGINAL LOGIC: Look at last 4 candles only
     for i in range(len(df)-5, len(df)-1):
@@ -293,10 +348,12 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         if candle["close"]>candle["open"] and prev_candle["close"]<prev_candle["open"]:
             ob_zone={"type":"bullish","low":min(candle["low"], prev_candle["low"]),"high":candle["close"]}
             ob_candle_index = i
+            ob_midpoint = (ob_zone["low"] + ob_zone["high"]) / 2
             break
         elif candle["close"]<candle["open"] and prev_candle["close"]>prev_candle["open"]:
             ob_zone={"type":"bearish","low":candle["close"],"high":max(candle["high"], prev_candle["high"])}
             ob_candle_index = i
+            ob_midpoint = (ob_zone["low"] + ob_zone["high"]) / 2
             break
 
     if ob_zone:
@@ -342,11 +399,13 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         calc_values["ob_type"] = ob_type
         calc_values["ob_low"] = round(ob_zone["low"], 6)
         calc_values["ob_high"] = round(ob_zone["high"], 6)
+        calc_values["ob_midpoint"] = ob_midpoint
     else:
         reasons.append("Zone Approach +0")
         ob_type = None
         calc_values["zone_approach"] = 0
         calc_values["ob_type"] = "NONE"
+        calc_values["ob_midpoint"] = None
 
     # Step 5: HTF Alignment (ORIGINAL LOGIC)
     tf_map={"1m":"15m","3m":"30m","5m":"1h","15m":"4h","30m":"1h"}
@@ -428,6 +487,34 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         return None
     reasons.append("Elite MTF Alignment ✅")
 
+    # ---------------- NEW: OB DISTANCE FILTER ----------------
+    if ob_midpoint is not None:
+        # Apply OB Distance Filter
+        ob_distance_filter = check_ob_distance_filter(
+            entry_price=entry,
+            ob_midpoint=ob_midpoint,
+            ob_low=ob_zone["low"] if ob_zone else None,
+            ob_high=ob_zone["high"] if ob_zone else None
+        )
+        
+        # Store filter result in calc values
+        calc_values["ob_distance_filter"] = ob_distance_filter
+        calc_values["ob_distance_pct"] = ob_distance_filter["distance_pct"]
+        
+        # REJECT if OB distance is too large
+        if not ob_distance_filter["passed"]:
+            reasons.append(f"❌ OB DISTANCE FILTER REJECTED: {ob_distance_filter['distance_pct']:.2f}% > {OB_DISTANCE_MAX_THRESHOLD}%")
+            calc_values["ob_distance_filter_status"] = "FAIL"
+            return None
+        
+        # Track quality of entry
+        reasons.append(f"✅ OB DISTANCE FILTER PASSED: {ob_distance_filter['distance_pct']:.2f}% ({ob_distance_filter['quality']})")
+        calc_values["ob_distance_filter_status"] = "PASS"
+    else:
+        calc_values["ob_distance_filter"] = {"passed": False, "distance_pct": 100, "status": "NO_OB"}
+        calc_values["ob_distance_pct"] = 100
+        calc_values["ob_distance_filter_status"] = "NO_OB"
+
     sig = {
         "symbol": symbol,
         "side": side,
@@ -456,7 +543,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         log.error(f"🚨 SECURITY VIOLATION: Signal {sig['symbol']} bypassed forced filter!")
         return None
     
-    log.info(f"✅ Signal {sig['symbol']} passed forced filter: Mom={momentum_val:.2f}, Disp={displacement_val:.2f}")
+    log.info(f"✅ Signal {sig['symbol']} passed all filters: Mom={momentum_val:.2f}, Disp={displacement_val:.2f}, OB Dist={calc_values.get('ob_distance_pct', 0):.2f}%")
     return sig
 
 # ---------------- TP/SL HELPERS ----------------
@@ -596,11 +683,12 @@ async def log_signal(sig):
                 tp3 = entry * 0.97
         
         calc = sig.get("calc_values", {})
+        ob_distance_filter = calc.get("ob_distance_filter", {})
         
         # Insert with all columns (including new ones if they exist)
         await db_conn.execute("""
-            INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score,latest_ob,ob_type,sweep_type,momentum_value,displacement_value)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score,latest_ob,ob_type,sweep_type,momentum_value,displacement_value,ob_distance_pct,ob_distance_filter)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             sig["symbol"],
             sig["side"],
@@ -617,7 +705,9 @@ async def log_signal(sig):
             calc.get("ob_type", ""),
             calc.get("sweep_type", ""),
             calc.get("momentum_value", 0),
-            calc.get("displacement_value", 0)
+            calc.get("displacement_value", 0),
+            calc.get("ob_distance_pct", 0),
+            ob_distance_filter.get("status", "UNKNOWN")
         ))
         await db_conn.commit()
 
@@ -705,6 +795,8 @@ async def scan_loop(exchange):
                         momentum_val = calc.get("momentum_value", 0)
                         displacement_val = calc.get("displacement_value", 0)
                         htf_trend_abs = abs(calc.get("htf_trend", 0))
+                        ob_distance_pct = calc.get("ob_distance_pct", 100)
+                        ob_filter_status = calc.get("ob_distance_filter_status", "UNKNOWN")
                         
                         filter_passed = force_filter_trade(momentum_val, displacement_val)
                         
@@ -741,6 +833,7 @@ async def scan_loop(exchange):
                         breakdown_lines.append(f"🔷 ORDER BLOCK DETAILS:")
                         ob_type = calc.get('ob_type', 'NONE')
                         ob_details = calc.get('ob_details', {})
+                        ob_distance_filter = calc.get('ob_distance_filter', {})
                         
                         if ob_type != 'NONE' and ob_details:
                             ob_low = calc.get('ob_low', 0)
@@ -784,6 +877,19 @@ async def scan_loop(exchange):
                             ])
                         else:
                             breakdown_lines.append(f"  • No order block detected")
+                        
+                        # 🆕 OB DISTANCE FILTER STATUS
+                        breakdown_lines.append(f"")
+                        breakdown_lines.append(f"📏 OB DISTANCE FILTER:")
+                        if ob_distance_filter.get('passed', False):
+                            quality = ob_distance_filter.get('quality', 'GOOD')
+                            breakdown_lines.append(f"  • ✅ PASSED: {ob_distance_pct:.2f}% ({quality})")
+                            breakdown_lines.append(f"  • Threshold: ≤ {OB_DISTANCE_MAX_THRESHOLD}%")
+                        else:
+                            if ob_distance_filter.get('status') == 'NO_OB':
+                                breakdown_lines.append(f"  • ⚠️ NO ORDER BLOCK")
+                            else:
+                                breakdown_lines.append(f"  • ❌ REJECTED: {ob_distance_pct:.2f}% > {OB_DISTANCE_MAX_THRESHOLD}%")
                         
                         breakdown_lines.append(f"")
                         
@@ -836,7 +942,7 @@ async def scan_loop(exchange):
                         last_signal_time[key]=time.time()
                         signals_found+=1
             
-            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found (Forced Filter Active)")
+            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found (Forced Filter + OB Distance Filter Active)")
         
         except Exception as e: 
             log.exception("scan error: %s", e)
@@ -874,6 +980,9 @@ async def main():
     await tg(f"⚡ RULE 1: Momentum ≥ {MOMENTUM_STRONG_THRESHOLD} → ENTER")
     await tg(f"⚡ RULE 2: Momentum ≥ {MOMENTUM_GOOD_THRESHOLD} AND Displacement ≥ {DISPLACEMENT_MIN_THRESHOLD} → ENTER")
     await tg("🚫 RULE 3: EVERYTHING ELSE → REJECTED")
+    await tg("🆕 OB DISTANCE FILTER ACTIVATED - Premium Entry Filter")
+    await tg(f"📏 OB Distance ≤ {OB_DISTANCE_MAX_THRESHOLD}% required")
+    await tg(f"⭐ Optimal: ≤ {OB_DISTANCE_OPTIMAL_MAX}% (Premium entries)")
     
     # Start main loops
     await asyncio.gather(
