@@ -18,6 +18,7 @@ LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features + FORCED FILTER + DETAILE
 - 📊 ENHANCED BREAKDOWN: Shows all numerical values with FULL OB & SWEEP DETAILS
 - 🔒 FORCED FILTER: Momentum ≥ 0.70 OR (Momentum ≥ 0.65 AND Displacement ≥ 0.60)
 - 🆕 OB DISTANCE FILTER: Reject trades where OB distance > 0.70% (Premium Entry Filter)
+- 🆕 AGGRESSIVE TP RATIOS: TP1=0.8R, TP2=1.6R, TP3=2.5R (Optimized Scaling)
 """
 
 import os, time, asyncio, logging, datetime
@@ -50,6 +51,12 @@ DISPLACEMENT_MIN_THRESHOLD = 0.60 # Rule 2: Displacement ≥ 0.60
 # ---------------- NEW OB DISTANCE FILTER PARAMETERS ----------------
 OB_DISTANCE_MAX_THRESHOLD = 0.70  # Maximum OB distance allowed (in percentage)
 OB_DISTANCE_OPTIMAL_MAX = 0.50    # Optimal maximum distance (better entries)
+
+# ---------------- NEW TP RATIOS ----------------
+TP1_RATIO = 0.8    # 0.8R - Conservative first profit
+TP2_RATIO = 1.6    # 1.6R - Let winners run further
+TP3_RATIO = 2.5    # 2.5R - Maximum runner target
+MIN_TP_GAP_RATIO = 0.3  # Minimum gap between TPs as percentage of risk
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -530,12 +537,15 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     
     sig = update_tp_sl_live(sig, df)
     
-    # ---------------- TP1 DISTANCE FILTER ----------------
+    # ---------------- UPDATED TP1 DISTANCE FILTER ----------------
+    # With 0.8R TP1, we need less distance requirement
     if sig and "sl" in sig and "tp1" in sig:
         risk = abs(sig["entry"] - sig["sl"])
         tp1_distance = abs(sig["tp1"] - sig["entry"])
         
-        if tp1_distance < risk * 0.1:
+        # Minimum TP1 distance: 0.5R (was 0.1R)
+        if tp1_distance < risk * 0.5:
+            reasons.append(f"❌ TP1 too close: {tp1_distance:.6f} < {risk*0.5:.6f} (0.5R)")
             return None
     
     # ---------------- FINAL FORCED VALIDATION ----------------
@@ -546,7 +556,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     log.info(f"✅ Signal {sig['symbol']} passed all filters: Mom={momentum_val:.2f}, Disp={displacement_val:.2f}, OB Dist={calc_values.get('ob_distance_pct', 0):.2f}%")
     return sig
 
-# ---------------- TP/SL HELPERS ----------------
+# ---------------- UPDATED TP/SL HELPERS WITH NEW RATIOS ----------------
 def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
     recent_high = df['high'].iloc[-10:].max()
     recent_low = df['low'].iloc[-10:].min()
@@ -562,9 +572,10 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
             risk = min_risk
             sl = entry - risk
         
-        base_tp1 = entry + (risk * 0.8)
-        base_tp2 = entry + (risk * 1.5)
-        base_tp3 = entry + (risk * 2.5)
+        # 🆕 UPDATED TP RATIOS: 0.8R, 1.6R, 2.5R
+        base_tp1 = entry + (risk * TP1_RATIO)      # 0.8R
+        base_tp2 = entry + (risk * TP2_RATIO)      # 1.6R  
+        base_tp3 = entry + (risk * TP3_RATIO)      # 2.5R
         
         nearest_resistance = df['high'].tail(20).max()
         major_resistance = df['high'].tail(50).max()
@@ -573,10 +584,12 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
         tp2 = min(base_tp2, major_resistance) if major_resistance > tp1 else base_tp2
         tp3 = base_tp3
         
-        min_tp_gap = risk * 0.3
-        tp1 = max(tp1, entry + (risk * 0.5))
-        tp2 = max(tp2, tp1 + min_tp_gap)
-        tp3 = max(tp3, tp2 + min_tp_gap)
+        min_tp_gap = risk * MIN_TP_GAP_RATIO  # 0.3R minimum gap
+        
+        # Ensure minimum distances
+        tp1 = max(tp1, entry + (risk * 0.6))  # At least 0.6R
+        tp2 = max(tp2, tp1 + min_tp_gap)      # At least TP1 + 0.3R
+        tp3 = max(tp3, tp2 + min_tp_gap)      # At least TP2 + 0.3R
         
     else:
         sl_ob = ob_zone["high"] + (atr_val * 0.3)
@@ -589,9 +602,10 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
             risk = min_risk
             sl = entry + risk
         
-        base_tp1 = entry - (risk * 0.8)
-        base_tp2 = entry - (risk * 1.5)
-        base_tp3 = entry - (risk * 2.5)
+        # 🆕 UPDATED TP RATIOS: 0.8R, 1.6R, 2.5R
+        base_tp1 = entry - (risk * TP1_RATIO)      # 0.8R
+        base_tp2 = entry - (risk * TP2_RATIO)      # 1.6R
+        base_tp3 = entry - (risk * TP3_RATIO)      # 2.5R
         
         nearest_support = df['low'].tail(20).min()
         major_support = df['low'].tail(50).min()
@@ -600,10 +614,12 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
         tp2 = max(base_tp2, major_support) if major_support < tp1 else base_tp2
         tp3 = base_tp3
         
-        min_tp_gap = risk * 0.3
-        tp1 = min(tp1, entry - (risk * 0.5))
-        tp2 = min(tp2, tp1 - min_tp_gap)
-        tp3 = min(tp3, tp2 - min_tp_gap)
+        min_tp_gap = risk * MIN_TP_GAP_RATIO  # 0.3R minimum gap
+        
+        # Ensure minimum distances
+        tp1 = min(tp1, entry - (risk * 0.6))  # At least 0.6R
+        tp2 = min(tp2, tp1 - min_tp_gap)      # At least TP1 - 0.3R
+        tp3 = min(tp3, tp2 - min_tp_gap)      # At least TP2 - 0.3R
 
     return sl, tp1, tp2, tp3
 
@@ -634,16 +650,19 @@ def update_tp_sl_live(sig: dict, df: pd.DataFrame):
         side = sig["side"]
         atr_val = float(atr(df, 14).iloc[-1])
         
+        # 🆕 UPDATED: Use new TP ratios for basic setup
+        risk = atr_val * 0.5
+        
         if side == "BUY":
             sig["sl"] = entry * 0.99
-            sig["tp1"] = entry * 1.01
-            sig["tp2"] = entry * 1.02
-            sig["tp3"] = entry * 1.03
+            sig["tp1"] = entry + (risk * TP1_RATIO)
+            sig["tp2"] = entry + (risk * TP2_RATIO)
+            sig["tp3"] = entry + (risk * TP3_RATIO)
         else:
             sig["sl"] = entry * 1.01
-            sig["tp1"] = entry * 0.99
-            sig["tp2"] = entry * 0.98
-            sig["tp3"] = entry * 0.97
+            sig["tp1"] = entry - (risk * TP1_RATIO)
+            sig["tp2"] = entry - (risk * TP2_RATIO)
+            sig["tp3"] = entry - (risk * TP3_RATIO)
         sig["latest_ob"] = "basic"
         return sig
     
@@ -800,6 +819,17 @@ async def scan_loop(exchange):
                         
                         filter_passed = force_filter_trade(momentum_val, displacement_val)
                         
+                        # Calculate risk and TP distances for display
+                        risk = abs(sig.get('entry', 0) - sig.get('sl', 0))
+                        tp1_dist = abs(sig.get('tp1', 0) - sig.get('entry', 0)) if sig.get('tp1') else 0
+                        tp2_dist = abs(sig.get('tp2', 0) - sig.get('entry', 0)) if sig.get('tp2') else 0
+                        tp3_dist = abs(sig.get('tp3', 0) - sig.get('entry', 0)) if sig.get('tp3') else 0
+                        
+                        # Calculate R multiples
+                        tp1_r = tp1_dist / risk if risk > 0 else 0
+                        tp2_r = tp2_dist / risk if risk > 0 else 0
+                        tp3_r = tp3_dist / risk if risk > 0 else 0
+                        
                         # Start building the enhanced breakdown
                         breakdown_lines = [
                             f"🏆 {sig['symbol']} ({tf}) {sig['side']}",
@@ -920,13 +950,14 @@ async def scan_loop(exchange):
                         
                         breakdown_lines.append(f"")
                         
-                        # 🎯 TARGETS SECTION (YOUR ORIGINAL)
-                        breakdown_lines.append(f"🎯 TARGETS:")
+                        # 🎯 UPDATED TARGETS SECTION WITH R MULTIPLES
+                        breakdown_lines.append(f"🎯 TARGETS (AGGRESSIVE SCALING):")
                         breakdown_lines.extend([
                             f"  SL: {format_number(sig.get('sl', 0))}",
-                            f"  TP1: {format_number(sig.get('tp1', 0))}",
-                            f"  TP2: {format_number(sig.get('tp2', 0))}",
-                            f"  TP3: {format_number(sig.get('tp3', 0))}"
+                            f"  TP1: {format_number(sig.get('tp1', 0))} ({tp1_r:.1f}R)",
+                            f"  TP2: {format_number(sig.get('tp2', 0))} ({tp2_r:.1f}R)",
+                            f"  TP3: {format_number(sig.get('tp3', 0))} ({tp3_r:.1f}R)",
+                            f"  Risk: {format_number(risk)} | TP Ratios: {TP1_RATIO}R/{TP2_RATIO}R/{TP3_RATIO}R"
                         ])
                         
                         # Clean up empty lines
@@ -942,7 +973,7 @@ async def scan_loop(exchange):
                         last_signal_time[key]=time.time()
                         signals_found+=1
             
-            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found (Forced Filter + OB Distance Filter Active)")
+            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found (Forced Filter + OB Distance Filter + Aggressive TP Scaling)")
         
         except Exception as e: 
             log.exception("scan error: %s", e)
@@ -973,7 +1004,7 @@ async def main():
         }
     })
     
-    # Start announcement
+    # Start announcement with new TP ratios
     await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals")
     await tg("📊 ENHANCED BREAKDOWN ACTIVATED - Full OB & Sweep Details")
     await tg("🔒 FORCED FILTER ACTIVATED - NO EXCEPTIONS")
@@ -983,6 +1014,9 @@ async def main():
     await tg("🆕 OB DISTANCE FILTER ACTIVATED - Premium Entry Filter")
     await tg(f"📏 OB Distance ≤ {OB_DISTANCE_MAX_THRESHOLD}% required")
     await tg(f"⭐ Optimal: ≤ {OB_DISTANCE_OPTIMAL_MAX}% (Premium entries)")
+    await tg("🎯 AGGRESSIVE TP SCALING ACTIVATED")
+    await tg(f"💰 TP1: {TP1_RATIO}R | TP2: {TP2_RATIO}R | TP3: {TP3_RATIO}R")
+    await tg(f"📈 Minimum TP Gap: {MIN_TP_GAP_RATIO}R between targets")
     
     # Start main loops
     await asyncio.gather(
