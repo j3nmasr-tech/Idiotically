@@ -17,6 +17,7 @@ LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features)
 - Elite multi-timeframe confirmation (15m,1h,4h)
 - FIXED: Strong trend filter to avoid counter-trend losses
 - 🆕 ENHANCED BREAKDOWN: Shows all numerical values with FULL OB & SWEEP DETAILS (like Code 1)
+- 🚫 COUNTER-TREND FILTER: DISABLED (Allows all trades regardless of HTF trend)
 """
 
 import os, time, asyncio, logging, datetime
@@ -204,67 +205,13 @@ def format_number(value, decimals=6):
             return f"{value:.{decimals}f}"
     return str(value)
 
-# ---------------- STRONG TREND DETECTION ----------------
+# ---------------- STRONG TREND DETECTION (DISABLED) ----------------
 async def check_strong_counter_trend(exchange, symbol: str, timeframe: str, signal_side: str):
     """
-    Check if higher timeframe is in STRONG trend AGAINST our signal.
-    Returns True if we should REJECT the signal (strong counter-trend).
+    DISABLED: Trend filter is turned off
+    Returns False to allow all trades regardless of HTF trend
     """
-    trend_check_map = {
-        "1m": "15m",   # Check 15m trend for 1m signals
-        "3m": "30m",   # Check 30m trend for 3m signals  
-        "5m": "1h",    # Check 1h trend for 5m signals
-        "15m": "4h",   # Check 4h trend for 15m signals
-        "30m": "4h"    # Check 4h trend for 30m signals
-    }
-    
-    check_tf = trend_check_map.get(timeframe, "15m")
-    
-    ohlcv = await fetch_ohlcv(exchange, symbol, check_tf, 50)
-    if not ohlcv:
-        return False
-        
-    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-    for c in ["open","high","low","close","vol"]: 
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    
-    df['ema20'] = calculate_ema(df, 20)
-    recent = df.iloc[-10:]
-    
-    above_ema = (recent['close'] > recent['ema20']).sum()
-    below_ema = (recent['close'] < recent['ema20']).sum()
-    
-    recent_trend = []
-    for i in range(len(recent)-1):
-        if recent['close'].iloc[i+1] > recent['close'].iloc[i]:
-            recent_trend.append(1)  # Up
-        else:
-            recent_trend.append(-1)  # Down
-    
-    if len(recent_trend) >= 5:
-        last_5 = recent_trend[-5:]
-        if all(x > 0 for x in last_5):
-            if signal_side == "SELL":
-                log.info(f"🚫 {symbol} {timeframe} {signal_side} rejected: Strong {check_tf} UPTREND")
-                return True
-        elif all(x < 0 for x in last_5):
-            if signal_side == "BUY":
-                log.info(f"🚫 {symbol} {timeframe} {signal_side} rejected: Strong {check_tf} DOWNTREND")
-                return True
-    
-    current_atr = float(atr(df, 14).iloc[-1])
-    ema_distance = abs(df['close'].iloc[-1] - df['ema20'].iloc[-1])
-    
-    if current_atr > 0:
-        distance_in_atr = ema_distance / current_atr
-        if distance_in_atr > 2.0:
-            if signal_side == "BUY" and df['close'].iloc[-1] < df['ema20'].iloc[-1]:
-                log.info(f"🚫 {symbol} {timeframe} {signal_side} rejected: Price >2 ATR below {check_tf} EMA")
-                return True
-            elif signal_side == "SELL" and df['close'].iloc[-1] > df['ema20'].iloc[-1]:
-                log.info(f"🚫 {symbol} {timeframe} {signal_side} rejected: Price >2 ATR above {check_tf} EMA")
-                return True
-    
+    # Always return False - no trend filtering
     return False
 
 # ---------------- MARKET REGIME ----------------
@@ -502,11 +449,12 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     # Step5: HTF alignment with IMPROVED detection
     side = "BUY" if ob_zone['type'] == "bullish" else "SELL"
     
-    # Check for STRONG counter-trend
-    should_reject = await check_strong_counter_trend(exchange, symbol, tf, side)
-    if should_reject:
-        reasons.append(f"Strong HTF trend against {side} → Rejected")
-        return None
+    # DISABLED: Check for STRONG counter-trend (always allows trades)
+    # should_reject = await check_strong_counter_trend(exchange, symbol, tf, side)
+    # if should_reject:
+    #     reasons.append(f"Strong HTF trend against {side} → Rejected")
+    #     return None
+    reasons.append("Counter-Trend Filter: DISABLED")
     
     tf_map = {"1m":"15m", "3m":"30m", "5m":"1h", "15m":"4h", "30m":"1h"}
     htf = tf_map.get(tf, "15m")
@@ -706,7 +654,8 @@ async def send_enhanced_breakdown(sig: dict):
         f"  • HTF Trend: {calc.get('htf_trend_value', 0):+.6f}",
         f"  • HTF Direction: {calc.get('htf_direction', '?')}",
         f"  • HTF Alignment Score: +{calc.get('htf_alignment_score', 0)}",
-        f"  • Momentum Score: +{calc.get('momentum_score', 0)}"
+        f"  • Momentum Score: +{calc.get('momentum_score', 0)}",
+        f"  • Counter-Trend Filter: 🚫 DISABLED (allows all trades)"
     ])
     
     breakdown_lines.append(f"")
@@ -869,7 +818,7 @@ async def scan_loop():
                         await log_signal(sig)
                         last_signal_time[key] = time.time()
                         signals_found += 1
-            log.info(f"📊 Scan complete: {signals_found} RomeOPT-P signals found (Enhanced Breakdown)")
+            log.info(f"📊 Scan complete: {signals_found} RomeOPT-P signals found (Enhanced Breakdown, No Trend Filter)")
         except Exception as e:
             log.exception("scan error: %s", e)
         elapsed = time.time() - t0
@@ -892,8 +841,8 @@ async def main():
     await init_db()
     exchange = ccxt.okx({"enableRateLimit": True})
     await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals")
-    await tg("✅ TREND FILTER ACTIVE: Will reject counter-trend trades")
-    await tg("📊 ENHANCED BREAKDOWN ACTIVATED: Full OB & Sweep Details (like Code 1)")
+    await tg("🚫 COUNTER-TREND FILTER: DISABLED (Allows all trades)")
+    await tg("📊 ENHANCED BREAKDOWN ACTIVATED: Full OB & Sweep Details")
     await tg("💰 ROMEOPT-P STYLE: TP1=0.8R, TP2=1.6R, SL→BE after TP1")
     await asyncio.gather(scan_loop(), monitor_signals())
 
