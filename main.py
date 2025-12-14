@@ -75,6 +75,42 @@ async def tg(msg: str):
         except Exception as e:
             log.warning(f"Telegram send failed: {e}")
 
+# ---------------- DATABASE MIGRATION ----------------
+async def migrate_db():
+    """Check and add missing columns to existing database"""
+    try:
+        # Get current table schema
+        async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
+            columns = await cursor.fetchall()
+            existing_columns = [col[1] for col in columns]
+        
+        log.info(f"Existing columns: {existing_columns}")
+        
+        # List of columns that should exist
+        required_columns = [
+            ("htf_trend_value", "REAL"),
+            ("ob_distance_pct", "REAL"),
+            ("sweep_score", "INTEGER DEFAULT 0"),
+            ("zone_approach_score", "INTEGER DEFAULT 0"),
+            ("htf_alignment_score", "INTEGER DEFAULT 0"),
+            ("momentum_score", "INTEGER DEFAULT 0")
+        ]
+        
+        # Add missing columns
+        for column_name, column_type in required_columns:
+            if column_name not in existing_columns:
+                try:
+                    await db_conn.execute(f"ALTER TABLE signals ADD COLUMN {column_name} {column_type}")
+                    log.info(f"✅ Added missing column: {column_name}")
+                except Exception as e:
+                    log.warning(f"Could not add column {column_name}: {e}")
+        
+        await db_conn.commit()
+        log.info("✅ Database migration complete")
+        
+    except Exception as e:
+        log.error(f"Migration failed: {e}")
+
 # ---------------- DATABASE ----------------
 async def init_db():
     global db_conn
@@ -105,8 +141,8 @@ async def init_db():
             sweep_type TEXT,
             momentum_value REAL,
             displacement_value REAL,
-            htf_trend_value REAL,
-            ob_distance_pct REAL,
+            htf_trend_value REAL DEFAULT 0,
+            ob_distance_pct REAL DEFAULT 0,
             sweep_score INTEGER DEFAULT 0,
             zone_approach_score INTEGER DEFAULT 0,
             htf_alignment_score INTEGER DEFAULT 0,
@@ -114,6 +150,9 @@ async def init_db():
         );
     """)
     await db_conn.commit()
+    
+    # Run migration for existing databases
+    await migrate_db()
 
 # ---------------- OHLCV ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
