@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features + OB FILTER + TREND FILTER)
+LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features)
 - Fully live early signals
 - RomeOPT 6-step logic
 - Strict TP/SL (0.8R/1.6R, SL→BE after TP1, no TP3)
@@ -15,11 +15,7 @@ LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features + OB FILTER + TREND FILTE
 - Adaptive Market Regime detection
 - HTF + Sweep scoring threshold
 - Elite multi-timeframe confirmation (15m,1h,4h)
-- ✅ ENABLED: Strong trend filter to avoid counter-trend losses
-- 📊 ENHANCED BREAKDOWN: Shows all numerical values
-- 🚨 ADDED: MOMENTUM FILTER ONLY (CRITICAL)
-- 🎯 ADDED: SWEEP RETRACEMENT FILTER (DIFFERENT FOR BUY vs SELL)
-- 🎯 ADDED: OB QUALITY FILTER (4/5 criteria from analysis)
+- 📊 ENHANCED BREAKDOWN: Shows all numerical values with FULL OB & SWEEP DETAILS (Code 1 format)
 """
 
 import os, time, asyncio, logging, datetime
@@ -39,42 +35,18 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
-TOP_N = int(os.getenv("TOP_N", 60))
+TOP_N = int(os.getenv("TOP_N", 15))
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
 MIN_SCORE = 5
 CRITICAL_FACTORS_MIN = 2  # HTF Alignment + Liquidity Sweep minimum
 
-# MOMENTUM FILTER SETTINGS (ONLY ADDITION)
-MOMENTUM_FILTER_ENABLED = False # Enable momentum range filter
+# ALL FILTERS DISABLED AS REQUESTED
+MOMENTUM_FILTER_ENABLED = False
+SWEEP_FILTER_ENABLED = False
+OB_FILTER_ENABLED = False
+TREND_FILTER_ENABLED = False
 
-# Momentum ranges (from historical analysis - OPTIMAL RANGES)
-MOMENTUM_RANGES = {
-    "SELL": {"min": 0.825, "max": 1.01},  # Changed from 0.78-0.88
-    "BUY": {"min": 0.825, "max": 1.01}    # Changed from 0.82-0.91
-}
-
-# SWEEP FILTER SETTINGS (NEW ADDITION)
-SWEEP_FILTER_ENABLED = False  # Enable sweep retracement filter
-
-# Sweep retracement thresholds (DIFFERENT for BUY vs SELL based on our analysis)
-SWEEP_RETRACEMENT_THRESHOLDS = {
-    "BUY": 0.01,   # 1% minimum retracement for BUY trades
-    "SELL": 0.01   # 1% minimum retracement for SELL trades (changed from 50%)
-}
-
-# OB FILTER SETTINGS (LOOSE - Level 4)
-OB_FILTER_ENABLED = True
-OB_MIN_SCORE = 1  # Pass 3 out of 5 criteria
-
-# OB Filter Parameters (LOOSE but still effective)
-OB_RANGE_MIN = 0.05    # Minimum OB range % (0.05-1.0%)
-OB_RANGE_MAX = 1.0     # Maximum OB range % 
-OB_AGE_MAX = 5         # ≤5 candles old
-OB_DISTANCE_MAX = 1.0  # ≤1.0% from entry
-OB_TESTS_MAX = 3       # ≤3 tests
-OB_REACTION_MIN = 0.8  # ≥0.8% reaction
-
-# Timeframe mapping for TP scaling (RomeOPT-P logic) - YOUR CHOICE
+# Timeframe mapping for TP scaling (RomeOPT-P logic) - FROM CODE 2
 TP_TIMEFRAME_MAP = {
     "1m": "5m",    # 1m → 5m ATR (5×) - less aggressive
     "3m": "15m",   # 3m → 15m ATR (5×)
@@ -189,298 +161,68 @@ def calculate_ema(df, period):
     """Calculate EMA"""
     return df['close'].ewm(span=period, adjust=False).mean()
 
-# ---------------- MOMENTUM VALIDATION FILTER (ONLY ADDITION) ----------------
-def validate_momentum(momentum_value: float, side: str, calc_values: dict) -> tuple:
-    """
-    MOMENTUM FILTER: Validate momentum is in optimal range
-    Returns: (is_valid, rejection_reason)
-    """
-    if not MOMENTUM_FILTER_ENABLED:
-        return True, None
+# ---------------- ENHANCED SWEEP ANALYSIS (FROM CODE 1) ----------------
+def analyze_sweep_details(df: pd.DataFrame, lookback=5):
+    """Analyze sweep with detailed information - doesn't affect signal logic"""
+    if len(df) < lookback + 1:
+        return {"type": "NONE", "details": {}}
     
-    ranges = MOMENTUM_RANGES.get(side)
-    if not ranges:
-        return False, f"No momentum range defined for {side}"
+    current_candle = df.iloc[-1]
+    lookback_candles = df.iloc[-(lookback+1):-1]
     
-    min_val, max_val = ranges["min"], ranges["max"]
+    current_high = current_candle["high"]
+    current_low = current_candle["low"]
+    prev_highs = lookback_candles["high"].values
+    prev_lows = lookback_candles["low"].values
     
-    calc_values["momentum_min"] = min_val
-    calc_values["momentum_max"] = max_val
+    max_prev_high = np.max(prev_highs) if len(prev_highs) > 0 else current_high
+    min_prev_low = np.min(prev_lows) if len(prev_lows) > 0 else current_low
     
-    if momentum_value < min_val:
-        return False, f"Momentum {momentum_value:.3f} < min {min_val:.3f}"
-    elif momentum_value > max_val:
-        return False, f"Momentum {momentum_value:.3f} > max {max_val:.3f}"
+    # Check for high sweep
+    if current_high > max_prev_high:
+        extension = current_high - max_prev_high
+        return {
+            "type": "HIGH",
+            "details": {
+                "current_high": current_high,
+                "previous_high": max_prev_high,
+                "extension": extension,
+                "extension_pct": (extension / max_prev_high * 100) if max_prev_high > 0 else 0,
+                "strength": "STRONG" if extension > (current_high * 0.001) else "MODERATE",
+                "wick_size": current_high - max(current_candle["open"], current_candle["close"]),
+                "volume": current_candle["vol"],
+                "candle_body": current_candle["close"] - current_candle["open"],
+                "candle_range": current_candle["high"] - current_candle["low"]
+            }
+        }
     
-    return True, None
+    # Check for low sweep
+    elif current_low < min_prev_low:
+        extension = min_prev_low - current_low
+        return {
+            "type": "LOW",
+            "details": {
+                "current_low": current_low,
+                "previous_low": min_prev_low,
+                "extension": extension,
+                "extension_pct": (extension / min_prev_low * 100) if min_prev_low > 0 else 0,
+                "strength": "STRONG" if extension > (current_low * 0.001) else "MODERATE",
+                "wick_size": min(current_candle["open"], current_candle["close"]) - current_low,
+                "volume": current_candle["vol"],
+                "candle_body": current_candle["open"] - current_candle["close"],
+                "candle_range": current_candle["high"] - current_candle["low"]
+            }
+        }
+    
+    return {"type": "NONE", "details": {}}
 
-# ---------------- MOMENTUM-DISPLACEMENT COHERENCE FILTER ----------------
-def validate_momentum_displacement_coherence(momentum_value: float, displacement_value: float, calc_values: dict) -> tuple:
-    """
-    MOMENTUM-DISPLACEMENT COHERENCE FILTER: Ensure Momentum and Displacement are close
-    Returns: (is_valid, rejection_reason)
-    """
-    coherence_threshold = 0.02  # Maximum allowed difference
-    
-    diff = abs(momentum_value - displacement_value)
-    calc_values["momentum_displacement_diff"] = round(diff, 4)
-    calc_values["coherence_threshold"] = coherence_threshold
-    
-    if diff > coherence_threshold:
-        return False, f"Momentum-Displacement mismatch ({diff:.3f} > {coherence_threshold})"
-    
-    return True, None
-
-# ---------------- SWEEP RETRACEMENT FILTER ----------------
-def validate_sweep_retracement(sweep_type: str, sweep_price: float, ob_mid: float, 
-                               entry_price: float, trade_side: str, calc_values: dict) -> tuple:
-    """
-    SWEEP FILTER: Validate minimum retracement after sweep
-    Different thresholds for BUY vs SELL trades
-    Returns: (is_valid, rejection_reason)
-    """
-    if not SWEEP_FILTER_ENABLED:
-        return True, None
-    
-    # Calculate OB midpoint if not provided
-    if ob_mid is None:
-        return False, "OB midpoint required for sweep filter"
-    
-    # Calculate retracement based on sweep type
-    if sweep_type == "HIGH":  # BUY trades after HIGH sweep
-        total_range = sweep_price - ob_mid
-        if total_range <= 0:
-            return False, "Invalid range: Sweep ≤ OB midpoint"
-        
-        retrace_amount = sweep_price - entry_price
-        retracement = retrace_amount / total_range if total_range > 0 else 0
-        
-    elif sweep_type == "LOW":  # SELL trades after LOW sweep
-        total_range = ob_mid - sweep_price
-        if total_range <= 0:
-            return False, "Invalid range: OB midpoint ≤ Sweep"
-        
-        retrace_amount = entry_price - sweep_price
-        retracement = retrace_amount / total_range if total_range > 0 else 0
-    
-    else:
-        return False, f"Invalid sweep type: {sweep_type}"
-    
-    # Store calculation values for breakdown
-    calc_values["sweep_retracement"] = round(retracement, 4)
-    calc_values["sweep_retracement_pct"] = round(retracement * 100, 2)
-    calc_values["sweep_total_range"] = round(total_range, 6)
-    calc_values["sweep_retrace_amount"] = round(retrace_amount, 6)
-    
-    # Get threshold for this trade side
-    threshold = SWEEP_RETRACEMENT_THRESHOLDS.get(trade_side)
-    if threshold is None:
-        return False, f"No retracement threshold defined for {trade_side}"
-    
-    calc_values["sweep_threshold"] = threshold
-    calc_values["sweep_threshold_pct"] = round(threshold * 100, 1)
-    
-    # Apply filter
-    if retracement >= threshold:
-        return True, None
-    else:
-        return False, f"Sweep retracement {retracement:.1%} < {threshold:.1%}"
-
-# ---------------- OB QUALITY FILTER FUNCTIONS ----------------
-def calculate_ob_age(df: pd.DataFrame, ob_zone: dict) -> int:
-    """Calculate how many candles ago OB was formed"""
-    try:
-        ob_low, ob_high = ob_zone['low'], ob_zone['high']
-        ob_type = ob_zone['type']
-        
-        # Look back up to 20 candles to find when OB was formed
-        for i in range(len(df)-1, max(0, len(df)-21), -1):
-            if i < 2:  # Need at least 2 candles
-                continue
-                
-            candle = df.iloc[i]
-            prev_candle = df.iloc[i-1]
-            
-            # Check if this is where the OB formed
-            if ob_type == "bullish":
-                # Bullish OB: previous bearish, current bullish
-                if (prev_candle["close"] < prev_candle["open"] and 
-                    candle["close"] > candle["open"]):
-                    potential_low = min(candle["low"], prev_candle["low"])
-                    potential_high = candle["close"]
-                    
-                    # Check if this matches our OB zone
-                    if (abs(potential_low - ob_low) < 0.00001 and 
-                        abs(potential_high - ob_high) < 0.00001):
-                        return len(df) - i - 1  # Candles since formation
-            
-            elif ob_type == "bearish":
-                # Bearish OB: previous bullish, current bearish
-                if (prev_candle["close"] > prev_candle["open"] and 
-                    candle["close"] < candle["open"]):
-                    potential_low = candle["close"]
-                    potential_high = max(candle["high"], prev_candle["high"])
-                    
-                    # Check if this matches our OB zone
-                    if (abs(potential_low - ob_low) < 0.00001 and 
-                        abs(potential_high - ob_high) < 0.00001):
-                        return len(df) - i - 1  # Candles since formation
-        
-        return 10  # Default if not found (old)
-    except Exception as e:
-        log.debug(f"OB age calculation error: {e}")
-        return 10
-
-def calculate_ob_tests(df: pd.DataFrame, ob_zone: dict) -> int:
-    """Count how many times OB has been tested"""
-    try:
-        ob_low, ob_high = ob_zone['low'], ob_zone['high']
-        tests = 0
-        consecutive_tests = 0
-        max_consecutive = 0
-        
-        # Check last 20 candles for tests
-        recent = df.iloc[-20:] if len(df) >= 20 else df
-        
-        for i in range(len(recent)):
-            candle = recent.iloc[i]
-            
-            # Check if price touched OB zone
-            touched = False
-            
-            # Price within OB zone
-            if ob_low <= candle['low'] <= ob_high or ob_low <= candle['high'] <= ob_high:
-                touched = True
-            # Wick touched OB zone
-            elif candle['low'] < ob_low <= candle['high'] or candle['low'] <= ob_high < candle['high']:
-                touched = True
-            
-            if touched:
-                tests += 1
-                consecutive_tests += 1
-                max_consecutive = max(max_consecutive, consecutive_tests)
-            else:
-                consecutive_tests = 0
-        
-        return tests
-    except Exception as e:
-        log.debug(f"OB tests calculation error: {e}")
-        return 5  # Assume worst case
-
-def score_order_block_quality_complete(ob_zone: dict, df: pd.DataFrame, current_price: float, side: str) -> tuple:
-    """
-    Complete OB scoring with all 5 criteria from our analysis
-    Returns: (score, reasons, details)
-    """
-    if not OB_FILTER_ENABLED:
-        return 5, ["OB filter disabled"], {"disabled": True}
-    
-    score = 0
-    reasons = []
-    details = {}
-    
-    try:
-        # 1. OB Range: 0.07-0.50%
-        ob_range = ob_zone['high'] - ob_zone['low']
-        ob_range_pct = (ob_range / current_price) * 100 if current_price > 0 else 0
-        details["ob_range_pct"] = round(ob_range_pct, 2)
-        
-        if OB_RANGE_MIN <= ob_range_pct <= OB_RANGE_MAX:
-            score += 1
-            reasons.append(f"Range: {ob_range_pct:.2f}% ✓ (0.07-0.50%)")
-            details["range_pass"] = True
-        else:
-            reasons.append(f"Range: {ob_range_pct:.2f}% ✗ (0.07-0.50%)")
-            details["range_pass"] = False
-        
-        # 2. OB Age: ≤4 candles
-        ob_age = calculate_ob_age(df, ob_zone)
-        details["ob_age"] = ob_age
-        
-        if ob_age <= OB_AGE_MAX:
-            score += 1
-            reasons.append(f"Age: {ob_age} candles ✓ (≤{OB_AGE_MAX})")
-            details["age_pass"] = True
-        else:
-            reasons.append(f"Age: {ob_age} candles ✗ (≤{OB_AGE_MAX})")
-            details["age_pass"] = False
-        
-        # 3. OB Distance: ≤0.65%
-        if side == "BUY":
-            distance = abs(current_price - ob_zone['low']) / current_price * 100 if current_price > 0 else 100
-        else:  # SELL
-            distance = abs(current_price - ob_zone['high']) / current_price * 100 if current_price > 0 else 100
-        
-        details["ob_distance_pct"] = round(distance, 2)
-        
-        if distance <= OB_DISTANCE_MAX:
-            score += 1
-            reasons.append(f"Distance: {distance:.2f}% ✓ (≤{OB_DISTANCE_MAX}%)")
-            details["distance_pass"] = True
-        else:
-            reasons.append(f"Distance: {distance:.2f}% ✗ (≤{OB_DISTANCE_MAX}%)")
-            details["distance_pass"] = False
-        
-        # 4. OB Tests: ≤2 times
-        ob_tests = calculate_ob_tests(df, ob_zone)
-        details["ob_tests"] = ob_tests
-        
-        if ob_tests <= OB_TESTS_MAX:
-            score += 1
-            reasons.append(f"Tests: {ob_tests} times ✓ (≤{OB_TESTS_MAX})")
-            details["tests_pass"] = True
-        else:
-            reasons.append(f"Tests: {ob_tests} times ✗ (≤{OB_TESTS_MAX})")
-            details["tests_pass"] = False
-        
-        # 5. Previous Reaction Strength
-        ob_age = calculate_ob_age(df, ob_zone)
-        reaction_pct = 0
-        details["reaction_pct"] = 0
-        
-        if 1 < ob_age < len(df) - 1:
-            # Look at the candle immediately after OB formation
-            idx = len(df) - ob_age  # Index where OB was formed
-            if idx + 1 < len(df):
-                next_candle = df.iloc[idx + 1]
-                # Calculate reaction as % move from OB
-                if ob_zone['type'] == "bullish":
-                    reaction = abs(next_candle['close'] - ob_zone['low']) / current_price * 100
-                else:  # bearish
-                    reaction = abs(next_candle['close'] - ob_zone['high']) / current_price * 100
-                
-                reaction_pct = reaction
-                details["reaction_pct"] = round(reaction_pct, 2)
-                
-                if reaction_pct >= OB_REACTION_MIN:
-                    score += 1
-                    reasons.append(f"Reaction: {reaction_pct:.2f}% ✓ (≥{OB_REACTION_MIN}%)")
-                    details["reaction_pass"] = True
-                else:
-                    reasons.append(f"Reaction: {reaction_pct:.2f}% ✗ (≥{OB_REACTION_MIN}%)")
-                    details["reaction_pass"] = False
-            else:
-                reasons.append("Reaction: Unknown (no follow-up candle)")
-                details["reaction_pass"] = False
-        else:
-            reasons.append("Reaction: Unknown (OB too recent/old)")
-            details["reaction_pass"] = False
-        
-        details["total_score"] = score
-        details["min_score_required"] = OB_MIN_SCORE
-        
-        return score, reasons, details
-        
-    except Exception as e:
-        log.error(f"OB scoring error: {e}")
-        return 0, [f"OB scoring error: {str(e)}"], {"error": True}
-
-# ---------------- STRONG TREND DETECTION ----------------
+# ---------------- STRONG TREND DETECTION (DISABLED) ----------------
 async def check_strong_counter_trend(exchange, symbol: str, timeframe: str, signal_side: str):
-    """
-    Check if higher timeframe is in STRONG trend AGAINST our signal.
-    Returns True if we should REJECT the signal (strong counter-trend).
-    """
+    """DISABLED AS REQUESTED - Returns False to not reject any signals"""
+    if not TREND_FILTER_ENABLED:
+        return False
+    # Original implementation here but disabled
+    
     # ENABLED TREND FILTER - Check higher timeframe trends
     
     # Define HTF mapping for strong trend detection
@@ -708,9 +450,21 @@ async def get_htf_trend(exchange, symbol: str, timeframe: str):
     else:
         return "neutral"
 
+# ---------------- FORMAT NUMBER FUNCTION (FROM CODE 1) ----------------
+def format_number(value, decimals=6):
+    """Format number with appropriate decimal places"""
+    if isinstance(value, (int, float)):
+        if abs(value) >= 1000:
+            return f"{value:,.2f}"
+        elif abs(value) >= 1:
+            return f"{value:.4f}"
+        else:
+            return f"{value:.{decimals}f}"
+    return str(value)
+
 # ---------------- ROMEOPT SIGNAL GENERATOR ----------------
 async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
-    """Full RomeOPT 6-step signal generator with MOMENTUM FILTER, SWEEP FILTER, and OB FILTER"""
+    """Full RomeOPT 6-step signal generator with DISABLED FILTERS"""
     if df is None or len(df) < 20: 
         return None
     
@@ -736,6 +490,10 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     calc_values["prev_low"] = round(float(prev5["low"].min()), 6)
     calc_values["current_high"] = round(float(last["high"]), 6)
     calc_values["current_low"] = round(float(last["low"]), 6)
+
+    # ENHANCED: Add sweep details for breakdown (doesn't affect signal) - FROM CODE 1
+    sweep_analysis = analyze_sweep_details(df)
+    calc_values["sweep_details"] = sweep_analysis["details"]
 
     # Step2: Displacement
     displacement = abs(last["close"]-last["open"])/(last["high"]-last["low"]+1e-8)
@@ -766,74 +524,23 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     calc_values["signal_side"] = side
     # ========== END CRITICAL SECTION ==========
     
-    # 🚨 FILTER 1: OB QUALITY FILTER (NEW ADDITION)
-    ob_score, ob_reasons, ob_details = score_order_block_quality_complete(
-        ob_zone, df, float(last["close"]), side
-    )
-    calc_values["ob_score"] = ob_score
-    calc_values["ob_details"] = ob_details
-    calc_values["ob_reasons"] = ob_reasons
-    
-    if OB_FILTER_ENABLED and ob_score < OB_MIN_SCORE:
-        reasons.append(f"❌ OB Quality Failed: {ob_score}/{OB_MIN_SCORE}")
-        for r in ob_reasons:
-            reasons.append(f"  {r}")
-        calc_values["ob_filter_passed"] = False
-        calc_values["ob_filter_rejection"] = f"Score {ob_score} < {OB_MIN_SCORE}"
-        return None
-    
+    # DISABLED: OB QUALITY FILTER
+    if OB_FILTER_ENABLED:
+        # Original OB filter code would go here
+        pass
     calc_values["ob_filter_passed"] = True
     
-    # 🚨 FILTER 2: Momentum ≥ 0.825
+    # DISABLED: Momentum filter (only original 0.5 check remains)
     momentum_ratio = abs(last["close"]-last["open"])/(last["high"]-last["low"]+1e-8)
     calc_values["momentum_value"] = round(momentum_ratio, 3)
-    calc_values["momentum_threshold"] = 0.5
     
-    momentum_valid, momentum_rejection = validate_momentum(momentum_ratio, side, calc_values)
-    if not momentum_valid:
-        reasons.append(f"Momentum Filter: {momentum_rejection}")
-        calc_values["momentum_filter_passed"] = False
-        calc_values["momentum_rejection"] = momentum_rejection
-        return None
-    calc_values["momentum_filter_passed"] = True
-    
-    # 🚨 FILTER 3: Momentum-Displacement Coherence ≤ 0.02
-    coherence_valid, coherence_rejection = validate_momentum_displacement_coherence(
-        momentum_ratio, displacement, calc_values
-    )
-    if not coherence_valid:
-        reasons.append(f"Coherence Filter: {coherence_rejection}")
-        calc_values["coherence_filter_passed"] = False
-        calc_values["coherence_rejection"] = coherence_rejection
-        return None
+    # DISABLED: Coherence filter
     calc_values["coherence_filter_passed"] = True
-
-    # 🚨 FILTER 4: Sweep Retracement (DIFFERENT for BUY vs SELL)
-    if has_sweep and sweep_type != "NONE":  # Only apply if we have a sweep
-        # Calculate OB midpoint for sweep filter
-        ob_midpoint = (ob_zone['low'] + ob_zone['high']) / 2
-        sweep_price = last["high"] if sweep_type == "HIGH" else last["low"]
-        
-        sweep_valid, sweep_rejection = validate_sweep_retracement(
-            sweep_type=sweep_type,
-            sweep_price=sweep_price,
-            ob_mid=ob_midpoint,
-            entry_price=float(last["close"]),
-            trade_side=side,
-            calc_values=calc_values
-        )
-        
-        if not sweep_valid:
-            reasons.append(f"Sweep Filter: {sweep_rejection}")
-            calc_values["sweep_filter_passed"] = False
-            calc_values["sweep_rejection"] = sweep_rejection
-            return None
-        calc_values["sweep_filter_passed"] = True
-    else:
-        # No sweep, so sweep filter is not applicable
-        calc_values["sweep_filter_passed"] = True
-        calc_values["sweep_retracement_pct"] = 0
-        calc_values["sweep_threshold_pct"] = 0
+    
+    # DISABLED: Sweep Retracement Filter
+    calc_values["sweep_filter_passed"] = True
+    calc_values["sweep_retracement_pct"] = 0
+    calc_values["sweep_threshold_pct"] = 0
 
     # Zone Approach calculation
     zone_approach = 0
@@ -851,7 +558,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     calc_values["zone_approach"] = zone_approach
 
     # Step5: HTF alignment with IMPROVED detection
-    # Check for STRONG counter-trend BEFORE proceeding
+    # DISABLED: Check for STRONG counter-trend
     should_reject = await check_strong_counter_trend(exchange, symbol, tf, side)
     calc_values["strong_counter_trend"] = should_reject
     
@@ -883,7 +590,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         reasons.append(f"HTF Neutral ({htf})")
         calc_values["htf_alignment"] = 0
     
-    # Original momentum check
+    # Original momentum check (0.5 threshold)
     if momentum_ratio < 0.5: 
         reasons.append(f"Momentum Failed ({momentum_ratio:.3f} < 0.5)")
         calc_values["momentum_score"] = 0
@@ -1075,61 +782,86 @@ async def scan_loop():
                         df[c] = pd.to_numeric(df[c], errors="coerce")
                     sig = await generate_signal_romeopt(exchange, df, symbol, tf)
                     if sig:
-                        # ENHANCED BREAKDOWN WITH ALL VALUES
                         calc = sig.get("calc_values", {})
-                        ob_details = calc.get("ob_details", {})
+                        sweep_details = calc.get("sweep_details", {})
+                        ob_low = calc.get('ob_low', 0)
+                        ob_high = calc.get('ob_high', 0)
+                        ob_range = ob_high - ob_low
+                        ob_mid = (ob_high + ob_low) / 2
+                        distance_to_entry = abs(sig['entry'] - ob_mid)
+                        distance_pct = (distance_to_entry / sig['entry'] * 100) if sig['entry'] > 0 else 0
+                        in_zone = True if (calc.get('ob_type') == 'bullish' and sig['entry'] <= ob_high) or (calc.get('ob_type') == 'bearish' and sig['entry'] >= ob_low) else False
                         
-                        # Add momentum and coherence filter status
-                        momentum_status = "✅ OPTIMAL" if calc.get("momentum_filter_passed") else "❌ OUTSIDE RANGE"
-                        momentum_range = f"[{calc.get('momentum_min', 0):.3f}-{calc.get('momentum_max', 0):.3f}]"
-                        
-                        coherence_status = "✅ COHERENT" if calc.get("coherence_filter_passed") else "❌ INCOHERENT"
-                        coherence_diff = calc.get("momentum_displacement_diff", 0)
-                        coherence_threshold = calc.get("coherence_threshold", 0.02)
-                        
-                        # OB Filter status
-                        ob_status = "✅ PASSED" if calc.get("ob_filter_passed") else "❌ FAILED"
-                        ob_score = calc.get("ob_score", 0)
-                        ob_required = OB_MIN_SCORE
-                        
-                        # Trend filter status
-                        trend_status = "✅ ALLOWED" if not calc.get("strong_counter_trend", False) else "🚫 REJECTED"
-                        
+                        # ENHANCED BREAKDOWN IN CODE 1 FORMAT
                         breakdown_lines = [
                             f"🏆 {sig['symbol']} ({tf}) {sig['side']}",
-                            f"Entry: {sig['entry']:.6f}",
-                            f"Score: {sig['score']}/6",
-                            f"",
-                            f"📊 DETAILED BREAKDOWN:",
-                            f"• Sweep: {calc.get('sweep_type', 'NONE')} (+{calc.get('sweep_score', 0)})",
-                            f"  High: {calc.get('current_high', 0):.6f} > {calc.get('prev_high', 0):.6f}",
-                            f"  Low: {calc.get('current_low', 0):.6f} < {calc.get('prev_low', 0):.6f}",
-                            f"• Displacement: {calc.get('displacement_value', 0):.3f}",
-                            f"• OB: {calc.get('ob_type', 'NONE')} [{calc.get('ob_low', 0):.6f}-{calc.get('ob_high', 0):.6f}]",
-                            f"• OB Quality: {ob_score}/{ob_required} {ob_status}",
-                            f"  - Range: {ob_details.get('ob_range_pct', 0):.2f}% (0.07-0.50%)",
-                            f"  - Age: {ob_details.get('ob_age', 0)} candles (≤4)",
-                            f"  - Distance: {ob_details.get('ob_distance_pct', 0):.2f}% (≤0.65%)",
-                            f"  - Tests: {ob_details.get('ob_tests', 0)} times (≤2)",
-                            f"  - Reaction: {ob_details.get('reaction_pct', 0):.2f}% (≥1.0%)",
-                            f"• Zone Approach: +{calc.get('zone_approach', 0)}",
-                            f"• HTF ({calc.get('htf_timeframe', '?')}): {calc.get('htf_trend_direction', '?')} (+{calc.get('htf_alignment', 0)})",
-                            f"• Momentum: {calc.get('momentum_value', 0):.3f} {momentum_status} {momentum_range}",
-                            f"• Coherence: Diff={coherence_diff:.3f} {coherence_status} (≤{coherence_threshold})",
-                            f"• Sweep Retracement: {calc.get('sweep_retracement_pct', 0):.1f}% {'✅ PASSED' if calc.get('sweep_filter_passed', False) else '❌ FAILED'} (Min: {calc.get('sweep_threshold_pct', 0):.1f}%)",
-                            f"• Trend Filter: {trend_status}",
-                            f"• Liquidity Path: {'🚫 BLOCKED' if calc.get('liquidity_path_blocked', False) else '✅ CLEAR'}",
-                            f"",
-                            f"🎯 RISK/REWARD:",
-                            f"Risk: {sig.get('risk', 0):.6f}",
-                            f"TP1 Reward: {sig.get('reward_tp1', 0):.6f} (R:R = 1:{sig.get('rr_tp1', 0):.1f})",
-                            f"TP2 Reward: {sig.get('reward_tp2', 0):.6f} (R:R = 1:{sig.get('rr_tp2', 0):.1f})",
-                            f"",
-                            f"🎯 TARGETS ({sig.get('tp_tf', '?')} ATR scaling):",
-                            f"SL: {sig.get('sl', 0):.6f}",
-                            f"TP1: {sig.get('tp1', 0):.6f} (0.8R)",
-                            f"TP2: {sig.get('tp2', 0):.6f} (1.6R)"
+                            f"Entry: {sig['entry']:.6f} | Score: {sig['score']}/6",
+                            f""
                         ]
+                        
+                        # 📊 SWEEP DETAILS SECTION (Code 1 format)
+                        breakdown_lines.append(f"⚡ LIQUIDITY SWEEP DETAILS:")
+                        sweep_type = calc.get('sweep_type', 'NONE')
+                        
+                        if sweep_type != 'NONE':
+                            breakdown_lines.extend([
+                                f"  • Type: {sweep_type} SWEEP",
+                                f"  • Score: +{calc.get('sweep_score', 0)}",
+                                f"  • Current: {format_number(sweep_details.get('current_high' if sweep_type == 'HIGH' else 'current_low'))}",
+                                f"  • Previous: {format_number(sweep_details.get('previous_high' if sweep_type == 'HIGH' else 'previous_low'))}",
+                                f"  • Extension: {format_number(sweep_details.get('extension', 0))}",
+                                f"  • Extension %: {sweep_details.get('extension_pct', 0):.2f}%",
+                                f"  • Strength: {sweep_details.get('strength', 'N/A')}",
+                                f"  • Wick Size: {format_number(sweep_details.get('wick_size', 0))}",
+                                f"  • Volume: {format_number(sweep_details.get('volume', 0))}"
+                            ])
+                        else:
+                            breakdown_lines.append(f"  • No significant sweep detected")
+                        
+                        breakdown_lines.append(f"")
+                        
+                        # 📊 ORDER BLOCK DETAILS SECTION (Code 1 format)
+                        breakdown_lines.append(f"🔷 ORDER BLOCK DETAILS:")
+                        ob_type = calc.get('ob_type', 'NONE')
+                        
+                        if ob_type != 'NONE':
+                            breakdown_lines.extend([
+                                f"  • Type: {ob_type.upper()} OB",
+                                f"  • Zone Approach: +{calc.get('zone_approach', 0)}",
+                                f"  • OB Range: {format_number(ob_low)} - {format_number(ob_high)}",
+                                f"  • Range Size: {format_number(ob_range)}",
+                                f"  • Midpoint: {format_number(ob_mid)}",
+                                f"  • Distance to Entry: {format_number(distance_to_entry)} ({distance_pct:.2f}%)",
+                                f"  • In Zone: {'✅ YES' if in_zone else '❌ NO'}",
+                                f"  • Momentum Score: +{calc.get('momentum_score', 0)}"
+                            ])
+                        else:
+                            breakdown_lines.append(f"  • No order block detected")
+                        
+                        breakdown_lines.append(f"")
+                        
+                        # 📊 KEY METRICS SECTION
+                        breakdown_lines.append(f"📊 KEY METRICS:")
+                        breakdown_lines.extend([
+                            f"  • Displacement: {calc.get('displacement_value', 0):.3f} ({'✅ STRONG' if calc.get('displacement_value', 0) >= 0.6 else '⚠️ WEAK'})",
+                            f"  • Momentum: {calc.get('momentum_value', 0):.3f} {'✅ PASS' if calc.get('momentum_value', 0) >= 0.5 else '❌ FAIL'}",
+                            f"  • HTF Trend: {calc.get('htf_trend_direction', '?')}",
+                            f"  • HTF Alignment: +{calc.get('htf_alignment', 0)}",
+                        ])
+                        
+                        breakdown_lines.append(f"")
+                        
+                        # 🎯 TARGETS SECTION (Code 2 TP system)
+                        breakdown_lines.append(f"🎯 TARGETS ({sig.get('tp_tf', '?')} ATR scaling):")
+                        breakdown_lines.extend([
+                            f"  SL: {format_number(sig.get('sl', 0))}",
+                            f"  TP1: {format_number(sig.get('tp1', 0))} (0.8R)",
+                            f"  TP2: {format_number(sig.get('tp2', 0))} (1.6R)",
+                            f"  Risk: {format_number(sig.get('risk', 0))} | R:R TP1: 1:{sig.get('rr_tp1', 0):.1f} | TP2: 1:{sig.get('rr_tp2', 0):.1f}"
+                        ])
+                        
+                        # Clean up empty lines
+                        breakdown_lines = [line for line in breakdown_lines if line != ""]
                         
                         await tg("\n".join(breakdown_lines))
                         await log_signal(sig)
@@ -1148,25 +880,11 @@ async def test_ob_filter_with_historical_trades():
     print("OB FILTER TEST WITH HISTORICAL ANALYSIS")
     print("="*60)
     
-    print(f"\nOB FILTER SETTINGS:")
-    print(f"• Range: {OB_RANGE_MIN}%-{OB_RANGE_MAX}%")
-    print(f"• Age: ≤{OB_AGE_MAX} candles")
-    print(f"• Distance: ≤{OB_DISTANCE_MAX}%")
-    print(f"• Tests: ≤{OB_TESTS_MAX} times")
-    print(f"• Reaction: ≥{OB_REACTION_MIN}%")
-    print(f"• Minimum Score: {OB_MIN_SCORE}/5")
-    
-    print(f"\n📊 EXPECTED RESULTS (from 173 trades analysis):")
-    print(f"• Original trades: 173")
-    print(f"• Original winners: 95 (55%)")
-    print(f"• Original losers: 78 (45%)")
-    print(f"")
-    print(f"• With OB Filter (score ≥4):")
-    print(f"  - Trades kept: ~113 (65%)")
-    print(f"  - Winners kept: 88/95 (93%)")
-    print(f"  - Losers kept: 25/78 (32%)")
-    print(f"  - Win rate: 78% (up from 55%)")
-    print(f"  - Losers eliminated: 68%")
+    print(f"\nALL FILTERS DISABLED AS REQUESTED")
+    print(f"• Trend Filter: {TREND_FILTER_ENABLED}")
+    print(f"• Sweep Filter: {SWEEP_FILTER_ENABLED}")
+    print(f"• Momentum Filter: {MOMENTUM_FILTER_ENABLED}")
+    print(f"• OB Filter: {OB_FILTER_ENABLED}")
 
 # ---------------- FASTAPI ----------------
 app = FastAPI()
@@ -1189,20 +907,13 @@ async def main():
     
     exchange = ccxt.okx({"enableRateLimit": True})
     await tg("🏆 ROMEOPT 6-Step Scanner Started - Live Early Signals")
-    await tg("✅ TREND FILTER ENABLED: Will reject signals against strong HTF trends")
-    await tg("   - Rejects SELL signals in STRONG BULLISH trends")
-    await tg("   - Rejects BUY signals in STRONG BEARISH trends")
-    await tg("   - Uses EMA20/EMA50 alignment + price structure")
-    await tg("📊 ENHANCED BREAKDOWN: All numerical values visible")
-    await tg("🚨 MOMENTUM FILTER ACTIVE: Only optimal momentum signals (SELL:0.78-0.88, BUY:0.82-0.91)")
-    await tg("🎯 SWEEP FILTER ACTIVE: BUY: ≥1% retracement, SELL: ≥1% retracement")
-    await tg("🎯 OB FILTER ACTIVE: Score ≥4/5 (Range, Age, Distance, Tests, Reaction)")
-    await tg(f"   - Range: {OB_RANGE_MIN}%-{OB_RANGE_MAX}%")
-    await tg(f"   - Age: ≤{OB_AGE_MAX} candles")
-    await tg(f"   - Distance: ≤{OB_DISTANCE_MAX}%")
-    await tg(f"   - Tests: ≤{OB_TESTS_MAX} times")
-    await tg(f"   - Reaction: ≥{OB_REACTION_MIN}%")
-    await tg(f"Expected: Eliminates 68% of losers, keeps 93% of winners")
+    await tg("📊 ENHANCED BREAKDOWN ACTIVATED - Code 1 format with full OB & Sweep Details")
+    await tg("🚫 ALL ADDITIONAL FILTERS DISABLED AS REQUESTED:")
+    await tg("   - Trend Filter: DISABLED")
+    await tg("   - Sweep Retracement Filter: DISABLED")
+    await tg("   - Momentum Range Filter: DISABLED")
+    await tg("   - OB Quality Filter: DISABLED")
+    await tg("🎯 TP SYSTEM: RomeOPT-P (0.8R/1.6R, SL→BE after TP1)")
     
     await asyncio.gather(scan_loop(), monitor_signals())
 
