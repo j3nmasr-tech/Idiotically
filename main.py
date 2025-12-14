@@ -2,10 +2,23 @@
 # -*- coding: utf-8 -*-
 
 """
-ROMEOPT SCANNER - Correct TP Framework Implementation
-✅ TP1 = 50% EQ of dealing range OR first touch opposing zone (not extreme)
-✅ TP2 = Liquidity zones (stop clusters, range extremes)
-✅ TP3 = MAJOR HTF OB/FVG OR 3R-5R fixed extension
+LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features)
+- Fully live early signals
+- RomeOPT 6-step logic with NUMERICAL BREAKDOWN
+- TP/SL tracking with PRIORITIZED STRUCTURE take profits
+- Dynamic TP/SL updates (market-structure-based)
+- Telegram alerts
+- Async SQLite logging
+- Filters: Score >=5, Displacement +2, Sweep+2 OR Zone+1, avoid counter-trend
+- Improved Order Block detection
+- Adaptive Market Regime detection
+- HTF + Sweep scoring threshold
+- Elite multi-timeframe confirmation (15m,1h,4h)
+- STRUCTURE-REQUIRED: Signals rejected if no valid structure levels exist for TP
+- FULL NUMERICAL BREAKDOWN: All component scores stored in database
+- FIXED MONITORING: No structure revalidation during monitoring
+- 🎯 ENHANCED BREAKDOWN FORMAT: Same detailed format as FORCED FILTER version
+- 🎯 PRIORITIZED STRUCTURE TPS: 1. OB/FVG, 2. Liquidity Zones, 3. Support/Resistance
 """
 
 import os, time, asyncio, logging, datetime, json
@@ -25,10 +38,10 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
-TOP_N = int(os.getenv("TOP_N", 10))
+TOP_N = int(os.getenv("TOP_N", 5))
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
 MIN_SCORE = 5
-CRITICAL_FACTORS_MIN = 2
+CRITICAL_FACTORS_MIN = 2  # HTF Alignment + Liquidity Sweep minimum
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -58,26 +71,74 @@ async def init_db():
     await db_conn.execute("PRAGMA journal_mode=WAL;")
     await db_conn.execute("PRAGMA synchronous=NORMAL;")
     
-    await db_conn.execute("""
-        CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT,
-            side TEXT,
-            entry REAL,
-            sl REAL,
-            tp1 REAL,
-            tp2 REAL,
-            tp3 REAL,
-            timestamp TEXT,
-            status TEXT,
-            reason TEXT,
-            score INTEGER,
-            tp1_hit INTEGER DEFAULT 0,
-            tp2_hit INTEGER DEFAULT 0,
-            tp3_hit INTEGER DEFAULT 0,
-            breakdown_json TEXT
-        );
-    """)
+    # First, check if table exists and get its current columns
+    cursor = await db_conn.execute("PRAGMA table_info(signals)")
+    columns = await cursor.fetchall()
+    column_names = [col[1] for col in columns] if columns else []
+    
+    # Create table if it doesn't exist with all new columns
+    if not column_names:
+        await db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
+                side TEXT,
+                entry REAL,
+                sl REAL,
+                tp1 REAL,
+                tp2 REAL,
+                tp3 REAL,
+                timestamp TEXT,
+                status TEXT,
+                reason TEXT,
+                score INTEGER,
+                tp1_hit INTEGER DEFAULT 0,
+                tp2_hit INTEGER DEFAULT 0,
+                tp3_hit INTEGER DEFAULT 0,
+                latest_ob TEXT,
+                -- NUMERICAL BREAKDOWN FIELDS --
+                liquidity_sweep_score INTEGER,
+                displacement_score INTEGER,
+                displacement_value REAL,
+                zone_approach_score INTEGER,
+                htf_alignment_score INTEGER,
+                momentum_score INTEGER,
+                momentum_value REAL,
+                elite_mtf_score INTEGER,
+                market_regime TEXT,
+                order_block_type TEXT,
+                order_block_low REAL,
+                order_block_high REAL,
+                atr_value REAL,
+                risk_reward REAL,
+                breakdown_json TEXT
+            );
+        """)
+    else:
+        # Table exists, add missing columns
+        new_columns = [
+            ("liquidity_sweep_score", "INTEGER"),
+            ("displacement_score", "INTEGER"),
+            ("displacement_value", "REAL"),
+            ("zone_approach_score", "INTEGER"),
+            ("htf_alignment_score", "INTEGER"),
+            ("momentum_score", "INTEGER"),
+            ("momentum_value", "REAL"),
+            ("elite_mtf_score", "INTEGER"),
+            ("market_regime", "TEXT"),
+            ("order_block_type", "TEXT"),
+            ("order_block_low", "REAL"),
+            ("order_block_high", "REAL"),
+            ("atr_value", "REAL"),
+            ("risk_reward", "REAL"),
+            ("breakdown_json", "TEXT")
+        ]
+        
+        for col_name, col_type in new_columns:
+            if col_name not in column_names:
+                log.info(f"Adding missing column: {col_name}")
+                await db_conn.execute(f"ALTER TABLE signals ADD COLUMN {col_name} {col_type}")
+    
     await db_conn.commit()
 
 # ---------------- OHLCV ----------------
@@ -128,13 +189,14 @@ async def elite_tf_alignment(exchange, symbol: str, side: str):
         trend_side = "BUY" if trend > 0 else "SELL"
         alignments.append(trend_side == side)
     
+    # Return both boolean result and alignment count
     all_aligned = all(alignments)
     alignment_count = sum(alignments)
     return all_aligned, alignment_count, len(tfs)
 
 # ---------------- ENHANCED SWEEP ANALYSIS ----------------
 def analyze_sweep_details(df: pd.DataFrame, lookback=5):
-    """Analyze sweep with detailed information"""
+    """Analyze sweep with detailed information - doesn't affect signal logic"""
     if len(df) < lookback + 1:
         return {"type": "NONE", "details": {}}
     
@@ -161,7 +223,9 @@ def analyze_sweep_details(df: pd.DataFrame, lookback=5):
                 "extension_pct": (extension / max_prev_high * 100) if max_prev_high > 0 else 0,
                 "strength": "STRONG" if extension > (current_high * 0.001) else "MODERATE",
                 "wick_size": current_high - max(current_candle["open"], current_candle["close"]),
-                "volume": current_candle["vol"]
+                "volume": current_candle["vol"],
+                "candle_body": current_candle["close"] - current_candle["open"],
+                "candle_range": current_candle["high"] - current_candle["low"]
             }
         }
     
@@ -177,7 +241,9 @@ def analyze_sweep_details(df: pd.DataFrame, lookback=5):
                 "extension_pct": (extension / min_prev_low * 100) if min_prev_low > 0 else 0,
                 "strength": "STRONG" if extension > (current_low * 0.001) else "MODERATE",
                 "wick_size": min(current_candle["open"], current_candle["close"]) - current_low,
-                "volume": current_candle["vol"]
+                "volume": current_candle["vol"],
+                "candle_body": current_candle["open"] - current_candle["close"],
+                "candle_range": current_candle["high"] - current_candle["low"]
             }
         }
     
@@ -195,425 +261,339 @@ def format_number(value, decimals=6):
             return f"{value:.{decimals}f}"
     return str(value)
 
-# ================ CORRECT ROMEOPT TP FRAMEWORK ================
-
-def calculate_equilibrium_price(df: pd.DataFrame):
+# ---------------- PRIORITIZED STRUCTURE FINDERS ----------------
+def find_prioritized_structure_levels(df: pd.DataFrame, side: str, entry: float):
     """
-    Calculate 50% equilibrium (EQ) of the dealing range.
-    Dealing range = recent high-low range where price has been trading.
-    EQ = midpoint where price wants to rebalance.
+    Find structure levels with priority:
+    1. Order Blocks / FVG (highest priority)
+    2. Liquidity Zones (medium priority)
+    3. Support/Resistance (lowest priority)
     """
-    # Use last 10-20 candles for dealing range
-    recent = df.iloc[-15:] if len(df) >= 15 else df
+    levels = []
     
-    # Find the actual trading range (ignore outliers)
-    high = recent['high'].quantile(0.9)  # 90th percentile high
-    low = recent['low'].quantile(0.1)    # 10th percentile low
+    # 1. ORDER BLOCKS / FVG (Highest Priority - 3)
+    for i in range(5, len(df) - 2):
+        candle = df.iloc[i]
+        prev_candle = df.iloc[i-1]
+        
+        # Order Blocks
+        if candle["close"] > candle["open"] and prev_candle["close"] < prev_candle["open"]:
+            # Bullish OB - use high as potential target
+            levels.append({
+                "price": float(candle["high"]),
+                "type": "order_block",
+                "priority": 3,
+                "strength": "high",
+                "index": i
+            })
+        
+        elif candle["close"] < candle["open"] and prev_candle["close"] > prev_candle["open"]:
+            # Bearish OB - use low as potential target
+            levels.append({
+                "price": float(candle["low"]),
+                "type": "order_block",
+                "priority": 3,
+                "strength": "high",
+                "index": i
+            })
+        
+        # Fair Value Gaps (simple version)
+        if i > 1:
+            prev_high = df.iloc[i-1]["high"]
+            prev_low = df.iloc[i-1]["low"]
+            
+            if candle["low"] > prev_high:  # Bullish FVG
+                levels.append({
+                    "price": float(candle["low"]),
+                    "type": "fvg",
+                    "priority": 3,
+                    "strength": "high",
+                    "index": i
+                })
+            elif candle["high"] < prev_low:  # Bearish FVG
+                levels.append({
+                    "price": float(candle["high"]),
+                    "type": "fvg",
+                    "priority": 3,
+                    "strength": "high",
+                    "index": i
+                })
     
-    # Ensure range is meaningful
-    if high - low < recent['close'].iloc[-1] * 0.001:  # Less than 0.1% range
-        high = recent['high'].max()
-        low = recent['low'].min()
-    
-    equilibrium = (high + low) / 2
-    return equilibrium, (low, high)
-
-def find_first_touch_opposing_zone(df: pd.DataFrame, side: str, entry: float):
-    """
-    Find first touch of opposing zone (NOT the extreme).
-    For BUY: First touch of Premium zone (not the top extreme)
-    For SELL: First touch of Discount zone (not the bottom extreme)
-    """
-    recent = df.iloc[-30:]
-    current_price = df['close'].iloc[-1]
+    # 2. LIQUIDITY ZONES (Medium Priority - 2)
+    # Look for price clusters in recent candles
+    recent_candles = df.iloc[-30:]  # Last 30 candles
     
     if side == "BUY":
-        # Premium zone = above fair value (1-2 std deviations)
-        fair_value = recent['close'].mean()
-        std_dev = recent['close'].std()
+        # For BUY: look for clusters of highs (sell stops)
+        highs = recent_candles["high"].values
+        unique_highs = np.unique(np.round(highs, 4))
         
-        # Premium zone boundaries
-        premium_first_touch = fair_value + (std_dev * 1.0)  # FIRST TOUCH POINT
-        premium_extreme = fair_value + (std_dev * 2.0)      # Extreme (for TP2)
-        
-        # If already in premium zone, use current price as first touch
-        if current_price >= premium_first_touch:
-            first_touch = current_price * 1.001  # Slightly above current
-        else:
-            first_touch = premium_first_touch
-            
-        return first_touch, "PREMIUM_ZONE_FIRST_TOUCH", (premium_first_touch, premium_extreme)
+        for price in unique_highs:
+            # Count how many candles have highs near this price
+            near_count = np.sum(np.abs(highs - price) < price * 0.001)
+            if near_count >= 2:  # At least 2 candles cluster here
+                levels.append({
+                    "price": float(price),
+                    "type": "liquidity_zone",
+                    "priority": 2,
+                    "strength": "medium",
+                    "cluster_size": int(near_count)
+                })
     
     else:  # SELL
-        # Discount zone = below fair value (1-2 std deviations)
-        fair_value = recent['close'].mean()
-        std_dev = recent['close'].std()
+        # For SELL: look for clusters of lows (buy stops)
+        lows = recent_candles["low"].values
+        unique_lows = np.unique(np.round(lows, 4))
         
-        # Discount zone boundaries
-        discount_extreme = fair_value - (std_dev * 2.0)     # Extreme
-        discount_first_touch = fair_value - (std_dev * 1.0) # FIRST TOUCH POINT
+        for price in unique_lows:
+            near_count = np.sum(np.abs(lows - price) < price * 0.001)
+            if near_count >= 2:
+                levels.append({
+                    "price": float(price),
+                    "type": "liquidity_zone",
+                    "priority": 2,
+                    "strength": "medium",
+                    "cluster_size": int(near_count)
+                })
+    
+    # 3. SUPPORT/RESISTANCE (Lowest Priority - 1)
+    # Simple swing high/low detection
+    for i in range(10, len(df) - 10):
+        # Swing highs (for BUY targets)
+        if side == "BUY":
+            if df['high'].iloc[i] == df['high'].iloc[i-5:i+6].max():
+                levels.append({
+                    "price": float(df['high'].iloc[i]),
+                    "type": "swing_high",
+                    "priority": 1,
+                    "strength": "low",
+                    "index": i
+                })
         
-        # If already in discount zone, use current price as first touch
-        if current_price <= discount_first_touch:
-            first_touch = current_price * 0.999  # Slightly below current
+        # Swing lows (for SELL targets)
         else:
-            first_touch = discount_first_touch
-            
-        return first_touch, "DISCOUNT_ZONE_FIRST_TOUCH", (discount_extreme, discount_first_touch)
-
-def find_liquidity_zones(df: pd.DataFrame, side: str, entry: float):
-    """
-    Find liquidity zones for TP2.
-    Liquidity = clusters of stops (equal highs/lows, range extremes).
-    """
-    zones = []
-    recent = df.iloc[-30:]
-    
-    # 1. Equal highs/lows (stop clusters)
-    if side == "BUY":
-        # For BUY: Look for equal highs (sell stop clusters above)
-        highs = recent['high'].values
-        price_levels, counts = np.unique(np.round(highs, 6), return_counts=True)
-        
-        for price, count in zip(price_levels, counts):
-            if count >= 2 and price > entry:  # At least 2 candles at this level
-                zones.append({
-                    "price": float(price),
-                    "type": "EQUAL_HIGHS_STOP_CLUSTER",
-                    "cluster_size": int(count),
-                    "confidence": "HIGH" if count >= 3 else "MEDIUM"
+            if df['low'].iloc[i] == df['low'].iloc[i-5:i+6].min():
+                levels.append({
+                    "price": float(df['low'].iloc[i]),
+                    "type": "swing_low",
+                    "priority": 1,
+                    "strength": "low",
+                    "index": i
                 })
-        
-        # Add recent high as potential liquidity
-        recent_high = recent['high'].max()
-        if recent_high > entry:
-            zones.append({
-                "price": float(recent_high),
-                "type": "RECENT_HIGH_EXTREME",
-                "cluster_size": 1,
-                "confidence": "MEDIUM"
-            })
     
-    else:  # SELL
-        # For SELL: Look for equal lows (buy stop clusters below)
-        lows = recent['low'].values
-        price_levels, counts = np.unique(np.round(lows, 6), return_counts=True)
-        
-        for price, count in zip(price_levels, counts):
-            if count >= 2 and price < entry:  # At least 2 candles at this level
-                zones.append({
-                    "price": float(price),
-                    "type": "EQUAL_LOWS_STOP_CLUSTER",
-                    "cluster_size": int(count),
-                    "confidence": "HIGH" if count >= 3 else "MEDIUM"
-                })
-        
-        # Add recent low as potential liquidity
-        recent_low = recent['low'].min()
-        if recent_low < entry:
-            zones.append({
-                "price": float(recent_low),
-                "type": "RECENT_LOW_EXTREME",
-                "cluster_size": 1,
-                "confidence": "MEDIUM"
-            })
-    
-    # Remove duplicates and sort by confidence then distance
-    unique_zones = []
+    # Filter by side and remove duplicates
+    filtered_levels = []
     seen_prices = set()
     
-    for zone in zones:
-        # Skip if too close to another zone (within 0.05%)
+    for level in levels:
+        price = level["price"]
+        
+        # Skip if too close to entry (0.1% threshold)
+        if abs(price - entry) / entry < 0.001:
+            continue
+            
+        # Skip if duplicate (within 0.1%)
         is_duplicate = False
-        for seen in seen_prices:
-            if abs(zone["price"] - seen) / zone["price"] < 0.0005:
+        for seen_price in seen_prices:
+            if abs(price - seen_price) / price < 0.001:
                 is_duplicate = True
                 break
         
-        if not is_duplicate and zone["price"] != entry:
-            zone["distance"] = abs(zone["price"] - entry)
-            unique_zones.append(zone)
-            seen_prices.add(zone["price"])
-    
-    # Sort by confidence (HIGH first), then distance (closer first)
-    unique_zones.sort(key=lambda x: (
-        {"HIGH": 0, "MEDIUM": 1, "LOW": 2}[x["confidence"]],
-        x["distance"]
-    ))
-    
-    return unique_zones
-
-async def find_htf_major_ob_fvg(exchange, symbol: str, side: str, entry: float):
-    """
-    Find MAJOR HTF Order Block or FVG for TP3.
-    Only significant HTF structures (15m, 1h, 4h).
-    LTF structures are execution tools, HTF are destination targets.
-    """
-    major_structures = []
-    
-    # Check major timeframes
-    for tf in ["15m", "1h", "4h"]:
-        ohlcv = await fetch_ohlcv(exchange, symbol, tf, 150)
-        if not ohlcv or len(ohlcv) < 50:
+        if is_duplicate:
             continue
         
-        df_htf = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
-        
-        # Look for MAJOR Order Blocks
-        for i in range(20, len(df_htf) - 5):
-            candle = df_htf.iloc[i]
-            prev_candle = df_htf.iloc[i-1]
-            candle_body = abs(candle["close"] - candle["open"])
-            candle_range = candle["high"] - candle["low"]
-            
-            # Must be significant candle (>50% body)
-            if candle_body < candle_range * 0.5:
-                continue
-            
-            # MAJOR Bullish OB (for SELL TP3 - resistance)
-            if (candle["close"] > candle["open"] and 
-                prev_candle["close"] < prev_candle["open"] and
-                candle["close"] > prev_candle["high"]):  # Clear breakout
-                
-                if side == "SELL":  # Resistance for SELL
-                    structure = {
-                        "price": float(candle["high"]),
-                        "type": f"MAJOR_HTF_OB",
-                        "timeframe": tf,
-                        "strength": "VERY_HIGH",
-                        "index": i
-                    }
-                    major_structures.append(structure)
-            
-            # MAJOR Bearish OB (for BUY TP3 - support)
-            elif (candle["close"] < candle["open"] and 
-                  prev_candle["close"] > prev_candle["open"] and
-                  candle["close"] < prev_candle["low"]):  # Clear breakdown
-                
-                if side == "BUY":  # Support for BUY
-                    structure = {
-                        "price": float(candle["low"]),
-                        "type": f"MAJOR_HTF_OB",
-                        "timeframe": tf,
-                        "strength": "VERY_HIGH",
-                        "index": i
-                    }
-                    major_structures.append(structure)
+        # Filter by direction
+        if side == "BUY":
+            if price > entry:
+                filtered_levels.append(level)
+                seen_prices.add(price)
+        else:  # SELL
+            if price < entry:
+                filtered_levels.append(level)
+                seen_prices.add(price)
     
-    # Filter by side and sort
-    valid_structures = []
-    for structure in major_structures:
-        if side == "BUY" and structure["price"] > entry:
-            valid_structures.append(structure)
-        elif side == "SELL" and structure["price"] < entry:
-            valid_structures.append(structure)
+    # Sort by: 1. Priority (highest first), 2. Distance from entry (closest first)
+    filtered_levels.sort(key=lambda x: (-x["priority"], abs(x["price"] - entry)))
     
-    # Sort by strength then distance
-    valid_structures.sort(key=lambda x: (
-        {"VERY_HIGH": 0, "HIGH": 1, "MEDIUM": 2}[x["strength"]],
-        abs(x["price"] - entry)
-    ))
-    
-    return valid_structures[0] if valid_structures else None
+    return filtered_levels
 
-def calculate_extension_r(momentum: float, volatility: float):
-    """
-    Calculate extension R for TP3 when no major HTF structure.
-    3R-5R based on momentum and volatility.
-    """
-    base_r = 3.0
-    
-    # Momentum adjustment
-    if momentum > 0.02:  # Strong momentum
-        base_r += 1.5
-    elif momentum > 0.01:  # Moderate momentum
-        base_r += 1.0
-    else:  # Weak momentum
-        base_r += 0.5
-    
-    # Volatility adjustment
-    if volatility > 0.015:  # High volatility
-        base_r += 0.5
-    
-    # Cap at 5R
-    return min(base_r, 5.0)
+# ---------------- TP/SL HELPERS ----------------
+def find_latest_ob(df: pd.DataFrame):
+    """Find the latest order block in the dataframe"""
+    if len(df) < 6:
+        return None
+    for i in range(len(df) - 5, len(df) - 1):
+        candle, prev_candle = df.iloc[i], df.iloc[i - 1]
+        if candle["close"] > candle["open"] and prev_candle["close"] < prev_candle["open"]:
+            return {
+                "type": "bullish", 
+                "low": min(candle["low"], prev_candle["low"]), 
+                "high": candle["close"],
+                "candle_index": i,
+                "candle_time": candle.name if hasattr(candle, 'name') else i
+            }
+        elif candle["close"] < candle["open"] and prev_candle["close"] > prev_candle["open"]:
+            return {
+                "type": "bearish", 
+                "low": candle["close"], 
+                "high": max(candle["high"], prev_candle["high"]),
+                "candle_index": i,
+                "candle_time": candle.name if hasattr(candle, 'name') else i
+            }
+    return None
 
-async def romeopt_tp_framework(exchange, entry: float, side: str, df: pd.DataFrame, symbol: str):
+def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
     """
-    🎯 CORRECT RomeOPT TP Framework Implementation
-    
-    TP1: 50% EQ of dealing range OR first touch opposing zone (not extreme)
-    TP2: Liquidity zones (stop clusters, range extremes)
-    TP3: MAJOR HTF OB/FVG OR 3R-5R fixed extension
+    PRIORITIZED STRUCTURE TP/SL system:
+    1. Order Blocks / FVG (highest priority)
+    2. Liquidity Zones (medium priority)
+    3. Support/Resistance (lowest priority)
+    NO FALLBACK - if no structure, signal is rejected
     """
-    atr_val = float(atr(df, 14).iloc[-1])
-    current_price = df['close'].iloc[-1]
-    
-    # Calculate Stop Loss
     recent_high = df['high'].iloc[-10:].max()
     recent_low = df['low'].iloc[-10:].min()
     
+    # Calculate stop loss (unchanged from your code)
     if side == "BUY":
-        sl = recent_low - (atr_val * 0.3)
+        sl_ob = ob_zone["low"] - (atr_val * 0.3)
+        sl_structure = recent_low - (atr_val * 0.3)
+        sl = min(sl_ob, sl_structure)
+        
         risk = entry - sl
-        if risk < atr_val * 0.5:
-            risk = atr_val * 0.5
+        min_risk = atr_val * 0.5
+        if risk < min_risk:
+            risk = min_risk
             sl = entry - risk
+        
     else:  # SELL
-        sl = recent_high + (atr_val * 0.3)
+        sl_ob = ob_zone["high"] + (atr_val * 0.3)
+        sl_structure = recent_high + (atr_val * 0.3)
+        sl = max(sl_ob, sl_structure)
+        
         risk = sl - entry
-        if risk < atr_val * 0.5:
-            risk = atr_val * 0.5
+        min_risk = atr_val * 0.5
+        if risk < min_risk:
+            risk = min_risk
             sl = entry + risk
     
-    result = {
+    # Find structure levels with priority
+    all_levels = find_prioritized_structure_levels(df, side, entry)
+    
+    # Filter for meaningful profit (at least 0.5R)
+    meaningful_levels = []
+    for level in all_levels:
+        if side == "BUY":
+            profit = level["price"] - entry
+        else:
+            profit = entry - level["price"]
+        
+        if profit >= risk * 0.5:  # Minimum 0.5R profit
+            level["profit_r"] = profit / risk
+            meaningful_levels.append(level)
+    
+    # NO STRUCTURE = REJECT SIGNAL (NO FALLBACK)
+    if not meaningful_levels:
+        log.debug(f"No valid structure levels found for {side} at {entry}")
+        return None
+    
+    # Select up to 3 levels with minimum spacing
+    selected_levels = []
+    for level in meaningful_levels:
+        if not selected_levels:
+            selected_levels.append(level)
+        else:
+            # Ensure minimum spacing (0.5R between levels)
+            last_price = selected_levels[-1]["price"]
+            min_spacing = risk * 0.5
+            
+            if side == "BUY":
+                if level["price"] - last_price >= min_spacing:
+                    selected_levels.append(level)
+            else:
+                if last_price - level["price"] >= min_spacing:
+                    selected_levels.append(level)
+        
+        if len(selected_levels) >= 3:
+            break
+    
+    # If we couldn't find enough levels, reject the signal
+    if len(selected_levels) < 1:
+        log.debug(f"Not enough structure levels (found {len(selected_levels)} need at least 1)")
+        return None
+    
+    # Get TP prices
+    tp1_data = selected_levels[0]
+    tp2_data = selected_levels[1] if len(selected_levels) > 1 else None
+    tp3_data = selected_levels[2] if len(selected_levels) > 2 else None
+    
+    tp1 = tp1_data["price"]
+    tp2 = tp2_data["price"] if tp2_data else None
+    tp3 = tp3_data["price"] if tp3_data else None
+    
+    # Calculate risk-reward for TP1
+    rr_tp1 = tp1_data["profit_r"]
+    
+    return sl, tp1, tp2, tp3, rr_tp1, [tp1_data, tp2_data, tp3_data]
+
+def update_tp_sl_live(sig: dict, df: pd.DataFrame):
+    """
+    Calculate TP/SL with PRIORITIZED STRUCTURE requirement
+    Returns None if no valid structure exists
+    """
+    latest_ob = find_latest_ob(df)
+    if not latest_ob:
+        return None  # REJECT: No order block
+    
+    atr_val = float(atr(df, 14).iloc[-1])
+    entry = sig["entry"]
+    side = sig["side"]
+    
+    # Get TP/SL - will return None if no structure
+    result = romeopt_tp_sl(entry, side, atr_val, latest_ob, df)
+    
+    if result is None:
+        return None  # REJECT: No valid structure for TP
+    
+    sl, tp1, tp2, tp3, rr_tp1, tp_data = result
+    
+    # Store all TP/SL data in signal
+    sig.update({
         "sl": sl,
-        "tp1": None,
-        "tp2": None,
-        "tp3": None,
-        "risk": risk,
-        "atr": atr_val,
-        "tp1_source": None,
-        "tp2_source": None,
-        "tp3_source": None
-    }
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "latest_ob": latest_ob,
+        "atr_value": atr_val,
+        "risk_reward": rr_tp1,
+        "tp1_data": tp_data[0] if tp_data and len(tp_data) > 0 else None,
+        "tp2_data": tp_data[1] if tp_data and len(tp_data) > 1 else None,
+        "tp3_data": tp_data[2] if tp_data and len(tp_data) > 2 else None,
+        "risk": abs(entry - sl)
+    })
     
-    # ========== TP1: 50% EQ or First Touch ==========
-    
-    # Option 1: 50% Equilibrium
-    equilibrium, dealing_range = calculate_equilibrium_price(df)
-    dealing_low, dealing_high = dealing_range
-    
-    if side == "BUY":
-        # For BUY, equilibrium should be above entry
-        if equilibrium > entry:
-            # Ensure minimum profit
-            if (equilibrium - entry) >= risk * 0.5:
-                result["tp1"] = equilibrium
-                result["tp1_source"] = "EQ_50%_DEALING_RANGE"
-    
-    else:  # SELL
-        # For SELL, equilibrium should be below entry
-        if equilibrium < entry:
-            if (entry - equilibrium) >= risk * 0.5:
-                result["tp1"] = equilibrium
-                result["tp1_source"] = "EQ_50%_DEALING_RANGE"
-    
-    # Option 2: First touch of opposing zone
-    first_touch, zone_type, zone_range = find_first_touch_opposing_zone(df, side, entry)
-    
-    if side == "BUY" and first_touch > entry:
-        # Check if it's better (closer/safer) than EQ
-        if not result["tp1"] or first_touch < result["tp1"]:
-            if (first_touch - entry) >= risk * 0.5:
-                result["tp1"] = first_touch
-                result["tp1_source"] = zone_type
-    
-    elif side == "SELL" and first_touch < entry:
-        if not result["tp1"] or first_touch > result["tp1"]:
-            if (entry - first_touch) >= risk * 0.5:
-                result["tp1"] = first_touch
-                result["tp1_source"] = zone_type
-    
-    # Fallback: Minimum 0.5R
-    if not result["tp1"]:
-        if side == "BUY":
-            result["tp1"] = entry + (risk * 0.5)
-        else:
-            result["tp1"] = entry - (risk * 0.5)
-        result["tp1_source"] = "MINIMUM_0.5R_FALLBACK"
-    
-    # Ensure minimum 0.5R profit
-    tp1_profit = abs(result["tp1"] - entry)
-    if tp1_profit < risk * 0.5:
-        if side == "BUY":
-            result["tp1"] = entry + (risk * 0.5)
-        else:
-            result["tp1"] = entry - (risk * 0.5)
-        result["tp1_source"] = "MINIMUM_0.5R_ADJUSTED"
-    
-    # ========== TP2: Liquidity Zones ==========
-    
-    liquidity_zones = find_liquidity_zones(df, side, entry)
-    
-    for zone in liquidity_zones:
-        zone_price = zone["price"]
-        zone_profit = abs(zone_price - entry)
-        
-        if side == "BUY":
-            if zone_price > result["tp1"] and zone_profit >= risk * 1.0:
-                result["tp2"] = zone_price
-                result["tp2_source"] = zone["type"]
-                break
-        else:  # SELL
-            if zone_price < result["tp1"] and zone_profit >= risk * 1.0:
-                result["tp2"] = zone_price
-                result["tp2_source"] = zone["type"]
-                break
-    
-    # ========== TP3: MAJOR HTF or Fixed Extension ==========
-    
-    # Try MAJOR HTF structure first
-    htf_structure = await find_htf_major_ob_fvg(exchange, symbol, side, entry)
-    
-    if htf_structure:
-        htf_price = htf_structure["price"]
-        htf_profit = abs(htf_price - entry)
-        
-        # Check if beyond TP2 (or TP1 if no TP2)
-        comparison_price = result["tp2"] if result["tp2"] else result["tp1"]
-        
-        if side == "BUY":
-            if htf_price > comparison_price and htf_profit >= risk * 2.5:
-                result["tp3"] = htf_price
-                result["tp3_source"] = htf_structure["type"]
-        else:  # SELL
-            if htf_price < comparison_price and htf_profit >= risk * 2.5:
-                result["tp3"] = htf_price
-                result["tp3_source"] = htf_structure["type"]
-    
-    # Fixed extension if no good HTF structure
-    if not result["tp3"]:
-        # Calculate appropriate extension
-        momentum = abs(df['close'].iloc[-1] - df['close'].iloc[-5]) / df['close'].iloc[-5]
-        volatility = atr_val / current_price
-        
-        extension_r = calculate_extension_r(momentum, volatility)
-        
-        if side == "BUY":
-            result["tp3"] = entry + (risk * extension_r)
-        else:
-            result["tp3"] = entry - (risk * extension_r)
-        
-        result["tp3_source"] = f"FIXED_{extension_r:.1f}R_EXTENSION"
-    
-    # Final validation: Ensure TP hierarchy
-    if result["tp2"] and result["tp3"]:
-        if side == "BUY":
-            if not (result["tp1"] < result["tp2"] < result["tp3"]):
-                # Adjust TP3 to be beyond TP2
-                if result["tp3"] <= result["tp2"]:
-                    result["tp3"] = result["tp2"] + risk
-        else:  # SELL
-            if not (result["tp1"] > result["tp2"] > result["tp3"]):
-                if result["tp3"] >= result["tp2"]:
-                    result["tp3"] = result["tp2"] - risk
-    
-    return result
+    return sig
 
 # ---------------- ROMEOPT 6-STEP SIGNAL ----------------
 async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
-    """Generate RomeOPT 6-step signal"""
+    """Generate RomeOPT 6-step signal with PRIORITIZED STRUCTURE TP requirement"""
     if df is None or len(df) < 20:
         return None
     
     last = df.iloc[-1]
     prev5 = df.iloc[-6:-1]
     
+    # Initialize breakdown tracking
+    breakdown = {
+        "symbol": symbol,
+        "timeframe": tf,
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "components": {}
+    }
+    
     score = 0
     reasons = []
 
-    # Step 1: Liquidity Sweep
+    # Step 1: Liquidity Sweep - NUMERICAL DATA
     sweep_high = float(last["high"] > prev5["high"].max())
     sweep_low = float(last["low"] < prev5["low"].min())
     has_sweep = bool(sweep_high or sweep_low)
@@ -621,16 +601,41 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     score += liquidity_sweep
     reasons.append(f"Liquidity Sweep +{liquidity_sweep}")
     
-    # Step 2: Displacement
+    # ENHANCED: Add sweep details for breakdown (doesn't affect signal)
+    sweep_analysis = analyze_sweep_details(df)
+    breakdown["components"]["liquidity_sweep"] = {
+        "score": liquidity_sweep,
+        "sweep_high": sweep_high,
+        "sweep_low": sweep_low,
+        "has_sweep": has_sweep,
+        "current_high": float(last["high"]),
+        "prev_high_max": float(prev5["high"].max()),
+        "current_low": float(last["low"]),
+        "prev_low_min": float(prev5["low"].min()),
+        "sweep_details": sweep_analysis
+    }
+
+    # Step 2: Displacement - NUMERICAL DATA
     displacement = float(abs(last["close"] - last["open"]) / (last["high"] - last["low"] + 1e-8))
     has_disp = displacement > 0.6
     displacement_score = 2 if has_disp else 0
     score += displacement_score
     reasons.append(f"Displacement +{displacement_score}")
+    
+    breakdown["components"]["displacement"] = {
+        "score": displacement_score,
+        "value": displacement,
+        "has_displacement": has_disp,
+        "threshold": 0.6,
+        "candle_body": float(abs(last["close"] - last["open"])),
+        "candle_range": float(last["high"] - last["low"]),
+        "close": float(last["close"]),
+        "open": float(last["open"])
+    }
 
-    # Step 3 & 4: Order Block & Zone
+    # Step 3 & 4: Order Block & Zone - NUMERICAL DATA
     ob_zone = None
-    ob_type = None
+    ob_details = None
     
     for i in range(len(df) - 5, len(df) - 1):
         candle, prev_candle = df.iloc[i], df.iloc[i - 1]
@@ -640,7 +645,14 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
                 "low": min(candle["low"], prev_candle["low"]), 
                 "high": candle["close"]
             }
-            ob_type = "bullish"
+            ob_details = {
+                "candle_index": i,
+                "bullish_candle_close": float(candle["close"]),
+                "bullish_candle_open": float(candle["open"]),
+                "prev_candle_close": float(prev_candle["close"]),
+                "prev_candle_open": float(prev_candle["open"]),
+                "candle_range": float(candle["high"] - candle["low"])
+            }
             break
         elif candle["close"] < candle["open"] and prev_candle["close"] > prev_candle["open"]:
             ob_zone = {
@@ -648,11 +660,19 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
                 "low": candle["close"], 
                 "high": max(candle["high"], prev_candle["high"])
             }
-            ob_type = "bearish"
+            ob_details = {
+                "candle_index": i,
+                "bearish_candle_close": float(candle["close"]),
+                "bearish_candle_open": float(candle["open"]),
+                "prev_candle_close": float(prev_candle["close"]),
+                "prev_candle_open": float(prev_candle["open"]),
+                "candle_range": float(candle["high"] - candle["low"])
+            }
             break
 
     zone_score = 0
     if ob_zone:
+        ob_type = ob_zone["type"]
         if ob_type == "bullish" and last["close"] <= ob_zone["high"]:
             zone_score = 1
             score += zone_score
@@ -665,9 +685,56 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
             reasons.append("Zone Approach +0")
     else:
         reasons.append("Zone Approach +0")
+        ob_type = None
+
+    if not ob_type:
         return None
 
-    # Step 5: HTF Alignment
+    # Calculate detailed OB info for breakdown
+    if ob_zone:
+        ob_low = ob_zone["low"]
+        ob_high = ob_zone["high"]
+        ob_range = ob_high - ob_low
+        ob_mid = (ob_low + ob_high) / 2
+        distance_to_price = abs(last["close"] - ob_mid)
+        distance_pct = (distance_to_price / last["close"] * 100) if last["close"] > 0 else 100
+        
+        # Calculate OB strength
+        if ob_details and "candle_range" in ob_details:
+            strength = ob_details["candle_range"] / ob_range if ob_range > 0 else 0
+        else:
+            strength = 0
+        
+        ob_breakdown = {
+            "type": ob_type,
+            "low": float(ob_low),
+            "high": float(ob_high),
+            "midpoint": float(ob_mid),
+            "range": float(ob_range),
+            "distance_to_price": float(distance_to_price),
+            "distance_pct": float(distance_pct),
+            "strength": float(strength),
+            "in_zone": True if (ob_type == "bullish" and last["close"] <= ob_zone["high"]) or 
+                               (ob_type == "bearish" and last["close"] >= ob_zone["low"]) else False
+        }
+        
+        if ob_details:
+            ob_breakdown["details"] = ob_details
+    else:
+        ob_breakdown = {}
+
+    # Store order block data
+    breakdown["components"]["order_block"] = {
+        "score": zone_score,
+        "type": ob_type,
+        "zone_low": float(ob_zone["low"]) if ob_zone else None,
+        "zone_high": float(ob_zone["high"]) if ob_zone else None,
+        "current_price_vs_zone": "inside" if (ob_type == "bullish" and last["close"] <= ob_zone["high"]) or 
+                                          (ob_type == "bearish" and last["close"] >= ob_zone["low"]) else "outside",
+        "breakdown": ob_breakdown
+    }
+
+    # Step 5: HTF Alignment - NUMERICAL DATA
     tf_map = {"1m": "15m", "3m": "30m", "5m": "1h", "15m": "4h", "30m": "1h"}
     htf = tf_map.get(tf, "15m")
     ohlcv_htf = await fetch_ohlcv(exchange, symbol, htf, 50)
@@ -688,7 +755,16 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     else:
         reasons.append("HTF Alignment ?")
 
-    # Step 6: Momentum
+    breakdown["components"]["htf_alignment"] = {
+        "score": htf_alignment,
+        "higher_timeframe": htf,
+        "trend_value": htf_trend_value,
+        "alignment": htf_dir == ob_type if ohlcv_htf else None,
+        "ob_type": ob_type,
+        "htf_direction": htf_dir if ohlcv_htf else "unknown"
+    }
+
+    # Step 6: Momentum - NUMERICAL DATA
     momentum_ratio = float(abs(last["close"] - last["open"]) / (last["high"] - last["low"] + 1e-8))
     momentum_score = 0
     
@@ -703,305 +779,146 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     else:
         reasons.append("Momentum +0")
 
+    breakdown["components"]["momentum"] = {
+        "score": momentum_score,
+        "ratio": momentum_ratio,
+        "threshold": 0.5,
+        "candle_direction": "bullish" if last["close"] > last["open"] else "bearish",
+        "has_momentum": momentum_score > 0
+    }
+
     side = "BUY" if ob_type == "bullish" else "SELL"
     entry = float(last["close"])
 
     # ---------------- CRITICAL FILTERS ----------------
     critical_score = htf_alignment + liquidity_sweep
+    breakdown["critical_score"] = critical_score
+    breakdown["critical_threshold"] = CRITICAL_FACTORS_MIN
     
     if critical_score < CRITICAL_FACTORS_MIN:
+        breakdown["rejection_reason"] = "Critical score too low"
         return None
     if score < MIN_SCORE:
+        breakdown["rejection_reason"] = "Total score too low"
         return None
     if not has_disp:
+        breakdown["rejection_reason"] = "No displacement"
         return None
     
-    # ---------------- HTF ALIGNMENT MANDATORY ----------------
+    # ---------------- HTF ALIGNMENT MANDATORY FILTER ----------------
     if htf_alignment != 1:
+        breakdown["rejection_reason"] = "No HTF alignment"
         return None
 
     # ---------------- MARKET REGIME ----------------
     market_regime = await detect_market_regime(df)
+    breakdown["market_regime"] = market_regime
     
     if (market_regime == "BULL" and side == "SELL") or (market_regime == "BEAR" and side == "BUY"):
+        breakdown["rejection_reason"] = "Counter-trend in current regime"
         return None
 
     # ---------------- TREND MA FILTER ----------------
     trend_ma = df["close"].rolling(20).mean().iloc[-1]
+    breakdown["trend_ma"] = float(trend_ma)
+    breakdown["price_vs_ma"] = float(last["close"] - trend_ma)
     
     if (side == "BUY" and last["close"] < trend_ma) or (side == "SELL" and last["close"] > trend_ma):
+        breakdown["rejection_reason"] = "Price wrong side of MA"
         return None
 
     # ---------------- ELITE MTF CONFIRMATION ----------------
     elite_result, elite_count, elite_total = await elite_tf_alignment(exchange, symbol, side)
+    elite_score = 1 if elite_result else 0
     
     if not elite_result:
+        breakdown["rejection_reason"] = f"Elite MTF failed ({elite_count}/{elite_total})"
         return None
     
-    # Create signal
+    reasons.append("Elite MTF Alignment ✅")
+    
+    breakdown["components"]["elite_mtf"] = {
+        "score": elite_score,
+        "aligned": elite_result,
+        "alignment_count": elite_count,
+        "total_timeframes": elite_total,
+        "timeframes": ["15m", "1h", "4h"]
+    }
+
+    # Create initial signal with ALL breakdown data
     sig = {
         "symbol": symbol,
         "side": side,
         "entry": entry,
         "score": score,
         "reason": "RomeOPT 6-Step",
+        "reason_list": reasons,
+        "breakdown": breakdown,
+        # Store individual component scores for database
+        "liquidity_sweep_score": liquidity_sweep,
+        "displacement_score": displacement_score,
+        "displacement_value": displacement,
+        "zone_approach_score": zone_score,
+        "htf_alignment_score": htf_alignment,
+        "momentum_score": momentum_score,
+        "momentum_value": momentum_ratio,
+        "elite_mtf_score": elite_score,
         "market_regime": market_regime,
-        "trend_ma": trend_ma,
-        "price_vs_ma": float(last["close"] - trend_ma),
-        "ob_type": ob_type,
-        "ob_low": ob_zone["low"] if ob_zone else None,
-        "ob_high": ob_zone["high"] if ob_zone else None,
-        "htf_trend": htf_trend_value,
-        "momentum": momentum_ratio,
-        "elite_mtf": f"{elite_count}/{elite_total}",
-        "displacement": displacement
+        "order_block_type": ob_type,
+        "order_block_low": float(ob_zone["low"]) if ob_zone else None,
+        "order_block_high": float(ob_zone["high"]) if ob_zone else None,
+        "trend_ma_value": float(trend_ma),
+        "price_vs_ma": float(last["close"] - trend_ma)
     }
     
-    # ---------------- ROMEOPT TP FRAMEWORK ----------------
-    tp_result = await romeopt_tp_framework(exchange, entry, side, df, symbol)
+    # ---------------- PRIORITIZED STRUCTURE TP/SL CALCULATION ----------------
+    sig = update_tp_sl_live(sig, df)
     
-    sig.update({
-        "sl": tp_result["sl"],
-        "tp1": tp_result["tp1"],
-        "tp2": tp_result["tp2"],
-        "tp3": tp_result["tp3"],
-        "risk": tp_result["risk"],
-        "atr": tp_result["atr"],
-        "tp1_source": tp_result["tp1_source"],
-        "tp2_source": tp_result["tp2_source"],
-        "tp3_source": tp_result["tp3_source"]
-    })
+    # If no structure for TP, reject the signal
+    if sig is None:
+        breakdown["rejection_reason"] = "No valid structure levels for TP"
+        log.debug(f"Signal rejected for {symbol}: No valid structure levels for TP")
+        return None
     
-    # Add sweep details
-    sweep_details = analyze_sweep_details(df)
-    sig["sweep_details"] = sweep_details
+    # Add TP/SL data to breakdown
+    if "risk" in sig:
+        breakdown["risk_management"] = {
+            "risk": sig["risk"],
+            "risk_reward": sig.get("risk_reward", 0),
+            "atr_value": sig.get("atr_value", 0),
+            "stop_loss": sig.get("sl"),
+            "take_profit_1": sig.get("tp1"),
+            "take_profit_2": sig.get("tp2"),
+            "take_profit_3": sig.get("tp3"),
+            "tp1_data": sig.get("tp1_data"),
+            "tp2_data": sig.get("tp2_data"),
+            "tp3_data": sig.get("tp3_data")
+        }
+    
+    # ---------------- FINAL VALIDATION ----------------
+    # Ensure TP1 is at least 0.5R profit
+    if "sl" in sig and "tp1" in sig:
+        risk = abs(sig["entry"] - sig["sl"])
+        tp1_distance = abs(sig["tp1"] - sig["entry"])
+        
+        if tp1_distance < risk * 0.5:
+            breakdown["rejection_reason"] = f"TP1 too close ({tp1_distance:.6f} < {risk*0.5:.6f})"
+            log.debug(f"Signal rejected for {symbol}: TP1 too close ({tp1_distance:.6f} < {risk*0.5:.6f})")
+            return None
+        
+        breakdown["risk_management"]["tp1_distance"] = tp1_distance
+        breakdown["risk_management"]["tp1_min_required"] = risk * 0.5
+    
+    # Finalize breakdown
+    breakdown["final_score"] = score
+    breakdown["signal_generated"] = True
+    breakdown["generation_time"] = datetime.datetime.utcnow().isoformat()
+    
+    # Update sig with final breakdown
+    sig["breakdown"] = breakdown
+    sig["breakdown_json"] = json.dumps(breakdown, default=str)
     
     return sig
-
-# ---------------- SIMPLIFIED TELEGRAM OUTPUT ----------------
-async def send_simplified_signal(sig):
-    """Send simplified Telegram output"""
-    lines = []
-    
-    # Header
-    lines.append(f"🏆 {sig['symbol']} ({sig.get('timeframe', 'N/A')}) {sig['side']}")
-    lines.append(f"Entry: {format_number(sig['entry'])} | Score: {sig['score']}/9")
-    lines.append("")
-    
-    # Sweep Details
-    sweep = sig.get("sweep_details", {})
-    if sweep["type"] != "NONE":
-        details = sweep["details"]
-        sweep_type = sweep["type"]
-        lines.append(f"⚡ LIQUIDITY SWEEP DETAILS:")
-        lines.append(f"  • Type: {sweep_type} SWEEP")
-        lines.append(f"  • Score: +2")
-        lines.append(f"  • Current: {format_number(details.get('current_high' if sweep_type == 'HIGH' else 'current_low'))}")
-        lines.append(f"  • Previous: {format_number(details.get('previous_high' if sweep_type == 'HIGH' else 'previous_low'))}")
-        lines.append(f"  • Extension: {format_number(details.get('extension', 0))}")
-        lines.append(f"  • Extension %: {details.get('extension_pct', 0):.2f}%")
-        lines.append(f"  • Strength: {details.get('strength', 'N/A')}")
-        lines.append(f"  • Wick Size: {format_number(details.get('wick_size', 0))}")
-        lines.append(f"  • Volume: {format_number(details.get('volume', 0))}")
-    else:
-        lines.append(f"⚡ LIQUIDITY SWEEP DETAILS:")
-        lines.append(f"  • No significant sweep detected")
-    
-    lines.append("")
-    
-    # Order Block Details
-    ob_type = sig.get("ob_type", "").upper()
-    ob_low = sig.get("ob_low", 0)
-    ob_high = sig.get("ob_high", 0)
-    ob_range = ob_high - ob_low
-    ob_mid = (ob_low + ob_high) / 2
-    distance_to_entry = abs(sig['entry'] - ob_mid)
-    distance_pct = (distance_to_entry / sig['entry'] * 100) if sig['entry'] > 0 else 0
-    in_zone = (sig['side'] == "BUY" and sig['entry'] <= ob_high) or (sig['side'] == "SELL" and sig['entry'] >= ob_low)
-    
-    lines.append(f"🔷 ORDER BLOCK DETAILS:")
-    lines.append(f"  • Type: {ob_type} OB")
-    lines.append(f"  • Zone Approach: +{1 if in_zone else 0}")
-    lines.append(f"  • OB Range: {format_number(ob_low)} - {format_number(ob_high)}")
-    lines.append(f"  • Range Size: {format_number(ob_range)}")
-    lines.append(f"  • Midpoint: {format_number(ob_mid)}")
-    lines.append(f"  • Distance to Entry: {format_number(distance_to_entry)} ({distance_pct:.2f}%)")
-    lines.append(f"  • In Zone: {'✅ YES' if in_zone else '❌ NO'}")
-    lines.append(f"  • Strength: {sig.get('momentum', 0):.2f}")
-    
-    lines.append("")
-    
-    # Key Metrics
-    lines.append(f"📊 KEY METRICS:")
-    lines.append(f"  • Displacement: {sig.get('displacement', 0):.2f} ({'✅ STRONG' if sig.get('displacement', 0) >= 0.6 else '⚠️ WEAK'})")
-    lines.append(f"  • Momentum: {sig.get('momentum', 0):.2f} {'✅ PASS' if sig.get('momentum', 0) >= 0.5 else '❌ FAIL'}")
-    lines.append(f"  • HTF Trend: {sig.get('htf_trend', 0):+.6f}")
-    lines.append(f"  • HTF Direction: {'bullish' if sig.get('htf_trend', 0) > 0 else 'bearish'}")
-    lines.append(f"  • Elite MTF: {sig.get('elite_mtf', '0/3')} aligned")
-    
-    lines.append("")
-    
-    # RomeOPT TP Validation
-    lines.append(f"🏛️ ROMEOPT TP VALIDATION:")
-    
-    # Format TP sources
-    def format_tp_source(source):
-        if not source:
-            return "N/A"
-        if source == "EQ_50%_DEALING_RANGE":
-            return "EQ (50% dealing range)"
-        elif source == "PREMIUM_ZONE_FIRST_TOUCH":
-            return "Premium zone first touch"
-        elif source == "DISCOUNT_ZONE_FIRST_TOUCH":
-            return "Discount zone first touch"
-        elif "EQUAL_HIGHS" in source:
-            return "Equal highs stop cluster"
-        elif "EQUAL_LOWS" in source:
-            return "Equal lows stop cluster"
-        elif "RECENT_" in source:
-            return "Recent range extreme"
-        elif "MAJOR_HTF_OB" in source:
-            return "HTF order block"
-        elif "FIXED_" in source:
-            r_value = source.split("_")[1]
-            return f"Fixed {r_value}R extension"
-        return source
-    
-    lines.append(f"  • TP1 Source: {format_tp_source(sig.get('tp1_source', 'N/A'))}")
-    
-    if sig.get('tp2'):
-        lines.append(f"  • TP2 Source: {format_tp_source(sig.get('tp2_source', 'N/A'))}")
-    else:
-        lines.append(f"  • TP2 Source: No valid liquidity zone")
-    
-    if sig.get('tp3'):
-        lines.append(f"  • TP3 Source: {format_tp_source(sig.get('tp3_source', 'N/A'))}")
-    else:
-        lines.append(f"  • TP3 Source: Not set")
-    
-    lines.append("")
-    
-    # RomeOPT Targets
-    lines.append(f"🎯 ROMEOPT TARGETS:")
-    risk = sig.get("risk", 0)
-    
-    if sig.get('sl'):
-        lines.append(f"  SL: {format_number(sig.get('sl', 0))}")
-    
-    if sig.get('tp1'):
-        tp1_r = abs(sig['tp1'] - sig['entry']) / risk if risk > 0 else 0
-        lines.append(f"  TP1: {format_number(sig.get('tp1', 0))} ({tp1_r:.1f}R)")
-    
-    if sig.get('tp2'):
-        tp2_r = abs(sig['tp2'] - sig['entry']) / risk if risk > 0 else 0
-        lines.append(f"  TP2: {format_number(sig.get('tp2', 0))} ({tp2_r:.1f}R)")
-    
-    if sig.get('tp3'):
-        tp3_r = abs(sig['tp3'] - sig['entry']) / risk if risk > 0 else 0
-        lines.append(f"  TP3: {format_number(sig.get('tp3', 0))} ({tp3_r:.1f}R)")
-    
-    if risk > 0:
-        lines.append(f"  Risk: {format_number(risk)}")
-        lines.append(f"  ATR: {format_number(sig.get('atr', 0))}")
-    
-    lines.append("")
-    
-    # Market Conditions
-    lines.append(f"📈 MARKET CONDITIONS:")
-    lines.append(f"  • Regime: {sig.get('market_regime', 'N/A')}")
-    lines.append(f"  • Trend MA: {format_number(sig.get('trend_ma', 0))}")
-    lines.append(f"  • Price vs MA: {format_number(sig.get('price_vs_ma', 0))}")
-    
-    # Send to Telegram
-    try:
-        await tg("\n".join(lines))
-    except Exception as e:
-        log.error(f"Failed to send Telegram signal: {e}")
-
-# ---------------- LOG SIGNAL ----------------
-async def log_signal(sig):
-    async with db_lock:
-        await db_conn.execute("""
-            INSERT INTO signals (
-                symbol, side, entry, sl, tp1, tp2, tp3, timestamp, status, reason, score, breakdown_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            sig["symbol"], sig["side"], sig["entry"], 
-            sig.get("sl"), sig.get("tp1"), sig.get("tp2"), sig.get("tp3"),
-            datetime.datetime.utcnow().isoformat(), "OPEN", sig["reason"], sig["score"],
-            json.dumps(sig, default=str)
-        ))
-        await db_conn.commit()
-
-# ---------------- MONITOR SIGNALS ----------------
-async def monitor_signals():
-    """Monitor open positions for TP/SL hits"""
-    while True:
-        try:
-            async with db_lock:
-                async with db_conn.execute("SELECT id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status FROM signals WHERE status='OPEN'") as cursor:
-                    async for row in cursor:
-                        sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status = row
-                        
-                        try:
-                            ticker = await exchange.fetch_ticker(symbol)
-                            last_price = ticker.get("last")
-                            if last_price is None:
-                                continue
-                        except Exception:
-                            continue
-                        
-                        hits = []
-                        sl_hit = False
-                        
-                        if side == "BUY":
-                            if not tp1_hit and last_price >= tp1:
-                                hits.append("TP1")
-                                tp1_hit = 1
-                            if tp2 and not tp2_hit and last_price >= tp2:
-                                hits.append("TP2")
-                                tp2_hit = 1
-                            if tp3 and not tp3_hit and last_price >= tp3:
-                                hits.append("TP3")
-                                tp3_hit = 1
-                            if last_price <= sl:
-                                hits.append("SL")
-                                status = "CLOSED"
-                                sl_hit = True
-                        else:  # SELL
-                            if not tp1_hit and last_price <= tp1:
-                                hits.append("TP1")
-                                tp1_hit = 1
-                            if tp2 and not tp2_hit and last_price <= tp2:
-                                hits.append("TP2")
-                                tp2_hit = 1
-                            if tp3 and not tp3_hit and last_price <= tp3:
-                                hits.append("TP3")
-                                tp3_hit = 1
-                            if last_price >= sl:
-                                hits.append("SL")
-                                status = "CLOSED"
-                                sl_hit = True
-                        
-                        if hits:
-                            msg = f"🎯 {symbol} {side} update\nEntry: {entry:.8f}\nLast: {last_price:.8f}\nHits: {','.join(hits)}"
-                            msg += f"\nSL: {sl:.8f}"
-                            if tp1: msg += f"\nTP1: {tp1:.8f}"
-                            if tp2: msg += f" TP2: {tp2:.8f}"
-                            if tp3: msg += f" TP3: {tp3:.8f}"
-                            await tg(msg)
-                        
-                        # Update database
-                        await db_conn.execute(
-                            "UPDATE signals SET tp1_hit=?, tp2_hit=?, tp3_hit=?, status=? WHERE id=?",
-                            (tp1_hit, tp2_hit, tp3_hit, status, sig_id)
-                        )
-                
-                await db_conn.commit()
-        except Exception as e:
-            log.exception("monitor error: %s", e)
-        
-        await asyncio.sleep(SCAN_INTERVAL)
 
 # ---------------- SL CLUSTER ----------------
 recent_sl = defaultdict(lambda: deque())
@@ -1022,6 +939,317 @@ def deprioritized(symbol: str, threshold=3, lookback=30):
         dq.popleft()
     return len(dq) >= threshold
 
+# ---------------- LOG SIGNAL ----------------
+async def log_signal(sig):
+    async with db_lock:
+        await db_conn.execute("""
+            INSERT INTO signals (
+                symbol, side, entry, sl, tp1, tp2, tp3, timestamp, status, reason, score,
+                liquidity_sweep_score, displacement_score, displacement_value, 
+                zone_approach_score, htf_alignment_score, momentum_score, momentum_value,
+                elite_mtf_score, market_regime, order_block_type, order_block_low, 
+                order_block_high, atr_value, risk_reward, breakdown_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            sig["symbol"], sig["side"], sig["entry"], 
+            sig.get("sl"), sig.get("tp1"), sig.get("tp2"), sig.get("tp3"),
+            datetime.datetime.utcnow().isoformat(), "OPEN", sig["reason"], sig["score"],
+            sig.get("liquidity_sweep_score", 0),
+            sig.get("displacement_score", 0),
+            sig.get("displacement_value", 0.0),
+            sig.get("zone_approach_score", 0),
+            sig.get("htf_alignment_score", 0),
+            sig.get("momentum_score", 0),
+            sig.get("momentum_value", 0.0),
+            sig.get("elite_mtf_score", 0),
+            sig.get("market_regime", "UNKNOWN"),
+            sig.get("order_block_type", "UNKNOWN"),
+            sig.get("order_block_low", 0.0),
+            sig.get("order_block_high", 0.0),
+            sig.get("atr_value", 0.0),
+            sig.get("risk_reward", 0.0),
+            sig.get("breakdown_json", "{}")
+        ))
+        await db_conn.commit()
+
+# ---------------- ENHANCED BREAKDOWN FORMATTING ----------------
+async def send_enhanced_breakdown(sig):
+    """
+    Format and send the enhanced breakdown with structure source information
+    """
+    breakdown = sig.get("breakdown", {})
+    components = breakdown.get("components", {})
+    
+    # Start building the enhanced breakdown
+    breakdown_lines = [
+        f"🏆 {sig['symbol']} ({breakdown.get('timeframe', 'N/A')}) {sig['side']}",
+        f"Entry: {format_number(sig['entry'])} | Score: {sig['score']}/9",
+        f""
+    ]
+    
+    # 📊 SWEEP DETAILS SECTION
+    breakdown_lines.append(f"⚡ LIQUIDITY SWEEP DETAILS:")
+    sweep_info = components.get("liquidity_sweep", {})
+    sweep_details = sweep_info.get("sweep_details", {}).get("details", {})
+    
+    if sweep_info.get("has_sweep"):
+        sweep_type = "HIGH" if sweep_info.get("sweep_high") else "LOW"
+        breakdown_lines.extend([
+            f"  • Type: {sweep_type} SWEEP",
+            f"  • Score: +{sweep_info.get('score', 0)}",
+            f"  • Current: {format_number(sweep_details.get('current_high' if sweep_type == 'HIGH' else 'current_low'))}",
+            f"  • Previous: {format_number(sweep_details.get('previous_high' if sweep_type == 'HIGH' else 'previous_low'))}",
+            f"  • Extension: {format_number(sweep_details.get('extension', 0))}",
+            f"  • Extension %: {sweep_details.get('extension_pct', 0):.2f}%",
+            f"  • Strength: {sweep_details.get('strength', 'N/A')}",
+            f"  • Wick Size: {format_number(sweep_details.get('wick_size', 0))}",
+            f"  • Volume: {format_number(sweep_details.get('volume', 0))}"
+        ])
+    else:
+        breakdown_lines.append(f"  • No significant sweep detected")
+    
+    breakdown_lines.append(f"")
+    
+    # 🔷 ORDER BLOCK DETAILS SECTION
+    breakdown_lines.append(f"🔷 ORDER BLOCK DETAILS:")
+    ob_info = components.get("order_block", {})
+    ob_breakdown = ob_info.get("breakdown", {})
+    
+    if ob_info.get("type"):
+        ob_type = ob_info.get("type", "").upper()
+        ob_low = ob_info.get("zone_low", 0)
+        ob_high = ob_info.get("zone_high", 0)
+        ob_range = ob_high - ob_low if ob_high and ob_low else 0
+        ob_mid = (ob_low + ob_high) / 2 if ob_high and ob_low else 0
+        distance_to_entry = abs(sig['entry'] - ob_mid) if ob_mid else 0
+        distance_pct = (distance_to_entry / sig['entry'] * 100) if sig['entry'] > 0 else 0
+        in_zone = ob_breakdown.get("in_zone", False)
+        
+        breakdown_lines.extend([
+            f"  • Type: {ob_type} OB",
+            f"  • Zone Approach: +{ob_info.get('score', 0)}",
+            f"  • OB Range: {format_number(ob_low)} - {format_number(ob_high)}",
+            f"  • Range Size: {format_number(ob_range)}",
+            f"  • Midpoint: {format_number(ob_mid)}",
+            f"  • Distance to Entry: {format_number(distance_to_entry)} ({distance_pct:.2f}%)",
+            f"  • In Zone: {'✅ YES' if in_zone else '❌ NO'}",
+            f"  • Strength: {ob_breakdown.get('strength', 0):.2f}"
+        ])
+    else:
+        breakdown_lines.append(f"  • No order block detected")
+    
+    breakdown_lines.append(f"")
+    
+    # 📊 KEY METRICS SECTION
+    breakdown_lines.append(f"📊 KEY METRICS:")
+    
+    # Displacement
+    disp_info = components.get("displacement", {})
+    disp_value = disp_info.get("value", 0)
+    disp_score = disp_info.get("score", 0)
+    breakdown_lines.append(f"  • Displacement: {disp_value:.2f} ({'✅ STRONG' if disp_value >= 0.6 else '⚠️ WEAK'})")
+    
+    # Momentum
+    mom_info = components.get("momentum", {})
+    mom_value = mom_info.get("ratio", 0)
+    breakdown_lines.append(f"  • Momentum: {mom_value:.2f} {'✅ PASS' if mom_value >= 0.5 else '❌ FAIL'}")
+    
+    # HTF Alignment
+    htf_info = components.get("htf_alignment", {})
+    htf_trend = htf_info.get("trend_value", 0)
+    htf_dir = htf_info.get("htf_direction", "?")
+    breakdown_lines.append(f"  • HTF Trend: {htf_trend:+.6f}")
+    breakdown_lines.append(f"  • HTF Direction: {htf_dir}")
+    
+    # Elite MTF
+    elite_info = components.get("elite_mtf", {})
+    elite_count = elite_info.get("alignment_count", 0)
+    elite_total = elite_info.get("total_timeframes", 3)
+    breakdown_lines.append(f"  • Elite MTF: {elite_count}/{elite_total} aligned")
+    
+    breakdown_lines.append(f"")
+    
+    # 🏛️ PRIORITIZED STRUCTURE TP VALIDATION
+    breakdown_lines.append(f"🏛️ PRIORITIZED STRUCTURE TP VALIDATION:")
+    
+    risk_mgmt = breakdown.get("risk_management", {})
+    if risk_mgmt:
+        # Show structure source for each TP
+        tp1_data = risk_mgmt.get("tp1_data", {})
+        tp2_data = risk_mgmt.get("tp2_data", {})
+        tp3_data = risk_mgmt.get("tp3_data", {})
+        
+        breakdown_lines.append(f"  • TP1 Source: {tp1_data.get('type', 'unknown').upper()} (Priority: {tp1_data.get('priority', 'N/A')})")
+        
+        if tp2_data:
+            breakdown_lines.append(f"  • TP2 Source: {tp2_data.get('type', 'unknown').upper()} (Priority: {tp2_data.get('priority', 'N/A')})")
+        else:
+            breakdown_lines.append(f"  • TP2 Source: No valid structure found")
+            
+        if tp3_data:
+            breakdown_lines.append(f"  • TP3 Source: {tp3_data.get('type', 'unknown').upper()} (Priority: {tp3_data.get('priority', 'N/A')})")
+        else:
+            breakdown_lines.append(f"  • TP3 Source: No valid structure found")
+        
+        breakdown_lines.append(f"  • Structure Levels Found: ✅ YES (Priority: 1.OB/FVG, 2.Liquidity, 3.S/R)")
+    else:
+        breakdown_lines.append(f"  • Structure Levels Found: ❌ NO (Signal rejected)")
+    
+    breakdown_lines.append(f"")
+    
+    # 🎯 STRUCTURE-BASED TARGETS
+    breakdown_lines.append(f"🎯 STRUCTURE-BASED TARGETS (PRIORITIZED):")
+    
+    if "sl" in sig and sig["sl"]:
+        risk = abs(sig['entry'] - sig['sl'])
+        breakdown_lines.extend([
+            f"  SL: {format_number(sig.get('sl', 0))}",
+            f"  TP1: {format_number(sig.get('tp1', 0))} ({risk_mgmt.get('risk_reward', 0):.1f}R)",
+        ])
+        
+        if sig.get('tp2'):
+            tp2_dist = abs(sig['tp2'] - sig['entry'])
+            tp2_r = tp2_dist / risk if risk > 0 else 0
+            breakdown_lines.append(f"  TP2: {format_number(sig.get('tp2', 0))} ({tp2_r:.1f}R)")
+        
+        if sig.get('tp3'):
+            tp3_dist = abs(sig['tp3'] - sig['entry'])
+            tp3_r = tp3_dist / risk if risk > 0 else 0
+            breakdown_lines.append(f"  TP3: {format_number(sig.get('tp3', 0))} ({tp3_r:.1f}R)")
+        
+        breakdown_lines.append(f"  Risk: {format_number(risk)}")
+        breakdown_lines.append(f"  ATR: {format_number(risk_mgmt.get('atr_value', 0))}")
+    
+    breakdown_lines.append(f"")
+    
+    # 📈 MARKET CONDITIONS
+    breakdown_lines.append(f"📈 MARKET CONDITIONS:")
+    breakdown_lines.extend([
+        f"  • Regime: {sig.get('market_regime', 'N/A')}",
+        f"  • Trend MA: {format_number(sig.get('trend_ma_value', 0))}",
+        f"  • Price vs MA: {format_number(sig.get('price_vs_ma', 0))}"
+    ])
+    
+    # 🔍 FILTER STATUS
+    breakdown_lines.append(f"")
+    breakdown_lines.append(f"🔍 FILTER STATUS:")
+    
+    # Critical filters
+    crit_score = breakdown.get("critical_score", 0)
+    crit_thresh = breakdown.get("critical_threshold", 2)
+    breakdown_lines.append(f"  • Critical Score: {crit_score}/{crit_thresh} {'✅ PASS' if crit_score >= crit_thresh else '❌ FAIL'}")
+    
+    # Minimum score
+    min_score = MIN_SCORE
+    actual_score = sig.get("score", 0)
+    breakdown_lines.append(f"  • Minimum Score: {actual_score}/{min_score} {'✅ PASS' if actual_score >= min_score else '❌ FAIL'}")
+    
+    # HTF Alignment
+    htf_score = sig.get("htf_alignment_score", 0)
+    breakdown_lines.append(f"  • HTF Alignment: {'✅ MANDATORY PASS' if htf_score == 1 else '❌ MANDATORY FAIL'}")
+    
+    # Elite MTF
+    elite_score = sig.get("elite_mtf_score", 0)
+    breakdown_lines.append(f"  • Elite MTF: {'✅ PASS' if elite_score == 1 else '❌ FAIL'}")
+    
+    # STRUCTURE VALIDATION
+    has_structure = "risk_management" in breakdown
+    breakdown_lines.append(f"  • Structure Validation: {'✅ PASS' if has_structure else '❌ FAIL (NO TRADE)'}")
+    
+    # Clean up empty lines
+    breakdown_lines = [line for line in breakdown_lines if line != ""]
+    
+    # Send to Telegram
+    try:
+        await tg("\n".join(breakdown_lines))
+    except Exception as e:
+        log.error(f"Failed to send Telegram breakdown: {e}")
+
+# ---------------- MONITOR SIGNALS ----------------
+async def monitor_signals():
+    """
+    Monitor open positions for TP/SL hits
+    - TP/SL levels are FIXED after entry (not recalculated)
+    - Only checks if price hit predefined levels
+    - No structure revalidation during monitoring
+    - FIXED: Handle None values for TP2/TP3
+    """
+    while True:
+        try:
+            async with db_lock:
+                async with db_conn.execute("SELECT id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status FROM signals WHERE status='OPEN'") as cursor:
+                    async for row in cursor:
+                        sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status = row
+                        
+                        # Fetch current price
+                        try:
+                            ticker = await exchange.fetch_ticker(symbol)
+                            last_price = ticker.get("last")
+                            if last_price is None:
+                                continue
+                        except Exception as e:
+                            log.debug(f"Failed to fetch ticker for {symbol}: {e}")
+                            continue
+                        
+                        # Check for TP/SL hits - USING ORIGINAL TP/SL LEVELS
+                        hits = []
+                        sl_hit = False
+                        
+                        if side == "BUY":
+                            if not tp1_hit and last_price >= tp1:
+                                hits.append("TP1")
+                                tp1_hit = 1
+                            # Check TP2 only if it exists and is not None
+                            if tp2 is not None and not tp2_hit and last_price >= tp2:
+                                hits.append("TP2")
+                                tp2_hit = 1
+                            # Check TP3 only if it exists and is not None
+                            if tp3 is not None and not tp3_hit and last_price >= tp3:
+                                hits.append("TP3")
+                                tp3_hit = 1
+                            if last_price <= sl:
+                                hits.append("SL")
+                                status = "CLOSED"
+                                sl_hit = True
+                        else:  # SELL
+                            if not tp1_hit and last_price <= tp1:
+                                hits.append("TP1")
+                                tp1_hit = 1
+                            # Check TP2 only if it exists and is not None
+                            if tp2 is not None and not tp2_hit and last_price <= tp2:
+                                hits.append("TP2")
+                                tp2_hit = 1
+                            # Check TP3 only if it exists and is not None
+                            if tp3 is not None and not tp3_hit and last_price <= tp3:
+                                hits.append("TP3")
+                                tp3_hit = 1
+                            if last_price >= sl:
+                                hits.append("SL")
+                                status = "CLOSED"
+                                sl_hit = True
+                        
+                        if hits:
+                            msg = f"🎯 {symbol} {side} update\nEntry: {entry:.8f}\nLast: {last_price:.8f}\nHits: {','.join(hits)}\nSL: {sl:.8f}"
+                            if tp1: msg += f"\nTP1: {tp1:.8f}"
+                            if tp2: msg += f" TP2: {tp2:.8f}" if tp2 else ""
+                            if tp3: msg += f" TP3: {tp3:.8f}" if tp3 else ""
+                            await tg(msg)
+                        
+                        if sl_hit:
+                            record_sl_hit(symbol)
+                        
+                        # Update database
+                        await db_conn.execute(
+                            "UPDATE signals SET tp1_hit=?, tp2_hit=?, tp3_hit=?, status=? WHERE id=?",
+                            (tp1_hit, tp2_hit, tp3_hit, status, sig_id)
+                        )
+                
+                await db_conn.commit()
+        except Exception as e:
+            log.exception("monitor error: %s", e)
+        
+        await asyncio.sleep(SCAN_INTERVAL)
+
 # ---------------- SCAN LOOP ----------------
 last_signal_time = {}
 
@@ -1029,6 +1257,7 @@ async def scan_loop(exchange):
     while True:
         t0 = time.time()
         try:
+            # Fetch top volume pairs
             tickers = await exchange.fetch_tickers()
             usdt_pairs = [(s, v.get("quoteVolume", 0)) for s, v in tickers.items() if s.endswith("/USDT")]
             usdt_pairs.sort(key=lambda x: x[1], reverse=True)
@@ -1041,6 +1270,7 @@ async def scan_loop(exchange):
                 
                 for tf in TIMEFRAMES:
                     key = f"{symbol}:{tf}"
+                    # Rate limiting per symbol:timeframe
                     if key in last_signal_time and time.time() - last_signal_time[key] < 60:
                         continue
                     
@@ -1055,16 +1285,19 @@ async def scan_loop(exchange):
                     sig = await generate_signal_romeopt(exchange, df, symbol, tf)
                     
                     if sig:
-                        sig["timeframe"] = tf
-                        await send_simplified_signal(sig)
+                        # Send enhanced breakdown with structure source info
+                        await send_enhanced_breakdown(sig)
+                        
+                        # Log to database
                         await log_signal(sig)
                         
                         last_signal_time[key] = time.time()
                         signals_found += 1
                         
+                        # Small delay between signals to avoid rate limits
                         await asyncio.sleep(0.5)
             
-            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found")
+            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found (Prioritized Structure TP/SL)")
             
         except Exception as e:
             log.exception("scan error: %s", e)
@@ -1131,15 +1364,18 @@ async def main():
     global exchange
     await init_db()
     
+    # Initialize exchange
     exchange = ccxt.okx({
         "enableRateLimit": True,
         "options": {"defaultType": "spot"}
     })
     
-    await tg("🏆 ROMEOPT SCANNER STARTED")
-    await tg("🎯 TP Framework: TP1=EQ/First Touch, TP2=Liquidity, TP3=HTF/Fixed Ext")
-    await tg("✅ Implementation verified with correct RomeOPT definitions")
+    await tg("🏆 ROMEOPT 6-Step Scanner Started - PRIORITIZED STRUCTURE TP/SL")
+    await tg("🎯 STRUCTURE PRIORITY: 1. OB/FVG, 2. Liquidity Zones, 3. Support/Resistance")
+    await tg("🏛️ NO STRUCTURE = NO TRADE: Signals rejected if no valid TP levels")
+    await tg("📊 ENHANCED BREAKDOWN: Shows structure source for each TP level")
     
+    # Run both tasks concurrently
     await asyncio.gather(
         scan_loop(exchange),
         monitor_signals()
