@@ -35,7 +35,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
-TOP_N = int(os.getenv("TOP_N", 15))
+TOP_N = int(os.getenv("TOP_N", 60))
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
 MIN_SCORE = 5
 CRITICAL_FACTORS_MIN = 2  # HTF Alignment + Liquidity Sweep minimum
@@ -219,76 +219,12 @@ def analyze_sweep_details(df: pd.DataFrame, lookback=5):
 # ---------------- STRONG TREND DETECTION (DISABLED) ----------------
 async def check_strong_counter_trend(exchange, symbol: str, timeframe: str, signal_side: str):
     """DISABLED AS REQUESTED - Returns False to not reject any signals"""
-    if not TREND_FILTER_ENABLED:
-        return False
-    # Original implementation here but disabled
-    
-    # ENABLED TREND FILTER - Check higher timeframe trends
-    
-    # Define HTF mapping for strong trend detection
-    htf_mapping = {
-        "1m": "15m",
-        "3m": "30m", 
-        "5m": "1h",
-        "15m": "4h",
-        "30m": "4h"
-    }
-    
-    # Get the higher timeframe for trend analysis
-    htf = htf_mapping.get(timeframe, "15m")
-    
-    # Fetch HTF data
-    ohlcv = await fetch_ohlcv(exchange, symbol, htf, 100)
-    if not ohlcv:
-        return False  # If we can't get data, don't reject
-        
-    df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-    for c in ["open","high","low","close","vol"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    
-    # Calculate indicators for trend detection
-    df['ema20'] = calculate_ema(df, 20)
-    df['ema50'] = calculate_ema(df, 50)
-    
-    # Get current values
-    current_price = df['close'].iloc[-1]
-    ema20 = df['ema20'].iloc[-1]
-    ema50 = df['ema50'].iloc[-1]
-    
-    # Check for STRONG trend conditions
-    # Strong Bullish Trend:
-    # 1. Price > EMA20 > EMA50
-    # 2. EMAs are aligned bullish
-    # 3. Recent price action shows consistent higher highs/lows
-    strong_bullish = (
-        current_price > ema20 > ema50 and
-        ema20 > df['ema20'].iloc[-5] and  # EMA20 sloping up
-        df['high'].iloc[-5:].max() > df['high'].iloc[-10:-5].max()  # Higher highs
-    )
-    
-    # Strong Bearish Trend:
-    # 1. Price < EMA20 < EMA50  
-    # 2. EMAs are aligned bearish
-    # 3. Recent price action shows consistent lower highs/lows
-    strong_bearish = (
-        current_price < ema20 < ema50 and
-        ema20 < df['ema20'].iloc[-5] and  # EMA20 sloping down
-        df['low'].iloc[-5:].min() < df['low'].iloc[-10:-5].min()  # Lower lows
-    )
-    
-    # Determine if we should reject based on counter-trend
-    if strong_bullish and signal_side == "SELL":
-        log.debug(f"🚫 Trend Filter: STRONG BULLISH trend on {htf}, rejecting SELL signal")
-        return True  # Reject SELL in strong bullish trend
-        
-    if strong_bearish and signal_side == "BUY":
-        log.debug(f"🚫 Trend Filter: STRONG BEARISH trend on {htf}, rejecting BUY signal")
-        return True  # Reject BUY in strong bearish trend
-    
-    return False  # Allow the signal (either no strong trend or trend aligns with signal)
+    return False
 
 # ---------------- MARKET REGIME ----------------
 async def detect_market_regime(df: pd.DataFrame):
+    if len(df) < 50:
+        return "RANGE"
     ma_htf = df["close"].rolling(50).mean().iloc[-1]
     price = df["close"].iloc[-1]
     recent_high = df["high"].iloc[-20:].max()
@@ -330,18 +266,19 @@ def find_latest_ob(df: pd.DataFrame):
             return {"type":"bearish","low":candle["close"],"high":max(candle["high"], prev_candle["high"])}
     return None
 
-# ---------------- TP/SL CALCULATION (RomeOPT-P Style) ----------------
-async def romeoptp_tp_sl(exchange, entry: float, side: str, entry_tf: str, ob_zone: dict, symbol: str):
+# ---------------- TP/SL CALCULATION (TRUE RomeOPT-P Style) ----------------
+async def romeoptp_tp_sl(exchange, entry: float, side: str, entry_tf: str, ob_zone: dict, symbol: str, df: pd.DataFrame):
     """
-    RomeOPT-P Logic:
+    TRUE RomeOPT-P Logic:
     - SL based on entry timeframe OB (tight)
-    - TP scaled to higher timeframe ATR (meaningful)
-    - TP1 = 0.8R, TP2 = 1.6R
+    - TP1 = next liquidity pool (previous swing high/low) - MANDATORY
+    - TP2 = 1.6R or next major structure
+    - REJECT if no liquidity pool found
     """
     if not ob_zone:
-        return None, None, None, entry_tf
+        return None, None, None, entry_tf, "No OB zone"
     
-    # Get ATR from higher timeframe for TP scaling
+    # Get ATR from higher timeframe for risk calculation
     tp_tf = TP_TIMEFRAME_MAP.get(entry_tf, "15m")
     htf_ohlcv = await fetch_ohlcv(exchange, symbol, tp_tf, 100)
     
@@ -351,7 +288,7 @@ async def romeoptp_tp_sl(exchange, entry: float, side: str, entry_tf: str, ob_zo
         tp_tf = entry_tf
     
     if not htf_ohlcv:
-        return None, None, None, tp_tf
+        return None, None, None, tp_tf, "No HTF data"
     
     df_htf = pd.DataFrame(htf_ohlcv, columns=["ts","open","high","low","close","vol"])
     for c in ["open","high","low","close","vol"]: 
@@ -365,18 +302,97 @@ async def romeoptp_tp_sl(exchange, entry: float, side: str, entry_tf: str, ob_zo
         # SL just below bullish OB low
         sl = ob_zone['low'] - (atr_val * 0.1)  # Very tight (0.1 × HTF ATR)
         risk = entry - sl
-        # TP scaled to HTF ATR
-        tp1 = entry + (risk * 0.8)  # 0.8R
-        tp2 = entry + (risk * 1.6)  # 1.6R
+        min_risk = atr_val * 0.5
+        if risk < min_risk:
+            risk = min_risk
+            sl = entry - risk
+        
+        # TRUE ROMEOPT-P: TP1 = Next liquidity pool (previous swing high) - MANDATORY
+        # Look for nearest resistance in recent price action
+        lookback_period = min(50, len(df))
+        recent_highs = df['high'].iloc[-lookback_period:]
+        
+        # Filter highs above entry (potential resistance/liquidity pools)
+        resistances = recent_highs[recent_highs > entry]
+        
+        if len(resistances) == 0:
+            # NO LIQUIDITY POOL FOUND - REJECT TRADE
+            return None, None, None, tp_tf, "No liquidity pool (resistance) found for BUY"
+        
+        # TP1 = nearest resistance (liquidity pool)
+        tp1 = resistances.min()
+        
+        # Ensure minimum distance (0.5R) - if too close, reject
+        min_tp1_distance = risk * 0.5
+        if (tp1 - entry) < min_tp1_distance:
+            # Liquidity pool too close - REJECT
+            return None, None, None, tp_tf, f"Liquidity pool too close: {(tp1-entry):.6f} < {min_tp1_distance:.6f} (0.5R)"
+        
+        # TP2 = 1.6R or next major structure
+        # Look for next major resistance beyond TP1
+        major_resistances = recent_highs[recent_highs > tp1]
+        if len(major_resistances) > 0:
+            tp2 = major_resistances.min()
+            # Ensure TP2 is at least 0.3R beyond TP1
+            min_tp2_gap = risk * 0.3
+            if (tp2 - tp1) < min_tp2_gap:
+                tp2 = entry + (risk * 1.6)
+        else:
+            tp2 = entry + (risk * 1.6)
+        
+        # Final validation: TP1 must be > entry + 0.5R
+        if (tp1 - entry) < (risk * 0.5):
+            # Should not happen due to earlier check, but safety check
+            return None, None, None, tp_tf, f"TP1 validation failed: {(tp1-entry):.6f} < {risk*0.5:.6f}"
+        
     else:  # SELL
         # SL just above bearish OB high  
         sl = ob_zone['high'] + (atr_val * 0.1)  # Very tight (0.1 × HTF ATR)
         risk = sl - entry
-        # TP scaled to HTF ATR
-        tp1 = entry - (risk * 0.8)  # 0.8R
-        tp2 = entry - (risk * 1.6)  # 1.6R
+        min_risk = atr_val * 0.5
+        if risk < min_risk:
+            risk = min_risk
+            sl = entry + risk
+        
+        # TRUE ROMEOPT-P: TP1 = Next liquidity pool (previous swing low) - MANDATORY
+        # Look for nearest support in recent price action
+        lookback_period = min(50, len(df))
+        recent_lows = df['low'].iloc[-lookback_period:]
+        
+        # Filter lows below entry (potential support/liquidity pools)
+        supports = recent_lows[recent_lows < entry]
+        
+        if len(supports) == 0:
+            # NO LIQUIDITY POOL FOUND - REJECT TRADE
+            return None, None, None, tp_tf, "No liquidity pool (support) found for SELL"
+        
+        # TP1 = nearest support (liquidity pool)
+        tp1 = supports.max()
+        
+        # Ensure minimum distance (0.5R) - if too close, reject
+        min_tp1_distance = risk * 0.5
+        if (entry - tp1) < min_tp1_distance:
+            # Liquidity pool too close - REJECT
+            return None, None, None, tp_tf, f"Liquidity pool too close: {(entry-tp1):.6f} < {min_tp1_distance:.6f} (0.5R)"
+        
+        # TP2 = 1.6R or next major structure
+        # Look for next major support beyond TP1
+        major_supports = recent_lows[recent_lows < tp1]
+        if len(major_supports) > 0:
+            tp2 = major_supports.max()
+            # Ensure TP2 is at least 0.3R beyond TP1
+            min_tp2_gap = risk * 0.3
+            if (tp1 - tp2) < min_tp2_gap:
+                tp2 = entry - (risk * 1.6)
+        else:
+            tp2 = entry - (risk * 1.6)
+        
+        # Final validation: TP1 must be < entry - 0.5R
+        if (entry - tp1) < (risk * 0.5):
+            # Should not happen due to earlier check, but safety check
+            return None, None, None, tp_tf, f"TP1 validation failed: {(entry-tp1):.6f} < {risk*0.5:.6f}"
     
-    return sl, tp1, tp2, tp_tf
+    return sl, tp1, tp2, tp_tf, "OK"
 
 # ---------------- UPDATE SIGNAL TP/SL ----------------
 async def update_tp_sl_live(sig: dict):
@@ -400,16 +416,19 @@ async def update_tp_sl_live(sig: dict):
         return sig
     
     # Recalculate TP/SL with current data
-    sl, tp1, tp2, tp_tf = await romeoptp_tp_sl(
-        exchange, sig["entry"], sig["side"], sig["entry_tf"], latest_ob, sig["symbol"]
+    sl, tp1, tp2, tp_tf, tp_reason = await romeoptp_tp_sl(
+        exchange, sig["entry"], sig["side"], sig["entry_tf"], latest_ob, sig["symbol"], df_entry
     )
     
-    if sl is not None and tp1 is not None and tp2 is not None:
-        sig["sl"] = sl
-        sig["tp1"] = tp1
-        sig["tp2"] = tp2
-        sig["tp_tf"] = tp_tf
-        sig["latest_ob"] = latest_ob
+    if sl is None or tp1 is None or tp2 is None:
+        # Could not recalculate TP/SL - keep existing values
+        return sig
+    
+    sig["sl"] = sl
+    sig["tp1"] = tp1
+    sig["tp2"] = tp2
+    sig["tp_tf"] = tp_tf
+    sig["latest_ob"] = latest_ob
     
     return sig
 
@@ -525,9 +544,6 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     # ========== END CRITICAL SECTION ==========
     
     # DISABLED: OB QUALITY FILTER
-    if OB_FILTER_ENABLED:
-        # Original OB filter code would go here
-        pass
     calc_values["ob_filter_passed"] = True
     
     # DISABLED: Momentum filter (only original 0.5 check remains)
@@ -559,12 +575,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
 
     # Step5: HTF alignment with IMPROVED detection
     # DISABLED: Check for STRONG counter-trend
-    should_reject = await check_strong_counter_trend(exchange, symbol, tf, side)
-    calc_values["strong_counter_trend"] = should_reject
-    
-    if should_reject:
-        reasons.append(f"🚫 Strong counter-trend detected on HTF")
-        return None
+    calc_values["strong_counter_trend"] = False
     
     # Use mapping consistent with elite_tf_alignment
     tf_map = {"1m":"15m", "3m":"30m", "5m":"1h", "15m":"4h", "30m":"1h"}
@@ -610,10 +621,10 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         reasons.append("No displacement")
         return None
 
-    # Calculate TP/SL with RomeOPT-P logic
-    sl, tp1, tp2, tp_tf = await romeoptp_tp_sl(exchange, float(last["close"]), side, tf, ob_zone, symbol)
+    # Calculate TP/SL with TRUE RomeOPT-P logic (NO FALLBACK)
+    sl, tp1, tp2, tp_tf, tp_reason = await romeoptp_tp_sl(exchange, float(last["close"]), side, tf, ob_zone, symbol, df)
     if sl is None or tp1 is None or tp2 is None:
-        reasons.append("TP/SL calc failed")
+        reasons.append(f"TP/SL rejected: {tp_reason}")
         return None
     
     # Calculate risk/reward
@@ -651,7 +662,8 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         "reward_tp1": round(reward_tp1, 6),
         "reward_tp2": round(reward_tp2, 6),
         "rr_tp1": round(rr_tp1, 2),
-        "rr_tp2": round(rr_tp2, 2)
+        "rr_tp2": round(rr_tp2, 2),
+        "tp_reason": tp_reason
     }
 
     # Liquidity path filter: skip blocked trades
@@ -794,7 +806,7 @@ async def scan_loop():
                         
                         # ENHANCED BREAKDOWN IN CODE 1 FORMAT
                         breakdown_lines = [
-                            f"🏆 {sig['symbol']} ({tf}) {sig['side']}",
+                            f"🏆 {sig['symbol']} ({sig['entry_tf']}) {sig['side']}",
                             f"Entry: {sig['entry']:.6f} | Score: {sig['score']}/6",
                             f""
                         ]
@@ -851,13 +863,14 @@ async def scan_loop():
                         
                         breakdown_lines.append(f"")
                         
-                        # 🎯 TARGETS SECTION (Code 2 TP system)
-                        breakdown_lines.append(f"🎯 TARGETS ({sig.get('tp_tf', '?')} ATR scaling):")
+                        # 🎯 TRUE ROMEOPT-P TARGETS SECTION
+                        breakdown_lines.append(f"🎯 TRUE ROMEOPT-P TARGETS ({sig.get('tp_tf', '?')} ATR scaling):")
                         breakdown_lines.extend([
                             f"  SL: {format_number(sig.get('sl', 0))}",
-                            f"  TP1: {format_number(sig.get('tp1', 0))} (0.8R)",
-                            f"  TP2: {format_number(sig.get('tp2', 0))} (1.6R)",
-                            f"  Risk: {format_number(sig.get('risk', 0))} | R:R TP1: 1:{sig.get('rr_tp1', 0):.1f} | TP2: 1:{sig.get('rr_tp2', 0):.1f}"
+                            f"  TP1: {format_number(sig.get('tp1', 0))} (Liquidity Pool) (R:R = 1:{sig.get('rr_tp1', 0):.1f})",
+                            f"  TP2: {format_number(sig.get('tp2', 0))} (Next Structure/1.6R) (R:R = 1:{sig.get('rr_tp2', 0):.1f})",
+                            f"  Risk: {format_number(sig.get('risk', 0))}",
+                            f"  TP Validation: {sig.get('tp_reason', 'OK')}"
                         ])
                         
                         # Clean up empty lines
@@ -877,7 +890,7 @@ async def scan_loop():
 async def test_ob_filter_with_historical_trades():
     """Test the OB filter with historical trades"""
     print("\n" + "="*60)
-    print("OB FILTER TEST WITH HISTORICAL ANALYSIS")
+    print("CONFIGURATION STATUS")
     print("="*60)
     
     print(f"\nALL FILTERS DISABLED AS REQUESTED")
@@ -885,6 +898,10 @@ async def test_ob_filter_with_historical_trades():
     print(f"• Sweep Filter: {SWEEP_FILTER_ENABLED}")
     print(f"• Momentum Filter: {MOMENTUM_FILTER_ENABLED}")
     print(f"• OB Filter: {OB_FILTER_ENABLED}")
+    print(f"\nTRUE ROMEOPT-P TP LOGIC ACTIVE:")
+    print(f"• TP1 = Next Liquidity Pool (MANDATORY)")
+    print(f"• NO FALLBACK - Rejects if no liquidity pool found")
+    print(f"• TP2 = Next Structure or 1.6R")
 
 # ---------------- FASTAPI ----------------
 app = FastAPI()
@@ -902,7 +919,7 @@ async def main():
     global exchange, db_conn
     await init_db()
     
-    # Test the OB filter
+    # Show configuration status
     await test_ob_filter_with_historical_trades()
     
     exchange = ccxt.okx({"enableRateLimit": True})
@@ -913,7 +930,11 @@ async def main():
     await tg("   - Sweep Retracement Filter: DISABLED")
     await tg("   - Momentum Range Filter: DISABLED")
     await tg("   - OB Quality Filter: DISABLED")
-    await tg("🎯 TP SYSTEM: RomeOPT-P (0.8R/1.6R, SL→BE after TP1)")
+    await tg("🎯 TRUE ROMEOPT-P TP SYSTEM ACTIVE:")
+    await tg("   - TP1 = Next Liquidity Pool (MANDATORY)")
+    await tg("   - NO FALLBACK - Rejects if no liquidity pool")
+    await tg("   - TP2 = Next Structure or 1.6R")
+    await tg("   - SL → BE after TP1 hit")
     
     await asyncio.gather(scan_loop(), monitor_signals())
 
