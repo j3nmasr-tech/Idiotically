@@ -17,6 +17,7 @@ LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features)
 - STRUCTURE-REQUIRED: Signals rejected if no valid structure levels exist for TP
 - FULL NUMERICAL BREAKDOWN: All component scores stored in database
 - FIXED MONITORING: No structure revalidation during monitoring
+- 🎯 ENHANCED BREAKDOWN FORMAT: Same detailed format as FORCED FILTER version
 """
 
 import os, time, asyncio, logging, datetime, json
@@ -191,6 +192,73 @@ async def elite_tf_alignment(exchange, symbol: str, side: str):
     all_aligned = all(alignments)
     alignment_count = sum(alignments)
     return all_aligned, alignment_count, len(tfs)
+
+# ---------------- ENHANCED SWEEP ANALYSIS ----------------
+def analyze_sweep_details(df: pd.DataFrame, lookback=5):
+    """Analyze sweep with detailed information - doesn't affect signal logic"""
+    if len(df) < lookback + 1:
+        return {"type": "NONE", "details": {}}
+    
+    current_candle = df.iloc[-1]
+    lookback_candles = df.iloc[-(lookback+1):-1]
+    
+    current_high = current_candle["high"]
+    current_low = current_candle["low"]
+    prev_highs = lookback_candles["high"].values
+    prev_lows = lookback_candles["low"].values
+    
+    max_prev_high = np.max(prev_highs) if len(prev_highs) > 0 else current_high
+    min_prev_low = np.min(prev_lows) if len(prev_lows) > 0 else current_low
+    
+    # Check for high sweep
+    if current_high > max_prev_high:
+        extension = current_high - max_prev_high
+        return {
+            "type": "HIGH",
+            "details": {
+                "current_high": current_high,
+                "previous_high": max_prev_high,
+                "extension": extension,
+                "extension_pct": (extension / max_prev_high * 100) if max_prev_high > 0 else 0,
+                "strength": "STRONG" if extension > (current_high * 0.001) else "MODERATE",
+                "wick_size": current_high - max(current_candle["open"], current_candle["close"]),
+                "volume": current_candle["vol"],
+                "candle_body": current_candle["close"] - current_candle["open"],
+                "candle_range": current_candle["high"] - current_candle["low"]
+            }
+        }
+    
+    # Check for low sweep
+    elif current_low < min_prev_low:
+        extension = min_prev_low - current_low
+        return {
+            "type": "LOW",
+            "details": {
+                "current_low": current_low,
+                "previous_low": min_prev_low,
+                "extension": extension,
+                "extension_pct": (extension / min_prev_low * 100) if min_prev_low > 0 else 0,
+                "strength": "STRONG" if extension > (current_low * 0.001) else "MODERATE",
+                "wick_size": min(current_candle["open"], current_candle["close"]) - current_low,
+                "volume": current_candle["vol"],
+                "candle_body": current_candle["open"] - current_candle["close"],
+                "candle_range": current_candle["high"] - current_candle["low"]
+            }
+        }
+    
+    return {"type": "NONE", "details": {}}
+
+# ---------------- FORMAT NUMBER ----------------
+def format_number(value, decimals=6):
+    """Format number with appropriate decimal places"""
+    if isinstance(value, (int, float)):
+        if abs(value) >= 1000:
+            return f"{value:,.2f}"
+        elif abs(value) >= 1:
+            return f"{value:.4f}"
+        else:
+            return f"{value:.{decimals}f}"
+    return str(value)
 
 # ---------------- TP/SL HELPERS ----------------
 def find_latest_ob(df: pd.DataFrame):
@@ -468,7 +536,8 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     score += liquidity_sweep
     reasons.append(f"Liquidity Sweep +{liquidity_sweep}")
     
-    # Store numerical sweep data
+    # ENHANCED: Add sweep details for breakdown (doesn't affect signal)
+    sweep_analysis = analyze_sweep_details(df)
     breakdown["components"]["liquidity_sweep"] = {
         "score": liquidity_sweep,
         "sweep_high": sweep_high,
@@ -477,7 +546,8 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         "current_high": float(last["high"]),
         "prev_high_max": float(prev5["high"].max()),
         "current_low": float(last["low"]),
-        "prev_low_min": float(prev5["low"].min())
+        "prev_low_min": float(prev5["low"].min()),
+        "sweep_details": sweep_analysis
     }
 
     # Step 2: Displacement - NUMERICAL DATA
@@ -515,7 +585,8 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
                 "bullish_candle_close": float(candle["close"]),
                 "bullish_candle_open": float(candle["open"]),
                 "prev_candle_close": float(prev_candle["close"]),
-                "prev_candle_open": float(prev_candle["open"])
+                "prev_candle_open": float(prev_candle["open"]),
+                "candle_range": float(candle["high"] - candle["low"])
             }
             break
         elif candle["close"] < candle["open"] and prev_candle["close"] > prev_candle["open"]:
@@ -529,7 +600,8 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
                 "bearish_candle_close": float(candle["close"]),
                 "bearish_candle_open": float(candle["open"]),
                 "prev_candle_close": float(prev_candle["close"]),
-                "prev_candle_open": float(prev_candle["open"])
+                "prev_candle_open": float(prev_candle["open"]),
+                "candle_range": float(candle["high"] - candle["low"])
             }
             break
 
@@ -553,6 +625,39 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     if not ob_type:
         return None
 
+    # Calculate detailed OB info for breakdown
+    if ob_zone:
+        ob_low = ob_zone["low"]
+        ob_high = ob_zone["high"]
+        ob_range = ob_high - ob_low
+        ob_mid = (ob_low + ob_high) / 2
+        distance_to_price = abs(last["close"] - ob_mid)
+        distance_pct = (distance_to_price / last["close"] * 100) if last["close"] > 0 else 100
+        
+        # Calculate OB strength
+        if ob_details and "candle_range" in ob_details:
+            strength = ob_details["candle_range"] / ob_range if ob_range > 0 else 0
+        else:
+            strength = 0
+        
+        ob_breakdown = {
+            "type": ob_type,
+            "low": float(ob_low),
+            "high": float(ob_high),
+            "midpoint": float(ob_mid),
+            "range": float(ob_range),
+            "distance_to_price": float(distance_to_price),
+            "distance_pct": float(distance_pct),
+            "strength": float(strength),
+            "in_zone": True if (ob_type == "bullish" and last["close"] <= ob_zone["high"]) or 
+                               (ob_type == "bearish" and last["close"] >= ob_zone["low"]) else False
+        }
+        
+        if ob_details:
+            ob_breakdown["details"] = ob_details
+    else:
+        ob_breakdown = {}
+
     # Store order block data
     breakdown["components"]["order_block"] = {
         "score": zone_score,
@@ -561,7 +666,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         "zone_high": float(ob_zone["high"]) if ob_zone else None,
         "current_price_vs_zone": "inside" if (ob_type == "bullish" and last["close"] <= ob_zone["high"]) or 
                                           (ob_type == "bearish" and last["close"] >= ob_zone["low"]) else "outside",
-        "details": ob_details
+        "breakdown": ob_breakdown
     }
 
     # Step 5: HTF Alignment - NUMERICAL DATA
@@ -802,6 +907,197 @@ async def log_signal(sig):
         ))
         await db_conn.commit()
 
+# ---------------- ENHANCED BREAKDOWN FORMATTING ----------------
+async def send_enhanced_breakdown(sig):
+    """
+    Format and send the enhanced breakdown in the same style as code 1
+    """
+    breakdown = sig.get("breakdown", {})
+    components = breakdown.get("components", {})
+    
+    # Start building the enhanced breakdown
+    breakdown_lines = [
+        f"🏆 {sig['symbol']} ({breakdown.get('timeframe', 'N/A')}) {sig['side']}",
+        f"Entry: {format_number(sig['entry'])} | Score: {sig['score']}/9",
+        f""
+    ]
+    
+    # 📊 SWEEP DETAILS SECTION
+    breakdown_lines.append(f"⚡ LIQUIDITY SWEEP DETAILS:")
+    sweep_info = components.get("liquidity_sweep", {})
+    sweep_details = sweep_info.get("sweep_details", {}).get("details", {})
+    
+    if sweep_info.get("has_sweep"):
+        sweep_type = "HIGH" if sweep_info.get("sweep_high") else "LOW"
+        breakdown_lines.extend([
+            f"  • Type: {sweep_type} SWEEP",
+            f"  • Score: +{sweep_info.get('score', 0)}",
+            f"  • Current: {format_number(sweep_details.get('current_high' if sweep_type == 'HIGH' else 'current_low'))}",
+            f"  • Previous: {format_number(sweep_details.get('previous_high' if sweep_type == 'HIGH' else 'previous_low'))}",
+            f"  • Extension: {format_number(sweep_details.get('extension', 0))}",
+            f"  • Extension %: {sweep_details.get('extension_pct', 0):.2f}%",
+            f"  • Strength: {sweep_details.get('strength', 'N/A')}",
+            f"  • Wick Size: {format_number(sweep_details.get('wick_size', 0))}",
+            f"  • Volume: {format_number(sweep_details.get('volume', 0))}"
+        ])
+    else:
+        breakdown_lines.append(f"  • No significant sweep detected")
+    
+    breakdown_lines.append(f"")
+    
+    # 🔷 ORDER BLOCK DETAILS SECTION
+    breakdown_lines.append(f"🔷 ORDER BLOCK DETAILS:")
+    ob_info = components.get("order_block", {})
+    ob_breakdown = ob_info.get("breakdown", {})
+    
+    if ob_info.get("type"):
+        ob_type = ob_info.get("type", "").upper()
+        ob_low = ob_info.get("zone_low", 0)
+        ob_high = ob_info.get("zone_high", 0)
+        ob_range = ob_high - ob_low if ob_high and ob_low else 0
+        ob_mid = (ob_low + ob_high) / 2 if ob_high and ob_low else 0
+        distance_to_entry = abs(sig['entry'] - ob_mid) if ob_mid else 0
+        distance_pct = (distance_to_entry / sig['entry'] * 100) if sig['entry'] > 0 else 0
+        in_zone = ob_breakdown.get("in_zone", False)
+        
+        breakdown_lines.extend([
+            f"  • Type: {ob_type} OB",
+            f"  • Zone Approach: +{ob_info.get('score', 0)}",
+            f"  • OB Range: {format_number(ob_low)} - {format_number(ob_high)}",
+            f"  • Range Size: {format_number(ob_range)}",
+            f"  • Midpoint: {format_number(ob_mid)}",
+            f"  • Distance to Entry: {format_number(distance_to_entry)} ({distance_pct:.2f}%)",
+            f"  • In Zone: {'✅ YES' if in_zone else '❌ NO'}",
+            f"  • Strength: {ob_breakdown.get('strength', 0):.2f}"
+        ])
+    else:
+        breakdown_lines.append(f"  • No order block detected")
+    
+    breakdown_lines.append(f"")
+    
+    # 📊 KEY METRICS SECTION
+    breakdown_lines.append(f"📊 KEY METRICS:")
+    
+    # Displacement
+    disp_info = components.get("displacement", {})
+    disp_value = disp_info.get("value", 0)
+    disp_score = disp_info.get("score", 0)
+    breakdown_lines.append(f"  • Displacement: {disp_value:.2f} ({'✅ STRONG' if disp_value >= 0.6 else '⚠️ WEAK'})")
+    
+    # Momentum
+    mom_info = components.get("momentum", {})
+    mom_value = mom_info.get("ratio", 0)
+    breakdown_lines.append(f"  • Momentum: {mom_value:.2f} {'✅ PASS' if mom_value >= 0.5 else '❌ FAIL'}")
+    
+    # HTF Alignment
+    htf_info = components.get("htf_alignment", {})
+    htf_trend = htf_info.get("trend_value", 0)
+    htf_dir = htf_info.get("htf_direction", "?")
+    breakdown_lines.append(f"  • HTF Trend: {htf_trend:+.6f}")
+    breakdown_lines.append(f"  • HTF Direction: {htf_dir}")
+    
+    # Elite MTF
+    elite_info = components.get("elite_mtf", {})
+    elite_count = elite_info.get("alignment_count", 0)
+    elite_total = elite_info.get("total_timeframes", 3)
+    breakdown_lines.append(f"  • Elite MTF: {elite_count}/{elite_total} aligned")
+    
+    breakdown_lines.append(f"")
+    
+    # 🏛️ STRUCTURE-ONLY TP VALIDATION
+    breakdown_lines.append(f"🏛️ STRUCTURE-ONLY TP VALIDATION:")
+    
+    risk_mgmt = breakdown.get("risk_management", {})
+    if risk_mgmt:
+        # Check if TPs are from structure
+        tp1_data = risk_mgmt.get("tp1_data", {})
+        tp2_data = risk_mgmt.get("tp2_data", {})
+        tp3_data = risk_mgmt.get("tp3_data", {})
+        
+        breakdown_lines.append(f"  • TP1 Source: {tp1_data.get('type', 'structure') if tp1_data else 'N/A'}")
+        if tp2_data:
+            breakdown_lines.append(f"  • TP2 Source: {tp2_data.get('type', 'structure')}")
+        if tp3_data:
+            tp3_type = tp3_data.get('type', 'structure')
+            if tp3_type == "extended_rr":
+                breakdown_lines.append(f"  • TP3 Source: Extended target ({tp3_data.get('rr_multiple', 0)}R)")
+            else:
+                breakdown_lines.append(f"  • TP3 Source: {tp3_type}")
+        
+        breakdown_lines.append(f"  • Structure Levels Found: ✅ YES")
+    else:
+        breakdown_lines.append(f"  • Structure Levels Found: ❌ NO (Signal would be rejected)")
+    
+    breakdown_lines.append(f"")
+    
+    # 🎯 TARGETS SECTION
+    breakdown_lines.append(f"🎯 STRUCTURE-BASED TARGETS:")
+    
+    if "sl" in sig and sig["sl"]:
+        risk = abs(sig['entry'] - sig['sl'])
+        breakdown_lines.extend([
+            f"  SL: {format_number(sig.get('sl', 0))}",
+            f"  TP1: {format_number(sig.get('tp1', 0))} ({risk_mgmt.get('risk_reward', 0):.1f}R)",
+        ])
+        
+        if sig.get('tp2'):
+            tp2_dist = abs(sig['tp2'] - sig['entry'])
+            tp2_r = tp2_dist / risk if risk > 0 else 0
+            breakdown_lines.append(f"  TP2: {format_number(sig.get('tp2', 0))} ({tp2_r:.1f}R)")
+        
+        if sig.get('tp3'):
+            tp3_dist = abs(sig['tp3'] - sig['entry'])
+            tp3_r = tp3_dist / risk if risk > 0 else 0
+            breakdown_lines.append(f"  TP3: {format_number(sig.get('tp3', 0))} ({tp3_r:.1f}R)")
+        
+        breakdown_lines.append(f"  Risk: {format_number(risk)}")
+        breakdown_lines.append(f"  ATR: {format_number(risk_mgmt.get('atr_value', 0))}")
+    
+    breakdown_lines.append(f"")
+    
+    # 📈 MARKET CONDITIONS
+    breakdown_lines.append(f"📈 MARKET CONDITIONS:")
+    breakdown_lines.extend([
+        f"  • Regime: {sig.get('market_regime', 'N/A')}",
+        f"  • Trend MA: {format_number(sig.get('trend_ma_value', 0))}",
+        f"  • Price vs MA: {format_number(sig.get('price_vs_ma', 0))}"
+    ])
+    
+    # 🔍 FILTER STATUS
+    breakdown_lines.append(f"")
+    breakdown_lines.append(f"🔍 FILTER STATUS:")
+    
+    # Critical filters
+    crit_score = breakdown.get("critical_score", 0)
+    crit_thresh = breakdown.get("critical_threshold", 2)
+    breakdown_lines.append(f"  • Critical Score: {crit_score}/{crit_thresh} {'✅ PASS' if crit_score >= crit_thresh else '❌ FAIL'}")
+    
+    # Minimum score
+    min_score = MIN_SCORE
+    actual_score = sig.get("score", 0)
+    breakdown_lines.append(f"  • Minimum Score: {actual_score}/{min_score} {'✅ PASS' if actual_score >= min_score else '❌ FAIL'}")
+    
+    # HTF Alignment
+    htf_score = sig.get("htf_alignment_score", 0)
+    breakdown_lines.append(f"  • HTF Alignment: {'✅ MANDATORY PASS' if htf_score == 1 else '❌ MANDATORY FAIL'}")
+    
+    # Elite MTF
+    elite_score = sig.get("elite_mtf_score", 0)
+    breakdown_lines.append(f"  • Elite MTF: {'✅ PASS' if elite_score == 1 else '❌ FAIL'}")
+    
+    # STRUCTURE VALIDATION
+    has_structure = "risk_management" in breakdown
+    breakdown_lines.append(f"  • Structure Validation: {'✅ PASS' if has_structure else '❌ FAIL (NO TRADE)'}")
+    
+    # Clean up empty lines
+    breakdown_lines = [line for line in breakdown_lines if line != ""]
+    
+    # Send to Telegram
+    try:
+        await tg("\n".join(breakdown_lines))
+    except Exception as e:
+        log.error(f"Failed to send Telegram breakdown: {e}")
+
 # ---------------- MONITOR SIGNALS ----------------
 async def monitor_signals():
     """
@@ -922,71 +1218,10 @@ async def scan_loop(exchange):
                     sig = await generate_signal_romeopt(exchange, df, symbol, tf)
                     
                     if sig:
-                        # Format detailed Telegram message with numerical breakdown
-                        breakdown = sig.get("breakdown", {})
-                        components = breakdown.get("components", {})
+                        # Send enhanced breakdown (same format as code 1)
+                        await send_enhanced_breakdown(sig)
                         
-                        msg = f"🏆 {sig['symbol']} ({tf}) {sig['side']}\n"
-                        msg += f"Entry: {sig['entry']:.8f}\n"
-                        msg += f"SL: {sig.get('sl', 'N/A'):.8f}\n"
-                        
-                        # TP levels
-                        tp_msg = ""
-                        if 'tp1' in sig and sig['tp1']:
-                            tp_msg += f"TP1: {sig['tp1']:.8f}"
-                        if 'tp2' in sig and sig['tp2']:
-                            tp_msg += f" TP2: {sig['tp2']:.8f}"
-                        if 'tp3' in sig and sig['tp3']:
-                            tp_msg += f" TP3: {sig['tp3']:.8f}"
-                        
-                        if tp_msg:
-                            msg += f"{tp_msg}\n"
-                        
-                        msg += f"Score: {sig['score']}/9\n"
-                        msg += f"Regime: {sig.get('market_regime', 'N/A')}\n"
-                        
-                        # Detailed component breakdown
-                        msg += "\n📊 COMPONENT BREAKDOWN:\n"
-                        
-                        # Liquidity Sweep
-                        ls = components.get("liquidity_sweep", {})
-                        msg += f"• Liquidity Sweep: {ls.get('score', 0)}/2"
-                        if ls.get('has_sweep'):
-                            if ls.get('sweep_high'):
-                                msg += f" (HIGH: {ls.get('current_high', 0):.8f} > {ls.get('prev_high_max', 0):.8f})"
-                            else:
-                                msg += f" (LOW: {ls.get('current_low', 0):.8f} < {ls.get('prev_low_min', 0):.8f})"
-                        msg += "\n"
-                        
-                        # Displacement
-                        disp = components.get("displacement", {})
-                        msg += f"• Displacement: {disp.get('score', 0)}/2 (Value: {disp.get('value', 0):.2f})\n"
-                        
-                        # Zone Approach
-                        zone = components.get("order_block", {})
-                        msg += f"• Zone Approach: {zone.get('score', 0)}/1 (Type: {zone.get('type', 'N/A')})\n"
-                        
-                        # HTF Alignment
-                        htf = components.get("htf_alignment", {})
-                        msg += f"• HTF Alignment: {htf.get('score', 0)}/1 (TF: {htf.get('higher_timeframe', 'N/A')})\n"
-                        
-                        # Momentum
-                        mom = components.get("momentum", {})
-                        msg += f"• Momentum: {mom.get('score', 0)}/1 (Ratio: {mom.get('ratio', 0):.2f})\n"
-                        
-                        # Elite MTF
-                        elite = components.get("elite_mtf", {})
-                        msg += f"• Elite MTF: {elite.get('score', 0)}/1 ({elite.get('alignment_count', 0)}/{elite.get('total_timeframes', 3)})\n"
-                        
-                        # Risk Management
-                        if "risk_management" in breakdown:
-                            rm = breakdown["risk_management"]
-                            msg += f"\n💰 RISK/REWARD:\n"
-                            msg += f"• Risk: {rm.get('risk', 0):.8f}\n"
-                            msg += f"• R:R (TP1): {rm.get('risk_reward', 0):.2f}:1\n"
-                            msg += f"• ATR: {rm.get('atr_value', 0):.8f}\n"
-                        
-                        await tg(msg)
+                        # Log to database
                         await log_signal(sig)
                         
                         last_signal_time[key] = time.time()
@@ -995,7 +1230,7 @@ async def scan_loop(exchange):
                         # Small delay between signals to avoid rate limits
                         await asyncio.sleep(0.5)
             
-            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found")
+            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found (Structure-Only TP/SL)")
             
         except Exception as e:
             log.exception("scan error: %s", e)
@@ -1068,7 +1303,10 @@ async def main():
         "options": {"defaultType": "spot"}
     })
     
-    await tg("🏆 ROMEOPT 6-Step Scanner Started - Structure-Only TP/SL with Full Numerical Breakdown")
+    await tg("🏆 ROMEOPT 6-Step Scanner Started - Structure-Only TP/SL with Enhanced Breakdown")
+    await tg("📊 ENHANCED BREAKDOWN ACTIVATED - Full OB & Sweep Details")
+    await tg("🏛️ STRUCTURE-ONLY TP/SL: TPs must be at valid structure levels")
+    await tg("📈 NO STRUCTURE = NO TRADE: Signals rejected if no valid TP levels")
     
     # Run both tasks concurrently
     await asyncio.gather(
