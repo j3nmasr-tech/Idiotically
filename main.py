@@ -5,7 +5,7 @@
 LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features)
 - Fully live early signals
 - RomeOPT 6-step logic with NUMERICAL BREAKDOWN
-- TP/SL tracking with PRIORITIZED STRUCTURE take profits
+- TP/SL tracking with CONSERVATIVE-FIRST TP strategy
 - Dynamic TP/SL updates (market-structure-based)
 - Telegram alerts
 - Async SQLite logging
@@ -18,7 +18,7 @@ LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features)
 - FULL NUMERICAL BREAKDOWN: All component scores stored in database
 - FIXED MONITORING: No structure revalidation during monitoring
 - 🎯 ENHANCED BREAKDOWN FORMAT: Same detailed format as FORCED FILTER version
-- 🎯 PRIORITIZED STRUCTURE TPS: 1. OB/FVG, 2. Liquidity Zones, 3. Support/Resistance
+- 🎯 CONSERVATIVE-FIRST TP: TP1=Discount/Premium, TP2=Liquidity, TP3=Major OB/FVG
 """
 
 import os, time, asyncio, logging, datetime, json
@@ -261,161 +261,245 @@ def format_number(value, decimals=6):
             return f"{value:.{decimals}f}"
     return str(value)
 
-# ---------------- PRIORITIZED STRUCTURE FINDERS ----------------
-def find_prioritized_structure_levels(df: pd.DataFrame, side: str, entry: float):
+# ---------------- CONSERVATIVE-FIRST STRUCTURE FINDERS ----------------
+def find_discount_premium_zones(df: pd.DataFrame, side: str, entry: float):
     """
-    Find structure levels with priority:
-    1. Order Blocks / FVG (highest priority)
-    2. Liquidity Zones (medium priority)
-    3. Support/Resistance (lowest priority)
+    Find DISCOUNT zones (for BUY) or PREMIUM zones (for SELL)
+    These are the CLOSEST, most CONSERVATIVE structure levels for TP1
     """
     levels = []
     
-    # 1. ORDER BLOCKS / FVG (Highest Priority - 3)
-    for i in range(5, len(df) - 2):
-        candle = df.iloc[i]
-        prev_candle = df.iloc[i-1]
+    if side == "BUY":
+        # For BUY: Look for NEAREST resistance (PREMIUM zones)
         
-        # Order Blocks
-        if candle["close"] > candle["open"] and prev_candle["close"] < prev_candle["open"]:
-            # Bullish OB - use high as potential target
-            levels.append({
-                "price": float(candle["high"]),
-                "type": "order_block",
-                "priority": 3,
-                "strength": "high",
-                "index": i
-            })
+        # 1. Recent swing highs (closest first)
+        for i in range(5, len(df) - 5):
+            if df['high'].iloc[i] == df['high'].iloc[i-3:i+4].max():
+                price = float(df['high'].iloc[i])
+                if price > entry:
+                    levels.append({
+                        "price": price,
+                        "type": "premium_swing_high",
+                        "priority": "TP1",
+                        "distance": price - entry,
+                        "index": i
+                    })
         
-        elif candle["close"] < candle["open"] and prev_candle["close"] > prev_candle["open"]:
-            # Bearish OB - use low as potential target
-            levels.append({
-                "price": float(candle["low"]),
-                "type": "order_block",
-                "priority": 3,
-                "strength": "high",
-                "index": i
-            })
+        # 2. Recent consolidation highs
+        recent_highs = df['high'].iloc[-20:].values
+        unique_highs = np.unique(np.round(recent_highs, 4))
         
-        # Fair Value Gaps (simple version)
-        if i > 1:
-            prev_high = df.iloc[i-1]["high"]
-            prev_low = df.iloc[i-1]["low"]
-            
-            if candle["low"] > prev_high:  # Bullish FVG
-                levels.append({
-                    "price": float(candle["low"]),
-                    "type": "fvg",
-                    "priority": 3,
-                    "strength": "high",
-                    "index": i
-                })
-            elif candle["high"] < prev_low:  # Bearish FVG
-                levels.append({
-                    "price": float(candle["high"]),
-                    "type": "fvg",
-                    "priority": 3,
-                    "strength": "high",
-                    "index": i
-                })
+        for price in unique_highs:
+            if price > entry:
+                # Check if price consolidated here
+                near_count = np.sum(np.abs(recent_highs - price) < price * 0.001)
+                if near_count >= 2:
+                    levels.append({
+                        "price": float(price),
+                        "type": "premium_consolidation",
+                        "priority": "TP1",
+                        "distance": price - entry,
+                        "cluster_size": int(near_count)
+                    })
     
-    # 2. LIQUIDITY ZONES (Medium Priority - 2)
-    # Look for price clusters in recent candles
-    recent_candles = df.iloc[-30:]  # Last 30 candles
+    else:  # SELL
+        # For SELL: Look for NEAREST support (DISCOUNT zones)
+        
+        # 1. Recent swing lows (closest first)
+        for i in range(5, len(df) - 5):
+            if df['low'].iloc[i] == df['low'].iloc[i-3:i+4].min():
+                price = float(df['low'].iloc[i])
+                if price < entry:
+                    levels.append({
+                        "price": price,
+                        "type": "discount_swing_low",
+                        "priority": "TP1",
+                        "distance": entry - price,
+                        "index": i
+                    })
+        
+        # 2. Recent consolidation lows
+        recent_lows = df['low'].iloc[-20:].values
+        unique_lows = np.unique(np.round(recent_lows, 4))
+        
+        for price in unique_lows:
+            if price < entry:
+                near_count = np.sum(np.abs(recent_lows - price) < price * 0.001)
+                if near_count >= 2:
+                    levels.append({
+                        "price": float(price),
+                        "type": "discount_consolidation",
+                        "priority": "TP1",
+                        "distance": entry - price,
+                        "cluster_size": int(near_count)
+                    })
+    
+    # Sort by distance (closest first) - CONSERVATIVE TP1
+    levels.sort(key=lambda x: x["distance"])
+    
+    return levels
+
+def find_liquidity_zones(df: pd.DataFrame, side: str, entry: float):
+    """
+    Find liquidity zones for TP2 (medium distance)
+    """
+    levels = []
+    
+    # Look for stronger clusters (more candles)
+    recent_candles = df.iloc[-50:]
     
     if side == "BUY":
-        # For BUY: look for clusters of highs (sell stops)
         highs = recent_candles["high"].values
         unique_highs = np.unique(np.round(highs, 4))
         
         for price in unique_highs:
-            # Count how many candles have highs near this price
-            near_count = np.sum(np.abs(highs - price) < price * 0.001)
-            if near_count >= 2:  # At least 2 candles cluster here
-                levels.append({
-                    "price": float(price),
-                    "type": "liquidity_zone",
-                    "priority": 2,
-                    "strength": "medium",
-                    "cluster_size": int(near_count)
-                })
+            if price > entry * 1.005:  # Further than TP1
+                near_count = np.sum(np.abs(highs - price) < price * 0.001)
+                if near_count >= 3:  # Stronger cluster for TP2
+                    levels.append({
+                        "price": float(price),
+                        "type": "liquidity_zone",
+                        "priority": "TP2",
+                        "distance": price - entry,
+                        "cluster_size": int(near_count)
+                    })
     
     else:  # SELL
-        # For SELL: look for clusters of lows (buy stops)
         lows = recent_candles["low"].values
         unique_lows = np.unique(np.round(lows, 4))
         
         for price in unique_lows:
-            near_count = np.sum(np.abs(lows - price) < price * 0.001)
-            if near_count >= 2:
-                levels.append({
-                    "price": float(price),
-                    "type": "liquidity_zone",
-                    "priority": 2,
-                    "strength": "medium",
-                    "cluster_size": int(near_count)
-                })
+            if price < entry * 0.995:  # Further than TP1
+                near_count = np.sum(np.abs(lows - price) < price * 0.001)
+                if near_count >= 3:
+                    levels.append({
+                        "price": float(price),
+                        "type": "liquidity_zone",
+                        "priority": "TP2",
+                        "distance": entry - price,
+                        "cluster_size": int(near_count)
+                    })
     
-    # 3. SUPPORT/RESISTANCE (Lowest Priority - 1)
-    # Simple swing high/low detection
-    for i in range(10, len(df) - 10):
-        # Swing highs (for BUY targets)
-        if side == "BUY":
-            if df['high'].iloc[i] == df['high'].iloc[i-5:i+6].max():
-                levels.append({
-                    "price": float(df['high'].iloc[i]),
-                    "type": "swing_high",
-                    "priority": 1,
-                    "strength": "low",
-                    "index": i
-                })
+    # Sort by cluster strength (strongest first)
+    levels.sort(key=lambda x: -x["cluster_size"])
+    
+    return levels
+
+def find_major_structure(df: pd.DataFrame, side: str, entry: float):
+    """
+    Find major OB/FVG or large liquidity for TP3 (aggressive targets)
+    """
+    levels = []
+    
+    # 1. Major Order Blocks (clear, strong ones)
+    for i in range(20, len(df) - 10):
+        candle = df.iloc[i]
+        prev_candle = df.iloc[i-1]
         
-        # Swing lows (for SELL targets)
-        else:
-            if df['low'].iloc[i] == df['low'].iloc[i-5:i+6].min():
-                levels.append({
-                    "price": float(df['low'].iloc[i]),
-                    "type": "swing_low",
-                    "priority": 1,
-                    "strength": "low",
-                    "index": i
-                })
-    
-    # Filter by side and remove duplicates
-    filtered_levels = []
-    seen_prices = set()
-    
-    for level in levels:
-        price = level["price"]
-        
-        # Skip if too close to entry (0.1% threshold)
-        if abs(price - entry) / entry < 0.001:
-            continue
+        # Strong bullish OB (big candle, clear reversal)
+        if (candle["close"] > candle["open"] and 
+            prev_candle["close"] < prev_candle["open"] and
+            abs(candle["close"] - candle["open"]) > candle["close"] * 0.02):  # Big candle
             
-        # Skip if duplicate (within 0.1%)
-        is_duplicate = False
-        for seen_price in seen_prices:
-            if abs(price - seen_price) / price < 0.001:
-                is_duplicate = True
-                break
+            if side == "BUY":
+                price = float(candle["high"])
+                if price > entry * 1.01:  # Further away
+                    levels.append({
+                        "price": price,
+                        "type": "major_ob_bullish",
+                        "priority": "TP3",
+                        "distance": price - entry,
+                        "strength": "high",
+                        "index": i
+                    })
         
-        if is_duplicate:
-            continue
+        # Strong bearish OB
+        elif (candle["close"] < candle["open"] and 
+              prev_candle["close"] > prev_candle["open"] and
+              abs(candle["close"] - candle["open"]) > candle["close"] * 0.02):
+            
+            if side == "SELL":
+                price = float(candle["low"])
+                if price < entry * 0.99:  # Further away
+                    levels.append({
+                        "price": price,
+                        "type": "major_ob_bearish",
+                        "priority": "TP3",
+                        "distance": entry - price,
+                        "strength": "high",
+                        "index": i
+                    })
+    
+    # 2. Large liquidity clusters
+    recent_candles = df.iloc[-100:]  # Larger lookback
+    
+    if side == "BUY":
+        highs = recent_candles["high"].values
+        unique_highs = np.unique(np.round(highs, 4))
         
-        # Filter by direction
-        if side == "BUY":
-            if price > entry:
-                filtered_levels.append(level)
-                seen_prices.add(price)
-        else:  # SELL
-            if price < entry:
-                filtered_levels.append(level)
-                seen_prices.add(price)
+        for price in unique_highs:
+            if price > entry * 1.02:  # Much further
+                near_count = np.sum(np.abs(highs - price) < price * 0.001)
+                if near_count >= 5:  # Very strong cluster
+                    levels.append({
+                        "price": float(price),
+                        "type": "major_liquidity_cluster",
+                        "priority": "TP3",
+                        "distance": price - entry,
+                        "cluster_size": int(near_count)
+                    })
     
-    # Sort by: 1. Priority (highest first), 2. Distance from entry (closest first)
-    filtered_levels.sort(key=lambda x: (-x["priority"], abs(x["price"] - entry)))
+    else:  # SELL
+        lows = recent_candles["low"].values
+        unique_lows = np.unique(np.round(lows, 4))
+        
+        for price in unique_lows:
+            if price < entry * 0.98:  # Much further
+                near_count = np.sum(np.abs(lows - price) < price * 0.001)
+                if near_count >= 5:
+                    levels.append({
+                        "price": float(price),
+                        "type": "major_liquidity_cluster",
+                        "priority": "TP3",
+                        "distance": entry - price,
+                        "cluster_size": int(near_count)
+                    })
     
-    return filtered_levels
+    # 3. Clear Fair Value Gaps
+    for i in range(10, len(df) - 5):
+        candle = df.iloc[i]
+        prev_candle = df.iloc[i-1]
+        
+        # Bullish FVG (price gapped up)
+        if candle["low"] > prev_candle["high"]:
+            gap_mid = (prev_candle["high"] + candle["low"]) / 2
+            if side == "BUY" and gap_mid > entry * 1.01:
+                levels.append({
+                    "price": float(gap_mid),
+                    "type": "major_fvg_bullish",
+                    "priority": "TP3",
+                    "distance": gap_mid - entry,
+                    "strength": "high",
+                    "index": i
+                })
+        
+        # Bearish FVG (price gapped down)
+        elif candle["high"] < prev_candle["low"]:
+            gap_mid = (candle["high"] + prev_candle["low"]) / 2
+            if side == "SELL" and gap_mid < entry * 0.99:
+                levels.append({
+                    "price": float(gap_mid),
+                    "type": "major_fvg_bearish",
+                    "priority": "TP3",
+                    "distance": entry - gap_mid,
+                    "strength": "high",
+                    "index": i
+                })
+    
+    # Sort by distance (furthest first for TP3 - aggressive)
+    levels.sort(key=lambda x: -x["distance"])
+    
+    return levels
 
 # ---------------- TP/SL HELPERS ----------------
 def find_latest_ob(df: pd.DataFrame):
@@ -444,16 +528,15 @@ def find_latest_ob(df: pd.DataFrame):
 
 def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
     """
-    PRIORITIZED STRUCTURE TP/SL system:
-    1. Order Blocks / FVG (highest priority)
-    2. Liquidity Zones (medium priority)
-    3. Support/Resistance (lowest priority)
-    NO FALLBACK - if no structure, signal is rejected
+    CONSERVATIVE-FIRST TP/SL system:
+    TP1 = Discount/Premium zones (closest, safest, highest hit rate)
+    TP2 = Liquidity zones (medium distance, moderate probability)
+    TP3 = Major OB/FVG (aggressive, max reward, lower probability)
     """
     recent_high = df['high'].iloc[-10:].max()
     recent_low = df['low'].iloc[-10:].min()
     
-    # Calculate stop loss (unchanged from your code)
+    # Calculate stop loss (unchanged)
     if side == "BUY":
         sl_ob = ob_zone["low"] - (atr_val * 0.3)
         sl_structure = recent_low - (atr_val * 0.3)
@@ -476,59 +559,84 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
             risk = min_risk
             sl = entry + risk
     
-    # Find structure levels with priority
-    all_levels = find_prioritized_structure_levels(df, side, entry)
+    # 1. Find TP1 levels (Discount/Premium zones - CLOSEST, SAFEST)
+    tp1_levels = find_discount_premium_zones(df, side, entry)
     
-    # Filter for meaningful profit (at least 0.5R)
-    meaningful_levels = []
-    for level in all_levels:
+    # Filter for minimum 0.5R profit
+    valid_tp1_levels = []
+    for level in tp1_levels:
         if side == "BUY":
             profit = level["price"] - entry
         else:
             profit = entry - level["price"]
         
-        if profit >= risk * 0.5:  # Minimum 0.5R profit
+        if profit >= risk * 0.5:
             level["profit_r"] = profit / risk
-            meaningful_levels.append(level)
+            valid_tp1_levels.append(level)
     
-    # NO STRUCTURE = REJECT SIGNAL (NO FALLBACK)
-    if not meaningful_levels:
-        log.debug(f"No valid structure levels found for {side} at {entry}")
+    # If no valid TP1 levels, reject signal (NO TP1 = NO TRADE)
+    if not valid_tp1_levels:
+        log.debug(f"No valid discount/premium zones for {side} at {entry}")
         return None
     
-    # Select up to 3 levels with minimum spacing
-    selected_levels = []
-    for level in meaningful_levels:
-        if not selected_levels:
-            selected_levels.append(level)
+    # Select TP1 (closest valid level)
+    tp1_data = valid_tp1_levels[0]
+    tp1 = tp1_data["price"]
+    
+    # 2. Find TP2 levels (Liquidity zones - MEDIUM distance)
+    tp2_levels = find_liquidity_zones(df, side, entry)
+    
+    # Filter: must be beyond TP1 + minimum spacing
+    valid_tp2_levels = []
+    for level in tp2_levels:
+        # Check minimum spacing from TP1 (0.5R)
+        min_spacing = risk * 0.5
+        
+        if side == "BUY":
+            if level["price"] > tp1 + min_spacing:
+                profit = level["price"] - entry
+                if profit >= risk * 1.0:  # At least 1R for TP2
+                    level["profit_r"] = profit / risk
+                    valid_tp2_levels.append(level)
         else:
-            # Ensure minimum spacing (0.5R between levels)
-            last_price = selected_levels[-1]["price"]
+            if level["price"] < tp1 - min_spacing:
+                profit = entry - level["price"]
+                if profit >= risk * 1.0:
+                    level["profit_r"] = profit / risk
+                    valid_tp2_levels.append(level)
+    
+    # Select TP2 (strongest liquidity cluster)
+    tp2_data = valid_tp2_levels[0] if valid_tp2_levels else None
+    tp2 = tp2_data["price"] if tp2_data else None
+    
+    # 3. Find TP3 levels (Major OB/FVG - AGGRESSIVE)
+    if tp2:
+        tp3_levels = find_major_structure(df, side, entry)
+        
+        valid_tp3_levels = []
+        for level in tp3_levels:
+            # Must be beyond TP2 + minimum spacing (0.5R)
             min_spacing = risk * 0.5
             
             if side == "BUY":
-                if level["price"] - last_price >= min_spacing:
-                    selected_levels.append(level)
+                if level["price"] > tp2 + min_spacing:
+                    profit = level["price"] - entry
+                    if profit >= risk * 1.5:  # At least 1.5R for TP3
+                        level["profit_r"] = profit / risk
+                        valid_tp3_levels.append(level)
             else:
-                if last_price - level["price"] >= min_spacing:
-                    selected_levels.append(level)
+                if level["price"] < tp2 - min_spacing:
+                    profit = entry - level["price"]
+                    if profit >= risk * 1.5:
+                        level["profit_r"] = profit / risk
+                        valid_tp3_levels.append(level)
         
-        if len(selected_levels) >= 3:
-            break
-    
-    # If we couldn't find enough levels, reject the signal
-    if len(selected_levels) < 1:
-        log.debug(f"Not enough structure levels (found {len(selected_levels)} need at least 1)")
-        return None
-    
-    # Get TP prices
-    tp1_data = selected_levels[0]
-    tp2_data = selected_levels[1] if len(selected_levels) > 1 else None
-    tp3_data = selected_levels[2] if len(selected_levels) > 2 else None
-    
-    tp1 = tp1_data["price"]
-    tp2 = tp2_data["price"] if tp2_data else None
-    tp3 = tp3_data["price"] if tp3_data else None
+        # Select TP3 (furthest major structure)
+        tp3_data = valid_tp3_levels[0] if valid_tp3_levels else None
+        tp3 = tp3_data["price"] if tp3_data else None
+    else:
+        tp3_data = None
+        tp3 = None
     
     # Calculate risk-reward for TP1
     rr_tp1 = tp1_data["profit_r"]
@@ -537,7 +645,7 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
 
 def update_tp_sl_live(sig: dict, df: pd.DataFrame):
     """
-    Calculate TP/SL with PRIORITIZED STRUCTURE requirement
+    Calculate TP/SL with CONSERVATIVE-FIRST TP requirement
     Returns None if no valid structure exists
     """
     latest_ob = find_latest_ob(df)
@@ -575,7 +683,7 @@ def update_tp_sl_live(sig: dict, df: pd.DataFrame):
 
 # ---------------- ROMEOPT 6-STEP SIGNAL ----------------
 async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
-    """Generate RomeOPT 6-step signal with PRIORITIZED STRUCTURE TP requirement"""
+    """Generate RomeOPT 6-step signal with CONSERVATIVE-FIRST TP requirement"""
     if df is None or len(df) < 20:
         return None
     
@@ -871,7 +979,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         "price_vs_ma": float(last["close"] - trend_ma)
     }
     
-    # ---------------- PRIORITIZED STRUCTURE TP/SL CALCULATION ----------------
+    # ---------------- CONSERVATIVE-FIRST TP/SL CALCULATION ----------------
     sig = update_tp_sl_live(sig, df)
     
     # If no structure for TP, reject the signal
@@ -975,7 +1083,7 @@ async def log_signal(sig):
 # ---------------- ENHANCED BREAKDOWN FORMATTING ----------------
 async def send_enhanced_breakdown(sig):
     """
-    Format and send the enhanced breakdown with structure source information
+    Format and send the enhanced breakdown with CONSERVATIVE-FIRST TP strategy
     """
     breakdown = sig.get("breakdown", {})
     components = breakdown.get("components", {})
@@ -1069,8 +1177,16 @@ async def send_enhanced_breakdown(sig):
     
     breakdown_lines.append(f"")
     
-    # 🏛️ PRIORITIZED STRUCTURE TP VALIDATION
-    breakdown_lines.append(f"🏛️ PRIORITIZED STRUCTURE TP VALIDATION:")
+    # 🎯 CONSERVATIVE-FIRST TP STRATEGY
+    breakdown_lines.append(f"🎯 CONSERVATIVE-FIRST TP STRATEGY:")
+    breakdown_lines.append(f"  • TP1: Discount/Premium Zone (Closest, Safest, Highest Hit Rate)")
+    breakdown_lines.append(f"  • TP2: Liquidity Zone (Medium Distance, Moderate Probability)")
+    breakdown_lines.append(f"  • TP3: Major OB/FVG (Aggressive, Max Reward, Lower Probability)")
+    
+    breakdown_lines.append(f"")
+    
+    # 🏛️ TP STRUCTURE VALIDATION
+    breakdown_lines.append(f"🏛️ TP STRUCTURE VALIDATION:")
     
     risk_mgmt = breakdown.get("risk_management", {})
     if risk_mgmt:
@@ -1079,43 +1195,49 @@ async def send_enhanced_breakdown(sig):
         tp2_data = risk_mgmt.get("tp2_data", {})
         tp3_data = risk_mgmt.get("tp3_data", {})
         
-        breakdown_lines.append(f"  • TP1 Source: {tp1_data.get('type', 'unknown').upper()} (Priority: {tp1_data.get('priority', 'N/A')})")
+        if tp1_data:
+            tp1_type = tp1_data.get('type', 'unknown').replace('_', ' ').upper()
+            breakdown_lines.append(f"  • TP1 Source: {tp1_type}")
+        else:
+            breakdown_lines.append(f"  • TP1 Source: No valid structure (Signal would be rejected)")
         
         if tp2_data:
-            breakdown_lines.append(f"  • TP2 Source: {tp2_data.get('type', 'unknown').upper()} (Priority: {tp2_data.get('priority', 'N/A')})")
+            tp2_type = tp2_data.get('type', 'unknown').replace('_', ' ').upper()
+            breakdown_lines.append(f"  • TP2 Source: {tp2_type}")
         else:
-            breakdown_lines.append(f"  • TP2 Source: No valid structure found")
+            breakdown_lines.append(f"  • TP2 Source: No valid liquidity zone found")
             
         if tp3_data:
-            breakdown_lines.append(f"  • TP3 Source: {tp3_data.get('type', 'unknown').upper()} (Priority: {tp3_data.get('priority', 'N/A')})")
+            tp3_type = tp3_data.get('type', 'unknown').replace('_', ' ').upper()
+            breakdown_lines.append(f"  • TP3 Source: {tp3_type}")
         else:
-            breakdown_lines.append(f"  • TP3 Source: No valid structure found")
+            breakdown_lines.append(f"  • TP3 Source: No major OB/FVG found")
         
-        breakdown_lines.append(f"  • Structure Levels Found: ✅ YES (Priority: 1.OB/FVG, 2.Liquidity, 3.S/R)")
+        breakdown_lines.append(f"  • Structure Levels Found: ✅ YES (Conservative-First Strategy)")
     else:
         breakdown_lines.append(f"  • Structure Levels Found: ❌ NO (Signal rejected)")
     
     breakdown_lines.append(f"")
     
-    # 🎯 STRUCTURE-BASED TARGETS
-    breakdown_lines.append(f"🎯 STRUCTURE-BASED TARGETS (PRIORITIZED):")
+    # 🎯 TARGET LEVELS
+    breakdown_lines.append(f"🎯 TARGET LEVELS:")
     
     if "sl" in sig and sig["sl"]:
         risk = abs(sig['entry'] - sig['sl'])
         breakdown_lines.extend([
             f"  SL: {format_number(sig.get('sl', 0))}",
-            f"  TP1: {format_number(sig.get('tp1', 0))} ({risk_mgmt.get('risk_reward', 0):.1f}R)",
+            f"  TP1: {format_number(sig.get('tp1', 0))} ({risk_mgmt.get('risk_reward', 0):.1f}R) - CONSERVATIVE",
         ])
         
         if sig.get('tp2'):
             tp2_dist = abs(sig['tp2'] - sig['entry'])
             tp2_r = tp2_dist / risk if risk > 0 else 0
-            breakdown_lines.append(f"  TP2: {format_number(sig.get('tp2', 0))} ({tp2_r:.1f}R)")
+            breakdown_lines.append(f"  TP2: {format_number(sig.get('tp2', 0))} ({tp2_r:.1f}R) - MODERATE")
         
         if sig.get('tp3'):
             tp3_dist = abs(sig['tp3'] - sig['entry'])
             tp3_r = tp3_dist / risk if risk > 0 else 0
-            breakdown_lines.append(f"  TP3: {format_number(sig.get('tp3', 0))} ({tp3_r:.1f}R)")
+            breakdown_lines.append(f"  TP3: {format_number(sig.get('tp3', 0))} ({tp3_r:.1f}R) - AGGRESSIVE")
         
         breakdown_lines.append(f"  Risk: {format_number(risk)}")
         breakdown_lines.append(f"  ATR: {format_number(risk_mgmt.get('atr_value', 0))}")
@@ -1285,7 +1407,7 @@ async def scan_loop(exchange):
                     sig = await generate_signal_romeopt(exchange, df, symbol, tf)
                     
                     if sig:
-                        # Send enhanced breakdown with structure source info
+                        # Send enhanced breakdown
                         await send_enhanced_breakdown(sig)
                         
                         # Log to database
@@ -1297,7 +1419,7 @@ async def scan_loop(exchange):
                         # Small delay between signals to avoid rate limits
                         await asyncio.sleep(0.5)
             
-            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found (Prioritized Structure TP/SL)")
+            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals found (Conservative-First TP/SL)")
             
         except Exception as e:
             log.exception("scan error: %s", e)
@@ -1370,10 +1492,11 @@ async def main():
         "options": {"defaultType": "spot"}
     })
     
-    await tg("🏆 ROMEOPT 6-Step Scanner Started - PRIORITIZED STRUCTURE TP/SL")
-    await tg("🎯 STRUCTURE PRIORITY: 1. OB/FVG, 2. Liquidity Zones, 3. Support/Resistance")
-    await tg("🏛️ NO STRUCTURE = NO TRADE: Signals rejected if no valid TP levels")
-    await tg("📊 ENHANCED BREAKDOWN: Shows structure source for each TP level")
+    await tg("🏆 ROMEOPT 6-Step Scanner Started - CONSERVATIVE-FIRST TP STRATEGY")
+    await tg("🎯 TP1: Discount/Premium Zones (Closest, Safest, Highest Hit Rate)")
+    await tg("🎯 TP2: Liquidity Zones (Medium Distance, Moderate Probability)")
+    await tg("🎯 TP3: Major OB/FVG (Aggressive, Max Reward, Lower Probability)")
+    await tg("🏛️ NO TP1 = NO TRADE: Conservative-first approach ensures early profit safety")
     
     # Run both tasks concurrently
     await asyncio.gather(
