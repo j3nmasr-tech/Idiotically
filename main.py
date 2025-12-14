@@ -16,6 +16,7 @@ LIVE ROMEOPT 6-STEP SCANNER (Enhanced + Elite Features)
 - Elite multi-timeframe confirmation (15m,1h,4h)
 - STRUCTURE-REQUIRED: Signals rejected if no valid structure levels exist for TP
 - FULL NUMERICAL BREAKDOWN: All component scores stored in database
+- FIXED MONITORING: No structure revalidation during monitoring
 """
 
 import os, time, asyncio, logging, datetime, json
@@ -770,6 +771,12 @@ async def log_signal(sig):
 
 # ---------------- MONITOR SIGNALS ----------------
 async def monitor_signals():
+    """
+    Monitor open positions for TP/SL hits
+    - TP/SL levels are FIXED after entry (not recalculated)
+    - Only checks if price hit predefined levels
+    - No structure revalidation during monitoring
+    """
     while True:
         try:
             async with db_lock:
@@ -783,31 +790,11 @@ async def monitor_signals():
                             last_price = ticker.get("last")
                             if last_price is None:
                                 continue
-                        except:
+                        except Exception as e:
+                            log.debug(f"Failed to fetch ticker for {symbol}: {e}")
                             continue
                         
-                        # Update TP/SL based on latest structure (optional)
-                        try:
-                            ohlcv = await fetch_ohlcv(exchange, symbol, "1m", 100)
-                            if ohlcv:
-                                df_live = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
-                                for col in ["open", "high", "low", "close", "vol"]:
-                                    df_live[col] = pd.to_numeric(df_live[col], errors="coerce")
-                                
-                                # Recalculate TP/SL to check if still valid
-                                sig = {"symbol": symbol, "side": side, "entry": entry}
-                                updated_sig = update_tp_sl_live(sig, df_live)
-                                
-                                if updated_sig:
-                                    sl, tp1, tp2, tp3 = updated_sig["sl"], updated_sig["tp1"], updated_sig["tp2"], updated_sig["tp3"]
-                                else:
-                                    # Structure no longer valid - close signal
-                                    status = "CLOSED"
-                                    await tg(f"⚠️ {symbol} {side} CLOSED\nStructure invalidated\nEntry: {entry}\nLast: {last_price}")
-                        except:
-                            pass  # Keep existing TP/SL if update fails
-                        
-                        # Check for TP/SL hits
+                        # Check for TP/SL hits - USING ORIGINAL TP/SL LEVELS
                         hits = []
                         sl_hit = False
                         
