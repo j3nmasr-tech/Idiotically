@@ -68,42 +68,75 @@ async def init_db():
     db_conn = await aiosqlite.connect(DB_PATH)
     await db_conn.execute("PRAGMA journal_mode=WAL;")
     await db_conn.execute("PRAGMA synchronous=NORMAL;")
-    await db_conn.execute("""
-        CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT,
-            side TEXT,
-            entry REAL,
-            sl REAL,
-            tp1 REAL,
-            tp2 REAL,
-            tp3 REAL,
-            timestamp TEXT,
-            status TEXT,
-            reason TEXT,
-            score INTEGER,
-            tp1_hit INTEGER DEFAULT 0,
-            tp2_hit INTEGER DEFAULT 0,
-            tp3_hit INTEGER DEFAULT 0,
-            latest_ob TEXT,
-            -- NUMERICAL BREAKDOWN FIELDS --
-            liquidity_sweep_score INTEGER,
-            displacement_score INTEGER,
-            displacement_value REAL,
-            zone_approach_score INTEGER,
-            htf_alignment_score INTEGER,
-            momentum_score INTEGER,
-            momentum_value REAL,
-            elite_mtf_score INTEGER,
-            market_regime TEXT,
-            order_block_type TEXT,
-            order_block_low REAL,
-            order_block_high REAL,
-            atr_value REAL,
-            risk_reward REAL,
-            breakdown_json TEXT
-        );
-    """)
+    
+    # First, check if table exists and get its current columns
+    cursor = await db_conn.execute("PRAGMA table_info(signals)")
+    columns = await cursor.fetchall()
+    column_names = [col[1] for col in columns] if columns else []
+    
+    # Create table if it doesn't exist with all new columns
+    if not column_names:
+        await db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
+                side TEXT,
+                entry REAL,
+                sl REAL,
+                tp1 REAL,
+                tp2 REAL,
+                tp3 REAL,
+                timestamp TEXT,
+                status TEXT,
+                reason TEXT,
+                score INTEGER,
+                tp1_hit INTEGER DEFAULT 0,
+                tp2_hit INTEGER DEFAULT 0,
+                tp3_hit INTEGER DEFAULT 0,
+                latest_ob TEXT,
+                -- NUMERICAL BREAKDOWN FIELDS --
+                liquidity_sweep_score INTEGER,
+                displacement_score INTEGER,
+                displacement_value REAL,
+                zone_approach_score INTEGER,
+                htf_alignment_score INTEGER,
+                momentum_score INTEGER,
+                momentum_value REAL,
+                elite_mtf_score INTEGER,
+                market_regime TEXT,
+                order_block_type TEXT,
+                order_block_low REAL,
+                order_block_high REAL,
+                atr_value REAL,
+                risk_reward REAL,
+                breakdown_json TEXT
+            );
+        """)
+    else:
+        # Table exists, add missing columns
+        new_columns = [
+            ("liquidity_sweep_score", "INTEGER"),
+            ("displacement_score", "INTEGER"),
+            ("displacement_value", "REAL"),
+            ("zone_approach_score", "INTEGER"),
+            ("htf_alignment_score", "INTEGER"),
+            ("momentum_score", "INTEGER"),
+            ("momentum_value", "REAL"),
+            ("elite_mtf_score", "INTEGER"),
+            ("market_regime", "TEXT"),
+            ("order_block_type", "TEXT"),
+            ("order_block_low", "REAL"),
+            ("order_block_high", "REAL"),
+            ("atr_value", "REAL"),
+            ("risk_reward", "REAL"),
+            ("breakdown_json", "TEXT")
+        ]
+        
+        for col_name, col_type in new_columns:
+            if col_name not in column_names:
+                log.info(f"Adding missing column: {col_name}")
+                await db_conn.execute(f"ALTER TABLE signals ADD COLUMN {col_name} {col_type}")
+    
     await db_conn.commit()
 
 # ---------------- OHLCV ----------------
@@ -753,18 +786,18 @@ async def log_signal(sig):
             datetime.datetime.utcnow().isoformat(), "OPEN", sig["reason"], sig["score"],
             sig.get("liquidity_sweep_score", 0),
             sig.get("displacement_score", 0),
-            sig.get("displacement_value", 0),
+            sig.get("displacement_value", 0.0),
             sig.get("zone_approach_score", 0),
             sig.get("htf_alignment_score", 0),
             sig.get("momentum_score", 0),
-            sig.get("momentum_value", 0),
+            sig.get("momentum_value", 0.0),
             sig.get("elite_mtf_score", 0),
             sig.get("market_regime", "UNKNOWN"),
             sig.get("order_block_type", "UNKNOWN"),
-            sig.get("order_block_low"),
-            sig.get("order_block_high"),
-            sig.get("atr_value", 0),
-            sig.get("risk_reward", 0),
+            sig.get("order_block_low", 0.0),
+            sig.get("order_block_high", 0.0),
+            sig.get("atr_value", 0.0),
+            sig.get("risk_reward", 0.0),
             sig.get("breakdown_json", "{}")
         ))
         await db_conn.commit()
@@ -776,6 +809,7 @@ async def monitor_signals():
     - TP/SL levels are FIXED after entry (not recalculated)
     - Only checks if price hit predefined levels
     - No structure revalidation during monitoring
+    - FIXED: Handle None values for TP2/TP3
     """
     while True:
         try:
@@ -802,10 +836,12 @@ async def monitor_signals():
                             if not tp1_hit and last_price >= tp1:
                                 hits.append("TP1")
                                 tp1_hit = 1
-                            if not tp2_hit and last_price >= tp2:
+                            # Check TP2 only if it exists and is not None
+                            if tp2 is not None and not tp2_hit and last_price >= tp2:
                                 hits.append("TP2")
                                 tp2_hit = 1
-                            if not tp3_hit and last_price >= tp3:
+                            # Check TP3 only if it exists and is not None
+                            if tp3 is not None and not tp3_hit and last_price >= tp3:
                                 hits.append("TP3")
                                 tp3_hit = 1
                             if last_price <= sl:
@@ -816,10 +852,12 @@ async def monitor_signals():
                             if not tp1_hit and last_price <= tp1:
                                 hits.append("TP1")
                                 tp1_hit = 1
-                            if not tp2_hit and last_price <= tp2:
+                            # Check TP2 only if it exists and is not None
+                            if tp2 is not None and not tp2_hit and last_price <= tp2:
                                 hits.append("TP2")
                                 tp2_hit = 1
-                            if not tp3_hit and last_price <= tp3:
+                            # Check TP3 only if it exists and is not None
+                            if tp3 is not None and not tp3_hit and last_price <= tp3:
                                 hits.append("TP3")
                                 tp3_hit = 1
                             if last_price >= sl:
@@ -830,8 +868,8 @@ async def monitor_signals():
                         if hits:
                             msg = f"🎯 {symbol} {side} update\nEntry: {entry:.8f}\nLast: {last_price:.8f}\nHits: {','.join(hits)}\nSL: {sl:.8f}"
                             if tp1: msg += f"\nTP1: {tp1:.8f}"
-                            if tp2: msg += f" TP2: {tp2:.8f}"
-                            if tp3: msg += f" TP3: {tp3:.8f}"
+                            if tp2: msg += f" TP2: {tp2:.8f}" if tp2 else ""
+                            if tp3: msg += f" TP3: {tp3:.8f}" if tp3 else ""
                             await tg(msg)
                         
                         if sl_hit:
