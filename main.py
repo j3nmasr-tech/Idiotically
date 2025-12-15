@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-TRUE ROMEOPT SCANNER (Final Refined Version)
+TRUE ROMEOPT SCANNER (Final Refined Version) - WITH ENHANCED SWEEP & OB DATA
 - RomeOPT 6-step entry logic
 - TRUE RomeOPT TP: ONE liquidity target, no TP ladders
 - Simple but accurate market state detection
@@ -11,6 +11,7 @@ TRUE ROMEOPT SCANNER (Final Refined Version)
 - TP LOCK: No recalculation after entry
 - Telegram alerts + SQLite logging
 - Forced Filter: Momentum ≥ 0.87 OR (Momentum ≥ 0.85 AND Displacement ≥ 0.80)
+- ENHANCED: Comprehensive liquidity sweep and order block data
 """
 
 import os, time, asyncio, logging, datetime
@@ -122,14 +123,6 @@ async def migrate_db():
                         await db_conn.execute("UPDATE signals SET tp_hit = tp1_hit WHERE tp_hit = 0 AND tp1_hit = 1")
                     
                     log.info("✅ Data migration complete")
-        
-        # Drop old columns if they exist (optional - can keep for backward compatibility)
-        # columns_to_drop = ['tp1', 'tp2', 'tp3', 'tp1_hit', 'tp2_hit', 'tp3_hit']
-        # for col in columns_to_drop:
-        #     if col in column_names:
-        #         # SQLite doesn't support DROP COLUMN, would need table recreation
-        #         # We'll just leave them for now
-        #         pass
         
         await db_conn.commit()
         
@@ -377,6 +370,86 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
     
     return sl, tp, tp_type
 
+# ---------------- ENHANCED ORDER BLOCK DETECTION ----------------
+def find_latest_ob(df: pd.DataFrame, lookback=50):
+    """
+    Enhanced Order Block detection with detailed classification
+    Returns comprehensive OB data
+    """
+    blocks = []
+    
+    # Look for order blocks in the specified lookback
+    for i in range(max(2, len(df) - lookback), len(df) - 1):
+        candle = df.iloc[i]
+        prev_candle = df.iloc[i-1]
+        
+        # Bullish Order Block: Bearish candle followed by bullish candle
+        if (prev_candle["close"] < prev_candle["open"] and  # Previous bearish
+            candle["close"] > candle["open"] and            # Current bullish
+            candle["close"] > prev_candle["close"]):        # Closes above previous close
+            
+            block = {
+                "type": "BULLISH_OB",
+                "index": i,
+                "timestamp": candle.name if hasattr(candle, 'name') else i,
+                "low": min(candle["low"], prev_candle["low"]),
+                "high": max(candle["close"], prev_candle["close"]),
+                "body_low": min(candle["open"], candle["close"]),
+                "body_high": max(candle["open"], candle["close"]),
+                "volume": candle["vol"] if "vol" in candle else 0,
+                "candle_size": candle["high"] - candle["low"],
+                "body_size": abs(candle["close"] - candle["open"]),
+                "wick_ratio": (candle["high"] - max(candle["open"], candle["close"])) / 
+                              (candle["high"] - candle["low"]) if (candle["high"] - candle["low"]) > 0 else 0
+            }
+            blocks.append(block)
+        
+        # Bearish Order Block: Bullish candle followed by bearish candle
+        elif (prev_candle["close"] > prev_candle["open"] and  # Previous bullish
+              candle["close"] < candle["open"] and            # Current bearish
+              candle["close"] < prev_candle["close"]):        # Closes below previous close
+            
+            block = {
+                "type": "BEARISH_OB",
+                "index": i,
+                "timestamp": candle.name if hasattr(candle, 'name') else i,
+                "low": min(candle["close"], prev_candle["close"]),
+                "high": max(candle["high"], prev_candle["high"]),
+                "body_low": min(candle["open"], candle["close"]),
+                "body_high": max(candle["open"], candle["close"]),
+                "volume": candle["vol"] if "vol" in candle else 0,
+                "candle_size": candle["high"] - candle["low"],
+                "body_size": abs(candle["close"] - candle["open"]),
+                "wick_ratio": (min(candle["open"], candle["close"]) - candle["low"]) / 
+                              (candle["high"] - candle["low"]) if (candle["high"] - candle["low"]) > 0 else 0
+            }
+            blocks.append(block)
+    
+    # Return the most recent order block if any exist
+    if blocks:
+        latest_block = max(blocks, key=lambda x: x["index"])
+        
+        # Add classification based on strength
+        body_ratio = latest_block["body_size"] / latest_block["candle_size"] if latest_block["candle_size"] > 0 else 0
+        if body_ratio >= 0.7:
+            latest_block["strength"] = "STRONG"
+        elif body_ratio >= 0.5:
+            latest_block["strength"] = "MODERATE"
+        else:
+            latest_block["strength"] = "WEAK"
+        
+        # Check if OB has been tested
+        if latest_block["type"] == "BULLISH_OB":
+            subsequent_candles = df.iloc[latest_block["index"]+1:min(latest_block["index"]+10, len(df))]
+            latest_block["tested"] = any(candle["low"] <= latest_block["high"] for _, candle in subsequent_candles.iterrows())
+        else:  # BEARISH_OB
+            subsequent_candles = df.iloc[latest_block["index"]+1:min(latest_block["index"]+10, len(df))]
+            latest_block["tested"] = any(candle["high"] >= latest_block["low"] for _, candle in subsequent_candles.iterrows())
+        
+        return latest_block
+    
+    return None
+
 # ---------------- REST OF SIGNAL GENERATION ----------------
 async def elite_tf_alignment(exchange, symbol: str, side: str):
     tfs = ["15m","1h","4h"]
@@ -400,16 +473,69 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     
     calc_values = {}
 
-    # Step 1: Liquidity Sweep
-    sweep_high = last["high"] > prev5["high"].max()
-    sweep_low = last["low"] < prev5["low"].min()
-    has_sweep = sweep_high or sweep_low
+    # Step 1: ENHANCED Liquidity Sweep Detection
+    lookback_period = 20
+    high_lookback = df['high'].iloc[-lookback_period:-1]
+    low_lookback = df['low'].iloc[-lookback_period:-1]
+    
+    # Check for sweeping previous highs/lows with more precision
+    sweep_high = last["high"] > high_lookback.max()
+    sweep_low = last["low"] < low_lookback.min()
+    
+    # Check if sweep was respected (price closed back inside range)
+    respected_high_sweep = False
+    respected_low_sweep = False
+    sweep_strength = 0.0
+    
+    if sweep_high:
+        # Calculate how much it swept the high
+        sweep_amount = last["high"] - high_lookback.max()
+        candle_range = last["high"] - last["low"]
+        if candle_range > 0:
+            sweep_strength = sweep_amount / candle_range
+        # Check if closed below the swept level (respected)
+        if last["close"] < high_lookback.max():
+            respected_high_sweep = True
+    
+    if sweep_low:
+        # Calculate how much it swept the low
+        sweep_amount = low_lookback.min() - last["low"]
+        candle_range = last["high"] - last["low"]
+        if candle_range > 0:
+            sweep_strength = sweep_amount / candle_range
+        # Check if closed above the swept level (respected)
+        if last["close"] > low_lookback.min():
+            respected_low_sweep = True
+    
+    has_sweep = (sweep_high and respected_high_sweep) or (sweep_low and respected_low_sweep)
+    
     liquidity_sweep = 2 if has_sweep else 0
     score += liquidity_sweep
-    sweep_type = "HIGH" if sweep_high else ("LOW" if sweep_low else "NONE")
-    reasons.append(f"Liquidity Sweep +{liquidity_sweep}")
+    
+    # Enhanced sweep type classification
+    if sweep_high and respected_high_sweep:
+        sweep_type = "HIGH_SWEEP_RESPECTED"
+        sweep_direction = "BEARISH"
+    elif sweep_low and respected_low_sweep:
+        sweep_type = "LOW_SWEEP_RESPECTED"
+        sweep_direction = "BULLISH"
+    elif sweep_high:
+        sweep_type = "HIGH_SWEEP_UNRESPECTED"
+        sweep_direction = "NEUTRAL"
+    elif sweep_low:
+        sweep_type = "LOW_SWEEP_UNRESPECTED"
+        sweep_direction = "NEUTRAL"
+    else:
+        sweep_type = "NONE"
+        sweep_direction = "NONE"
+    
+    reasons.append(f"Liquidity Sweep +{liquidity_sweep} ({sweep_type})")
     calc_values["sweep_type"] = sweep_type
+    calc_values["sweep_direction"] = sweep_direction
     calc_values["sweep_score"] = liquidity_sweep
+    calc_values["sweep_strength"] = round(sweep_strength, 2) if has_sweep else 0
+    calc_values["sweep_respected"] = respected_high_sweep or respected_low_sweep
+    calc_values["swept_level"] = float(high_lookback.max()) if sweep_high else (float(low_lookback.min()) if sweep_low else 0.0)
 
     # Step 2: Displacement
     displacement = abs(last["close"] - last["open"]) / (last["high"] - last["low"] + 1e-8)
@@ -420,30 +546,51 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     else:
         reasons.append(f"Displacement +0 ({displacement:.2f})")
 
-    # Step 3 & 4: Order Block & Zone
-    ob_zone = None
-    for i in range(len(df)-5, len(df)-1):
-        candle, prev_candle = df.iloc[i], df.iloc[i-1]
-        if candle["close"]>candle["open"] and prev_candle["close"]<prev_candle["open"]:
-            ob_zone={"type":"bullish","low":min(candle["low"], prev_candle["low"]),"high":candle["close"]}; break
-        elif candle["close"]<candle["open"] and prev_candle["close"]>prev_candle["open"]:
-            ob_zone={"type":"bearish","low":candle["close"],"high":max(candle["high"], prev_candle["high"])}; break
-
+    # Step 3 & 4: ENHANCED Order Block & Zone
+    ob_zone = find_latest_ob(df, lookback=30)
+    
     if ob_zone:
-        ob_type = ob_zone["type"]
+        ob_type = "bullish" if ob_zone["type"] == "BULLISH_OB" else "bearish"
         zone_approach = 0
-        if ob_type=="bullish" and last["close"] <= ob_zone["high"]: 
-            score+=1; zone_approach=1; reasons.append("Zone Approach +1")
-        elif ob_type=="bearish" and last["close"] >= ob_zone["low"]: 
-            score+=1; zone_approach=1; reasons.append("Zone Approach +1")
-        else: 
-            reasons.append("Zone Approach +0")
+        
+        # Enhanced zone approach check
+        if ob_type == "bullish":
+            # For bullish OB, check if price is approaching from above
+            distance_to_ob = (last["close"] - ob_zone["high"]) / (ob_zone["high"] - ob_zone["low"] + 1e-8)
+            if last["close"] <= ob_zone["high"] or distance_to_ob < 0.1:
+                score += 1
+                zone_approach = 1
+                approach_status = f"APPROACHING (dist: {distance_to_ob:.2%})"
+            else:
+                approach_status = f"FAR ({distance_to_ob:.2%} away)"
+        else:  # bearish
+            # For bearish OB, check if price is approaching from below
+            distance_to_ob = (ob_zone["low"] - last["close"]) / (ob_zone["high"] - ob_zone["low"] + 1e-8)
+            if last["close"] >= ob_zone["low"] or distance_to_ob < 0.1:
+                score += 1
+                zone_approach = 1
+                approach_status = f"APPROACHING (dist: {distance_to_ob:.2%})"
+            else:
+                approach_status = f"FAR ({distance_to_ob:.2%} away)"
+        
+        reasons.append(f"Zone Approach +{zone_approach} ({approach_status})")
+        
+        # Store comprehensive OB data
         calc_values["zone_approach"] = zone_approach
         calc_values["ob_type"] = ob_type
+        calc_values["ob_strength"] = ob_zone.get("strength", "UNKNOWN")
+        calc_values["ob_tested"] = ob_zone.get("tested", False)
         calc_values["ob_low"] = round(ob_zone["low"], 6)
         calc_values["ob_high"] = round(ob_zone["high"], 6)
+        calc_values["ob_body_low"] = round(ob_zone.get("body_low", ob_zone["low"]), 6)
+        calc_values["ob_body_high"] = round(ob_zone.get("body_high", ob_zone["high"]), 6)
+        calc_values["ob_candle_size"] = round(ob_zone.get("candle_size", 0), 6)
+        calc_values["ob_body_ratio"] = round(ob_zone.get("body_size", 0) / ob_zone.get("candle_size", 1) if ob_zone.get("candle_size", 0) > 0 else 0, 2)
+        calc_values["ob_volume"] = ob_zone.get("volume", 0)
+        calc_values["distance_to_ob"] = round(distance_to_ob, 4)
     else:
-        reasons.append("Zone Approach +0"); ob_type=None
+        reasons.append("Zone Approach +0 (No OB detected)")
+        ob_type = None
         calc_values["zone_approach"] = 0
         calc_values["ob_type"] = "NONE"
 
@@ -544,16 +691,6 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     
     log.info(f"✅ Signal {sig['symbol']} passed forced filter: Mom={momentum_val:.2f}, Disp={displacement_val:.2f}")
     return sig
-
-# ---------------- ORDER BLOCK DETECTION ----------------
-def find_latest_ob(df: pd.DataFrame):
-    for i in range(len(df)-5, len(df)-1):
-        candle, prev_candle = df.iloc[i], df.iloc[i-1]
-        if candle["close"]>candle["open"] and prev_candle["close"]<prev_candle["open"]:
-            return {"type":"bullish","low":min(candle["low"], prev_candle["low"]),"high":candle["close"]}
-        elif candle["close"]<candle["open"] and prev_candle["close"]>prev_candle["open"]:
-            return {"type":"bearish","low":candle["close"],"high":max(candle["high"], prev_candle["high"])}
-    return None
 
 # ---------------- REFINED UPDATE TP/SL LIVE ----------------
 def update_tp_sl_live(sig: dict, df: pd.DataFrame):
@@ -734,8 +871,23 @@ async def scan_loop(exchange):
                             f"Entry: {sig['entry']:.6f}",
                             f"Score: {sig['score']}/6",
                             f"",
+                            f"📊 LIQUIDITY SWEEP DATA:",
+                            f"• Type: {calc.get('sweep_type', 'NONE')}",
+                            f"• Direction: {calc.get('sweep_direction', 'NONE')}",
+                            f"• Strength: {calc.get('sweep_strength', 0):.2f}",
+                            f"• Respected: {'✅' if calc.get('sweep_respected', False) else '❌'}",
+                            f"• Swept Level: {calc.get('swept_level', 0):.6f}",
+                            f"",
+                            f"📊 ORDER BLOCK DATA:",
+                            f"• Type: {calc.get('ob_type', 'NONE')}",
+                            f"• Strength: {calc.get('ob_strength', 'UNKNOWN')}",
+                            f"• Tested: {'✅' if calc.get('ob_tested', False) else '❌'}",
+                            f"• Range: {calc.get('ob_low', 0):.6f} - {calc.get('ob_high', 0):.6f}",
+                            f"• Body: {calc.get('ob_body_low', 0):.6f} - {calc.get('ob_body_high', 0):.6f}",
+                            f"• Body Ratio: {calc.get('ob_body_ratio', 0):.2f}",
+                            f"• Distance: {calc.get('distance_to_ob', 0):.2%}",
+                            f"",
                             f"📊 CORE METRICS:",
-                            f"• Sweep: {calc.get('sweep_type', 'NONE')}",
                             f"• Displacement: {calc.get('displacement_value', 0):.2f}",
                             f"• Momentum: {calc.get('momentum_value', 0):.2f}",
                             f"• HTF: {calc.get('htf_direction', '?')}",
@@ -775,9 +927,9 @@ async def main():
     await init_db()
     global exchange
     exchange = ccxt.okx({"enableRateLimit": True})
-    await tg("🏆 TRUE ROMEOPT SCANNER STARTED (FINAL REFINED)")
-    await tg("🎯 REFINED MARKET STATE: Displacement + Follow-through")
-    await tg("📊 ATR-BASED LIQUIDITY: Visual cluster tolerance")
+    await tg("🏆 TRUE ROMEOPT SCANNER STARTED (ENHANCED SWEEP & OB DATA)")
+    await tg("🎯 ENHANCED: Comprehensive liquidity sweep analysis")
+    await tg("📊 ENHANCED: Detailed order block classification")
     await tg("🔒 TP LOCK: No recalculation after entry")
     await tg("⚡ EXTERNAL LIQUIDITY: Range extremes only")
     await tg("💎 ROMEOPT CORE: Target where price MUST go")
