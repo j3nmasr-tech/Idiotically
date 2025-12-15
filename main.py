@@ -2,16 +2,17 @@
 # -*- coding: utf-8 -*-
 
 """
-TRUE ROMEOPT SCANNER (Final Refined Version) - WITH ENHANCED SWEEP & OB DATA
+TRUE ROMEOPT SCANNER (FINAL FIXED VERSION) - WITH ALL LIQUIDITY FIXES
 - RomeOPT 6-step entry logic
 - TRUE RomeOPT TP: ONE liquidity target, no TP ladders
-- Simple but accurate market state detection
-- ATR-based tolerance for liquidity detection
-- External liquidity = range extremes (not local swings)
+- FIXED liquidity detection (less strict, more realistic)
+- Smart hybrid liquidity: internal + external candidates
+- Flexible R:R requirements based on market state
+- Proper sweep invalidation (consumption ≠ touch)
 - TP LOCK: No recalculation after entry
+- Enhanced breakdown with comprehensive liquidity data
 - Telegram alerts + SQLite logging
 - Forced Filter: Momentum ≥ 0.87 OR (Momentum ≥ 0.85 AND Displacement ≥ 0.80)
-- ENHANCED: Comprehensive liquidity sweep and order block data
 """
 
 import os, time, asyncio, logging, datetime
@@ -61,82 +62,14 @@ async def tg(msg: str):
         except Exception as e:
             log.warning(f"Telegram send failed: {e}")
 
-# ---------------- COMPLETE DATABASE MIGRATION ----------------
-async def migrate_db():
-    """Complete database migration from old schema to new schema"""
-    global db_conn
-    
-    try:
-        # Check if table exists at all
-        async with db_conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='signals'") as cursor:
-            table_exists = await cursor.fetchone()
-        
-        if not table_exists:
-            log.info("Table 'signals' doesn't exist yet, will create new schema")
-            return
-        
-        # Get current columns
-        async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
-            columns = await cursor.fetchall()
-            column_names = [col[1] for col in columns]
-        
-        log.info(f"Current columns: {column_names}")
-        
-        # List of required columns for new schema
-        required_columns = {
-            'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
-            'symbol': 'TEXT',
-            'side': 'TEXT',
-            'entry': 'REAL',
-            'sl': 'REAL',
-            'tp': 'REAL',
-            'timestamp': 'TEXT',
-            'status': 'TEXT',
-            'reason': 'TEXT',
-            'score': 'INTEGER',
-            'tp_hit': 'INTEGER DEFAULT 0',
-            'latest_ob': 'TEXT',
-            'tp_type': 'TEXT',
-            'tp_locked': 'INTEGER DEFAULT 1'
-        }
-        
-        # Add missing columns
-        for col_name, col_type in required_columns.items():
-            if col_name not in column_names:
-                try:
-                    await db_conn.execute(f"ALTER TABLE signals ADD COLUMN {col_name} {col_type}")
-                    log.info(f"✅ Added missing column: {col_name}")
-                except Exception as e:
-                    log.warning(f"Could not add column {col_name}: {e}")
-        
-        # If old TP columns exist, migrate data from tp1 to tp
-        if 'tp1' in column_names and 'tp' in column_names:
-            # Check if tp column is empty but tp1 has data
-            async with db_conn.execute("SELECT COUNT(*) FROM signals WHERE tp IS NULL AND tp1 IS NOT NULL") as cursor:
-                count = await cursor.fetchone()
-                if count and count[0] > 0:
-                    log.info(f"🚀 Migrating {count[0]} records from tp1 to tp...")
-                    await db_conn.execute("UPDATE signals SET tp = tp1 WHERE tp IS NULL AND tp1 IS NOT NULL")
-                    
-                    # Also migrate tp1_hit to tp_hit if needed
-                    if 'tp1_hit' in column_names:
-                        await db_conn.execute("UPDATE signals SET tp_hit = tp1_hit WHERE tp_hit = 0 AND tp1_hit = 1")
-                    
-                    log.info("✅ Data migration complete")
-        
-        await db_conn.commit()
-        
-    except Exception as e:
-        log.error(f"Migration error: {e}")
-
-# ---------------- INIT DATABASE ----------------
+# ---------------- DATABASE ----------------
 async def init_db():
     global db_conn
     db_conn = await aiosqlite.connect(DB_PATH)
     await db_conn.execute("PRAGMA journal_mode=WAL;")
     await db_conn.execute("PRAGMA synchronous=NORMAL;")
     
-    # Create table if it doesn't exist (NEW SCHEMA)
+    # Create table with complete schema
     await db_conn.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -152,13 +85,12 @@ async def init_db():
             tp_hit INTEGER DEFAULT 0,
             latest_ob TEXT,
             tp_type TEXT,
-            tp_locked INTEGER DEFAULT 1
+            tp_locked INTEGER DEFAULT 1,
+            liquidity_data TEXT,
+            market_state TEXT
         );
     """)
     await db_conn.commit()
-    
-    # Run complete migration
-    await migrate_db()
 
 # ---------------- OHLCV ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
@@ -170,13 +102,27 @@ async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
 
 # ---------------- INDICATORS ----------------
 def atr(df: pd.DataFrame, period=14):
+    if len(df) < period:
+        period = max(1, len(df) // 2)
+    
     high, low, close = df["high"], df["low"], df["close"]
     tr = pd.DataFrame({
         "h-l": high - low,
         "h-pc": (high - close.shift(1)).abs(),
         "l-pc": (low - close.shift(1)).abs()
     }).max(axis=1)
-    return tr.rolling(period, min_periods=1).mean()
+    
+    # Ensure we have enough data
+    if len(tr) < 2:
+        # Fallback to simple range if not enough data
+        return pd.Series([(high.iloc[i] - low.iloc[i]) for i in range(len(df))], index=df.index)
+    
+    atr_series = tr.rolling(period, min_periods=1).mean()
+    
+    # Smooth the ATR to avoid extreme spikes
+    atr_series = atr_series.ewm(span=period//2, adjust=False).mean()
+    
+    return atr_series
 
 # ---------------- FORCED FILTER FUNCTION ----------------
 def force_filter_trade(momentum_value: float, displacement_value: float) -> bool:
@@ -211,62 +157,78 @@ def romeopt_market_state(df, atr_val):
     
     return "IMBALANCED" if strong_displacement else "BALANCED"
 
-# ---------------- REFINED ROMEOPT INTERNAL LIQUIDITY ----------------
+# ---------------- FIXED ROMEOPT INTERNAL LIQUIDITY ----------------
 def romeopt_internal_liquidity(df, side, atr_val, lookback=15):
     """
-    REFINED RomeOPT internal liquidity detection
-    Uses ATR-based tolerance for visual clusters
+    FIXED: RomeOPT internal liquidity detection
+    Realistic tolerance for compressed liquidity zones
     """
     if side == "SELL":
-        # For SELL: Look for obvious equal lows
+        # For SELL: Look for compressed swing lows
         lows = df['low'].iloc[-lookback:].dropna()
         if len(lows) < 5:
             return None
         
-        # ATR-based tolerance (15% of ATR = visual clustering tolerance)
-        tolerance = atr_val * 0.15
+        # ✅ FIX: REALISTIC tolerance (35% of ATR = compressed zone tolerance)
+        tolerance = atr_val * 0.35
         
         # Find potential cluster centers
         potential_targets = []
         for i in range(len(lows)):
             current_low = lows.iloc[i]
             # Count how many lows are within tolerance
-            nearby_count = (abs(lows - current_low) <= tolerance).sum()
+            nearby_mask = abs(lows - current_low) <= tolerance
+            nearby_count = nearby_mask.sum()
+            
             if nearby_count >= 2:  # At least 2 lows form a visual cluster
-                potential_targets.append((current_low, nearby_count))
+                # ✅ ENHANCEMENT: Require cluster span to be meaningful
+                cluster_prices = lows[nearby_mask]
+                cluster_span = cluster_prices.max() - cluster_prices.min()
+                
+                if cluster_span >= atr_val * 0.2:  # Meaningful cluster width
+                    # Choose the lowest price in the cluster (stop pool)
+                    cluster_low = cluster_prices.min()
+                    potential_targets.append((cluster_low, nearby_count, cluster_span))
         
         if potential_targets:
-            # Choose the lowest price among clusters (most obvious stop pool)
-            best_target = min(potential_targets, key=lambda x: x[0])[0]
+            # Choose the most significant cluster (max nearby_count, min price)
+            best_target = min(potential_targets, key=lambda x: (x[0], -x[1]))[0]
             return best_target
         
     else:  # BUY
-        # For BUY: Look for obvious equal highs
+        # For BUY: Look for compressed swing highs
         highs = df['high'].iloc[-lookback:].dropna()
         if len(highs) < 5:
             return None
         
-        tolerance = atr_val * 0.15
+        tolerance = atr_val * 0.35
         potential_targets = []
         
         for i in range(len(highs)):
             current_high = highs.iloc[i]
-            nearby_count = (abs(highs - current_high) <= tolerance).sum()
+            nearby_mask = abs(highs - current_high) <= tolerance
+            nearby_count = nearby_mask.sum()
+            
             if nearby_count >= 2:
-                potential_targets.append((current_high, nearby_count))
+                cluster_prices = highs[nearby_mask]
+                cluster_span = cluster_prices.max() - cluster_prices.min()
+                
+                if cluster_span >= atr_val * 0.2:
+                    # Choose the highest price in the cluster
+                    cluster_high = cluster_prices.max()
+                    potential_targets.append((cluster_high, nearby_count, cluster_span))
         
         if potential_targets:
-            # Choose the highest price among clusters
-            best_target = max(potential_targets, key=lambda x: x[0])[0]
+            best_target = max(potential_targets, key=lambda x: (x[0], -x[1]))[0]
             return best_target
     
-    return None  # No obvious visual liquidity cluster
+    return None  # No meaningful compressed liquidity zone
 
-# ---------------- REFINED ROMEOPT EXTERNAL LIQUIDITY ----------------
+# ---------------- ROMEOPT EXTERNAL LIQUIDITY ----------------
 def romeopt_external_liquidity(df, side, lookback=50):
     """
-    REFINED RomeOPT external liquidity detection
-    Simple: Range extremes (RomeOPT prefers guaranteed stops)
+    RomeOPT external liquidity detection
+    Simple: Range extremes (guaranteed stops)
     """
     if side == "SELL":
         # For SELL in trend: Range low (guaranteed stops below)
@@ -275,52 +237,69 @@ def romeopt_external_liquidity(df, side, lookback=50):
         # For BUY in trend: Range high (guaranteed stops above)
         return df['high'].iloc[-lookback:].max()
 
-# ---------------- ROMEOPT TP DECISION (REFINED VERSION) ----------------
+# ---------------- FIXED ROMEOPT TP DECISION ----------------
 def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
     """
-    REFINED RomeOPT TP logic with all fixes
+    FIXED: RomeOPT TP logic with ALL corrections
     """
     # Step 1: Determine market state
     market_state = romeopt_market_state(df, atr_val)
     
-    # Step 2: Find liquidity based on market state
-    tp = None
-    tp_type = ""
+    # Step 2: ✅ SMART HYBRID LOGIC (BOTH INTERNAL & EXTERNAL)
+    internal_tp = romeopt_internal_liquidity(df, side, atr_val)
+    external_tp = romeopt_external_liquidity(df, side)
     
-    if market_state == "BALANCED":
-        # RANGE: Look for internal liquidity clusters
-        tp = romeopt_internal_liquidity(df, side, atr_val)
-        if tp:
-            tp_type = f"RANGE: Visual {'Lows' if side == 'SELL' else 'Highs'} Cluster"
-    else:  # IMBALANCED
-        # TREND: Look for external range extremes
-        tp = romeopt_external_liquidity(df, side)
-        if tp:
-            tp_type = f"TREND: Range {'Low' if side == 'SELL' else 'High'}"
+    # RomeOPT often targets external even in range if it's cleaner
+    candidates = []
+    if internal_tp is not None:
+        candidates.append(("INTERNAL", internal_tp, "Visual Cluster"))
+    if external_tp is not None:
+        candidates.append(("EXTERNAL", external_tp, "Range Extreme"))
     
-    # REJECT if no obvious liquidity found
-    if tp is None:
-        log.debug(f"❌ No obvious liquidity found for {side} | Market: {market_state}")
+    if not candidates:
+        log.debug(f"❌ No liquidity candidates found for {side}")
         return None
     
-    # Step 3: Safety check - reject if recently swept
-    recent_candles = min(10, len(df))
+    # Step 3: ✅ PICK NEAREST VALID LIQUIDITY (RomeOPT: target closest guaranteed stop)
+    valid_candidates = []
+    
+    if side == "BUY":
+        for cand_type, cand_price, cand_desc in candidates:
+            if cand_price > entry:  # Valid TP must be above entry for BUY
+                distance = cand_price - entry
+                valid_candidates.append((cand_type, cand_price, cand_desc, distance))
+    else:  # SELL
+        for cand_type, cand_price, cand_desc in candidates:
+            if cand_price < entry:  # Valid TP must be below entry for SELL
+                distance = entry - cand_price
+                valid_candidates.append((cand_type, cand_price, cand_desc, distance))
+    
+    if not valid_candidates:
+        log.debug(f"❌ No valid TP direction for {side} | Entry: {entry}")
+        return None
+    
+    # ✅ Pick closest valid liquidity (RomeOPT: minimum travel to guaranteed stops)
+    cand_type, tp, tp_type_desc, distance = min(valid_candidates, key=lambda x: x[3])
+    
+    # Step 4: ✅ FIXED SWEEP INVALIDATION LOGIC
+    # RomeOPT: Liquidity being touched ≠ liquidity being consumed
+    sweep_invalidated = False
+    check_len = min(10, len(df))
+    
     if side == "SELL":
-        recent_touch = any(
-            abs(df['low'].iloc[-i] - tp) <= atr_val * 0.1  # Within 10% ATR
-            for i in range(1, recent_candles)
-        )
+        # For SELL TP: Check if price closed BELOW the liquidity multiple times
+        closes_below = sum(df['close'].iloc[-i] < tp for i in range(1, check_len))
+        sweep_invalidated = closes_below >= 2  # Fully consumed if 2+ closes below
     else:  # BUY
-        recent_touch = any(
-            abs(df['high'].iloc[-i] - tp) <= atr_val * 0.1
-            for i in range(1, recent_candles)
-        )
+        # For BUY TP: Check if price closed ABOVE the liquidity multiple times
+        closes_above = sum(df['close'].iloc[-i] > tp for i in range(1, check_len))
+        sweep_invalidated = closes_above >= 2  # Fully consumed if 2+ closes above
     
-    if recent_touch:
-        log.debug(f"❌ Liquidity recently swept for {side} at {tp}")
+    if sweep_invalidated:
+        log.debug(f"❌ Liquidity fully consumed for {side} at {tp}")
         return None
     
-    # Step 4: Calculate SL (keep OB-based SL)
+    # Step 5: Calculate SL (keep OB-based SL)
     if side == "BUY":
         sl = ob_zone["low"] - (atr_val * 0.3)
         recent_low = df['low'].iloc[-10:].min()
@@ -333,14 +312,17 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
             risk = min_risk
             sl = entry - risk
         
-        # Ensure TP is valid (above entry, at least 0.5R)
+        # Ensure TP is valid (above entry)
         if tp <= entry:
             log.debug(f"❌ TP {tp} not above entry {entry} for BUY")
             return None
             
         reward = tp - entry
-        if reward < risk * 0.5:
-            log.debug(f"❌ TP reward {reward/risk:.2f}R < 0.5R minimum")
+        
+        # ✅ FIX: FLEXIBLE RR REQUIREMENT (RomeOPT allows smaller R if liquidity is guaranteed)
+        min_rr = 0.3 if market_state == "BALANCED" else 0.5  # Range trades can have lower R
+        if reward < risk * min_rr:
+            log.debug(f"❌ TP reward {reward/risk:.2f}R < {min_rr}R minimum | Market: {market_state}")
             return None
         
     else:  # SELL
@@ -354,27 +336,52 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
             risk = min_risk
             sl = entry + risk
         
-        # Ensure TP is valid (below entry, at least 0.5R)
+        # Ensure TP is valid (below entry)
         if tp >= entry:
             log.debug(f"❌ TP {tp} not below entry {entry} for SELL")
             return None
             
         reward = entry - tp
-        if reward < risk * 0.5:
-            log.debug(f"❌ TP reward {reward/risk:.2f}R < 0.5R minimum")
+        
+        min_rr = 0.3 if market_state == "BALANCED" else 0.5
+        if reward < risk * min_rr:
+            log.debug(f"❌ TP reward {reward/risk:.2f}R < {min_rr}R minimum | Market: {market_state}")
             return None
+    
+    # Create descriptive TP type
+    tp_type = f"{cand_type}: {tp_type_desc}"
+    if market_state == "BALANCED":
+        tp_type += " (Range)"
+    else:
+        tp_type += " (Trend)"
+    
+    # Comprehensive liquidity data for logging
+    liquidity_data = {
+        "market_state": market_state,
+        "selected_type": cand_type,
+        "selected_tp": tp,
+        "internal_candidate": internal_tp,
+        "external_candidate": external_tp,
+        "atr_value": atr_val,
+        "tolerance_used": atr_val * 0.35,
+        "distance_to_entry": distance,
+        "risk": risk,
+        "reward": reward,
+        "rr_ratio": reward / risk if risk > 0 else 0,
+        "min_rr_required": min_rr
+    }
     
     log.info(f"✅ {side} {entry:.6f} | Market: {market_state}")
     log.info(f"   SL: {sl:.6f} | TP: {tp:.6f} | Type: {tp_type}")
     log.info(f"   Risk: {risk:.6f} | R:R: {abs(tp-entry)/risk:.2f}:1")
+    log.info(f"   Candidate: {cand_type} | Distance: {distance:.6f}")
     
-    return sl, tp, tp_type
+    return sl, tp, tp_type, liquidity_data
 
 # ---------------- ENHANCED ORDER BLOCK DETECTION ----------------
 def find_latest_ob(df: pd.DataFrame, lookback=50):
     """
     Enhanced Order Block detection with detailed classification
-    Returns comprehensive OB data
     """
     blocks = []
     
@@ -398,9 +405,7 @@ def find_latest_ob(df: pd.DataFrame, lookback=50):
                 "body_high": max(candle["open"], candle["close"]),
                 "volume": candle["vol"] if "vol" in candle else 0,
                 "candle_size": candle["high"] - candle["low"],
-                "body_size": abs(candle["close"] - candle["open"]),
-                "wick_ratio": (candle["high"] - max(candle["open"], candle["close"])) / 
-                              (candle["high"] - candle["low"]) if (candle["high"] - candle["low"]) > 0 else 0
+                "body_size": abs(candle["close"] - candle["open"])
             }
             blocks.append(block)
         
@@ -419,9 +424,7 @@ def find_latest_ob(df: pd.DataFrame, lookback=50):
                 "body_high": max(candle["open"], candle["close"]),
                 "volume": candle["vol"] if "vol" in candle else 0,
                 "candle_size": candle["high"] - candle["low"],
-                "body_size": abs(candle["close"] - candle["open"]),
-                "wick_ratio": (min(candle["open"], candle["close"]) - candle["low"]) / 
-                              (candle["high"] - candle["low"]) if (candle["high"] - candle["low"]) > 0 else 0
+                "body_size": abs(candle["close"] - candle["open"])
             }
             blocks.append(block)
     
@@ -438,19 +441,11 @@ def find_latest_ob(df: pd.DataFrame, lookback=50):
         else:
             latest_block["strength"] = "WEAK"
         
-        # Check if OB has been tested
-        if latest_block["type"] == "BULLISH_OB":
-            subsequent_candles = df.iloc[latest_block["index"]+1:min(latest_block["index"]+10, len(df))]
-            latest_block["tested"] = any(candle["low"] <= latest_block["high"] for _, candle in subsequent_candles.iterrows())
-        else:  # BEARISH_OB
-            subsequent_candles = df.iloc[latest_block["index"]+1:min(latest_block["index"]+10, len(df))]
-            latest_block["tested"] = any(candle["high"] >= latest_block["low"] for _, candle in subsequent_candles.iterrows())
-        
         return latest_block
     
     return None
 
-# ---------------- REST OF SIGNAL GENERATION ----------------
+# ---------------- SIGNAL GENERATION ----------------
 async def elite_tf_alignment(exchange, symbol: str, side: str):
     tfs = ["15m","1h","4h"]
     for tf in tfs:
@@ -478,41 +473,33 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     high_lookback = df['high'].iloc[-lookback_period:-1]
     low_lookback = df['low'].iloc[-lookback_period:-1]
     
-    # Check for sweeping previous highs/lows with more precision
     sweep_high = last["high"] > high_lookback.max()
     sweep_low = last["low"] < low_lookback.min()
     
-    # Check if sweep was respected (price closed back inside range)
     respected_high_sweep = False
     respected_low_sweep = False
     sweep_strength = 0.0
     
     if sweep_high:
-        # Calculate how much it swept the high
         sweep_amount = last["high"] - high_lookback.max()
         candle_range = last["high"] - last["low"]
         if candle_range > 0:
             sweep_strength = sweep_amount / candle_range
-        # Check if closed below the swept level (respected)
         if last["close"] < high_lookback.max():
             respected_high_sweep = True
     
     if sweep_low:
-        # Calculate how much it swept the low
         sweep_amount = low_lookback.min() - last["low"]
         candle_range = last["high"] - last["low"]
         if candle_range > 0:
             sweep_strength = sweep_amount / candle_range
-        # Check if closed above the swept level (respected)
         if last["close"] > low_lookback.min():
             respected_low_sweep = True
     
     has_sweep = (sweep_high and respected_high_sweep) or (sweep_low and respected_low_sweep)
-    
     liquidity_sweep = 2 if has_sweep else 0
     score += liquidity_sweep
     
-    # Enhanced sweep type classification
     if sweep_high and respected_high_sweep:
         sweep_type = "HIGH_SWEEP_RESPECTED"
         sweep_direction = "BEARISH"
@@ -553,9 +540,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         ob_type = "bullish" if ob_zone["type"] == "BULLISH_OB" else "bearish"
         zone_approach = 0
         
-        # Enhanced zone approach check
         if ob_type == "bullish":
-            # For bullish OB, check if price is approaching from above
             distance_to_ob = (last["close"] - ob_zone["high"]) / (ob_zone["high"] - ob_zone["low"] + 1e-8)
             if last["close"] <= ob_zone["high"] or distance_to_ob < 0.1:
                 score += 1
@@ -564,7 +549,6 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
             else:
                 approach_status = f"FAR ({distance_to_ob:.2%} away)"
         else:  # bearish
-            # For bearish OB, check if price is approaching from below
             distance_to_ob = (ob_zone["low"] - last["close"]) / (ob_zone["high"] - ob_zone["low"] + 1e-8)
             if last["close"] >= ob_zone["low"] or distance_to_ob < 0.1:
                 score += 1
@@ -575,18 +559,13 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         
         reasons.append(f"Zone Approach +{zone_approach} ({approach_status})")
         
-        # Store comprehensive OB data
         calc_values["zone_approach"] = zone_approach
         calc_values["ob_type"] = ob_type
         calc_values["ob_strength"] = ob_zone.get("strength", "UNKNOWN")
-        calc_values["ob_tested"] = ob_zone.get("tested", False)
         calc_values["ob_low"] = round(ob_zone["low"], 6)
         calc_values["ob_high"] = round(ob_zone["high"], 6)
         calc_values["ob_body_low"] = round(ob_zone.get("body_low", ob_zone["low"]), 6)
         calc_values["ob_body_high"] = round(ob_zone.get("body_high", ob_zone["high"]), 6)
-        calc_values["ob_candle_size"] = round(ob_zone.get("candle_size", 0), 6)
-        calc_values["ob_body_ratio"] = round(ob_zone.get("body_size", 0) / ob_zone.get("candle_size", 1) if ob_zone.get("candle_size", 0) > 0 else 0, 2)
-        calc_values["ob_volume"] = ob_zone.get("volume", 0)
         calc_values["distance_to_ob"] = round(distance_to_ob, 4)
     else:
         reasons.append("Zone Approach +0 (No OB detected)")
@@ -671,7 +650,10 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         reasons.append("❌ NO VALID LIQUIDITY FOUND")
         return None
     
-    sl, tp, tp_type = result
+    sl, tp, tp_type, liquidity_data = result
+    
+    # Add liquidity data to calc_values for detailed breakdown
+    calc_values.update(liquidity_data)
     
     sig = {
         "symbol": symbol,
@@ -686,37 +668,12 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         "liquidity_sweep": liquidity_sweep,
         "momentum_ratio": momentum_ratio,
         "calc_values": calc_values,
-        "tp_type": tp_type
+        "tp_type": tp_type,
+        "liquidity_data": liquidity_data,
+        "market_state": liquidity_data["market_state"]
     }
     
     log.info(f"✅ Signal {sig['symbol']} passed forced filter: Mom={momentum_val:.2f}, Disp={displacement_val:.2f}")
-    return sig
-
-# ---------------- REFINED UPDATE TP/SL LIVE ----------------
-def update_tp_sl_live(sig: dict, df: pd.DataFrame):
-    """
-    REFINED: Only update if TP hasn't been hit AND structure invalidated
-    RomeOPT commits to liquidity objective - no chasing price
-    """
-    # TP LOCK: If TP already hit, do nothing
-    if sig.get("tp_hit", 0) == 1:
-        return sig
-    
-    # Only update if structure is completely invalid
-    latest_ob = find_latest_ob(df)
-    if not latest_ob:
-        # No OB anymore - structure invalid, close trade
-        return None
-    
-    # Check if price has taken out the OB (structure break)
-    if sig["side"] == "BUY":
-        if df['low'].iloc[-1] < latest_ob["low"]:
-            return None  # OB broken, close
-    else:  # SELL
-        if df['high'].iloc[-1] > latest_ob["high"]:
-            return None  # OB broken, close
-    
-    # Structure still valid - keep original TP (RomeOPT doesn't chase)
     return sig
 
 # ---------------- SL CLUSTER ----------------
@@ -734,106 +691,15 @@ def deprioritized(symbol: str, threshold=3, lookback=30):
 async def log_signal(sig):
     async with db_lock:
         await db_conn.execute("""
-            INSERT INTO signals (symbol,side,entry,sl,tp,timestamp,status,reason,score,latest_ob,tp_type,tp_locked)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (sig["symbol"],sig["side"],sig["entry"],sig.get("sl"),sig.get("tp"),
-              datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"],
-              str(sig.get("latest_ob","")), sig.get("tp_type", ""), 1))
+            INSERT INTO signals (symbol,side,entry,sl,tp,timestamp,status,reason,score,latest_ob,tp_type,tp_locked,liquidity_data,market_state)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            sig["symbol"], sig["side"], sig["entry"], sig.get("sl"), sig.get("tp"),
+            datetime.datetime.utcnow().isoformat(), "OPEN", sig["reason"], sig["score"],
+            str(sig.get("latest_ob","")), sig.get("tp_type", ""), 1,
+            str(sig.get("liquidity_data", {})), sig.get("market_state", "UNKNOWN")
+        ))
         await db_conn.commit()
-
-# ---------------- ROBUST MONITOR SIGNALS ----------------
-async def monitor_signals():
-    while True:
-        try:
-            async with db_lock:
-                # Get current columns to build dynamic query
-                async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
-                    columns = await cursor.fetchall()
-                    column_names = [col[1] for col in columns]
-                
-                # Build query with fallback for missing columns
-                select_fields = []
-                if 'id' in column_names:
-                    select_fields.append('id')
-                if 'symbol' in column_names:
-                    select_fields.append('symbol')
-                if 'side' in column_names:
-                    select_fields.append('side')
-                if 'entry' in column_names:
-                    select_fields.append('entry')
-                if 'sl' in column_names:
-                    select_fields.append('sl')
-                if 'tp' in column_names:
-                    select_fields.append('tp')
-                else:
-                    select_fields.append('NULL as tp')  # Fallback
-                
-                if 'tp_hit' in column_names:
-                    select_fields.append('tp_hit')
-                else:
-                    select_fields.append('0 as tp_hit')  # Default value
-                
-                if 'status' in column_names:
-                    select_fields.append('status')
-                
-                query = f"SELECT {','.join(select_fields)} FROM signals WHERE status='OPEN'"
-                
-                async with db_conn.execute(query) as cursor:
-                    async for row in cursor:
-                        # Map row to variables based on query structure
-                        row_dict = dict(zip(select_fields, row))
-                        
-                        sig_id = row_dict.get('id')
-                        symbol = row_dict.get('symbol')
-                        side = row_dict.get('side')
-                        entry = row_dict.get('entry')
-                        sl = row_dict.get('sl')
-                        tp = row_dict.get('tp')
-                        tp_hit = row_dict.get('tp_hit', 0)
-                        status = row_dict.get('status')
-                        
-                        if not all([sig_id, symbol, side, entry]):
-                            continue
-                        
-                        # Check if TP already hit
-                        if tp_hit == 1:
-                            continue
-                        
-                        ticker = await exchange.fetch_ticker(symbol)
-                        last_price = ticker.get("last")
-                        if last_price is None: 
-                            continue
-
-                        # RomeOPT: TP LOCK - Don't recalculate unless structure broken
-                        hits = []
-                        new_tp_hit = tp_hit
-                        new_status = status
-                        
-                        if side == "BUY":
-                            if not tp_hit and tp is not None and last_price >= tp:
-                                hits.append("TP"); new_tp_hit = 1
-                            if sl is not None and last_price <= sl:
-                                hits.append("SL"); new_status = "CLOSED"
-                        else:
-                            if not tp_hit and tp is not None and last_price <= tp:
-                                hits.append("TP"); new_tp_hit = 1
-                            if sl is not None and last_price >= sl:
-                                hits.append("SL"); new_status = "CLOSED"
-
-                        if hits:
-                            await tg(f"🎯 {symbol} {side} HIT\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP:{tp}")
-
-                        if "SL" in hits:
-                            record_sl_hit(symbol)
-                        
-                        # Only update if something changed
-                        if new_tp_hit != tp_hit or new_status != status:
-                            await db_conn.execute("UPDATE signals SET tp_hit=?,status=? WHERE id=?",
-                                                 (new_tp_hit, new_status, sig_id))
-                await db_conn.commit()
-        except Exception as e: 
-            log.exception("monitor error: %s", e)
-        await asyncio.sleep(SCAN_INTERVAL)
 
 # ---------------- SCAN LOOP ----------------
 last_signal_time = {}
@@ -856,16 +722,19 @@ async def scan_loop(exchange):
                     sig = await generate_signal_romeopt(exchange,df,symbol,tf)
                     if sig:
                         calc = sig.get("calc_values", {})
+                        liquidity = sig.get("liquidity_data", {})
+                        
                         momentum_val = calc.get("momentum_value", 0)
                         displacement_val = calc.get("displacement_value", 0)
                         
                         filter_passed = force_filter_trade(momentum_val, displacement_val)
                         
-                        # Calculate R:R
+                        # Risk/Reward calculation
                         risk = abs(sig["entry"] - sig.get("sl", 0))
                         reward = abs(sig.get("tp", 0) - sig["entry"])
                         rr = reward / risk if risk > 0 else 0
                         
+                        # ✅ ENHANCED BREAKDOWN WITH COMPREHENSIVE LIQUIDITY DATA
                         breakdown_lines = [
                             f"🏆 ROMEOPT SIGNAL: {sig['symbol']} ({tf}) {sig['side']}",
                             f"Entry: {sig['entry']:.6f}",
@@ -881,11 +750,20 @@ async def scan_loop(exchange):
                             f"📊 ORDER BLOCK DATA:",
                             f"• Type: {calc.get('ob_type', 'NONE')}",
                             f"• Strength: {calc.get('ob_strength', 'UNKNOWN')}",
-                            f"• Tested: {'✅' if calc.get('ob_tested', False) else '❌'}",
                             f"• Range: {calc.get('ob_low', 0):.6f} - {calc.get('ob_high', 0):.6f}",
                             f"• Body: {calc.get('ob_body_low', 0):.6f} - {calc.get('ob_body_high', 0):.6f}",
-                            f"• Body Ratio: {calc.get('ob_body_ratio', 0):.2f}",
                             f"• Distance: {calc.get('distance_to_ob', 0):.2%}",
+                            f"",
+                            f"📊 LIQUIDITY TARGET ANALYSIS:",
+                            f"• Market State: {liquidity.get('market_state', 'UNKNOWN')}",
+                            f"• Selected Type: {liquidity.get('selected_type', 'NONE')}",
+                            f"• Internal Candidate: {liquidity.get('internal_candidate', 'N/A')}",
+                            f"• External Candidate: {liquidity.get('external_candidate', 'N/A')}",
+                            f"• ATR Value: {liquidity.get('atr_value', 0):.6f}",
+                            f"• Tolerance Used: {liquidity.get('tolerance_used', 0):.6f}",
+                            f"• Distance to Entry: {liquidity.get('distance_to_entry', 0):.6f}",
+                            f"• Min R:R Required: {liquidity.get('min_rr_required', 0):.1f}",
+                            f"• Actual R:R: {liquidity.get('rr_ratio', 0):.2f}",
                             f"",
                             f"📊 CORE METRICS:",
                             f"• Displacement: {calc.get('displacement_value', 0):.2f}",
@@ -898,19 +776,84 @@ async def scan_loop(exchange):
                             f"SL: {sig.get('sl'):.6f}",
                             f"TP: {sig.get('tp'):.6f}",
                             f"",
+                            f"📈 LIQUIDITY SELECTION REASON:",
+                            f"• Chose {liquidity.get('selected_type', 'NONE')} over alternatives",
+                            f"• Distance to entry: {liquidity.get('distance_to_entry', 0):.6f}",
+                            f"• Reward: {liquidity.get('reward', 0):.6f}",
+                            f"• Risk: {liquidity.get('risk', 0):.6f}",
+                            f"",
                             f"💎 ROMEOPT PHILOSOPHY:",
                             f"One TP = One liquidity objective",
-                            f"TP LOCKED - No chasing price"
+                            f"TP LOCKED - No chasing price",
+                            f"Guaranteed stops only"
                         ]
                         
                         await tg("\n".join(breakdown_lines))
                         await log_signal(sig)
                         last_signal_time[key]=time.time()
                         signals_found+=1
-            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals (TP LOCKED)")
-        except Exception as e: log.exception("scan error: %s", e)
+            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals (FIXED LIQUIDITY)")
+        except Exception as e: 
+            log.exception("scan error: %s", e)
         elapsed=time.time()-t0
         await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
+
+# ---------------- MONITOR SIGNALS ----------------
+async def monitor_signals():
+    while True:
+        try:
+            async with db_lock:
+                async with db_conn.execute("""
+                    SELECT id, symbol, side, entry, sl, tp, tp_hit, status 
+                    FROM signals WHERE status='OPEN'
+                """) as cursor:
+                    async for row in cursor:
+                        sig_id, symbol, side, entry, sl, tp, tp_hit, status = row
+                        
+                        if not all([sig_id, symbol, side, entry]):
+                            continue
+                        
+                        if tp_hit == 1:
+                            continue
+                        
+                        try:
+                            ticker = await exchange.fetch_ticker(symbol)
+                            last_price = ticker.get("last")
+                            if last_price is None: 
+                                continue
+                        except:
+                            continue
+
+                        hits = []
+                        new_tp_hit = tp_hit
+                        new_status = status
+                        
+                        if side == "BUY":
+                            if not tp_hit and tp is not None and last_price >= tp:
+                                hits.append("TP"); new_tp_hit = 1
+                            if sl is not None and last_price <= sl:
+                                hits.append("SL"); new_status = "CLOSED"
+                        else:
+                            if not tp_hit and tp is not None and last_price <= tp:
+                                hits.append("TP"); new_tp_hit = 1
+                            if sl is not None and last_price >= sl:
+                                hits.append("SL"); new_status = "CLOSED"
+
+                        if hits:
+                            await tg(f"🎯 {symbol} {side} HIT\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP:{tp}")
+
+                        if "SL" in hits:
+                            record_sl_hit(symbol)
+                        
+                        if new_tp_hit != tp_hit or new_status != status:
+                            await db_conn.execute(
+                                "UPDATE signals SET tp_hit=?,status=? WHERE id=?",
+                                (new_tp_hit, new_status, sig_id)
+                            )
+                await db_conn.commit()
+        except Exception as e: 
+            log.exception("monitor error: %s", e)
+        await asyncio.sleep(SCAN_INTERVAL)
 
 # ---------------- FASTAPI ----------------
 app = FastAPI()
@@ -923,16 +866,29 @@ async def webhook(request: Request):
     return {"ok":True}
 
 # ---------------- MAIN ----------------
+exchange = None
+
 async def main():
-    await init_db()
     global exchange
+    await init_db()
     exchange = ccxt.okx({"enableRateLimit": True})
-    await tg("🏆 TRUE ROMEOPT SCANNER STARTED (ENHANCED SWEEP & OB DATA)")
-    await tg("🎯 ENHANCED: Comprehensive liquidity sweep analysis")
-    await tg("📊 ENHANCED: Detailed order block classification")
-    await tg("🔒 TP LOCK: No recalculation after entry")
-    await tg("⚡ EXTERNAL LIQUIDITY: Range extremes only")
-    await tg("💎 ROMEOPT CORE: Target where price MUST go")
+    
+    # Startup announcement with all fixes highlighted
+    startup_msgs = [
+        "🏆 TRUE ROMEOPT SCANNER STARTED (ALL LIQUIDITY FIXES)",
+        "✅ FIX 1: Realistic internal liquidity (tolerance 0.35*ATR)",
+        "✅ FIX 2: Proper sweep invalidation (consumption ≠ touch)",
+        "✅ FIX 3: Flexible R:R (0.3R range / 0.5R trend)",
+        "✅ SMART HYBRID: Internal + External liquidity candidates",
+        "🎯 ENHANCED: Comprehensive liquidity breakdown in signals",
+        "🔒 TP LOCK: No recalculation after entry",
+        "💎 ROMEOPT CORE: Target guaranteed stops only"
+    ]
+    
+    for msg in startup_msgs:
+        await tg(msg)
+        await asyncio.sleep(0.5)
+    
     await asyncio.gather(scan_loop(exchange), monitor_signals())
 
 if __name__=="__main__":
@@ -945,6 +901,10 @@ if __name__=="__main__":
     else:
         try:
             asyncio.run(main())
+        except KeyboardInterrupt:
+            log.info("Bot stopped by user")
         finally:
             if db_conn:
                 asyncio.run(db_conn.close())
+            if exchange:
+                asyncio.run(exchange.close())
