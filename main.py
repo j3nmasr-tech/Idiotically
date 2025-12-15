@@ -30,15 +30,15 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
-TOP_N = int(os.getenv("TOP_N", 55))
+TOP_N = int(os.getenv("TOP_N", 60))
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
-MIN_SCORE = 5
+MIN_SCORE = 4
 CRITICAL_FACTORS_MIN = 2
 
 # ---------------- FORCED FILTER PARAMETERS ----------------
-MOMENTUM_STRONG_THRESHOLD = 0.70
-MOMENTUM_GOOD_THRESHOLD = 0.65
-DISPLACEMENT_MIN_THRESHOLD = 0.60
+MOMENTUM_STRONG_THRESHOLD = 0.60
+MOMENTUM_GOOD_THRESHOLD = 0.55
+DISPLACEMENT_MIN_THRESHOLD = 0.50
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
