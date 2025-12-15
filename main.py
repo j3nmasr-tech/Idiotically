@@ -12,6 +12,7 @@ TRUE ROMEOPT SCANNER (Final Refined Version) - WITH ENHANCED SWEEP & OB DATA
 - Telegram alerts + SQLite logging
 - Forced Filter: Momentum ≥ 0.87 OR (Momentum ≥ 0.85 AND Displacement ≥ 0.80)
 - ENHANCED: Comprehensive liquidity sweep and order block data
+- FIXED: Relaxed liquidity detection criteria for more signals
 """
 
 import os, time, asyncio, logging, datetime
@@ -211,69 +212,141 @@ def romeopt_market_state(df, atr_val):
     
     return "IMBALANCED" if strong_displacement else "BALANCED"
 
-# ---------------- REFINED ROMEOPT INTERNAL LIQUIDITY ----------------
-def romeopt_internal_liquidity(df, side, atr_val, lookback=15):
+# ---------------- RELAXED ROMEOPT INTERNAL LIQUIDITY ----------------
+def romeopt_internal_liquidity(df, side, atr_val, lookback=20):
     """
-    REFINED RomeOPT internal liquidity detection
-    Uses ATR-based tolerance for visual clusters
+    RELAXED RomeOPT internal liquidity detection
+    More permissive criteria for finding liquidity zones
     """
     if side == "SELL":
-        # For SELL: Look for obvious equal lows
+        # For SELL: Look for recent lows that could be liquidity pools
         lows = df['low'].iloc[-lookback:].dropna()
-        if len(lows) < 5:
+        if len(lows) < 3:  # Reduced from 5
             return None
         
-        # ATR-based tolerance (15% of ATR = visual clustering tolerance)
-        tolerance = atr_val * 0.15
+        # INCREASED TOLERANCE: 25% of ATR instead of 15%
+        tolerance = atr_val * 0.25
         
-        # Find potential cluster centers
+        # Also consider volume clusters
+        volumes = df['volume'].iloc[-lookback:] if 'volume' in df.columns else None
+        
         potential_targets = []
         for i in range(len(lows)):
             current_low = lows.iloc[i]
-            # Count how many lows are within tolerance
-            nearby_count = (abs(lows - current_low) <= tolerance).sum()
-            if nearby_count >= 2:  # At least 2 lows form a visual cluster
-                potential_targets.append((current_low, nearby_count))
+            
+            # Count nearby lows within tolerance
+            nearby_lows = (abs(lows - current_low) <= tolerance).sum()
+            
+            # Also check if this is a "significant" low (not just any wick)
+            if i > 0:
+                is_local_min = (current_low < lows.iloc[i-1] and 
+                               (i == len(lows)-1 or current_low < lows.iloc[i+1]))
+            else:
+                is_local_min = True
+            
+            # RELAXED REQUIREMENT: Accept clusters OR significant lows
+            if nearby_lows >= 2 or (nearby_lows >= 1 and is_local_min):
+                # Weight by recency (more recent = better)
+                recency_weight = (lookback - i) / lookback
+                score = nearby_lows + recency_weight
+                potential_targets.append((current_low, score))
         
         if potential_targets:
-            # Choose the lowest price among clusters (most obvious stop pool)
-            best_target = min(potential_targets, key=lambda x: x[0])[0]
+            # Choose the most significant (lowest with highest score)
+            best_target = min(potential_targets, key=lambda x: (x[0], -x[1]))[0]
+            log.debug(f"✅ Found SELL liquidity at {best_target:.6f} (tolerance: {tolerance:.6f})")
             return best_target
         
     else:  # BUY
-        # For BUY: Look for obvious equal highs
         highs = df['high'].iloc[-lookback:].dropna()
-        if len(highs) < 5:
+        if len(highs) < 3:  # Reduced from 5
             return None
         
-        tolerance = atr_val * 0.15
+        tolerance = atr_val * 0.25  # INCREASED
+        
         potential_targets = []
         
         for i in range(len(highs)):
             current_high = highs.iloc[i]
-            nearby_count = (abs(highs - current_high) <= tolerance).sum()
-            if nearby_count >= 2:
-                potential_targets.append((current_high, nearby_count))
+            nearby_highs = (abs(highs - current_high) <= tolerance).sum()
+            
+            if i > 0:
+                is_local_max = (current_high > highs.iloc[i-1] and 
+                               (i == len(highs)-1 or current_high > highs.iloc[i+1]))
+            else:
+                is_local_max = True
+            
+            # RELAXED REQUIREMENT
+            if nearby_highs >= 2 or (nearby_highs >= 1 and is_local_max):
+                recency_weight = (lookback - i) / lookback
+                score = nearby_highs + recency_weight
+                potential_targets.append((current_high, score))
         
         if potential_targets:
-            # Choose the highest price among clusters
-            best_target = max(potential_targets, key=lambda x: x[0])[0]
+            # Choose the most significant (highest with highest score)
+            best_target = max(potential_targets, key=lambda x: (x[0], x[1]))[0]
+            log.debug(f"✅ Found BUY liquidity at {best_target:.6f} (tolerance: {tolerance:.6f})")
             return best_target
     
-    return None  # No obvious visual liquidity cluster
+    log.debug(f"❌ No internal liquidity found for {side}")
+    return None
 
-# ---------------- REFINED ROMEOPT EXTERNAL LIQUIDITY ----------------
+# ---------------- ENHANCED ROMEOPT EXTERNAL LIQUIDITY ----------------
 def romeopt_external_liquidity(df, side, lookback=50):
     """
-    REFINED RomeOPT external liquidity detection
-    Simple: Range extremes (RomeOPT prefers guaranteed stops)
+    Enhanced external liquidity detection
+    Looks for multiple liquidity zones, not just extremes
     """
     if side == "SELL":
-        # For SELL in trend: Range low (guaranteed stops below)
-        return df['low'].iloc[-lookback:].min()
+        # For SELL: Look for significant lows in the range
+        lows = df['low'].iloc[-lookback:].values
+        
+        # Get the absolute minimum
+        absolute_min = lows.min()
+        
+        # Estimate ATR from range if not available
+        if len(df) >= 14:
+            range_14d = df['high'].iloc[-14:].max() - df['low'].iloc[-14:].min()
+            atr_val = range_14d / 14
+        else:
+            # Fallback: use recent range
+            recent_range = df['high'].iloc[-lookback:].max() - df['low'].iloc[-lookback:].min()
+            atr_val = recent_range / 10
+        
+        # Find all lows within 1 ATR of the absolute minimum
+        nearby_lows = lows[(lows - absolute_min) <= atr_val]
+        
+        if len(nearby_lows) >= 2:
+            # Return the average of nearby lows (stronger zone)
+            avg_zone = float(nearby_lows.mean())
+            log.debug(f"✅ Found SELL external liquidity cluster: {avg_zone:.6f} (based on {len(nearby_lows)} lows)")
+            return avg_zone
+        else:
+            # Return the absolute minimum
+            log.debug(f"✅ Found SELL external liquidity extreme: {absolute_min:.6f}")
+            return float(absolute_min)
+            
     else:  # BUY
-        # For BUY in trend: Range high (guaranteed stops above)
-        return df['high'].iloc[-lookback:].max()
+        highs = df['high'].iloc[-lookback:].values
+        absolute_max = highs.max()
+        
+        # Estimate ATR
+        if len(df) >= 14:
+            range_14d = df['high'].iloc[-14:].max() - df['low'].iloc[-14:].min()
+            atr_val = range_14d / 14
+        else:
+            recent_range = df['high'].iloc[-lookback:].max() - df['low'].iloc[-lookback:].min()
+            atr_val = recent_range / 10
+        
+        nearby_highs = highs[(absolute_max - highs) <= atr_val]
+        
+        if len(nearby_highs) >= 2:
+            avg_zone = float(nearby_highs.mean())
+            log.debug(f"✅ Found BUY external liquidity cluster: {avg_zone:.6f} (based on {len(nearby_highs)} highs)")
+            return avg_zone
+        else:
+            log.debug(f"✅ Found BUY external liquidity extreme: {absolute_max:.6f}")
+            return float(absolute_max)
 
 # ---------------- ROMEOPT TP DECISION (REFINED VERSION) ----------------
 def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
@@ -303,22 +376,27 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
         log.debug(f"❌ No obvious liquidity found for {side} | Market: {market_state}")
         return None
     
-    # Step 3: Safety check - reject if recently swept
-    recent_candles = min(10, len(df))
+    # Step 3: Relaxed safety check - don't reject for recent touch
+    recent_candles = min(5, len(df))  # Reduced from 10
+    touch_tolerance = atr_val * 0.2  # Increased from 0.1
+    
     if side == "SELL":
-        recent_touch = any(
-            abs(df['low'].iloc[-i] - tp) <= atr_val * 0.1  # Within 10% ATR
-            for i in range(1, recent_candles)
+        recent_touch_count = sum(
+            1 for i in range(1, recent_candles + 1)
+            if abs(df['low'].iloc[-i] - tp) <= touch_tolerance
         )
     else:  # BUY
-        recent_touch = any(
-            abs(df['high'].iloc[-i] - tp) <= atr_val * 0.1
-            for i in range(1, recent_candles)
+        recent_touch_count = sum(
+            1 for i in range(1, recent_candles + 1)
+            if abs(df['high'].iloc[-i] - tp) <= touch_tolerance
         )
     
-    if recent_touch:
-        log.debug(f"❌ Liquidity recently swept for {side} at {tp}")
+    # Only reject if heavily tested recently
+    if recent_touch_count >= 3:  # Was 1
+        log.debug(f"❌ Liquidity heavily tested ({recent_touch_count} touches) for {side} at {tp}")
         return None
+    elif recent_touch_count > 0:
+        log.debug(f"⚠️  Liquidity touched {recent_touch_count} times recently, but accepting")
     
     # Step 4: Calculate SL (keep OB-based SL)
     if side == "BUY":
@@ -933,6 +1011,7 @@ async def main():
     await tg("🔒 TP LOCK: No recalculation after entry")
     await tg("⚡ EXTERNAL LIQUIDITY: Range extremes only")
     await tg("💎 ROMEOPT CORE: Target where price MUST go")
+    await tg("🔄 RELAXED: More permissive liquidity detection criteria")
     await asyncio.gather(scan_loop(exchange), monitor_signals())
 
 if __name__=="__main__":
