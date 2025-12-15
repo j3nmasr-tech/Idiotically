@@ -37,7 +37,7 @@ CRITICAL_FACTORS_MIN = 2
 # ---------------- FORCED FILTER PARAMETERS ----------------
 MOMENTUM_STRONG_THRESHOLD = 0.70
 MOMENTUM_GOOD_THRESHOLD = 0.65
-DISPLACEMENT_MIN_THRESHOLD = 0.65
+DISPLACEMENT_MIN_THRESHOLD = 0.60
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -60,12 +60,57 @@ async def tg(msg: str):
         except Exception as e:
             log.warning(f"Telegram send failed: {e}")
 
-# ---------------- DATABASE ----------------
+# ---------------- DATABASE MIGRATION ----------------
+async def migrate_db():
+    """Migrate database schema from old version to new version"""
+    global db_conn
+    
+    # Check if old columns exist
+    async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
+        columns = await cursor.fetchall()
+        column_names = [col[1] for col in columns]
+    
+    log.info(f"Current columns: {column_names}")
+    
+    # If old TP columns exist, migrate data
+    if 'tp1' in column_names and 'tp' not in column_names:
+        log.info("🚀 Migrating database schema...")
+        
+        # Add new columns
+        await db_conn.execute("ALTER TABLE signals ADD COLUMN tp REAL")
+        await db_conn.execute("ALTER TABLE signals ADD COLUMN tp_locked INTEGER DEFAULT 1")
+        
+        # Migrate tp1 data to tp for existing records
+        await db_conn.execute("UPDATE signals SET tp = tp1 WHERE tp IS NULL")
+        
+        # For closed signals with tp1_hit=1, mark tp_hit=1
+        await db_conn.execute("UPDATE signals SET tp_hit = 1 WHERE tp1_hit = 1 AND tp_hit = 0")
+        
+        await db_conn.commit()
+        log.info("✅ Database migration complete")
+    
+    # Ensure all columns exist
+    required_columns = [
+        ('tp', 'REAL'),
+        ('tp_locked', 'INTEGER DEFAULT 1')
+    ]
+    
+    for col_name, col_type in required_columns:
+        if col_name not in column_names:
+            try:
+                await db_conn.execute(f"ALTER TABLE signals ADD COLUMN {col_name} {col_type}")
+                log.info(f"Added missing column: {col_name}")
+            except Exception as e:
+                log.warning(f"Could not add column {col_name}: {e}")
+
+# ---------------- INIT DATABASE ----------------
 async def init_db():
     global db_conn
     db_conn = await aiosqlite.connect(DB_PATH)
     await db_conn.execute("PRAGMA journal_mode=WAL;")
     await db_conn.execute("PRAGMA synchronous=NORMAL;")
+    
+    # Create table if it doesn't exist (NEW SCHEMA)
     await db_conn.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -81,10 +126,13 @@ async def init_db():
             tp_hit INTEGER DEFAULT 0,
             latest_ob TEXT,
             tp_type TEXT,
-            tp_locked INTEGER DEFAULT 1  -- NEW: TP lock to prevent recalculation
+            tp_locked INTEGER DEFAULT 1
         );
     """)
     await db_conn.commit()
+    
+    # Run migration
+    await migrate_db()
 
 # ---------------- OHLCV ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
@@ -528,7 +576,20 @@ async def monitor_signals():
     while True:
         try:
             async with db_lock:
-                async with db_conn.execute("SELECT id,symbol,side,entry,sl,tp,tp_hit,status FROM signals WHERE status='OPEN'") as cursor:
+                # SAFE QUERY: Check column existence first
+                async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
+                    columns = await cursor.fetchall()
+                    column_names = [col[1] for col in columns]
+                
+                # Build query based on available columns
+                if 'tp' in column_names:
+                    query = "SELECT id,symbol,side,entry,sl,tp,tp_hit,status FROM signals WHERE status='OPEN'"
+                else:
+                    # Fallback for old schema during migration
+                    log.warning("Using fallback query (old schema)")
+                    query = "SELECT id,symbol,side,entry,sl,NULL as tp,0 as tp_hit,status FROM signals WHERE status='OPEN'"
+                
+                async with db_conn.execute(query) as cursor:
                     async for row in cursor:
                         sig_id, symbol, side, entry, sl, tp, tp_hit, status = row
                         
@@ -541,7 +602,6 @@ async def monitor_signals():
                         if last_price is None: continue
 
                         # RomeOPT: TP LOCK - Don't recalculate unless structure broken
-                        # We only check for TP hit or SL hit
                         hits = []
                         new_tp_hit = tp_hit
                         new_status = status
