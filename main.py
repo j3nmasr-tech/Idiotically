@@ -60,48 +60,81 @@ async def tg(msg: str):
         except Exception as e:
             log.warning(f"Telegram send failed: {e}")
 
-# ---------------- DATABASE MIGRATION ----------------
+# ---------------- COMPLETE DATABASE MIGRATION ----------------
 async def migrate_db():
-    """Migrate database schema from old version to new version"""
+    """Complete database migration from old schema to new schema"""
     global db_conn
     
-    # Check if old columns exist
-    async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
-        columns = await cursor.fetchall()
-        column_names = [col[1] for col in columns]
-    
-    log.info(f"Current columns: {column_names}")
-    
-    # If old TP columns exist, migrate data
-    if 'tp1' in column_names and 'tp' not in column_names:
-        log.info("🚀 Migrating database schema...")
+    try:
+        # Check if table exists at all
+        async with db_conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='signals'") as cursor:
+            table_exists = await cursor.fetchone()
         
-        # Add new columns
-        await db_conn.execute("ALTER TABLE signals ADD COLUMN tp REAL")
-        await db_conn.execute("ALTER TABLE signals ADD COLUMN tp_locked INTEGER DEFAULT 1")
+        if not table_exists:
+            log.info("Table 'signals' doesn't exist yet, will create new schema")
+            return
         
-        # Migrate tp1 data to tp for existing records
-        await db_conn.execute("UPDATE signals SET tp = tp1 WHERE tp IS NULL")
+        # Get current columns
+        async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
+            columns = await cursor.fetchall()
+            column_names = [col[1] for col in columns]
         
-        # For closed signals with tp1_hit=1, mark tp_hit=1
-        await db_conn.execute("UPDATE signals SET tp_hit = 1 WHERE tp1_hit = 1 AND tp_hit = 0")
+        log.info(f"Current columns: {column_names}")
+        
+        # List of required columns for new schema
+        required_columns = {
+            'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
+            'symbol': 'TEXT',
+            'side': 'TEXT',
+            'entry': 'REAL',
+            'sl': 'REAL',
+            'tp': 'REAL',
+            'timestamp': 'TEXT',
+            'status': 'TEXT',
+            'reason': 'TEXT',
+            'score': 'INTEGER',
+            'tp_hit': 'INTEGER DEFAULT 0',
+            'latest_ob': 'TEXT',
+            'tp_type': 'TEXT',
+            'tp_locked': 'INTEGER DEFAULT 1'
+        }
+        
+        # Add missing columns
+        for col_name, col_type in required_columns.items():
+            if col_name not in column_names:
+                try:
+                    await db_conn.execute(f"ALTER TABLE signals ADD COLUMN {col_name} {col_type}")
+                    log.info(f"✅ Added missing column: {col_name}")
+                except Exception as e:
+                    log.warning(f"Could not add column {col_name}: {e}")
+        
+        # If old TP columns exist, migrate data from tp1 to tp
+        if 'tp1' in column_names and 'tp' in column_names:
+            # Check if tp column is empty but tp1 has data
+            async with db_conn.execute("SELECT COUNT(*) FROM signals WHERE tp IS NULL AND tp1 IS NOT NULL") as cursor:
+                count = await cursor.fetchone()
+                if count and count[0] > 0:
+                    log.info(f"🚀 Migrating {count[0]} records from tp1 to tp...")
+                    await db_conn.execute("UPDATE signals SET tp = tp1 WHERE tp IS NULL AND tp1 IS NOT NULL")
+                    
+                    # Also migrate tp1_hit to tp_hit if needed
+                    if 'tp1_hit' in column_names:
+                        await db_conn.execute("UPDATE signals SET tp_hit = tp1_hit WHERE tp_hit = 0 AND tp1_hit = 1")
+                    
+                    log.info("✅ Data migration complete")
+        
+        # Drop old columns if they exist (optional - can keep for backward compatibility)
+        # columns_to_drop = ['tp1', 'tp2', 'tp3', 'tp1_hit', 'tp2_hit', 'tp3_hit']
+        # for col in columns_to_drop:
+        #     if col in column_names:
+        #         # SQLite doesn't support DROP COLUMN, would need table recreation
+        #         # We'll just leave them for now
+        #         pass
         
         await db_conn.commit()
-        log.info("✅ Database migration complete")
-    
-    # Ensure all columns exist
-    required_columns = [
-        ('tp', 'REAL'),
-        ('tp_locked', 'INTEGER DEFAULT 1')
-    ]
-    
-    for col_name, col_type in required_columns:
-        if col_name not in column_names:
-            try:
-                await db_conn.execute(f"ALTER TABLE signals ADD COLUMN {col_name} {col_type}")
-                log.info(f"Added missing column: {col_name}")
-            except Exception as e:
-                log.warning(f"Could not add column {col_name}: {e}")
+        
+    except Exception as e:
+        log.error(f"Migration error: {e}")
 
 # ---------------- INIT DATABASE ----------------
 async def init_db():
@@ -131,7 +164,7 @@ async def init_db():
     """)
     await db_conn.commit()
     
-    # Run migration
+    # Run complete migration
     await migrate_db()
 
 # ---------------- OHLCV ----------------
@@ -344,7 +377,7 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
     
     return sl, tp, tp_type
 
-# ---------------- REST OF SIGNAL GENERATION (UNCHANGED) ----------------
+# ---------------- REST OF SIGNAL GENERATION ----------------
 async def elite_tf_alignment(exchange, symbol: str, side: str):
     tfs = ["15m","1h","4h"]
     for tf in tfs:
@@ -522,7 +555,7 @@ def find_latest_ob(df: pd.DataFrame):
             return {"type":"bearish","low":candle["close"],"high":max(candle["high"], prev_candle["high"])}
     return None
 
-# ---------------- REFINED UPDATE TP/SL LIVE (WITH TP LOCK) ----------------
+# ---------------- REFINED UPDATE TP/SL LIVE ----------------
 def update_tp_sl_live(sig: dict, df: pd.DataFrame):
     """
     REFINED: Only update if TP hasn't been hit AND structure invalidated
@@ -568,30 +601,62 @@ async def log_signal(sig):
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
         """, (sig["symbol"],sig["side"],sig["entry"],sig.get("sl"),sig.get("tp"),
               datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"],
-              str(sig.get("latest_ob","")), sig.get("tp_type", ""), 1))  # tp_locked = 1
+              str(sig.get("latest_ob","")), sig.get("tp_type", ""), 1))
         await db_conn.commit()
 
-# ---------------- MONITOR SIGNALS ----------------
+# ---------------- ROBUST MONITOR SIGNALS ----------------
 async def monitor_signals():
     while True:
         try:
             async with db_lock:
-                # SAFE QUERY: Check column existence first
+                # Get current columns to build dynamic query
                 async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
                     columns = await cursor.fetchall()
                     column_names = [col[1] for col in columns]
                 
-                # Build query based on available columns
+                # Build query with fallback for missing columns
+                select_fields = []
+                if 'id' in column_names:
+                    select_fields.append('id')
+                if 'symbol' in column_names:
+                    select_fields.append('symbol')
+                if 'side' in column_names:
+                    select_fields.append('side')
+                if 'entry' in column_names:
+                    select_fields.append('entry')
+                if 'sl' in column_names:
+                    select_fields.append('sl')
                 if 'tp' in column_names:
-                    query = "SELECT id,symbol,side,entry,sl,tp,tp_hit,status FROM signals WHERE status='OPEN'"
+                    select_fields.append('tp')
                 else:
-                    # Fallback for old schema during migration
-                    log.warning("Using fallback query (old schema)")
-                    query = "SELECT id,symbol,side,entry,sl,NULL as tp,0 as tp_hit,status FROM signals WHERE status='OPEN'"
+                    select_fields.append('NULL as tp')  # Fallback
+                
+                if 'tp_hit' in column_names:
+                    select_fields.append('tp_hit')
+                else:
+                    select_fields.append('0 as tp_hit')  # Default value
+                
+                if 'status' in column_names:
+                    select_fields.append('status')
+                
+                query = f"SELECT {','.join(select_fields)} FROM signals WHERE status='OPEN'"
                 
                 async with db_conn.execute(query) as cursor:
                     async for row in cursor:
-                        sig_id, symbol, side, entry, sl, tp, tp_hit, status = row
+                        # Map row to variables based on query structure
+                        row_dict = dict(zip(select_fields, row))
+                        
+                        sig_id = row_dict.get('id')
+                        symbol = row_dict.get('symbol')
+                        side = row_dict.get('side')
+                        entry = row_dict.get('entry')
+                        sl = row_dict.get('sl')
+                        tp = row_dict.get('tp')
+                        tp_hit = row_dict.get('tp_hit', 0)
+                        status = row_dict.get('status')
+                        
+                        if not all([sig_id, symbol, side, entry]):
+                            continue
                         
                         # Check if TP already hit
                         if tp_hit == 1:
@@ -599,7 +664,8 @@ async def monitor_signals():
                         
                         ticker = await exchange.fetch_ticker(symbol)
                         last_price = ticker.get("last")
-                        if last_price is None: continue
+                        if last_price is None: 
+                            continue
 
                         # RomeOPT: TP LOCK - Don't recalculate unless structure broken
                         hits = []
