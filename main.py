@@ -8,7 +8,7 @@ LIQUIDITY-ANCHORED ROMEOPT 6-STEP SCANNER
 - NO TP distance rejection
 - NO fallback to fixed numbers
 - If no liquidity target → REJECT signal
-- HTF liquidity pools for TP, LTF structure for SL
+- HTF liquidity pools for TP (mapped by entry TF), LTF structure for SL
 - Elite Multi-Timeframe Confirmation
 - FORCED FILTER: Momentum ≥ 0.70 OR (Momentum ≥ 0.65 AND Displacement ≥ 0.60)
 - OB DISTANCE FILTER: Reject trades where OB distance > 0.70%
@@ -51,7 +51,28 @@ LIQUIDITY_LOOKBACK = 100  # Candles to look back for liquidity
 MIN_TOUCHES_FOR_POOL = 3  # Minimum touches to consider a liquidity pool
 SWING_LOOKBACK = 5       # Candles each side for swing detection
 TOUCH_TOLERANCE_PCT = 0.1  # % tolerance for equal highs/lows
-HTF_FOR_TP = ["1h", "4h"]  # Timeframes to check for liquidity pools
+
+# ---------------- TIMEFRAME MAPPING FOR TP ----------------
+def get_tp_timeframes(entry_tf: str) -> list:
+    """
+    Get appropriate TP timeframes based on entry timeframe
+    Always target 1-2 higher timeframes above entry
+    Mapping:
+      Entry TF → TP TF (try first, then second)
+      1m → 15m, 30m
+      3m → 15m, 30m
+      5m → 15m, 30m
+      15m → 30m, 1h
+      30m → 1h, 4h
+    """
+    mapping = {
+        "1m": ["15m", "30m"],
+        "3m": ["15m", "30m"],
+        "5m": ["15m", "30m"],
+        "15m": ["30m", "1h"],
+        "30m": ["1h", "4h"],
+    }
+    return mapping.get(entry_tf, ["1h", "4h"])  # Default fallback
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -110,10 +131,44 @@ async def init_db():
             liquidity_anchored INTEGER DEFAULT 0,
             rr_tp1 REAL,
             rr_tp2 REAL,
-            rr_tp3 REAL
+            rr_tp3 REAL,
+            entry_tf TEXT,
+            tp_tf TEXT
         );
     """)
     await db_conn.commit()
+    
+    # Add missing columns if they don't exist
+    await add_missing_columns()
+
+async def add_missing_columns():
+    """Add missing columns to existing database"""
+    columns_to_add = [
+        ("liquidity_anchored", "INTEGER DEFAULT 0"),
+        ("rr_tp1", "REAL"),
+        ("rr_tp2", "REAL"),
+        ("rr_tp3", "REAL"),
+        ("entry_tf", "TEXT"),
+        ("tp_tf", "TEXT")
+    ]
+    
+    try:
+        # Get existing columns
+        async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
+            existing_columns = {row[1] for row in await cursor.fetchall()}
+        
+        # Add missing columns
+        for column_name, column_type in columns_to_add:
+            if column_name not in existing_columns:
+                try:
+                    await db_conn.execute(f"ALTER TABLE signals ADD COLUMN {column_name} {column_type}")
+                    log.info(f"Added missing column: {column_name}")
+                except Exception as e:
+                    log.warning(f"Could not add column {column_name}: {e}")
+        
+        await db_conn.commit()
+    except Exception as e:
+        log.error(f"Error adding columns: {e}")
 
 # ---------------- OHLCV ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
@@ -391,19 +446,23 @@ def is_swing_high(df, idx):
     return True
 
 # ---------------- LIQUIDITY-BASED TP/SL (NO RR AUTHORITY) ----------------
-async def liquidity_tp_sl(exchange, entry: float, side: str, symbol: str, df_entry_tf: pd.DataFrame):
+async def liquidity_tp_sl(exchange, entry: float, side: str, symbol: str, df_entry_tf: pd.DataFrame, entry_tf: str):
     """
     RomeoTPT-style TP/SL - 100% liquidity anchored
-    Returns: (sl, tp1, tp2, tp3) or (None, None, None, None) if no liquidity found
+    entry_tf: The timeframe where signal was detected (e.g., "1m", "5m", "15m")
+    Returns: (sl, tp1, tp2, tp3, selected_tf) or (None, None, None, None, None) if no liquidity found
     
     IMPORTANT: If no liquidity target → returns None → signal REJECTED
     """
     
-    # Step 1: Get HTF data for TP
+    # Step 1: Get HTF data for TP (based on entry timeframe mapping)
     df_htf = None
     selected_tf = None
     
-    for htf in HTF_FOR_TP:
+    # Get appropriate TP timeframes for this entry TF
+    tp_timeframes = get_tp_timeframes(entry_tf)
+    
+    for htf in tp_timeframes:
         ohlcv = await fetch_ohlcv(exchange, symbol, htf, LIQUIDITY_LOOKBACK)
         if ohlcv and len(ohlcv) >= 30:
             df_htf = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
@@ -413,15 +472,15 @@ async def liquidity_tp_sl(exchange, entry: float, side: str, symbol: str, df_ent
             break
     
     if df_htf is None:
-        log.debug(f"No HTF data for {symbol} - cannot find liquidity pools")
-        return None, None, None, None
+        log.debug(f"No HTF data for {symbol} at TP timeframes {tp_timeframes}")
+        return None, None, None, None, None
     
     # Step 2: Find liquidity pools on HTF
     liquidity_pools = find_liquidity_pools(df_htf, side)
     
     if not liquidity_pools:
         log.debug(f"No liquidity pools found for {symbol} {side} on {selected_tf}")
-        return None, None, None, None
+        return None, None, None, None, None
     
     # Step 3: Select TP levels based on liquidity
     if side == "BUY":
@@ -429,8 +488,8 @@ async def liquidity_tp_sl(exchange, entry: float, side: str, symbol: str, df_ent
         valid_pools = [p for p in liquidity_pools if p > entry]
         
         if not valid_pools:
-            log.debug(f"No BUY liquidity above entry for {symbol}")
-            return None, None, None, None
+            log.debug(f"No BUY liquidity above entry for {symbol} on {selected_tf}")
+            return None, None, None, None, None
         
         # TP1 = nearest buy-side liquidity above entry
         tp1 = min(valid_pools, key=lambda x: abs(x - entry))
@@ -481,8 +540,8 @@ async def liquidity_tp_sl(exchange, entry: float, side: str, symbol: str, df_ent
         valid_pools = [p for p in liquidity_pools if p < entry]
         
         if not valid_pools:
-            log.debug(f"No SELL liquidity below entry for {symbol}")
-            return None, None, None, None
+            log.debug(f"No SELL liquidity below entry for {symbol} on {selected_tf}")
+            return None, None, None, None, None
         
         # TP1 = nearest sell-side liquidity below entry
         tp1 = max(valid_pools, key=lambda x: abs(x - entry))
@@ -532,25 +591,25 @@ async def liquidity_tp_sl(exchange, entry: float, side: str, symbol: str, df_ent
     if side == "BUY":
         if not (entry < tp1 <= tp3):
             log.debug(f"Invalid TP hierarchy for BUY: entry={entry}, tp1={tp1}, tp3={tp3}")
-            return None, None, None, None
+            return None, None, None, None, None
         if tp2 and not (tp1 <= tp2 <= tp3):
             log.debug(f"Invalid TP2 for BUY: tp1={tp1}, tp2={tp2}, tp3={tp3}")
-            return None, None, None, None
+            return None, None, None, None, None
         if sl_buffer >= entry:
             log.debug(f"SL above entry for BUY: sl={sl_buffer}, entry={entry}")
-            return None, None, None, None
+            return None, None, None, None, None
     else:  # SELL
         if not (entry > tp1 >= tp3):
             log.debug(f"Invalid TP hierarchy for SELL: entry={entry}, tp1={tp1}, tp3={tp3}")
-            return None, None, None, None
+            return None, None, None, None, None
         if tp2 and not (tp1 >= tp2 >= tp3):
             log.debug(f"Invalid TP2 for SELL: tp1={tp1}, tp2={tp2}, tp3={tp3}")
-            return None, None, None, None
+            return None, None, None, None, None
         if sl_buffer <= entry:
             log.debug(f"SL below entry for SELL: sl={sl_buffer}, entry={entry}")
-            return None, None, None, None
+            return None, None, None, None, None
     
-    return sl_buffer, tp1, tp2, tp3
+    return sl_buffer, tp1, tp2, tp3, selected_tf
 
 def find_latest_ob(df: pd.DataFrame):
     """Find the latest Order Block for SL reference"""
@@ -675,7 +734,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         calc_values["ob_type"] = "NONE"
         calc_values["ob_midpoint"] = None
 
-    # Step 5: HTF Alignment
+    # Step 5: HTF Alignment (for signal confirmation, not TP)
     tf_map={"1m":"15m","3m":"30m","5m":"1h","15m":"4h","30m":"1h"}
     htf=tf_map.get(tf,"15m")
     ohlcv_htf = await fetch_ohlcv(exchange, symbol, htf, 50)
@@ -780,13 +839,14 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         calc_values["ob_distance_filter_status"] = "NO_OB"
 
     # ---------------- LIQUIDITY-BASED TP/SL (NO RR AUTHORITY) ----------------
-    tp_sl_result = await liquidity_tp_sl(exchange, entry, side, symbol, df)
+    tp_sl_result = await liquidity_tp_sl(exchange, entry, side, symbol, df, tf)
     
     if tp_sl_result[0] is None:  # No liquidity found → REJECT
-        reasons.append("❌ NO LIQUIDITY TARGET FOUND - Signal rejected")
+        tp_timeframes = get_tp_timeframes(tf)
+        reasons.append(f"❌ NO LIQUIDITY TARGET FOUND on TP timeframes {tp_timeframes}")
         return None
     
-    sl, tp1, tp2, tp3 = tp_sl_result
+    sl, tp1, tp2, tp3, tp_tf = tp_sl_result
     
     # Create signal with liquidity-based levels
     sig = {
@@ -804,7 +864,9 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         "liquidity_sweep": liquidity_sweep,
         "momentum_ratio": momentum_ratio,
         "calc_values": calc_values,
-        "latest_ob": find_latest_ob(df)
+        "latest_ob": find_latest_ob(df),
+        "entry_tf": tf,
+        "tp_tf": tp_tf
     }
     
     # Calculate RR for display ONLY (not for validation)
@@ -830,7 +892,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         log.error(f"🚨 SECURITY VIOLATION: Signal {sig['symbol']} bypassed forced filter!")
         return None
     
-    log.info(f"✅ Signal {sig['symbol']} passed all filters: Mom={momentum_val:.2f}, Disp={displacement_val:.2f}, OB Dist={calc_values.get('ob_distance_pct', 0):.2f}%, TP1={tp1_r:.1f}R")
+    log.info(f"✅ Signal {sig['symbol']} passed all filters: EntryTF={tf}, TPTF={tp_tf}, Mom={momentum_val:.2f}, Disp={displacement_val:.2f}, TP1={tp1_r:.1f}R")
     return sig
 
 # ---------------- SL CLUSTER ----------------
@@ -849,33 +911,87 @@ async def log_signal(sig):
     async with db_lock:
         rr_info = sig.get("rr_info", {})
         
-        await db_conn.execute("""
-            INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score,latest_ob,ob_type,sweep_type,momentum_value,displacement_value,ob_distance_pct,ob_distance_filter,liquidity_anchored,rr_tp1,rr_tp2,rr_tp3)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            sig["symbol"],
-            sig["side"],
-            sig["entry"],
-            sig.get("sl"),
-            sig.get("tp1"),
-            sig.get("tp2"),
-            sig.get("tp3"),
-            datetime.datetime.utcnow().isoformat(),
-            "OPEN",
-            sig["reason"],
-            sig["score"],
-            str(sig.get("latest_ob","")),
-            sig.get("calc_values", {}).get("ob_type", ""),
-            sig.get("calc_values", {}).get("sweep_type", ""),
-            sig.get("calc_values", {}).get("momentum_value", 0),
-            sig.get("calc_values", {}).get("displacement_value", 0),
-            sig.get("calc_values", {}).get("ob_distance_pct", 0),
-            sig.get("calc_values", {}).get("ob_distance_filter", {}).get("status", "UNKNOWN"),
-            1,  # liquidity_anchored = True
-            rr_info.get("tp1_r", 0),
-            rr_info.get("tp2_r", 0),
-            rr_info.get("tp3_r", 0)
-        ))
+        # Try with all columns first
+        try:
+            await db_conn.execute("""
+                INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score,latest_ob,ob_type,sweep_type,momentum_value,displacement_value,ob_distance_pct,ob_distance_filter,liquidity_anchored,rr_tp1,rr_tp2,rr_tp3,entry_tf,tp_tf)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                sig["symbol"],
+                sig["side"],
+                sig["entry"],
+                sig.get("sl"),
+                sig.get("tp1"),
+                sig.get("tp2"),
+                sig.get("tp3"),
+                datetime.datetime.utcnow().isoformat(),
+                "OPEN",
+                sig["reason"],
+                sig["score"],
+                str(sig.get("latest_ob","")),
+                sig.get("calc_values", {}).get("ob_type", ""),
+                sig.get("calc_values", {}).get("sweep_type", ""),
+                sig.get("calc_values", {}).get("momentum_value", 0),
+                sig.get("calc_values", {}).get("displacement_value", 0),
+                sig.get("calc_values", {}).get("ob_distance_pct", 0),
+                sig.get("calc_values", {}).get("ob_distance_filter", {}).get("status", "UNKNOWN"),
+                1,  # liquidity_anchored = True
+                rr_info.get("tp1_r", 0),
+                rr_info.get("tp2_r", 0),
+                rr_info.get("tp3_r", 0),
+                sig.get("entry_tf", ""),
+                sig.get("tp_tf", "")
+            ))
+        except Exception as e:
+            # If new schema fails, fall back to old schema without new columns
+            log.warning(f"New schema failed ({e}), falling back to old schema...")
+            try:
+                await db_conn.execute("""
+                    INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score,latest_ob,ob_type,sweep_type,momentum_value,displacement_value,ob_distance_pct,ob_distance_filter)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    sig["symbol"],
+                    sig["side"],
+                    sig["entry"],
+                    sig.get("sl"),
+                    sig.get("tp1"),
+                    sig.get("tp2"),
+                    sig.get("tp3"),
+                    datetime.datetime.utcnow().isoformat(),
+                    "OPEN",
+                    sig["reason"],
+                    sig["score"],
+                    str(sig.get("latest_ob","")),
+                    sig.get("calc_values", {}).get("ob_type", ""),
+                    sig.get("calc_values", {}).get("sweep_type", ""),
+                    sig.get("calc_values", {}).get("momentum_value", 0),
+                    sig.get("calc_values", {}).get("displacement_value", 0),
+                    sig.get("calc_values", {}).get("ob_distance_pct", 0),
+                    sig.get("calc_values", {}).get("ob_distance_filter", {}).get("status", "UNKNOWN")
+                ))
+            except Exception as e2:
+                log.error(f"Failed to log signal with old schema too: {e2}")
+                # Last resort: minimal schema
+                try:
+                    await db_conn.execute("""
+                        INSERT INTO signals (symbol,side,entry,sl,tp1,tp2,tp3,timestamp,status,reason,score)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    """, (
+                        sig["symbol"],
+                        sig["side"],
+                        sig["entry"],
+                        sig.get("sl"),
+                        sig.get("tp1"),
+                        sig.get("tp2"),
+                        sig.get("tp3"),
+                        datetime.datetime.utcnow().isoformat(),
+                        "OPEN",
+                        sig["reason"],
+                        sig["score"]
+                    ))
+                except Exception as e3:
+                    log.error(f"Failed to log signal with minimal schema: {e3}")
+        
         await db_conn.commit()
 
 # ---------------- ENHANCED BREAKDOWN FORMATTING ----------------
@@ -896,16 +1012,17 @@ async def update_signal_with_liquidity(exchange, sig: dict, df: pd.DataFrame):
     symbol = sig["symbol"]
     side = sig["side"]
     entry = sig["entry"]
+    entry_tf = sig.get("entry_tf", "15m")  # Default if not stored
     
     # Get fresh liquidity-based TP/SL
-    tp_sl_result = await liquidity_tp_sl(exchange, entry, side, symbol, df)
+    tp_sl_result = await liquidity_tp_sl(exchange, entry, side, symbol, df, entry_tf)
     
     if tp_sl_result[0] is None:
         # If no liquidity found now, keep old values but mark as stale
         sig["liquidity_status"] = "STALE"
         return sig
     
-    sl, tp1, tp2, tp3 = tp_sl_result
+    sl, tp1, tp2, tp3, tp_tf = tp_sl_result
     
     # Update signal
     sig.update({
@@ -913,6 +1030,7 @@ async def update_signal_with_liquidity(exchange, sig: dict, df: pd.DataFrame):
         "tp1": tp1,
         "tp2": tp2,
         "tp3": tp3,
+        "tp_tf": tp_tf,
         "liquidity_status": "FRESH"
     })
     
@@ -937,9 +1055,9 @@ async def monitor_signals():
     while True:
         try:
             async with db_lock:
-                async with db_conn.execute("SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,tp1_hit,tp2_hit,tp3_hit,status FROM signals WHERE status='OPEN'") as cursor:
+                async with db_conn.execute("SELECT id,symbol,side,entry,sl,tp1,tp2,tp3,tp1_hit,tp2_hit,tp3_hit,status,entry_tf FROM signals WHERE status='OPEN'") as cursor:
                     async for row in cursor:
-                        sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status = row
+                        sig_id, symbol, side, entry, sl, tp1, tp2, tp3, tp1_hit, tp2_hit, tp3_hit, status, entry_tf = row
                         ticker = await exchange.fetch_ticker(symbol)
                         last_price = ticker.get("last")
                         if last_price is None: continue
@@ -959,7 +1077,8 @@ async def monitor_signals():
                                 "sl": sl,
                                 "tp1": tp1,
                                 "tp2": tp2,
-                                "tp3": tp3
+                                "tp3": tp3,
+                                "entry_tf": entry_tf or "15m"
                             }
                             
                             sig = await update_signal_with_liquidity(exchange, sig, df_live)
@@ -981,8 +1100,8 @@ async def monitor_signals():
                             await tg(f"🎯 {symbol} {side} update\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP1:{tp1} TP2:{tp2} TP3:{tp3}")
 
                         if sl_hit: record_sl_hit(symbol)
-                        await db_conn.execute("UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=? WHERE id=?",
-                                             (tp1_hit,tp2_hit,tp3_hit,status,sig_id))
+                        await db_conn.execute("UPDATE signals SET tp1_hit=?,tp2_hit=?,tp3_hit=?,status=?,sl=?,tp1=?,tp2=?,tp3=? WHERE id=?",
+                                             (tp1_hit,tp2_hit,tp3_hit,status,sl,tp1,tp2,tp3,sig_id))
                 await db_conn.commit()
         except Exception as e: 
             log.exception("monitor error: %s", e)
@@ -1028,12 +1147,26 @@ async def scan_loop(exchange):
                         tp2_r = rr_info.get("tp2_r", 0)
                         tp3_r = rr_info.get("tp3_r", 0)
                         
+                        # Get TP timeframe info
+                        entry_tf = sig.get("entry_tf", tf)
+                        tp_tf = sig.get("tp_tf", "N/A")
+                        tp_timeframes = get_tp_timeframes(entry_tf)
+                        
                         # Start building the enhanced breakdown
                         breakdown_lines = [
-                            f"🏆 {sig['symbol']} ({tf}) {sig['side']}",
+                            f"🏆 {sig['symbol']} ({entry_tf}) {sig['side']}",
                             f"Entry: {sig['entry']:.6f} | Score: {sig['score']}/6",
                             f""
                         ]
+                        
+                        # 📊 TIMEFRAME MAPPING
+                        breakdown_lines.append(f"📊 TIMEFRAME MAPPING:")
+                        breakdown_lines.extend([
+                            f"  • Entry TF: {entry_tf}",
+                            f"  • TP TF: {tp_tf}",
+                            f"  • TP Timeframes checked: {', '.join(tp_timeframes)}",
+                            f""
+                        ])
                         
                         # 📊 SWEEP DETAILS SECTION
                         breakdown_lines.append(f"⚡ LIQUIDITY SWEEP DETAILS:")
@@ -1148,7 +1281,7 @@ async def scan_loop(exchange):
                         breakdown_lines.append(f"")
                         
                         # 🎯 LIQUIDITY-ANCHORED TARGETS
-                        breakdown_lines.append(f"🎯 LIQUIDITY-ANCHORED TARGETS:")
+                        breakdown_lines.append(f"🎯 LIQUIDITY-ANCHORED TARGETS (TP on {tp_tf}):")
                         breakdown_lines.extend([
                             f"  • SL: {format_number(sig.get('sl', 0))} (Structure-based)",
                             f"  • TP1: {format_number(sig.get('tp1', 0))} ({tp1_r:.1f}R) ← Nearest liquidity",
@@ -1157,11 +1290,11 @@ async def scan_loop(exchange):
                             f"  • Risk: {format_number(rr_info.get('risk', 0))}",
                             f"",
                             f"📊 LIQUIDITY AUTHORITY:",
+                            f"  • Entry TF: {entry_tf} → TP TF: {tp_tf}",
                             f"  • Market Liquidity → Math (RR calculated after)",
                             f"  • No RR-based rejection",
                             f"  • No fixed TP ratios",
-                            f"  • If no liquidity → No trade",
-                            f"  • HTF for TP: {', '.join(HTF_FOR_TP)}"
+                            f"  • If no liquidity → No trade"
                         ])
                         
                         # Clean up empty lines
@@ -1217,9 +1350,11 @@ async def main():
     await tg("🚫 RULE 3: EVERYTHING ELSE → REJECTED")
     await tg("🆕 OB DISTANCE FILTER ACTIVE")
     await tg(f"📏 OB Distance ≤ {OB_DISTANCE_MAX_THRESHOLD}% required")
-    await tg("🎯 LIQUIDITY-ANCHORED TP/SL")
-    await tg(f"💰 TP = HTF Liquidity Pools ({', '.join(HTF_FOR_TP)})")
-    await tg("📈 RR calculated AFTER, not BEFORE")
+    await tg("🎯 TIMEFRAME-MAPPED LIQUIDITY TP/SL")
+    await tg("📈 Entry TF → TP TF Mapping:")
+    await tg("   • 1m/3m/5m → 15m/30m")
+    await tg("   • 15m → 30m/1h")
+    await tg("   • 30m → 1h/4h")
     await tg("🚫 No trade if no liquidity target found")
     
     # Start main loops
