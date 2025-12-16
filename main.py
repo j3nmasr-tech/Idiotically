@@ -211,12 +211,10 @@ def romeopt_market_state(df, atr_val):
     
     return "IMBALANCED" if strong_displacement else "BALANCED"
 
-# ---------------- FIXED: ROMEOPT LIQUIDITY CONSUMPTION CHECK ----------------
+# ---------------- FIXED: LIQUIDITY CONSUMPTION CHECK ----------------
 def is_liquidity_consumed(df, tp, side, atr_val, lookback=10):
     """
     FIXED: Liquidity is only consumed when price CLOSES BEYOND it with momentum
-    - Touch is OK (RomeOPT entries happen after touch)
-    - Consumption = close beyond liquidity with conviction
     """
     recent_candles = min(lookback, len(df))
     
@@ -224,71 +222,55 @@ def is_liquidity_consumed(df, tp, side, atr_val, lookback=10):
         candle = df.iloc[-i]
         
         if side == "SELL":
-            # Liquidity consumed if price CLOSED significantly below TP
-            # AND had momentum (strong bearish candle)
             close_below = candle["close"] < tp
             momentum = (candle["close"] < candle["open"]) and \
                        (abs(candle["close"] - candle["open"]) > atr_val * 0.3)
             
             if close_below and momentum:
-                log.debug(f"❌ SELL Liquidity CONSUMED at {tp:.6f} "
-                         f"(closed at {candle['close']:.6f} with momentum)")
                 return True
                 
         else:  # BUY
-            # Liquidity consumed if price CLOSED significantly above TP
-            # AND had momentum (strong bullish candle)
             close_above = candle["close"] > tp
             momentum = (candle["close"] > candle["open"]) and \
                        (abs(candle["close"] - candle["open"]) > atr_val * 0.3)
             
             if close_above and momentum:
-                log.debug(f"❌ BUY Liquidity CONSUMED at {tp:.6f} "
-                         f"(closed at {candle['close']:.6f} with momentum)")
                 return True
     
-    # Touch alone is OK for RomeOPT
     return False
 
 # ---------------- FIXED: ROMEOPT INTERNAL LIQUIDITY ----------------
 def romeopt_internal_liquidity(df, side, atr_val, lookback=15):
     """
-    FIXED RomeOPT internal liquidity detection
-    Uses dynamic tolerance based on price scale, not just ATR
+    FIXED RomeOPT internal liquidity detection with detailed logging
     """
     if side == "SELL":
-        # For SELL: Look for obvious equal lows
         lows = df['low'].iloc[-lookback:].dropna()
         if len(lows) < 5:
+            log.debug("❌ INTERNAL LIQ: Not enough low data (SELL)")
             return None
         
-        # FIXED: Dynamic tolerance based on price, not just ATR
         price_median = lows.median()
-        
-        # Use percentage tolerance (0.1% for major coins)
-        tolerance_percentage = 0.001  # 0.1% tolerance
+        tolerance_percentage = 0.001
         tolerance = price_median * tolerance_percentage
-        
-        # Minimum tolerance for very low volatility (FIXED: increased from 0.15 to 0.5)
         min_tolerance = atr_val * 0.5
         tolerance = max(tolerance, min_tolerance)
-        
-        # Cap maximum tolerance
         max_tolerance = atr_val * 2.0
         tolerance = min(tolerance, max_tolerance)
         
-        # Find potential cluster centers
+        log.debug(f"🔍 INTERNAL LIQ SELL: Price median={price_median:.6f}, ATR={atr_val:.6f}, Tolerance={tolerance:.6f}")
+        log.debug(f"   Lows in lookback: {list(lows.round(6))}")
+        
         potential_targets = []
         price_levels = sorted(lows.unique())
         
-        # Group nearby prices into zones
         current_zone = []
         zones = []
         
         for price in price_levels:
             if not current_zone:
                 current_zone.append(price)
-            elif price - current_zone[-1] <= tolerance * 2:  # More lenient zone detection
+            elif price - current_zone[-1] <= tolerance * 2:
                 current_zone.append(price)
             else:
                 zones.append(current_zone.copy())
@@ -297,14 +279,12 @@ def romeopt_internal_liquidity(df, side, atr_val, lookback=15):
         if current_zone:
             zones.append(current_zone)
         
-        # Find zones with enough liquidity (multiple touches)
-        for zone in zones:
-            if len(zone) >= 2:  # At least 2 touches in zone
-                # For SELL: Use the LOWEST price in zone (most obvious stop pool)
+        log.debug(f"   Found {len(zones)} potential zones")
+        
+        for idx, zone in enumerate(zones):
+            if len(zone) >= 2:
                 zone_low = min(zone)
                 zone_high = max(zone)
-                
-                # Calculate zone strength (touches per candle)
                 touch_count = sum(1 for low in lows if zone_low <= low <= zone_high)
                 density = touch_count / len(lows)
                 
@@ -314,30 +294,34 @@ def romeopt_internal_liquidity(df, side, atr_val, lookback=15):
                     'density': density,
                     'zone_range': (zone_low, zone_high)
                 })
+                
+                log.debug(f"   Zone {idx}: {zone_low:.6f}-{zone_high:.6f}, {touch_count} touches, density={density:.2f}")
         
         if potential_targets:
-            # Choose strongest liquidity zone (most touches)
             best = max(potential_targets, key=lambda x: (x['strength'], -x['price']))
-            log.debug(f"✅ SELL Liquidity Zone: {best['price']:.6f} "
-                     f"({best['strength']} touches, range: {best['zone_range'][0]:.6f}-{best['zone_range'][1]:.6f})")
+            log.debug(f"✅ INTERNAL LIQ SELL: Best zone at {best['price']:.6f} ({best['strength']} touches)")
             return best['price']
-        
-    else:  # BUY
-        # For BUY: Look for obvious equal highs
-        highs = df['high'].iloc[-lookback:].dropna()
-        if len(highs) < 5:
+        else:
+            log.debug("❌ INTERNAL LIQ SELL: No valid zones found (need ≥2 touches)")
             return None
         
-        # FIXED: Same dynamic tolerance logic
+    else:  # BUY
+        highs = df['high'].iloc[-lookback:].dropna()
+        if len(highs) < 5:
+            log.debug("❌ INTERNAL LIQ: Not enough high data (BUY)")
+            return None
+        
         price_median = highs.median()
         tolerance_percentage = 0.001
         tolerance = price_median * tolerance_percentage
-        min_tolerance = atr_val * 0.5  # FIXED: increased from 0.15
+        min_tolerance = atr_val * 0.5
         tolerance = max(tolerance, min_tolerance)
         max_tolerance = atr_val * 2.0
         tolerance = min(tolerance, max_tolerance)
         
-        # Group into zones
+        log.debug(f"🔍 INTERNAL LIQ BUY: Price median={price_median:.6f}, ATR={atr_val:.6f}, Tolerance={tolerance:.6f}")
+        log.debug(f"   Highs in lookback: {list(highs.round(6))}")
+        
         potential_targets = []
         price_levels = sorted(highs.unique())
         current_zone = []
@@ -355,12 +339,12 @@ def romeopt_internal_liquidity(df, side, atr_val, lookback=15):
         if current_zone:
             zones.append(current_zone)
         
-        for zone in zones:
+        log.debug(f"   Found {len(zones)} potential zones")
+        
+        for idx, zone in enumerate(zones):
             if len(zone) >= 2:
-                # For BUY: Use the HIGHEST price in zone
                 zone_low = min(zone)
                 zone_high = max(zone)
-                
                 touch_count = sum(1 for high in highs if zone_low <= high <= zone_high)
                 density = touch_count / len(highs)
                 
@@ -370,60 +354,76 @@ def romeopt_internal_liquidity(df, side, atr_val, lookback=15):
                     'density': density,
                     'zone_range': (zone_low, zone_high)
                 })
+                
+                log.debug(f"   Zone {idx}: {zone_low:.6f}-{zone_high:.6f}, {touch_count} touches, density={density:.2f}")
         
         if potential_targets:
             best = max(potential_targets, key=lambda x: (x['strength'], x['price']))
-            log.debug(f"✅ BUY Liquidity Zone: {best['price']:.6f} "
-                     f"({best['strength']} touches, range: {best['zone_range'][0]:.6f}-{best['zone_range'][1]:.6f})")
+            log.debug(f"✅ INTERNAL LIQ BUY: Best zone at {best['price']:.6f} ({best['strength']} touches)")
             return best['price']
+        else:
+            log.debug("❌ INTERNAL LIQ BUY: No valid zones found (need ≥2 touches)")
+            return None
     
-    return None  # No obvious visual liquidity cluster
+    return None
 
 # ---------------- REFINED ROMEOPT EXTERNAL LIQUIDITY ----------------
 def romeopt_external_liquidity(df, side, lookback=50):
     """
     REFINED RomeOPT external liquidity detection
-    Simple: Range extremes (RomeOPT prefers guaranteed stops)
     """
     if side == "SELL":
-        # For SELL in trend: Range low (guaranteed stops below)
-        return df['low'].iloc[-lookback:].min()
+        ext_liq = df['low'].iloc[-lookback:].min()
+        log.debug(f"🔍 EXTERNAL LIQ SELL: Range low = {ext_liq:.6f} (lookback {lookback})")
+        return ext_liq
     else:  # BUY
-        # For BUY in trend: Range high (guaranteed stops above)
-        return df['high'].iloc[-lookback:].max()
+        ext_liq = df['high'].iloc[-lookback:].max()
+        log.debug(f"🔍 EXTERNAL LIQ BUY: Range high = {ext_liq:.6f} (lookback {lookback})")
+        return ext_liq
 
-# ---------------- FIXED: ROMEOPT TP DECISION ----------------
+# ---------------- FIXED: ROMEOPT TP DECISION WITH DETAILED LOGGING ----------------
 def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
     """
-    FIXED RomeOPT TP logic with corrected sweep detection
+    FIXED RomeOPT TP logic with detailed rejection logging
     """
+    log.debug(f"🔍 ROMEOPT TP CALCULATION START: {side} {entry:.6f}, ATR={atr_val:.6f}")
+    
     # Step 1: Determine market state
     market_state = romeopt_market_state(df, atr_val)
+    log.debug(f"   Market State: {market_state}")
     
     # Step 2: Find liquidity based on market state
     tp = None
     tp_type = ""
     
     if market_state == "BALANCED":
-        # RANGE: Look for internal liquidity clusters
+        log.debug("   Market BALANCED → Looking for INTERNAL liquidity")
         tp = romeopt_internal_liquidity(df, side, atr_val)
         if tp:
             tp_type = f"RANGE: Visual {'Lows' if side == 'SELL' else 'Highs'} Cluster"
+            log.debug(f"✅ Found INTERNAL liquidity: {tp:.6f}")
     else:  # IMBALANCED
-        # TREND: Look for external range extremes
+        log.debug("   Market IMBALANCED → Looking for EXTERNAL liquidity")
         tp = romeopt_external_liquidity(df, side)
         if tp:
             tp_type = f"TREND: Range {'Low' if side == 'SELL' else 'High'}"
+            log.debug(f"✅ Found EXTERNAL liquidity: {tp:.6f}")
     
     # REJECT if no obvious liquidity found
     if tp is None:
-        log.debug(f"❌ No obvious liquidity found for {side} | Market: {market_state}")
+        log.debug(f"❌ ROMEOPT TP REJECTED: No liquidity found for {side} | Market: {market_state}")
+        log.debug(f"   Entry: {entry:.6f}, ATR: {atr_val:.6f}")
         return None
+    
+    log.debug(f"✅ Potential TP found: {tp:.6f} ({tp_type})")
     
     # FIXED: Step 3 - Check if liquidity was CONSUMED, not just touched
     if is_liquidity_consumed(df, tp, side, atr_val):
-        log.debug(f"❌ Liquidity CONSUMED for {side} at {tp}")
+        log.debug(f"❌ ROMEOPT TP REJECTED: Liquidity CONSUMED at {tp:.6f}")
+        log.debug(f"   Price closed beyond TP with momentum")
         return None
+    else:
+        log.debug(f"✅ Liquidity NOT consumed at {tp:.6f}")
     
     # Step 4: Calculate SL (keep OB-based SL)
     if side == "BUY":
@@ -438,14 +438,24 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
             risk = min_risk
             sl = entry - risk
         
+        log.debug(f"   BUY SL Calculation:")
+        log.debug(f"   - OB low: {ob_zone['low']:.6f}")
+        log.debug(f"   - Recent low: {recent_low:.6f}")
+        log.debug(f"   - Initial SL: {sl:.6f}")
+        log.debug(f"   - Risk: {risk:.6f}")
+        log.debug(f"   - Min risk required: {min_risk:.6f}")
+        
         # Ensure TP is valid (above entry, at least 0.5R)
         if tp <= entry:
-            log.debug(f"❌ TP {tp} not above entry {entry} for BUY")
+            log.debug(f"❌ ROMEOPT TP REJECTED: TP {tp:.6f} not above entry {entry:.6f} for BUY")
             return None
             
         reward = tp - entry
+        log.debug(f"   Reward: {reward:.6f}")
+        
         if reward < risk * 0.5:
-            log.debug(f"❌ TP reward {reward/risk:.2f}R < 0.5R minimum")
+            log.debug(f"❌ ROMEOPT TP REJECTED: TP reward {reward/risk:.2f}R < 0.5R minimum")
+            log.debug(f"   Reward: {reward:.6f}, Risk: {risk:.6f}, R:R: {reward/risk:.2f}")
             return None
         
     else:  # SELL
@@ -459,17 +469,28 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
             risk = min_risk
             sl = entry + risk
         
+        log.debug(f"   SELL SL Calculation:")
+        log.debug(f"   - OB high: {ob_zone['high']:.6f}")
+        log.debug(f"   - Recent high: {recent_high:.6f}")
+        log.debug(f"   - Initial SL: {sl:.6f}")
+        log.debug(f"   - Risk: {risk:.6f}")
+        log.debug(f"   - Min risk required: {min_risk:.6f}")
+        
         # Ensure TP is valid (below entry, at least 0.5R)
         if tp >= entry:
-            log.debug(f"❌ TP {tp} not below entry {entry} for SELL")
+            log.debug(f"❌ ROMEOPT TP REJECTED: TP {tp:.6f} not below entry {entry:.6f} for SELL")
             return None
             
         reward = entry - tp
+        log.debug(f"   Reward: {reward:.6f}")
+        
         if reward < risk * 0.5:
-            log.debug(f"❌ TP reward {reward/risk:.2f}R < 0.5R minimum")
+            log.debug(f"❌ ROMEOPT TP REJECTED: TP reward {reward/risk:.2f}R < 0.5R minimum")
+            log.debug(f"   Reward: {reward:.6f}, Risk: {risk:.6f}, R:R: {reward/risk:.2f}")
             return None
     
-    log.info(f"✅ {side} {entry:.6f} | Market: {market_state}")
+    log.info(f"✅ ROMEOPT TP ACCEPTED: {side} {entry:.6f}")
+    log.info(f"   Market: {market_state}")
     log.info(f"   Liquidity Target: {tp:.6f} ({tp_type})")
     log.info(f"   SL: {sl:.6f} | Risk: {risk:.6f} | R:R: {abs(tp-entry)/risk:.2f}:1")
     
@@ -479,19 +500,16 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
 def find_latest_ob(df: pd.DataFrame, lookback=50):
     """
     Enhanced Order Block detection with detailed classification
-    Returns comprehensive OB data
     """
     blocks = []
     
-    # Look for order blocks in the specified lookback
     for i in range(max(2, len(df) - lookback), len(df) - 1):
         candle = df.iloc[i]
         prev_candle = df.iloc[i-1]
         
-        # Bullish Order Block: Bearish candle followed by bullish candle
-        if (prev_candle["close"] < prev_candle["open"] and  # Previous bearish
-            candle["close"] > candle["open"] and            # Current bullish
-            candle["close"] > prev_candle["close"]):        # Closes above previous close
+        if (prev_candle["close"] < prev_candle["open"] and
+            candle["close"] > candle["open"] and
+            candle["close"] > prev_candle["close"]):
             
             block = {
                 "type": "BULLISH_OB",
@@ -509,10 +527,9 @@ def find_latest_ob(df: pd.DataFrame, lookback=50):
             }
             blocks.append(block)
         
-        # Bearish Order Block: Bullish candle followed by bearish candle
-        elif (prev_candle["close"] > prev_candle["open"] and  # Previous bullish
-              candle["close"] < candle["open"] and            # Current bearish
-              candle["close"] < prev_candle["close"]):        # Closes below previous close
+        elif (prev_candle["close"] > prev_candle["open"] and
+              candle["close"] < candle["open"] and
+              candle["close"] < prev_candle["close"]):
             
             block = {
                 "type": "BEARISH_OB",
@@ -530,11 +547,9 @@ def find_latest_ob(df: pd.DataFrame, lookback=50):
             }
             blocks.append(block)
     
-    # Return the most recent order block if any exist
     if blocks:
         latest_block = max(blocks, key=lambda x: x["index"])
         
-        # Add classification based on strength
         body_ratio = latest_block["body_size"] / latest_block["candle_size"] if latest_block["candle_size"] > 0 else 0
         if body_ratio >= 0.7:
             latest_block["strength"] = "STRONG"
@@ -543,34 +558,25 @@ def find_latest_ob(df: pd.DataFrame, lookback=50):
         else:
             latest_block["strength"] = "WEAK"
         
-        # Check if OB has been tested
         if latest_block["type"] == "BULLISH_OB":
             subsequent_candles = df.iloc[latest_block["index"]+1:min(latest_block["index"]+10, len(df))]
             latest_block["tested"] = any(candle["low"] <= latest_block["high"] for _, candle in subsequent_candles.iterrows())
-        else:  # BEARISH_OB
+        else:
             subsequent_candles = df.iloc[latest_block["index"]+1:min(latest_block["index"]+10, len(df))]
             latest_block["tested"] = any(candle["high"] >= latest_block["low"] for _, candle in subsequent_candles.iterrows())
         
+        log.debug(f"✅ Found {latest_block['type']} OB: {latest_block['low']:.6f}-{latest_block['high']:.6f}")
         return latest_block
     
+    log.debug("❌ No Order Block found")
     return None
 
-# ---------------- REST OF SIGNAL GENERATION ----------------
-async def elite_tf_alignment(exchange, symbol: str, side: str):
-    tfs = ["15m","1h","4h"]
-    for tf in tfs:
-        ohlcv = await fetch_ohlcv(exchange, symbol, tf, 50)
-        if not ohlcv or len(ohlcv) < 10: return False
-        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-        if len(df) < 5: return False
-        trend = df["close"].iloc[-1] - df["close"].iloc[-5]
-        trend_side = "BUY" if trend>0 else "SELL"
-        if trend_side != side:
-            return False
-    return True
-
+# ---------------- SIGNAL GENERATION WITH REJECTION LOGGING ----------------
 async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
-    if df is None or len(df) < 20: return None
+    if df is None or len(df) < 20: 
+        log.debug(f"❌ {symbol} {tf}: Not enough data (<20 candles)")
+        return None
+    
     last = df.iloc[-1]
     prev5 = df.iloc[-6:-1]
     score = 0
@@ -578,58 +584,46 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     
     calc_values = {}
 
-    # Step 1: ENHANCED Liquidity Sweep Detection
+    log.debug(f"🔍 SIGNAL CHECK: {symbol} {tf} at {last['close']:.6f}")
+
+    # Step 1: Liquidity Sweep
     lookback_period = 20
     high_lookback = df['high'].iloc[-lookback_period:-1]
     low_lookback = df['low'].iloc[-lookback_period:-1]
     
-    # Check for sweeping previous highs/lows with more precision
     sweep_high = last["high"] > high_lookback.max()
     sweep_low = last["low"] < low_lookback.min()
     
-    # Check if sweep was respected (price closed back inside range)
     respected_high_sweep = False
     respected_low_sweep = False
     sweep_strength = 0.0
     
     if sweep_high:
-        # Calculate how much it swept the high
         sweep_amount = last["high"] - high_lookback.max()
         candle_range = last["high"] - last["low"]
         if candle_range > 0:
             sweep_strength = sweep_amount / candle_range
-        # Check if closed below the swept level (respected)
         if last["close"] < high_lookback.max():
             respected_high_sweep = True
     
     if sweep_low:
-        # Calculate how much it swept the low
         sweep_amount = low_lookback.min() - last["low"]
         candle_range = last["high"] - last["low"]
         if candle_range > 0:
             sweep_strength = sweep_amount / candle_range
-        # Check if closed above the swept level (respected)
         if last["close"] > low_lookback.min():
             respected_low_sweep = True
     
     has_sweep = (sweep_high and respected_high_sweep) or (sweep_low and respected_low_sweep)
-    
     liquidity_sweep = 2 if has_sweep else 0
     score += liquidity_sweep
     
-    # Enhanced sweep type classification
     if sweep_high and respected_high_sweep:
         sweep_type = "HIGH_SWEEP_RESPECTED"
         sweep_direction = "BEARISH"
     elif sweep_low and respected_low_sweep:
         sweep_type = "LOW_SWEEP_RESPECTED"
         sweep_direction = "BULLISH"
-    elif sweep_high:
-        sweep_type = "HIGH_SWEEP_UNRESPECTED"
-        sweep_direction = "NEUTRAL"
-    elif sweep_low:
-        sweep_type = "LOW_SWEEP_UNRESPECTED"
-        sweep_direction = "NEUTRAL"
     else:
         sweep_type = "NONE"
         sweep_direction = "NONE"
@@ -642,62 +636,62 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     calc_values["sweep_respected"] = respected_high_sweep or respected_low_sweep
     calc_values["swept_level"] = float(high_lookback.max()) if sweep_high else (float(low_lookback.min()) if sweep_low else 0.0)
 
+    log.debug(f"   Sweep: {sweep_type}, Score: {liquidity_sweep}/2")
+
     # Step 2: Displacement
     displacement = abs(last["close"] - last["open"]) / (last["high"] - last["low"] + 1e-8)
     calc_values["displacement_value"] = round(displacement, 2)
     has_disp = displacement > 0.6
     if has_disp:
         score += 2; reasons.append(f"Displacement +2 ({displacement:.2f})")
+        log.debug(f"✅ Displacement: {displacement:.2f} (+2)")
     else:
         reasons.append(f"Displacement +0 ({displacement:.2f})")
+        log.debug(f"❌ Displacement: {displacement:.2f} (<0.6)")
 
-    # Step 3 & 4: ENHANCED Order Block & Zone
+    # Step 3 & 4: Order Block & Zone
     ob_zone = find_latest_ob(df, lookback=30)
     
     if ob_zone:
         ob_type = "bullish" if ob_zone["type"] == "BULLISH_OB" else "bearish"
         zone_approach = 0
         
-        # Enhanced zone approach check
         if ob_type == "bullish":
-            # For bullish OB, check if price is approaching from above
             distance_to_ob = (last["close"] - ob_zone["high"]) / (ob_zone["high"] - ob_zone["low"] + 1e-8)
             if last["close"] <= ob_zone["high"] or distance_to_ob < 0.1:
                 score += 1
                 zone_approach = 1
                 approach_status = f"APPROACHING (dist: {distance_to_ob:.2%})"
+                log.debug(f"✅ Zone Approach: APPROACHING bullish OB")
             else:
                 approach_status = f"FAR ({distance_to_ob:.2%} away)"
-        else:  # bearish
-            # For bearish OB, check if price is approaching from below
+                log.debug(f"❌ Zone Approach: FAR from bullish OB ({distance_to_ob:.2%})")
+        else:
             distance_to_ob = (ob_zone["low"] - last["close"]) / (ob_zone["high"] - ob_zone["low"] + 1e-8)
             if last["close"] >= ob_zone["low"] or distance_to_ob < 0.1:
                 score += 1
                 zone_approach = 1
                 approach_status = f"APPROACHING (dist: {distance_to_ob:.2%})"
+                log.debug(f"✅ Zone Approach: APPROACHING bearish OB")
             else:
                 approach_status = f"FAR ({distance_to_ob:.2%} away)"
+                log.debug(f"❌ Zone Approach: FAR from bearish OB ({distance_to_ob:.2%})")
         
         reasons.append(f"Zone Approach +{zone_approach} ({approach_status})")
         
-        # Store comprehensive OB data
         calc_values["zone_approach"] = zone_approach
         calc_values["ob_type"] = ob_type
         calc_values["ob_strength"] = ob_zone.get("strength", "UNKNOWN")
         calc_values["ob_tested"] = ob_zone.get("tested", False)
         calc_values["ob_low"] = round(ob_zone["low"], 6)
         calc_values["ob_high"] = round(ob_zone["high"], 6)
-        calc_values["ob_body_low"] = round(ob_zone.get("body_low", ob_zone["low"]), 6)
-        calc_values["ob_body_high"] = round(ob_zone.get("body_high", ob_zone["high"]), 6)
-        calc_values["ob_candle_size"] = round(ob_zone.get("candle_size", 0), 6)
-        calc_values["ob_body_ratio"] = round(ob_zone.get("body_size", 0) / ob_zone.get("candle_size", 1) if ob_zone.get("candle_size", 0) > 0 else 0, 2)
-        calc_values["ob_volume"] = ob_zone.get("volume", 0)
         calc_values["distance_to_ob"] = round(distance_to_ob, 4)
     else:
         reasons.append("Zone Approach +0 (No OB detected)")
         ob_type = None
         calc_values["zone_approach"] = 0
         calc_values["ob_type"] = "NONE"
+        log.debug(f"❌ No Order Block found")
 
     # Step 5: HTF Alignment
     tf_map={"1m":"15m","3m":"30m","5m":"1h","15m":"4h","30m":"1h"}
@@ -705,6 +699,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     ohlcv_htf = await fetch_ohlcv(exchange, symbol, htf, 50)
     htf_alignment = 0
     htf_trend_value = 0
+    
     if ohlcv_htf and len(ohlcv_htf) >= 5:
         df_htf = pd.DataFrame(ohlcv_htf, columns=["ts","open","high","low","close","vol"])
         if len(df_htf) >= 5:
@@ -712,19 +707,24 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
             htf_trend_value = round(trend, 6)
             htf_dir = "bullish" if trend>0 else "bearish"
             if ob_type and htf_dir==ob_type:
-                score+=1; htf_alignment=1; reasons.append(f"HTF Alignment +1 ({htf_dir} {trend:+.6f})")
+                score+=1; htf_alignment=1
+                reasons.append(f"HTF Alignment +1 ({htf_dir} {trend:+.6f})")
+                log.debug(f"✅ HTF Alignment: {htf_dir} matches OB {ob_type}")
             else:
                 reasons.append(f"HTF Alignment +0 ({htf_dir} {trend:+.6f})")
+                log.debug(f"❌ HTF Alignment: {htf_dir} doesn't match OB {ob_type}")
             calc_values["htf_trend"] = htf_trend_value
             calc_values["htf_direction"] = htf_dir
         else:
             reasons.append("HTF Alignment ? (insufficient data)")
             calc_values["htf_trend"] = 0
             calc_values["htf_direction"] = "UNKNOWN"
+            log.debug(f"❌ HTF Alignment: insufficient HTF data")
     else:
         reasons.append("HTF Alignment ? (no data)")
         calc_values["htf_trend"] = 0
         calc_values["htf_direction"] = "UNKNOWN"
+        log.debug(f"❌ HTF Alignment: no HTF data")
 
     # Step 6: MOMENTUM
     momentum_ratio = abs(last["close"]-last["open"])/(last["high"]-last["low"]+1e-8)
@@ -733,46 +733,76 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     if ob_type=="bullish" and momentum_ratio>=0.8 and last["close"]>last["open"]:
         score+=1; reasons.append(f"Momentum +1 ({momentum_ratio:.2f})")
         calc_values["momentum_score"] = 1
+        log.debug(f"✅ Momentum: {momentum_ratio:.2f} (+1)")
     elif ob_type=="bearish" and momentum_ratio>=0.8 and last["close"]<last["open"]:
         score+=1; reasons.append(f"Momentum +1 ({momentum_ratio:.2f})")
         calc_values["momentum_score"] = 1
+        log.debug(f"✅ Momentum: {momentum_ratio:.2f} (+1)")
     else:
         reasons.append(f"Momentum +0 ({momentum_ratio:.2f})")
         calc_values["momentum_score"] = 0
+        log.debug(f"❌ Momentum: {momentum_ratio:.2f} (<0.8 or wrong direction)")
 
-    if not ob_type: return None
+    if not ob_type: 
+        log.debug(f"❌ SIGNAL REJECTED: No OB type")
+        return None
+    
     side_str = "BUY" if ob_type=="bullish" else "SELL"
     entry = float(last["close"])
 
     # ---------------- CRITICAL FILTERS ----------------
     critical_score = htf_alignment + liquidity_sweep
-    if critical_score < CRITICAL_FACTORS_MIN: return None
-    if score < MIN_SCORE: return None
-    if not has_disp: return None
-    if htf_alignment != 1: return None
+    log.debug(f"   Critical Score: {critical_score} (HTF: {htf_alignment}, Sweep: {liquidity_sweep})")
+    
+    if critical_score < CRITICAL_FACTORS_MIN: 
+        log.debug(f"❌ SIGNAL REJECTED: Critical score {critical_score} < {CRITICAL_FACTORS_MIN}")
+        return None
+    
+    if score < MIN_SCORE: 
+        log.debug(f"❌ SIGNAL REJECTED: Score {score} < {MIN_SCORE}")
+        return None
+    
+    if not has_disp: 
+        log.debug(f"❌ SIGNAL REJECTED: No displacement ({displacement:.2f} < 0.6)")
+        return None
+    
+    if htf_alignment != 1: 
+        log.debug(f"❌ SIGNAL REJECTED: HTF alignment {htf_alignment} != 1")
+        return None
+
+    log.debug(f"✅ Passed critical filters: Score={score}, Critical={critical_score}")
 
     # ---------------- FORCED FILTER ----------------
     displacement_val = calc_values["displacement_value"]
     momentum_val = calc_values["momentum_value"]
     
+    log.debug(f"   Forced Filter Check: Mom={momentum_val:.2f}, Disp={displacement_val:.2f}")
+    log.debug(f"   Thresholds: Mom≥{MOMENTUM_STRONG_THRESHOLD} OR (Mom≥{MOMENTUM_GOOD_THRESHOLD} AND Disp≥{DISPLACEMENT_MIN_THRESHOLD})")
+    
     if not force_filter_trade(momentum_val, displacement_val):
-        reasons.append(f"❌ FORCED FILTER REJECTED: Mom={momentum_val:.2f}, Disp={displacement_val:.2f}")
+        log.debug(f"❌ SIGNAL REJECTED: Forced filter failed")
+        log.debug(f"   Mom={momentum_val:.2f}, Disp={displacement_val:.2f}")
         return None
     
     filter_reason = "Mom≥0.87" if momentum_val >= MOMENTUM_STRONG_THRESHOLD else "Mom≥0.85 & Disp≥0.80"
     reasons.append(f"✅ FORCED FILTER PASSED: {filter_reason}")
+    log.debug(f"✅ Forced filter passed: {filter_reason}")
 
     # ---------------- ELITE MTF CONFIRMATION ----------------
     if not await elite_tf_alignment(exchange, symbol, side_str):
+        log.debug(f"❌ SIGNAL REJECTED: Elite MTF alignment failed")
         return None
     reasons.append("Elite MTF Alignment ✅")
+    log.debug(f"✅ Elite MTF alignment passed")
 
     # ---------------- ROMEOPT TP CALCULATION ----------------
     atr_val = float(atr(df, 14).iloc[-1])
+    log.debug(f"   ATR Value: {atr_val:.6f}")
+    
     result = romeopt_tp_sl(entry, side_str, atr_val, ob_zone, df)
     
-    # REJECT if no valid TP found
     if result is None:
+        log.debug(f"❌ SIGNAL REJECTED: No valid TP found (romeopt_tp_sl returned None)")
         reasons.append("❌ NO VALID LIQUIDITY FOUND")
         return None
     
@@ -794,37 +824,41 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         "tp_type": tp_type
     }
     
-    log.info(f"✅ Signal {sig['symbol']} passed forced filter: Mom={momentum_val:.2f}, Disp={displacement_val:.2f}")
+    log.info(f"✅ SIGNAL ACCEPTED: {sig['symbol']} {sig['side']} at {sig['entry']:.6f}")
+    log.info(f"   Score: {score}/6, TP: {tp:.6f}, R:R: {(tp-entry)/(entry-sl):.2f}:1")
     return sig
 
-# ---------------- REFINED UPDATE TP/SL LIVE ----------------
+# ---------------- REST OF THE CODE REMAINS UNCHANGED ----------------
+async def elite_tf_alignment(exchange, symbol: str, side: str):
+    tfs = ["15m","1h","4h"]
+    for tf in tfs:
+        ohlcv = await fetch_ohlcv(exchange, symbol, tf, 50)
+        if not ohlcv or len(ohlcv) < 10: return False
+        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
+        if len(df) < 5: return False
+        trend = df["close"].iloc[-1] - df["close"].iloc[-5]
+        trend_side = "BUY" if trend>0 else "SELL"
+        if trend_side != side:
+            return False
+    return True
+
 def update_tp_sl_live(sig: dict, df: pd.DataFrame):
-    """
-    REFINED: Only update if TP hasn't been hit AND structure invalidated
-    RomeOPT commits to liquidity objective - no chasing price
-    """
-    # TP LOCK: If TP already hit, do nothing
     if sig.get("tp_hit", 0) == 1:
         return sig
     
-    # Only update if structure is completely invalid
     latest_ob = find_latest_ob(df)
     if not latest_ob:
-        # No OB anymore - structure invalid, close trade
         return None
     
-    # Check if price has taken out the OB (structure break)
     if sig["side"] == "BUY":
         if df['low'].iloc[-1] < latest_ob["low"]:
-            return None  # OB broken, close
-    else:  # SELL
+            return None
+    else:
         if df['high'].iloc[-1] > latest_ob["high"]:
-            return None  # OB broken, close
+            return None
     
-    # Structure still valid - keep original TP (RomeOPT doesn't chase)
     return sig
 
-# ---------------- SL CLUSTER ----------------
 recent_sl = defaultdict(lambda: deque())
 def record_sl_hit(symbol: str, lookback_minutes=30):
     now = time.time(); dq = recent_sl[symbol]; dq.append(now)
@@ -835,7 +869,6 @@ def deprioritized(symbol: str, threshold=3, lookback=30):
     while dq and dq[0]<cutoff: dq.popleft()
     return len(dq)>=threshold
 
-# ---------------- LOG SIGNAL ----------------
 async def log_signal(sig):
     async with db_lock:
         await db_conn.execute("""
@@ -846,48 +879,33 @@ async def log_signal(sig):
               str(sig.get("latest_ob","")), sig.get("tp_type", ""), 1))
         await db_conn.commit()
 
-# ---------------- ROBUST MONITOR SIGNALS ----------------
 async def monitor_signals():
     while True:
         try:
             async with db_lock:
-                # Get current columns to build dynamic query
                 async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
                     columns = await cursor.fetchall()
                     column_names = [col[1] for col in columns]
                 
-                # Build query with fallback for missing columns
                 select_fields = []
-                if 'id' in column_names:
-                    select_fields.append('id')
-                if 'symbol' in column_names:
-                    select_fields.append('symbol')
-                if 'side' in column_names:
-                    select_fields.append('side')
-                if 'entry' in column_names:
-                    select_fields.append('entry')
-                if 'sl' in column_names:
-                    select_fields.append('sl')
-                if 'tp' in column_names:
-                    select_fields.append('tp')
-                else:
-                    select_fields.append('NULL as tp')  # Fallback
+                if 'id' in column_names: select_fields.append('id')
+                if 'symbol' in column_names: select_fields.append('symbol')
+                if 'side' in column_names: select_fields.append('side')
+                if 'entry' in column_names: select_fields.append('entry')
+                if 'sl' in column_names: select_fields.append('sl')
+                if 'tp' in column_names: select_fields.append('tp')
+                else: select_fields.append('NULL as tp')
                 
-                if 'tp_hit' in column_names:
-                    select_fields.append('tp_hit')
-                else:
-                    select_fields.append('0 as tp_hit')  # Default value
+                if 'tp_hit' in column_names: select_fields.append('tp_hit')
+                else: select_fields.append('0 as tp_hit')
                 
-                if 'status' in column_names:
-                    select_fields.append('status')
+                if 'status' in column_names: select_fields.append('status')
                 
                 query = f"SELECT {','.join(select_fields)} FROM signals WHERE status='OPEN'"
                 
                 async with db_conn.execute(query) as cursor:
                     async for row in cursor:
-                        # Map row to variables based on query structure
                         row_dict = dict(zip(select_fields, row))
-                        
                         sig_id = row_dict.get('id')
                         symbol = row_dict.get('symbol')
                         side = row_dict.get('side')
@@ -900,7 +918,6 @@ async def monitor_signals():
                         if not all([sig_id, symbol, side, entry]):
                             continue
                         
-                        # Check if TP already hit
                         if tp_hit == 1:
                             continue
                         
@@ -909,7 +926,6 @@ async def monitor_signals():
                         if last_price is None: 
                             continue
 
-                        # RomeOPT: TP LOCK - Don't recalculate unless structure broken
                         hits = []
                         new_tp_hit = tp_hit
                         new_status = status
@@ -931,7 +947,6 @@ async def monitor_signals():
                         if "SL" in hits:
                             record_sl_hit(symbol)
                         
-                        # Only update if something changed
                         if new_tp_hit != tp_hit or new_status != status:
                             await db_conn.execute("UPDATE signals SET tp_hit=?,status=? WHERE id=?",
                                                  (new_tp_hit, new_status, sig_id))
@@ -940,7 +955,6 @@ async def monitor_signals():
             log.exception("monitor error: %s", e)
         await asyncio.sleep(SCAN_INTERVAL)
 
-# ---------------- SCAN LOOP ----------------
 last_signal_time = {}
 async def scan_loop(exchange):
     while True:
@@ -966,7 +980,6 @@ async def scan_loop(exchange):
                         
                         filter_passed = force_filter_trade(momentum_val, displacement_val)
                         
-                        # Calculate R:R
                         risk = abs(sig["entry"] - sig.get("sl", 0))
                         reward = abs(sig.get("tp", 0) - sig["entry"])
                         rr = reward / risk if risk > 0 else 0
@@ -988,8 +1001,6 @@ async def scan_loop(exchange):
                             f"• Strength: {calc.get('ob_strength', 'UNKNOWN')}",
                             f"• Tested: {'✅' if calc.get('ob_tested', False) else '❌'}",
                             f"• Range: {calc.get('ob_low', 0):.6f} - {calc.get('ob_high', 0):.6f}",
-                            f"• Body: {calc.get('ob_body_low', 0):.6f} - {calc.get('ob_body_high', 0):.6f}",
-                            f"• Body Ratio: {calc.get('ob_body_ratio', 0):.2f}",
                             f"• Distance: {calc.get('distance_to_ob', 0):.2%}",
                             f"",
                             f"📊 CORE METRICS:",
@@ -1012,12 +1023,11 @@ async def scan_loop(exchange):
                         await log_signal(sig)
                         last_signal_time[key]=time.time()
                         signals_found+=1
-            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals (TP LOCKED)")
+            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals")
         except Exception as e: log.exception("scan error: %s", e)
         elapsed=time.time()-t0
         await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
 
-# ---------------- FASTAPI ----------------
 app = FastAPI()
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -1027,17 +1037,12 @@ async def webhook(request: Request):
     log.info("Webhook received: %s", data)
     return {"ok":True}
 
-# ---------------- MAIN ----------------
 async def main():
     await init_db()
     global exchange
     exchange = ccxt.okx({"enableRateLimit": True})
-    await tg("🏆 TRUE ROMEOPT SCANNER STARTED (ENHANCED SWEEP & OB DATA)")
-    await tg("🎯 ENHANCED: Comprehensive liquidity sweep analysis")
-    await tg("📊 ENHANCED: Detailed order block classification")
-    await tg("🔒 TP LOCK: No recalculation after entry")
-    await tg("⚡ EXTERNAL LIQUIDITY: Range extremes only")
-    await tg("💎 ROMEOPT CORE: Target where price MUST go")
+    await tg("🏆 TRUE ROMEOPT SCANNER STARTED (ENHANCED LOGGING)")
+    await tg("🔍 Detailed rejection logging enabled")
     await asyncio.gather(scan_loop(exchange), monitor_signals())
 
 if __name__=="__main__":
