@@ -294,120 +294,49 @@ def romeopt_external_liquidity(df, side, lookback=50):
 def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
     """
     AGGRESSIVE RomeOPT TP - ALWAYS hunts for liquidity
-    No market state split - just find the most obvious target
     """
-    # IGNORE market state - just hunt for ANY obvious liquidity
+    # ALWAYS return a TP - never None
     tp = None
     tp_type = ""
     
-    # STEP 1: Try ALL liquidity sources (no market state split)
-    
-    # Source 1: Internal clusters (visual equal highs/lows)
+    # Try internal clusters first
     internal_tp = romeopt_internal_liquidity(df, side, atr_val)
     if internal_tp:
         tp = internal_tp
         tp_type = f"VISUAL_CLUSTER"
     
-    # Source 2: External extremes (if internal not found)
+    # Try external extremes
     if tp is None:
-        external_tp = romeopt_external_liquidity(df, side, lookback=30)  # Shorter lookback
+        external_tp = romeopt_external_liquidity(df, side, lookback=30)
         if external_tp:
             tp = external_tp
             tp_type = f"RANGE_EXTREME"
     
-    # Source 3: Recent obvious levels (aggressive fallback)
+    # If still no TP, create basic one
     if tp is None:
         lookback = 20
         if side == "SELL":
-            # Find most obvious low (where stops would cluster)
-            # Look for candles with small lower wicks (liquidity grabs)
-            candidate_lows = []
-            for i in range(1, min(lookback, len(df))):
-                candle = df.iloc[-i]
-                lower_wick = min(candle["open"], candle["close"]) - candle["low"]
-                candle_range = candle["high"] - candle["low"]
-                
-                # If candle has notable lower wick (liquidity grab)
-                if lower_wick > atr_val * 0.1 and candle_range > atr_val * 0.5:
-                    candidate_lows.append(candle["low"])
-            
-            if candidate_lows:
-                tp = min(candidate_lows)  # Most obvious low
-                tp_type = "OBVIOUS_LOW"
-            else:
-                # Last resort: recent low
-                tp = df['low'].iloc[-lookback:].min()
-                tp_type = "RECENT_LOW"
-                
+            tp = df['low'].iloc[-lookback:].min()
+            tp_type = "RECENT_LOW"
         else:  # BUY
-            # Find most obvious high (where stops would cluster)
-            candidate_highs = []
-            for i in range(1, min(lookback, len(df))):
-                candle = df.iloc[-i]
-                upper_wick = candle["high"] - max(candle["open"], candle["close"])
-                candle_range = candle["high"] - candle["low"]
-                
-                # If candle has notable upper wick (liquidity grab)
-                if upper_wick > atr_val * 0.1 and candle_range > atr_val * 0.5:
-                    candidate_highs.append(candle["high"])
-            
-            if candidate_highs:
-                tp = max(candidate_highs)  # Most obvious high
-                tp_type = "OBVIOUS_HIGH"
-            else:
-                # Last resort: recent high
-                tp = df['high'].iloc[-lookback:].max()
-                tp_type = "RECENT_HIGH"
+            tp = df['high'].iloc[-lookback:].max()
+            tp_type = "RECENT_HIGH"
     
-    # GUARANTEE: tp is NEVER None at this point
-    log.info(f"✅ {side} Liquidity Hunt: Found {tp_type} at {tp:.6f}")
-    
-    # STEP 2: Minimal sweep check (only reject CLEAR sweeps)
-    recent_candles = min(5, len(df))
-    clear_sweep = False
-    
-    if side == "SELL":
-        # Only reject if price CLOSED significantly below target
-        for i in range(1, recent_candles):
-            if df['close'].iloc[-i] < tp - (atr_val * 0.1):  # 10% ATR tolerance
-                clear_sweep = True
-                break
-    else:  # BUY
-        for i in range(1, recent_candles):
-            if df['close'].iloc[-i] > tp + (atr_val * 0.1):
-                clear_sweep = True
-                break
-    
-    if clear_sweep:
-        log.debug(f"⚠️ Liquidity at {tp:.6f} was clearly swept, adjusting...")
-        # Adjust to next obvious level
-        if side == "SELL":
-            tp = tp - (atr_val * 0.5)  # Move half ATR lower
-            tp_type = f"ADJUSTED_{tp_type}"
-        else:
-            tp = tp + (atr_val * 0.5)
-            tp_type = f"ADJUSTED_{tp_type}"
-    
-    # STEP 3: Calculate SL (keep your OB-based logic)
+    # Calculate SL
     if side == "BUY":
         sl = ob_zone["low"] - (atr_val * 0.3)
         recent_low = df['low'].iloc[-10:].min()
         sl = min(sl, recent_low - (atr_val * 0.3))
         
-        # Minimum risk check
-        min_risk = atr_val * 0.4  # Reduced from 0.5
+        min_risk = atr_val * 0.4
         risk = entry - sl
         if risk < min_risk:
             risk = min_risk
             sl = entry - risk
         
-        # Direction check
         if tp <= entry:
-            # TP not above entry - adjust to minimum profit
-            tp = entry + (risk * 0.3)  # At least 0.3R
+            tp = entry + (risk * 0.3)
             tp_type = f"MIN_PROFIT_{tp_type}"
-        
-        reward = tp - entry
         
     else:  # SELL
         sl = ob_zone["high"] + (atr_val * 0.3)
@@ -423,20 +352,8 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
         if tp >= entry:
             tp = entry - (risk * 0.3)
             tp_type = f"MIN_PROFIT_{tp_type}"
-        
-        reward = entry - tp
     
-    # STEP 4: Flexible R:R check (much more permissive)
-    # Accept smaller profits if liquidity is obvious
-    min_rr = 0.2  # Reduced from 0.5
-    
-    if reward < risk * min_rr:
-        log.debug(f"⚠️ R:R only {reward/risk:.2f}:1, but keeping for obvious liquidity")
-        # Still accept - we found obvious liquidity
-    
-    log.info(f"✅ {side} {entry:.6f} | TP: {tp:.6f} ({tp_type})")
-    log.info(f"   SL: {sl:.6f} | Risk: {risk:.6f} | R:R: {reward/risk:.2f}:1")
-    
+    # ALWAYS return a TP
     return sl, tp, tp_type
 
 # ---------------- ENHANCED ORDER BLOCK DETECTION ----------------
@@ -735,11 +652,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     atr_val = float(atr(df, 14).iloc[-1])
     result = romeopt_tp_sl(entry, side_str, atr_val, ob_zone, df)
     
-    # REJECT if no valid TP found
-    if result is None:
-        reasons.append("❌ NO VALID LIQUIDITY FOUND")
-        return None
-    
+    # ALWAYS get TP - result is never None
     sl, tp, tp_type = result
     
     sig = {
