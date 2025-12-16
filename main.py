@@ -48,9 +48,9 @@ OB_DISTANCE_OPTIMAL_MAX = 0.50    # Optimal maximum distance (better entries)
 
 # ---------------- LIQUIDITY CONFIG ----------------
 # OPTIMIZED FOR RECENT LIQUIDITY (15m/30m/1h/4h)
-LIQUIDITY_LOOKBACK = 50    # ~2 days on 1h, perfect for recent liquidity
+LIQUIDITY_LOOKBACK = 35    # ~2 days on 1h, perfect for recent liquidity
 MIN_TOUCHES_FOR_POOL = 2   # 2 touches = confirmed recent interest  
-SWING_LOOKBACK = 4         # Balanced: catches meaningful swings but not too slow
+SWING_LOOKBACK = 3         # Balanced: catches meaningful swings but not too slow
 TOUCH_TOLERANCE_PCT = 0.20  # 0.1% tolerance is standard
 
 # ---------------- TIMEFRAME MAPPING FOR TP ----------------
