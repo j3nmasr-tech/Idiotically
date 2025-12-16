@@ -32,8 +32,8 @@ DB_PATH = "/app/data/signals.db"
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
 TOP_N = int(os.getenv("TOP_N", 60))
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
-MIN_SCORE = 4
-CRITICAL_FACTORS_MIN = 2
+MIN_SCORE = 2
+CRITICAL_FACTORS_MIN = 1
 
 # ---------------- FORCED FILTER PARAMETERS ----------------
 MOMENTUM_STRONG_THRESHOLD = 0.60
@@ -211,71 +211,56 @@ def romeopt_market_state(df, atr_val):
     
     return "IMBALANCED" if strong_displacement else "BALANCED"
 
-# ---------------- OPTIMIZED ROMEOPT INTERNAL LIQUIDITY ----------------
-def romeopt_internal_liquidity(df, side, atr_val, lookback=18):
+# ---------------- REFINED ROMEOPT INTERNAL LIQUIDITY ----------------
+def romeopt_internal_liquidity(df, side, atr_val, lookback=15):
     """
-    OPTIMIZED RomeOPT internal liquidity detection
-    More flexible but still pure RomeOPT
+    REFINED RomeOPT internal liquidity detection
+    Uses ATR-based tolerance for visual clusters
     """
     if side == "SELL":
-        # For SELL: Look for visual equal lows
+        # For SELL: Look for obvious equal lows
         lows = df['low'].iloc[-lookback:].dropna()
-        if len(lows) < 4:  # Reduced from 5
+        if len(lows) < 5:
             return None
         
-        # Increased tolerance: 18% of ATR (better visual detection)
-        tolerance = atr_val * 0.18
+        # ATR-based tolerance (15% of ATR = visual clustering tolerance)
+        tolerance = atr_val * 0.15
         
-        # Find potential cluster centers with weighted scoring
+        # Find potential cluster centers
         potential_targets = []
         for i in range(len(lows)):
             current_low = lows.iloc[i]
-            
-            # Check how many lows are within tolerance
-            nearby_lows = lows[abs(lows - current_low) <= tolerance]
-            nearby_count = len(nearby_lows)
-            
-            # RomeOPT: Give preference to RECENT clusters
-            recency_score = (lookback - i) / lookback  # 1.0 = most recent
-            
-            # Accept if: 
-            # 1. ≥2 nearby lows OR 
-            # 2. Single low but very recent (last 3 candles)
-            if nearby_count >= 2 or (nearby_count >= 1 and i >= len(lows)-3):
-                weighted_score = nearby_count * (1.0 + recency_score)
-                potential_targets.append((current_low, weighted_score, nearby_count))
+            # Count how many lows are within tolerance
+            nearby_count = (abs(lows - current_low) <= tolerance).sum()
+            if nearby_count >= 2:  # At least 2 lows form a visual cluster
+                potential_targets.append((current_low, nearby_count))
         
         if potential_targets:
-            # Choose the most obvious visual cluster
-            # Weighted by: cluster size + recency
-            best_target = min(potential_targets, key=lambda x: (x[0], -x[1]))[0]
+            # Choose the lowest price among clusters (most obvious stop pool)
+            best_target = min(potential_targets, key=lambda x: x[0])[0]
             return best_target
         
     else:  # BUY
-        # For BUY: Look for visual equal highs
+        # For BUY: Look for obvious equal highs
         highs = df['high'].iloc[-lookback:].dropna()
-        if len(highs) < 4:
+        if len(highs) < 5:
             return None
         
-        tolerance = atr_val * 0.18
+        tolerance = atr_val * 0.15
         potential_targets = []
         
         for i in range(len(highs)):
             current_high = highs.iloc[i]
-            nearby_highs = highs[abs(highs - current_high) <= tolerance]
-            nearby_count = len(nearby_highs)
-            
-            recency_score = (lookback - i) / lookback
-            
-            if nearby_count >= 2 or (nearby_count >= 1 and i >= len(highs)-3):
-                weighted_score = nearby_count * (1.0 + recency_score)
-                potential_targets.append((current_high, weighted_score, nearby_count))
+            nearby_count = (abs(highs - current_high) <= tolerance).sum()
+            if nearby_count >= 2:
+                potential_targets.append((current_high, nearby_count))
         
         if potential_targets:
-            best_target = max(potential_targets, key=lambda x: (x[0], -x[1]))[0]
+            # Choose the highest price among clusters
+            best_target = max(potential_targets, key=lambda x: x[0])[0]
             return best_target
     
-    return None  # No visual liquidity cluster
+    return None  # No obvious visual liquidity cluster
 
 # ---------------- REFINED ROMEOPT EXTERNAL LIQUIDITY ----------------
 def romeopt_external_liquidity(df, side, lookback=50):
@@ -290,70 +275,99 @@ def romeopt_external_liquidity(df, side, lookback=50):
         # For BUY in trend: Range high (guaranteed stops above)
         return df['high'].iloc[-lookback:].max()
 
-# ---------------- AGGRESSIVE ROMEOPT TP DECISION ----------------
+# ---------------- ROMEOPT TP DECISION (REFINED VERSION) ----------------
 def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
     """
-    AGGRESSIVE RomeOPT TP - ALWAYS hunts for liquidity
+    REFINED RomeOPT TP logic with all fixes
     """
-    # ALWAYS return a TP - never None
+    # Step 1: Determine market state
+    market_state = romeopt_market_state(df, atr_val)
+    
+    # Step 2: Find liquidity based on market state
     tp = None
     tp_type = ""
     
-    # Try internal clusters first
-    internal_tp = romeopt_internal_liquidity(df, side, atr_val)
-    if internal_tp:
-        tp = internal_tp
-        tp_type = f"VISUAL_CLUSTER"
+    if market_state == "BALANCED":
+        # RANGE: Look for internal liquidity clusters
+        tp = romeopt_internal_liquidity(df, side, atr_val)
+        if tp:
+            tp_type = f"RANGE: Visual {'Lows' if side == 'SELL' else 'Highs'} Cluster"
+    else:  # IMBALANCED
+        # TREND: Look for external range extremes
+        tp = romeopt_external_liquidity(df, side)
+        if tp:
+            tp_type = f"TREND: Range {'Low' if side == 'SELL' else 'High'}"
     
-    # Try external extremes
+    # REJECT if no obvious liquidity found
     if tp is None:
-        external_tp = romeopt_external_liquidity(df, side, lookback=30)
-        if external_tp:
-            tp = external_tp
-            tp_type = f"RANGE_EXTREME"
+        log.debug(f"❌ No obvious liquidity found for {side} | Market: {market_state}")
+        return None
     
-    # If still no TP, create basic one
-    if tp is None:
-        lookback = 20
-        if side == "SELL":
-            tp = df['low'].iloc[-lookback:].min()
-            tp_type = "RECENT_LOW"
-        else:  # BUY
-            tp = df['high'].iloc[-lookback:].max()
-            tp_type = "RECENT_HIGH"
+    # Step 3: Safety check - reject if recently swept
+    recent_candles = min(10, len(df))
+    if side == "SELL":
+        recent_touch = any(
+            abs(df['low'].iloc[-i] - tp) <= atr_val * 0.1  # Within 10% ATR
+            for i in range(1, recent_candles)
+        )
+    else:  # BUY
+        recent_touch = any(
+            abs(df['high'].iloc[-i] - tp) <= atr_val * 0.1
+            for i in range(1, recent_candles)
+        )
     
-    # Calculate SL
+    if recent_touch:
+        log.debug(f"❌ Liquidity recently swept for {side} at {tp}")
+        return None
+    
+    # Step 4: Calculate SL (keep OB-based SL)
     if side == "BUY":
         sl = ob_zone["low"] - (atr_val * 0.3)
         recent_low = df['low'].iloc[-10:].min()
         sl = min(sl, recent_low - (atr_val * 0.3))
         
-        min_risk = atr_val * 0.4
+        # Ensure minimum risk
+        min_risk = atr_val * 0.5
         risk = entry - sl
         if risk < min_risk:
             risk = min_risk
             sl = entry - risk
         
+        # Ensure TP is valid (above entry, at least 0.5R)
         if tp <= entry:
-            tp = entry + (risk * 0.3)
-            tp_type = f"MIN_PROFIT_{tp_type}"
+            log.debug(f"❌ TP {tp} not above entry {entry} for BUY")
+            return None
+            
+        reward = tp - entry
+        if reward < risk * 0.5:
+            log.debug(f"❌ TP reward {reward/risk:.2f}R < 0.5R minimum")
+            return None
         
     else:  # SELL
         sl = ob_zone["high"] + (atr_val * 0.3)
         recent_high = df['high'].iloc[-10:].max()
         sl = max(sl, recent_high + (atr_val * 0.3))
         
-        min_risk = atr_val * 0.4
+        min_risk = atr_val * 0.5
         risk = sl - entry
         if risk < min_risk:
             risk = min_risk
             sl = entry + risk
         
+        # Ensure TP is valid (below entry, at least 0.5R)
         if tp >= entry:
-            tp = entry - (risk * 0.3)
-            tp_type = f"MIN_PROFIT_{tp_type}"
+            log.debug(f"❌ TP {tp} not below entry {entry} for SELL")
+            return None
+            
+        reward = entry - tp
+        if reward < risk * 0.5:
+            log.debug(f"❌ TP reward {reward/risk:.2f}R < 0.5R minimum")
+            return None
     
-    # ALWAYS return a TP
+    log.info(f"✅ {side} {entry:.6f} | Market: {market_state}")
+    log.info(f"   SL: {sl:.6f} | TP: {tp:.6f} | Type: {tp_type}")
+    log.info(f"   Risk: {risk:.6f} | R:R: {abs(tp-entry)/risk:.2f}:1")
+    
     return sl, tp, tp_type
 
 # ---------------- ENHANCED ORDER BLOCK DETECTION ----------------
@@ -652,7 +666,11 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     atr_val = float(atr(df, 14).iloc[-1])
     result = romeopt_tp_sl(entry, side_str, atr_val, ob_zone, df)
     
-    # ALWAYS get TP - result is never None
+    # REJECT if no valid TP found
+    if result is None:
+        reasons.append("❌ NO VALID LIQUIDITY FOUND")
+        return None
+    
     sl, tp, tp_type = result
     
     sig = {
