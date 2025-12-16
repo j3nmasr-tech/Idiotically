@@ -15,6 +15,9 @@ from fastapi import FastAPI, Request, HTTPException
 import uvicorn
 from collections import defaultdict, deque
 
+# ---------------- FASTAPI INSTANCE (MOVED TO TOP) ----------------
+app = FastAPI()
+
 # ---------------- CONFIG ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -1238,7 +1241,7 @@ async def log_signal(sig):
               str(sig.get("latest_ob","")), sig.get("tp_type", ""), 1))
         await db_conn.commit()
 
-# ---------------- DEBUG WEBHOOK ENDPOINT ----------------
+# ---------------- DEBUG WEBHOOK ENDPOINTS ----------------
 @app.get("/debug/latest")
 async def get_latest_debug():
     """Get latest debug information from log file"""
@@ -1268,6 +1271,24 @@ async def get_rejection_summary(hours: int = 24):
         return {"rejection_summary": dict(rejections)}
     except Exception as e:
         return {"error": str(e)}
+
+@app.get("/debug/status")
+async def get_debug_status():
+    """Get debug system status"""
+    return {
+        "debug_mode": DEBUG_MODE,
+        "debug_log_file": DEBUG_LOG_FILE,
+        "log_file_exists": os.path.exists(DEBUG_LOG_FILE)
+    }
+
+# ---------------- WEBHOOK ENDPOINT ----------------
+@app.post("/webhook")
+async def webhook(request: Request):
+    token = request.headers.get("X-Auth","")
+    if token!=WEBHOOK_SECRET: raise HTTPException(403,"Invalid secret")
+    data = await request.json()
+    log.info("Webhook received: %s", data)
+    return {"ok":True}
 
 # ---------------- ROBUST MONITOR SIGNALS ----------------
 async def monitor_signals():
@@ -1444,16 +1465,6 @@ async def scan_loop(exchange):
             log.exception("scan error: %s", e)
         elapsed=time.time()-t0
         await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
-
-# ---------------- FASTAPI ----------------
-app = FastAPI()
-@app.post("/webhook")
-async def webhook(request: Request):
-    token = request.headers.get("X-Auth","")
-    if token!=WEBHOOK_SECRET: raise HTTPException(403,"Invalid secret")
-    data = await request.json()
-    log.info("Webhook received: %s", data)
-    return {"ok":True}
 
 # ---------------- MAIN ----------------
 async def main():
