@@ -211,56 +211,71 @@ def romeopt_market_state(df, atr_val):
     
     return "IMBALANCED" if strong_displacement else "BALANCED"
 
-# ---------------- REFINED ROMEOPT INTERNAL LIQUIDITY ----------------
-def romeopt_internal_liquidity(df, side, atr_val, lookback=15):
+# ---------------- OPTIMIZED ROMEOPT INTERNAL LIQUIDITY ----------------
+def romeopt_internal_liquidity(df, side, atr_val, lookback=18):
     """
-    REFINED RomeOPT internal liquidity detection
-    Uses ATR-based tolerance for visual clusters
+    OPTIMIZED RomeOPT internal liquidity detection
+    More flexible but still pure RomeOPT
     """
     if side == "SELL":
-        # For SELL: Look for obvious equal lows
+        # For SELL: Look for visual equal lows
         lows = df['low'].iloc[-lookback:].dropna()
-        if len(lows) < 5:
+        if len(lows) < 4:  # Reduced from 5
             return None
         
-        # ATR-based tolerance (15% of ATR = visual clustering tolerance)
-        tolerance = atr_val * 0.15
+        # Increased tolerance: 18% of ATR (better visual detection)
+        tolerance = atr_val * 0.18
         
-        # Find potential cluster centers
+        # Find potential cluster centers with weighted scoring
         potential_targets = []
         for i in range(len(lows)):
             current_low = lows.iloc[i]
-            # Count how many lows are within tolerance
-            nearby_count = (abs(lows - current_low) <= tolerance).sum()
-            if nearby_count >= 2:  # At least 2 lows form a visual cluster
-                potential_targets.append((current_low, nearby_count))
+            
+            # Check how many lows are within tolerance
+            nearby_lows = lows[abs(lows - current_low) <= tolerance]
+            nearby_count = len(nearby_lows)
+            
+            # RomeOPT: Give preference to RECENT clusters
+            recency_score = (lookback - i) / lookback  # 1.0 = most recent
+            
+            # Accept if: 
+            # 1. ≥2 nearby lows OR 
+            # 2. Single low but very recent (last 3 candles)
+            if nearby_count >= 2 or (nearby_count >= 1 and i >= len(lows)-3):
+                weighted_score = nearby_count * (1.0 + recency_score)
+                potential_targets.append((current_low, weighted_score, nearby_count))
         
         if potential_targets:
-            # Choose the lowest price among clusters (most obvious stop pool)
-            best_target = min(potential_targets, key=lambda x: x[0])[0]
+            # Choose the most obvious visual cluster
+            # Weighted by: cluster size + recency
+            best_target = min(potential_targets, key=lambda x: (x[0], -x[1]))[0]
             return best_target
         
     else:  # BUY
-        # For BUY: Look for obvious equal highs
+        # For BUY: Look for visual equal highs
         highs = df['high'].iloc[-lookback:].dropna()
-        if len(highs) < 5:
+        if len(highs) < 4:
             return None
         
-        tolerance = atr_val * 0.15
+        tolerance = atr_val * 0.18
         potential_targets = []
         
         for i in range(len(highs)):
             current_high = highs.iloc[i]
-            nearby_count = (abs(highs - current_high) <= tolerance).sum()
-            if nearby_count >= 2:
-                potential_targets.append((current_high, nearby_count))
+            nearby_highs = highs[abs(highs - current_high) <= tolerance]
+            nearby_count = len(nearby_highs)
+            
+            recency_score = (lookback - i) / lookback
+            
+            if nearby_count >= 2 or (nearby_count >= 1 and i >= len(highs)-3):
+                weighted_score = nearby_count * (1.0 + recency_score)
+                potential_targets.append((current_high, weighted_score, nearby_count))
         
         if potential_targets:
-            # Choose the highest price among clusters
-            best_target = max(potential_targets, key=lambda x: x[0])[0]
+            best_target = max(potential_targets, key=lambda x: (x[0], -x[1]))[0]
             return best_target
     
-    return None  # No obvious visual liquidity cluster
+    return None  # No visual liquidity cluster
 
 # ---------------- REFINED ROMEOPT EXTERNAL LIQUIDITY ----------------
 def romeopt_external_liquidity(df, side, lookback=50):
