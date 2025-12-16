@@ -32,8 +32,8 @@ DB_PATH = "/app/data/signals.db"
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
 TOP_N = int(os.getenv("TOP_N", 60))
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
-MIN_SCORE = 3
-CRITICAL_FACTORS_MIN = 1
+MIN_SCORE = 4
+CRITICAL_FACTORS_MIN = 2
 
 # ---------------- FORCED FILTER PARAMETERS ----------------
 MOMENTUM_STRONG_THRESHOLD = 0.60
@@ -303,22 +303,62 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
         log.debug(f"❌ No obvious liquidity found for {side} | Market: {market_state}")
         return None
     
-    # Step 3: Safety check - reject if recently swept
-    recent_candles = min(10, len(df))
-    if side == "SELL":
-        recent_touch = any(
-            abs(df['low'].iloc[-i] - tp) <= atr_val * 0.1  # Within 10% ATR
-            for i in range(1, recent_candles)
-        )
-    else:  # BUY
-        recent_touch = any(
-            abs(df['high'].iloc[-i] - tp) <= atr_val * 0.1
-            for i in range(1, recent_candles)
-        )
+    # Step 3: RomeOPT OPTIMAL sweep detection
+    # Reject only if price has CLOSED beyond liquidity (true sweep)
+    # Wick touches are OK - liquidity remains valid
     
-    if recent_touch:
-        log.debug(f"❌ Liquidity recently swept for {side} at {tp}")
-        return None
+    recent_candles = min(8, len(df))
+    candles_to_check = 3  # Only check most recent 3 candles (not 10)
+    
+    if side == "SELL":
+        # For SELL: Liquidity is at lows, reject if price CLOSED below it
+        true_sweep_detected = False
+        wick_touches = 0
+        
+        for i in range(1, min(candles_to_check + 1, recent_candles)):
+            candle_low = df['low'].iloc[-i]
+            candle_close = df['close'].iloc[-i]
+            
+            # Check 1: TRUE SWEEP - price closed below liquidity
+            if candle_close < tp - (atr_val * 0.03):  # 3% ATR below target
+                true_sweep_detected = True
+                log.debug(f"❌ TRUE SWEEP DETECTED: Candle {i} closed at {candle_close:.6f} below liquidity {tp:.6f}")
+                break
+            
+            # Check 2: Wick touched but didn't sweep (this is OK for RomeOPT)
+            elif abs(candle_low - tp) <= atr_val * 0.15:  # 15% ATR tolerance for wick
+                wick_touches += 1
+                log.debug(f"⚠️  Wick touch #{wick_touches} on candle {i} (low: {candle_low:.6f})")
+        
+        if true_sweep_detected:
+            return None
+        elif wick_touches > 0:
+            log.debug(f"✅ Liquidity at {tp:.6f} has {wick_touches} wick touch(es) but NOT swept")
+            
+    else:  # BUY
+        # For BUY: Liquidity is at highs, reject if price CLOSED above it
+        true_sweep_detected = False
+        wick_touches = 0
+        
+        for i in range(1, min(candles_to_check + 1, recent_candles)):
+            candle_high = df['high'].iloc[-i]
+            candle_close = df['close'].iloc[-i]
+            
+            # Check 1: TRUE SWEEP - price closed above liquidity
+            if candle_close > tp + (atr_val * 0.03):  # 3% ATR above target
+                true_sweep_detected = True
+                log.debug(f"❌ TRUE SWEEP DETECTED: Candle {i} closed at {candle_close:.6f} above liquidity {tp:.6f}")
+                break
+            
+            # Check 2: Wick touched but didn't sweep
+            elif abs(candle_high - tp) <= atr_val * 0.15:
+                wick_touches += 1
+                log.debug(f"⚠️  Wick touch #{wick_touches} on candle {i} (high: {candle_high:.6f})")
+        
+        if true_sweep_detected:
+            return None
+        elif wick_touches > 0:
+            log.debug(f"✅ Liquidity at {tp:.6f} has {wick_touches} wick touch(es) but NOT swept")
     
     # Step 4: Calculate SL (keep OB-based SL)
     if side == "BUY":
