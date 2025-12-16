@@ -51,7 +51,7 @@ OB_DISTANCE_OPTIMAL_MAX = 0.50    # Optimal maximum distance (better entries)
 LIQUIDITY_LOOKBACK = 50    # ~2 days on 1h, perfect for recent liquidity
 MIN_TOUCHES_FOR_POOL = 2   # 2 touches = confirmed recent interest  
 SWING_LOOKBACK = 4         # Balanced: catches meaningful swings but not too slow
-TOUCH_TOLERANCE_PCT = 0.1  # 0.1% tolerance is standard
+TOUCH_TOLERANCE_PCT = 0.20  # 0.1% tolerance is standard
 
 # ---------------- TIMEFRAME MAPPING FOR TP ----------------
 def get_tp_timeframes(entry_tf: str) -> list:
