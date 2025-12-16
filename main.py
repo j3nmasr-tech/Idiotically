@@ -32,8 +32,8 @@ DB_PATH = "/app/data/signals.db"
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
 TOP_N = int(os.getenv("TOP_N", 60))
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
-MIN_SCORE = 2
-CRITICAL_FACTORS_MIN = 1
+MIN_SCORE = 4
+CRITICAL_FACTORS_MIN = 2
 
 # ---------------- FORCED FILTER PARAMETERS ----------------
 MOMENTUM_STRONG_THRESHOLD = 0.60
