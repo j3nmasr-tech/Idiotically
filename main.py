@@ -2,8 +2,16 @@
 # -*- coding: utf-8 -*-
 
 """
-TRUE ROMEOPT SCANNER (Final Refined Version) - WITH ENHANCED DEBUGGING
-- Added comprehensive debugging for liquidity and TP rejection reasons
+TRUE ROMEOPT SCANNER (Final Refined Version) - WITH ENHANCED SWEEP & OB DATA
+- RomeOPT 6-step entry logic
+- TRUE RomeOPT TP: ONE liquidity target, no TP ladders
+- Simple but accurate market state detection
+- ATR-based tolerance for liquidity detection
+- External liquidity = range extremes (not local swings)
+- TP LOCK: No recalculation after entry
+- Telegram alerts + SQLite logging
+- Forced Filter: Momentum ≥ 0.87 OR (Momentum ≥ 0.85 AND Displacement ≥ 0.80)
+- ENHANCED: Comprehensive liquidity sweep and order block data
 """
 
 import os, time, asyncio, logging, datetime
@@ -15,9 +23,6 @@ from fastapi import FastAPI, Request, HTTPException
 import uvicorn
 from collections import defaultdict, deque
 
-# ---------------- FASTAPI INSTANCE (MOVED TO TOP) ----------------
-app = FastAPI()
-
 # ---------------- CONFIG ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -28,85 +33,18 @@ SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
 TOP_N = int(os.getenv("TOP_N", 60))
 TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
 MIN_SCORE = 4
-CRITICAL_FACTORS_MIN = 1
+CRITICAL_FACTORS_MIN = 2
 
 # ---------------- FORCED FILTER PARAMETERS ----------------
 MOMENTUM_STRONG_THRESHOLD = 0.60
 MOMENTUM_GOOD_THRESHOLD = 0.55
 DISPLACEMENT_MIN_THRESHOLD = 0.50
 
-# ---------------- ENHANCED DEBUGGING ----------------
-DEBUG_MODE = True  # Set to False in production
-DEBUG_LOG_FILE = "/app/data/debug_signals.log"
-
-# Setup enhanced debugging logging
-debug_logger = logging.getLogger("debug_logger")
-debug_logger.setLevel(logging.DEBUG if DEBUG_MODE else logging.INFO)
-debug_handler = logging.FileHandler(DEBUG_LOG_FILE)
-debug_handler.setFormatter(logging.Formatter(
-    "%(asctime)s | SYMBOL=%(symbol)s | TF=%(timeframe)s | %(levelname)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-))
-debug_logger.addHandler(debug_handler)
-
-# ---------------- MAIN LOGGING ----------------
+# ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger("romeopt_bot")
 db_lock = asyncio.Lock()
 db_conn = None
-
-# ---------------- DEBUG HELPER CLASS ----------------
-class SignalDebugger:
-    """Enhanced debugging for signal generation and rejection reasons"""
-    
-    def __init__(self, symbol, timeframe):
-        self.symbol = symbol
-        self.timeframe = timeframe
-        self.rejection_reasons = []
-        self.warnings = []
-        self.debug_data = {}
-        self.start_time = time.time()
-        
-    def log(self, level, message, **kwargs):
-        """Enhanced logging with symbol context"""
-        extra = {'symbol': self.symbol, 'timeframe': self.timeframe}
-        extra.update(kwargs)
-        debug_logger.log(level, message, extra=extra)
-        
-    def reject(self, reason, details=None):
-        """Record rejection reason with details"""
-        self.rejection_reasons.append(reason)
-        self.log(logging.WARNING, f"❌ REJECTED: {reason}", details=details)
-        return False
-    
-    def warn(self, warning, details=None):
-        """Record warning"""
-        self.warnings.append(warning)
-        self.log(logging.WARNING, f"⚠️ WARNING: {warning}", details=details)
-        
-    def info(self, message, details=None):
-        """Record informational message"""
-        self.log(logging.INFO, f"ℹ️ INFO: {message}", details=details)
-        
-    def success(self, message, details=None):
-        """Record success"""
-        self.log(logging.INFO, f"✅ SUCCESS: {message}", details=details)
-        
-    def debug_data_point(self, key, value):
-        """Store debug data"""
-        self.debug_data[key] = value
-        
-    def get_summary(self):
-        """Get debugging summary"""
-        elapsed = time.time() - self.start_time
-        return {
-            'symbol': self.symbol,
-            'timeframe': self.timeframe,
-            'rejection_reasons': self.rejection_reasons,
-            'warnings': self.warnings,
-            'debug_data': self.debug_data,
-            'elapsed_seconds': round(elapsed, 3)
-        }
 
 # ---------------- TELEGRAM ----------------
 def escape_html(msg: str) -> str:
@@ -241,46 +179,20 @@ def atr(df: pd.DataFrame, period=14):
     return tr.rolling(period, min_periods=1).mean()
 
 # ---------------- FORCED FILTER FUNCTION ----------------
-def force_filter_trade(momentum_value: float, displacement_value: float, debugger=None) -> bool:
-    """Enhanced forced filter with debugging"""
-    if debugger:
-        debugger.debug_data_point('momentum_value', momentum_value)
-        debugger.debug_data_point('displacement_value', displacement_value)
-        debugger.debug_data_point('momentum_threshold_strong', MOMENTUM_STRONG_THRESHOLD)
-        debugger.debug_data_point('momentum_threshold_good', MOMENTUM_GOOD_THRESHOLD)
-        debugger.debug_data_point('displacement_threshold', DISPLACEMENT_MIN_THRESHOLD)
-    
+def force_filter_trade(momentum_value: float, displacement_value: float) -> bool:
     if momentum_value >= MOMENTUM_STRONG_THRESHOLD:
-        if debugger:
-            debugger.success(f"Momentum ≥ {MOMENTUM_STRONG_THRESHOLD} ({momentum_value:.2f})")
         return True
-    
     if momentum_value >= MOMENTUM_GOOD_THRESHOLD and displacement_value >= DISPLACEMENT_MIN_THRESHOLD:
-        if debugger:
-            debugger.success(f"Momentum ≥ {MOMENTUM_GOOD_THRESHOLD} ({momentum_value:.2f}) AND Displacement ≥ {DISPLACEMENT_MIN_THRESHOLD} ({displacement_value:.2f})")
         return True
-    
-    if debugger:
-        debugger.reject(
-            f"Forced filter failed: Mom={momentum_value:.2f}, Disp={displacement_value:.2f}",
-            {
-                'required_momentum_strong': MOMENTUM_STRONG_THRESHOLD,
-                'required_momentum_good': MOMENTUM_GOOD_THRESHOLD,
-                'required_displacement': DISPLACEMENT_MIN_THRESHOLD,
-                'actual_momentum': momentum_value,
-                'actual_displacement': displacement_value
-            }
-        )
     return False
 
 # ---------------- REFINED ROMEOPT MARKET STATE ----------------
-def romeopt_market_state(df, atr_val, debugger=None):
+def romeopt_market_state(df, atr_val):
     """
-    REFINED RomeOPT market state detection with debugging
+    REFINED RomeOPT market state detection
+    Checks: Strong displacement + actual price movement
     """
     if len(df) < 3:
-        if debugger:
-            debugger.reject("Insufficient data for market state", {'df_length': len(df)})
         return "BALANCED"
     
     last = df.iloc[-1]
@@ -290,13 +202,6 @@ def romeopt_market_state(df, atr_val, debugger=None):
     candle_size = last["high"] - last["low"]
     price_movement = abs(last["close"] - prev["close"])
     
-    if debugger:
-        debugger.debug_data_point('market_state_body_ratio', round(body_ratio, 3))
-        debugger.debug_data_point('market_state_candle_size', round(candle_size, 6))
-        debugger.debug_data_point('market_state_atr', round(atr_val, 6))
-        debugger.debug_data_point('market_state_price_movement', round(price_movement, 6))
-        debugger.debug_data_point('market_state_candle_vs_atr', round(candle_size / atr_val, 2) if atr_val > 0 else 0)
-    
     # RomeOPT logic: Strong displacement with actual follow-through
     strong_displacement = (
         body_ratio > 0.7 and                    # Strong body
@@ -304,186 +209,79 @@ def romeopt_market_state(df, atr_val, debugger=None):
         price_movement > atr_val * 0.5          # Actual price movement
     )
     
-    result = "IMBALANCED" if strong_displacement else "BALANCED"
-    
-    if debugger:
-        if strong_displacement:
-            debugger.success(f"Market state: IMBALANCED", {
-                'body_ratio': round(body_ratio, 3),
-                'candle_size_atr_ratio': round(candle_size / atr_val, 2) if atr_val > 0 else 0,
-                'price_movement_atr_ratio': round(price_movement / atr_val, 2) if atr_val > 0 else 0
-            })
-        else:
-            debugger.info(f"Market state: BALANCED", {
-                'body_ratio': round(body_ratio, 3),
-                'candle_size_atr_ratio': round(candle_size / atr_val, 2) if atr_val > 0 else 0,
-                'price_movement_atr_ratio': round(price_movement / atr_val, 2) if atr_val > 0 else 0
-            })
-    
-    return result
+    return "IMBALANCED" if strong_displacement else "BALANCED"
 
 # ---------------- REFINED ROMEOPT INTERNAL LIQUIDITY ----------------
-def romeopt_internal_liquidity(df, side, atr_val, lookback=15, debugger=None):
+def romeopt_internal_liquidity(df, side, atr_val, lookback=15):
     """
-    REFINED RomeOPT internal liquidity detection with debugging
+    REFINED RomeOPT internal liquidity detection
+    Uses ATR-based tolerance for visual clusters
     """
-    if debugger:
-        debugger.info(f"Looking for internal liquidity for {side} side")
-        debugger.debug_data_point('internal_liquidity_lookback', lookback)
-        debugger.debug_data_point('internal_liquidity_atr', round(atr_val, 6))
-    
-    tolerance = atr_val * 0.15
-    if debugger:
-        debugger.debug_data_point('internal_liquidity_tolerance', round(tolerance, 6))
-    
     if side == "SELL":
         # For SELL: Look for obvious equal lows
         lows = df['low'].iloc[-lookback:].dropna()
-        if debugger:
-            debugger.debug_data_point('internal_liquidity_lows_count', len(lows))
-            debugger.debug_data_point('internal_liquidity_lows_min', round(lows.min(), 6) if len(lows) > 0 else None)
-            debugger.debug_data_point('internal_liquidity_lows_max', round(lows.max(), 6) if len(lows) > 0 else None)
-        
         if len(lows) < 5:
-            if debugger:
-                debugger.reject(f"Insufficient lows data for internal liquidity", {'lows_count': len(lows), 'min_required': 5})
             return None
+        
+        # ATR-based tolerance (15% of ATR = visual clustering tolerance)
+        tolerance = atr_val * 0.15
         
         # Find potential cluster centers
         potential_targets = []
-        cluster_details = []
-        
         for i in range(len(lows)):
             current_low = lows.iloc[i]
             # Count how many lows are within tolerance
-            nearby_mask = abs(lows - current_low) <= tolerance
-            nearby_count = nearby_mask.sum()
-            nearby_prices = lows[nearby_mask].tolist()
-            
+            nearby_count = (abs(lows - current_low) <= tolerance).sum()
             if nearby_count >= 2:  # At least 2 lows form a visual cluster
                 potential_targets.append((current_low, nearby_count))
-                cluster_details.append({
-                    'price': current_low,
-                    'count': nearby_count,
-                    'nearby_prices': nearby_prices
-                })
-        
-        if debugger and cluster_details:
-            debugger.debug_data_point('internal_liquidity_clusters_found', len(cluster_details))
-            for i, cluster in enumerate(cluster_details[:3]):  # Log first 3 clusters
-                debugger.info(f"Cluster {i+1}: Price={cluster['price']:.6f}, Count={cluster['count']}")
         
         if potential_targets:
             # Choose the lowest price among clusters (most obvious stop pool)
             best_target = min(potential_targets, key=lambda x: x[0])[0]
-            if debugger:
-                debugger.success(f"Found internal liquidity cluster for SELL", {
-                    'target_price': best_target,
-                    'clusters_found': len(potential_targets),
-                    'cluster_counts': [f"{p:.6f}({c})" for p, c in potential_targets]
-                })
             return best_target
         
     else:  # BUY
         # For BUY: Look for obvious equal highs
         highs = df['high'].iloc[-lookback:].dropna()
-        if debugger:
-            debugger.debug_data_point('internal_liquidity_highs_count', len(highs))
-            debugger.debug_data_point('internal_liquidity_highs_min', round(highs.min(), 6) if len(highs) > 0 else None)
-            debugger.debug_data_point('internal_liquidity_highs_max', round(highs.max(), 6) if len(highs) > 0 else None)
-        
         if len(highs) < 5:
-            if debugger:
-                debugger.reject(f"Insufficient highs data for internal liquidity", {'highs_count': len(highs), 'min_required': 5})
             return None
         
+        tolerance = atr_val * 0.15
         potential_targets = []
-        cluster_details = []
         
         for i in range(len(highs)):
             current_high = highs.iloc[i]
-            nearby_mask = abs(highs - current_high) <= tolerance
-            nearby_count = nearby_mask.sum()
-            nearby_prices = highs[nearby_mask].tolist()
-            
+            nearby_count = (abs(highs - current_high) <= tolerance).sum()
             if nearby_count >= 2:
                 potential_targets.append((current_high, nearby_count))
-                cluster_details.append({
-                    'price': current_high,
-                    'count': nearby_count,
-                    'nearby_prices': nearby_prices
-                })
-        
-        if debugger and cluster_details:
-            debugger.debug_data_point('internal_liquidity_clusters_found', len(cluster_details))
-            for i, cluster in enumerate(cluster_details[:3]):
-                debugger.info(f"Cluster {i+1}: Price={cluster['price']:.6f}, Count={cluster['count']}")
         
         if potential_targets:
             # Choose the highest price among clusters
             best_target = max(potential_targets, key=lambda x: x[0])[0]
-            if debugger:
-                debugger.success(f"Found internal liquidity cluster for BUY", {
-                    'target_price': best_target,
-                    'clusters_found': len(potential_targets),
-                    'cluster_counts': [f"{p:.6f}({c})" for p, c in potential_targets]
-                })
             return best_target
     
-    if debugger:
-        debugger.reject(f"No obvious visual liquidity cluster found", {
-            'side': side,
-            'lookback': lookback,
-            'tolerance': round(tolerance, 6),
-            'min_cluster_size': 2
-        })
-    return None
+    return None  # No obvious visual liquidity cluster
 
 # ---------------- REFINED ROMEOPT EXTERNAL LIQUIDITY ----------------
-def romeopt_external_liquidity(df, side, lookback=50, debugger=None):
+def romeopt_external_liquidity(df, side, lookback=50):
     """
-    REFINED RomeOPT external liquidity detection with debugging
+    REFINED RomeOPT external liquidity detection
+    Simple: Range extremes (RomeOPT prefers guaranteed stops)
     """
-    if debugger:
-        debugger.info(f"Looking for external liquidity for {side} side")
-        debugger.debug_data_point('external_liquidity_lookback', lookback)
-    
     if side == "SELL":
         # For SELL in trend: Range low (guaranteed stops below)
-        target = df['low'].iloc[-lookback:].min()
-        if debugger:
-            debugger.success(f"External liquidity for SELL (range low)", {
-                'target_price': target,
-                'lookback_range': f"{df.index[-lookback] if len(df) > lookback else 'start'} to {df.index[-1]}"
-            })
-        return target
+        return df['low'].iloc[-lookback:].min()
     else:  # BUY
         # For BUY in trend: Range high (guaranteed stops above)
-        target = df['high'].iloc[-lookback:].max()
-        if debugger:
-            debugger.success(f"External liquidity for BUY (range high)", {
-                'target_price': target,
-                'lookback_range': f"{df.index[-lookback] if len(df) > lookback else 'start'} to {df.index[-1]}"
-            })
-        return target
+        return df['high'].iloc[-lookback:].max()
 
-# ---------------- ROMEOPT TP DECISION (REFINED VERSION WITH DEBUGGING) ----------------
-def romeopt_tp_sl(entry, side, atr_val, ob_zone, df, debugger=None):
+# ---------------- ROMEOPT TP DECISION (REFINED VERSION) ----------------
+def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
     """
-    REFINED RomeOPT TP logic with enhanced debugging
+    REFINED RomeOPT TP logic with all fixes
     """
-    if debugger:
-        debugger.info("Starting RomeOPT TP/SL calculation")
-        debugger.debug_data_point('entry_price', entry)
-        debugger.debug_data_point('side', side)
-        debugger.debug_data_point('atr_value', round(atr_val, 6))
-        debugger.debug_data_point('ob_zone_low', ob_zone.get("low", 0) if ob_zone else None)
-        debugger.debug_data_point('ob_zone_high', ob_zone.get("high", 0) if ob_zone else None)
-    
     # Step 1: Determine market state
-    market_state = romeopt_market_state(df, atr_val, debugger)
-    if debugger:
-        debugger.debug_data_point('market_state', market_state)
+    market_state = romeopt_market_state(df, atr_val)
     
     # Step 2: Find liquidity based on market state
     tp = None
@@ -491,221 +289,94 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df, debugger=None):
     
     if market_state == "BALANCED":
         # RANGE: Look for internal liquidity clusters
-        if debugger:
-            debugger.info("Market is BALANCED, looking for internal liquidity clusters")
-        tp = romeopt_internal_liquidity(df, side, atr_val, debugger=debugger)
+        tp = romeopt_internal_liquidity(df, side, atr_val)
         if tp:
             tp_type = f"RANGE: Visual {'Lows' if side == 'SELL' else 'Highs'} Cluster"
     else:  # IMBALANCED
         # TREND: Look for external range extremes
-        if debugger:
-            debugger.info("Market is IMBALANCED, looking for external range extremes")
-        tp = romeopt_external_liquidity(df, side, debugger=debugger)
+        tp = romeopt_external_liquidity(df, side)
         if tp:
             tp_type = f"TREND: Range {'Low' if side == 'SELL' else 'High'}"
     
     # REJECT if no obvious liquidity found
     if tp is None:
-        if debugger:
-            debugger.reject(
-                f"No obvious liquidity found for {side} | Market: {market_state}",
-                {
-                    'side': side,
-                    'market_state': market_state,
-                    'entry_price': entry
-                }
-            )
+        log.debug(f"❌ No obvious liquidity found for {side} | Market: {market_state}")
         return None
-    
-    if debugger:
-        debugger.debug_data_point('tp_found', tp)
-        debugger.debug_data_point('tp_type', tp_type)
-        debugger.success(f"Liquidity target found: {tp:.6f} ({tp_type})")
     
     # Step 3: Safety check - reject if recently swept
     recent_candles = min(10, len(df))
-    recent_touch = False
-    touch_details = []
-    
     if side == "SELL":
-        for i in range(1, recent_candles):
-            candle_low = df['low'].iloc[-i]
-            distance = abs(candle_low - tp)
-            within_tolerance = distance <= atr_val * 0.1
-            if within_tolerance:
-                recent_touch = True
-                touch_details.append({
-                    'candle_index': -i,
-                    'candle_low': candle_low,
-                    'distance': distance,
-                    'within_tolerance': within_tolerance
-                })
+        recent_touch = any(
+            abs(df['low'].iloc[-i] - tp) <= atr_val * 0.1  # Within 10% ATR
+            for i in range(1, recent_candles)
+        )
     else:  # BUY
-        for i in range(1, recent_candles):
-            candle_high = df['high'].iloc[-i]
-            distance = abs(candle_high - tp)
-            within_tolerance = distance <= atr_val * 0.1
-            if within_tolerance:
-                recent_touch = True
-                touch_details.append({
-                    'candle_index': -i,
-                    'candle_high': candle_high,
-                    'distance': distance,
-                    'within_tolerance': within_tolerance
-                })
+        recent_touch = any(
+            abs(df['high'].iloc[-i] - tp) <= atr_val * 0.1
+            for i in range(1, recent_candles)
+        )
     
     if recent_touch:
-        if debugger:
-            debugger.reject(
-                f"Liquidity recently swept for {side} at {tp:.6f}",
-                {
-                    'target_price': tp,
-                    'touch_details': touch_details[:3],  # Show first 3 touches
-                    'atr_10_percent': atr_val * 0.1
-                }
-            )
+        log.debug(f"❌ Liquidity recently swept for {side} at {tp}")
         return None
-    elif debugger:
-        debugger.success("Liquidity target NOT recently swept")
     
     # Step 4: Calculate SL (keep OB-based SL)
-    if debugger:
-        debugger.info("Calculating Stop Loss")
-    
     if side == "BUY":
-        # Initial SL calculation
         sl = ob_zone["low"] - (atr_val * 0.3)
         recent_low = df['low'].iloc[-10:].min()
         sl = min(sl, recent_low - (atr_val * 0.3))
         
-        if debugger:
-            debugger.debug_data_point('sl_initial_ob', ob_zone["low"] - (atr_val * 0.3))
-            debugger.debug_data_point('sl_initial_recent', recent_low - (atr_val * 0.3))
-            debugger.debug_data_point('sl_before_risk_adjust', sl)
-        
         # Ensure minimum risk
         min_risk = atr_val * 0.5
         risk = entry - sl
-        
-        if debugger:
-            debugger.debug_data_point('risk_before_adjust', risk)
-            debugger.debug_data_point('min_risk_required', min_risk)
-        
         if risk < min_risk:
-            if debugger:
-                debugger.warn(f"Risk {risk:.6f} < min risk {min_risk:.6f}, adjusting SL")
             risk = min_risk
             sl = entry - risk
         
         # Ensure TP is valid (above entry, at least 0.5R)
         if tp <= entry:
-            if debugger:
-                debugger.reject(
-                    f"TP {tp:.6f} not above entry {entry:.6f} for BUY",
-                    {
-                        'tp': tp,
-                        'entry': entry,
-                        'tp_minus_entry': tp - entry
-                    }
-                )
-            return None
-        
-        reward = tp - entry
-        reward_risk_ratio = reward / risk if risk > 0 else 0
-        
-        if debugger:
-            debugger.debug_data_point('reward', reward)
-            debugger.debug_data_point('risk', risk)
-            debugger.debug_data_point('reward_risk_ratio', round(reward_risk_ratio, 2))
-        
-        if reward < risk * 0.5:
-            if debugger:
-                debugger.reject(
-                    f"TP reward {reward:.6f} < 0.5R minimum ({risk * 0.5:.6f})",
-                    {
-                        'reward': reward,
-                        'min_reward_required': risk * 0.5,
-                        'ratio': round(reward_risk_ratio, 2)
-                    }
-                )
+            log.debug(f"❌ TP {tp} not above entry {entry} for BUY")
             return None
             
+        reward = tp - entry
+        if reward < risk * 0.5:
+            log.debug(f"❌ TP reward {reward/risk:.2f}R < 0.5R minimum")
+            return None
+        
     else:  # SELL
-        # Initial SL calculation
         sl = ob_zone["high"] + (atr_val * 0.3)
         recent_high = df['high'].iloc[-10:].max()
         sl = max(sl, recent_high + (atr_val * 0.3))
         
-        if debugger:
-            debugger.debug_data_point('sl_initial_ob', ob_zone["high"] + (atr_val * 0.3))
-            debugger.debug_data_point('sl_initial_recent', recent_high + (atr_val * 0.3))
-            debugger.debug_data_point('sl_before_risk_adjust', sl)
-        
         min_risk = atr_val * 0.5
         risk = sl - entry
-        
-        if debugger:
-            debugger.debug_data_point('risk_before_adjust', risk)
-            debugger.debug_data_point('min_risk_required', min_risk)
-        
         if risk < min_risk:
-            if debugger:
-                debugger.warn(f"Risk {risk:.6f} < min risk {min_risk:.6f}, adjusting SL")
             risk = min_risk
             sl = entry + risk
         
         # Ensure TP is valid (below entry, at least 0.5R)
         if tp >= entry:
-            if debugger:
-                debugger.reject(
-                    f"TP {tp:.6f} not below entry {entry:.6f} for SELL",
-                    {
-                        'tp': tp,
-                        'entry': entry,
-                        'tp_minus_entry': tp - entry
-                    }
-                )
+            log.debug(f"❌ TP {tp} not below entry {entry} for SELL")
             return None
-        
+            
         reward = entry - tp
-        reward_risk_ratio = reward / risk if risk > 0 else 0
-        
-        if debugger:
-            debugger.debug_data_point('reward', reward)
-            debugger.debug_data_point('risk', risk)
-            debugger.debug_data_point('reward_risk_ratio', round(reward_risk_ratio, 2))
-        
         if reward < risk * 0.5:
-            if debugger:
-                debugger.reject(
-                    f"TP reward {reward:.6f} < 0.5R minimum ({risk * 0.5:.6f})",
-                    {
-                        'reward': reward,
-                        'min_reward_required': risk * 0.5,
-                        'ratio': round(reward_risk_ratio, 2)
-                    }
-                )
+            log.debug(f"❌ TP reward {reward/risk:.2f}R < 0.5R minimum")
             return None
     
-    if debugger:
-        debugger.success(f"✅ {side} {entry:.6f} | Market: {market_state}")
-        debugger.success(f"   SL: {sl:.6f} | TP: {tp:.6f} | Type: {tp_type}")
-        debugger.success(f"   Risk: {risk:.6f} | R:R: {abs(tp-entry)/risk:.2f}:1")
-        debugger.debug_data_point('final_sl', sl)
-        debugger.debug_data_point('final_tp', tp)
-        debugger.debug_data_point('final_rr_ratio', round(abs(tp-entry)/risk, 2))
+    log.info(f"✅ {side} {entry:.6f} | Market: {market_state}")
+    log.info(f"   SL: {sl:.6f} | TP: {tp:.6f} | Type: {tp_type}")
+    log.info(f"   Risk: {risk:.6f} | R:R: {abs(tp-entry)/risk:.2f}:1")
     
     return sl, tp, tp_type
 
 # ---------------- ENHANCED ORDER BLOCK DETECTION ----------------
-def find_latest_ob(df: pd.DataFrame, lookback=50, debugger=None):
+def find_latest_ob(df: pd.DataFrame, lookback=50):
     """
-    Enhanced Order Block detection with debugging
+    Enhanced Order Block detection with detailed classification
+    Returns comprehensive OB data
     """
     blocks = []
-    
-    if debugger:
-        debugger.info(f"Looking for order blocks (lookback={lookback})")
     
     # Look for order blocks in the specified lookback
     for i in range(max(2, len(df) - lookback), len(df) - 1):
@@ -754,9 +425,6 @@ def find_latest_ob(df: pd.DataFrame, lookback=50, debugger=None):
             }
             blocks.append(block)
     
-    if debugger:
-        debugger.debug_data_point('ob_blocks_found', len(blocks))
-    
     # Return the most recent order block if any exist
     if blocks:
         latest_block = max(blocks, key=lambda x: x["index"])
@@ -778,70 +446,26 @@ def find_latest_ob(df: pd.DataFrame, lookback=50, debugger=None):
             subsequent_candles = df.iloc[latest_block["index"]+1:min(latest_block["index"]+10, len(df))]
             latest_block["tested"] = any(candle["high"] >= latest_block["low"] for _, candle in subsequent_candles.iterrows())
         
-        if debugger:
-            debugger.success(f"Found order block: {latest_block['type']}", {
-                'index': latest_block['index'],
-                'strength': latest_block['strength'],
-                'tested': latest_block['tested'],
-                'range': f"{latest_block['low']:.6f} - {latest_block['high']:.6f}",
-                'body_ratio': round(body_ratio, 2)
-            })
-        
         return latest_block
     
-    if debugger:
-        debugger.info("No order blocks found in lookback period")
     return None
 
-# ---------------- REST OF SIGNAL GENERATION (WITH DEBUGGING) ----------------
-async def elite_tf_alignment(exchange, symbol: str, side: str, debugger=None):
+# ---------------- REST OF SIGNAL GENERATION ----------------
+async def elite_tf_alignment(exchange, symbol: str, side: str):
     tfs = ["15m","1h","4h"]
-    alignment_results = []
-    
     for tf in tfs:
         ohlcv = await fetch_ohlcv(exchange, symbol, tf, 50)
-        if not ohlcv or len(ohlcv) < 10:
-            alignment_results.append({"tf": tf, "result": "insufficient_data"})
-            continue
+        if not ohlcv or len(ohlcv) < 10: return False
         df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-        if len(df) < 5:
-            alignment_results.append({"tf": tf, "result": "insufficient_candles"})
-            continue
+        if len(df) < 5: return False
         trend = df["close"].iloc[-1] - df["close"].iloc[-5]
         trend_side = "BUY" if trend>0 else "SELL"
-        matches = trend_side == side
-        alignment_results.append({
-            "tf": tf,
-            "result": "match" if matches else "mismatch",
-            "trend": round(trend, 6),
-            "trend_side": trend_side
-        })
-        
-        if not matches:
-            if debugger:
-                debugger.reject(f"HTF alignment failed on {tf}: {trend_side} != {side}", {
-                    'timeframe': tf,
-                    'trend': trend,
-                    'trend_side': trend_side,
-                    'required_side': side
-                })
+        if trend_side != side:
             return False
-    
-    if debugger:
-        debugger.success("All HTF alignments passed", {'alignments': alignment_results})
     return True
 
 async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
-    """Enhanced signal generation with comprehensive debugging"""
-    
-    # Initialize debugger for this signal
-    debugger = SignalDebugger(symbol, tf)
-    debugger.info(f"Starting signal generation for {symbol} on {tf}")
-    
-    if df is None or len(df) < 20:
-        debugger.reject("Insufficient data", {'df_length': len(df) if df is not None else 0})
-        return None
-    
+    if df is None or len(df) < 20: return None
     last = df.iloc[-1]
     prev5 = df.iloc[-6:-1]
     score = 0
@@ -850,7 +474,6 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     calc_values = {}
 
     # Step 1: ENHANCED Liquidity Sweep Detection
-    debugger.info("Step 1: Liquidity Sweep Detection")
     lookback_period = 20
     high_lookback = df['high'].iloc[-lookback_period:-1]
     low_lookback = df['low'].iloc[-lookback_period:-1]
@@ -913,40 +536,18 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     calc_values["sweep_strength"] = round(sweep_strength, 2) if has_sweep else 0
     calc_values["sweep_respected"] = respected_high_sweep or respected_low_sweep
     calc_values["swept_level"] = float(high_lookback.max()) if sweep_high else (float(low_lookback.min()) if sweep_low else 0.0)
-    
-    debugger.debug_data_point('sweep_detection', {
-        'sweep_high': sweep_high,
-        'sweep_low': sweep_low,
-        'respected_high': respected_high_sweep,
-        'respected_low': respected_low_sweep,
-        'has_sweep': has_sweep,
-        'sweep_score': liquidity_sweep,
-        'sweep_type': sweep_type,
-        'sweep_direction': sweep_direction
-    })
 
     # Step 2: Displacement
-    debugger.info("Step 2: Displacement Calculation")
     displacement = abs(last["close"] - last["open"]) / (last["high"] - last["low"] + 1e-8)
     calc_values["displacement_value"] = round(displacement, 2)
     has_disp = displacement > 0.6
     if has_disp:
-        score += 2
-        reasons.append(f"Displacement +2 ({displacement:.2f})")
-        debugger.success(f"Displacement passed: {displacement:.2f}")
+        score += 2; reasons.append(f"Displacement +2 ({displacement:.2f})")
     else:
         reasons.append(f"Displacement +0 ({displacement:.2f})")
-        debugger.warn(f"Displacement low: {displacement:.2f}")
-    
-    debugger.debug_data_point('displacement', {
-        'value': displacement,
-        'has_disp': has_disp,
-        'score_added': 2 if has_disp else 0
-    })
 
     # Step 3 & 4: ENHANCED Order Block & Zone
-    debugger.info("Step 3-4: Order Block Detection and Zone Approach")
-    ob_zone = find_latest_ob(df, lookback=30, debugger=debugger)
+    ob_zone = find_latest_ob(df, lookback=30)
     
     if ob_zone:
         ob_type = "bullish" if ob_zone["type"] == "BULLISH_OB" else "bearish"
@@ -960,10 +561,8 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
                 score += 1
                 zone_approach = 1
                 approach_status = f"APPROACHING (dist: {distance_to_ob:.2%})"
-                debugger.success(f"Bullish OB approach: distance={distance_to_ob:.2%}")
             else:
                 approach_status = f"FAR ({distance_to_ob:.2%} away)"
-                debugger.warn(f"Bullish OB far: distance={distance_to_ob:.2%}")
         else:  # bearish
             # For bearish OB, check if price is approaching from below
             distance_to_ob = (ob_zone["low"] - last["close"]) / (ob_zone["high"] - ob_zone["low"] + 1e-8)
@@ -971,10 +570,8 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
                 score += 1
                 zone_approach = 1
                 approach_status = f"APPROACHING (dist: {distance_to_ob:.2%})"
-                debugger.success(f"Bearish OB approach: distance={distance_to_ob:.2%}")
             else:
                 approach_status = f"FAR ({distance_to_ob:.2%} away)"
-                debugger.warn(f"Bearish OB far: distance={distance_to_ob:.2%}")
         
         reasons.append(f"Zone Approach +{zone_approach} ({approach_status})")
         
@@ -996,23 +593,13 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         ob_type = None
         calc_values["zone_approach"] = 0
         calc_values["ob_type"] = "NONE"
-        debugger.reject("No order block detected")
-        return None
-    
-    debugger.debug_data_point('order_block', {
-        'type': ob_type,
-        'zone_approach': zone_approach,
-        'distance_to_ob': calc_values["distance_to_ob"]
-    })
 
     # Step 5: HTF Alignment
-    debugger.info("Step 5: HTF Alignment Check")
     tf_map={"1m":"15m","3m":"30m","5m":"1h","15m":"4h","30m":"1h"}
     htf=tf_map.get(tf,"15m")
     ohlcv_htf = await fetch_ohlcv(exchange, symbol, htf, 50)
     htf_alignment = 0
     htf_trend_value = 0
-    
     if ohlcv_htf and len(ohlcv_htf) >= 5:
         df_htf = pd.DataFrame(ohlcv_htf, columns=["ts","open","high","low","close","vol"])
         if len(df_htf) >= 5:
@@ -1020,139 +607,71 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
             htf_trend_value = round(trend, 6)
             htf_dir = "bullish" if trend>0 else "bearish"
             if ob_type and htf_dir==ob_type:
-                score+=1
-                htf_alignment=1
-                reasons.append(f"HTF Alignment +1 ({htf_dir} {trend:+.6f})")
-                debugger.success(f"HTF alignment passed: {htf_dir} ({trend:+.6f})")
+                score+=1; htf_alignment=1; reasons.append(f"HTF Alignment +1 ({htf_dir} {trend:+.6f})")
             else:
                 reasons.append(f"HTF Alignment +0 ({htf_dir} {trend:+.6f})")
-                debugger.reject(f"HTF alignment failed: {htf_dir} != {ob_type}")
-                return None
             calc_values["htf_trend"] = htf_trend_value
             calc_values["htf_direction"] = htf_dir
         else:
             reasons.append("HTF Alignment ? (insufficient data)")
             calc_values["htf_trend"] = 0
             calc_values["htf_direction"] = "UNKNOWN"
-            debugger.reject("HTF insufficient data")
-            return None
     else:
         reasons.append("HTF Alignment ? (no data)")
         calc_values["htf_trend"] = 0
         calc_values["htf_direction"] = "UNKNOWN"
-        debugger.reject("HTF no data")
-        return None
-    
-    debugger.debug_data_point('htf_alignment', {
-        'alignment': htf_alignment,
-        'trend': htf_trend_value,
-        'direction': htf_dir
-    })
 
     # Step 6: MOMENTUM
-    debugger.info("Step 6: Momentum Check")
     momentum_ratio = abs(last["close"]-last["open"])/(last["high"]-last["low"]+1e-8)
     calc_values["momentum_value"] = round(momentum_ratio, 2)
     
     if ob_type=="bullish" and momentum_ratio>=0.8 and last["close"]>last["open"]:
-        score+=1
-        reasons.append(f"Momentum +1 ({momentum_ratio:.2f})")
+        score+=1; reasons.append(f"Momentum +1 ({momentum_ratio:.2f})")
         calc_values["momentum_score"] = 1
-        debugger.success(f"Momentum passed: {momentum_ratio:.2f}")
     elif ob_type=="bearish" and momentum_ratio>=0.8 and last["close"]<last["open"]:
-        score+=1
-        reasons.append(f"Momentum +1 ({momentum_ratio:.2f})")
+        score+=1; reasons.append(f"Momentum +1 ({momentum_ratio:.2f})")
         calc_values["momentum_score"] = 1
-        debugger.success(f"Momentum passed: {momentum_ratio:.2f}")
     else:
         reasons.append(f"Momentum +0 ({momentum_ratio:.2f})")
         calc_values["momentum_score"] = 0
-        debugger.warn(f"Momentum low: {momentum_ratio:.2f}")
-    
-    debugger.debug_data_point('momentum', {
-        'ratio': momentum_ratio,
-        'score_added': calc_values["momentum_score"]
-    })
 
-    if not ob_type:
-        debugger.reject("No order block type determined")
-        return None
-    
+    if not ob_type: return None
     side_str = "BUY" if ob_type=="bullish" else "SELL"
     entry = float(last["close"])
-    
-    debugger.info(f"Signal side: {side_str}, Entry: {entry:.6f}, Score: {score}/6")
 
     # ---------------- CRITICAL FILTERS ----------------
-    debugger.info("Applying critical filters")
     critical_score = htf_alignment + liquidity_sweep
-    debugger.debug_data_point('critical_score', {
-        'htf_alignment': htf_alignment,
-        'liquidity_sweep': liquidity_sweep,
-        'total': critical_score,
-        'required': CRITICAL_FACTORS_MIN
-    })
-    
-    if critical_score < CRITICAL_FACTORS_MIN:
-        debugger.reject(f"Critical score {critical_score} < {CRITICAL_FACTORS_MIN}", {
-            'critical_score': critical_score,
-            'required': CRITICAL_FACTORS_MIN
-        })
-        return None
-    
-    if score < MIN_SCORE:
-        debugger.reject(f"Score {score} < {MIN_SCORE}", {
-            'score': score,
-            'required': MIN_SCORE
-        })
-        return None
-    
-    if not has_disp:
-        debugger.reject("No displacement", {'displacement': displacement})
-        return None
-    
-    if htf_alignment != 1:
-        debugger.reject("HTF alignment not 1", {'htf_alignment': htf_alignment})
-        return None
+    if critical_score < CRITICAL_FACTORS_MIN: return None
+    if score < MIN_SCORE: return None
+    if not has_disp: return None
+    if htf_alignment != 1: return None
 
     # ---------------- FORCED FILTER ----------------
-    debugger.info("Applying forced filter")
     displacement_val = calc_values["displacement_value"]
     momentum_val = calc_values["momentum_value"]
     
-    if not force_filter_trade(momentum_val, displacement_val, debugger):
-        # debugger already logs rejection in the function
+    if not force_filter_trade(momentum_val, displacement_val):
+        reasons.append(f"❌ FORCED FILTER REJECTED: Mom={momentum_val:.2f}, Disp={displacement_val:.2f}")
         return None
     
     filter_reason = "Mom≥0.87" if momentum_val >= MOMENTUM_STRONG_THRESHOLD else "Mom≥0.85 & Disp≥0.80"
     reasons.append(f"✅ FORCED FILTER PASSED: {filter_reason}")
-    debugger.success(f"Forced filter passed: {filter_reason}")
 
     # ---------------- ELITE MTF CONFIRMATION ----------------
-    debugger.info("Checking elite MTF confirmation")
-    if not await elite_tf_alignment(exchange, symbol, side_str, debugger):
-        # debugger already logs rejection in the function
+    if not await elite_tf_alignment(exchange, symbol, side_str):
         return None
     reasons.append("Elite MTF Alignment ✅")
-    debugger.success("Elite MTF alignment passed")
 
     # ---------------- ROMEOPT TP CALCULATION ----------------
-    debugger.info("Starting RomeOPT TP calculation")
     atr_val = float(atr(df, 14).iloc[-1])
-    result = romeopt_tp_sl(entry, side_str, atr_val, ob_zone, df, debugger)
+    result = romeopt_tp_sl(entry, side_str, atr_val, ob_zone, df)
     
     # REJECT if no valid TP found
     if result is None:
         reasons.append("❌ NO VALID LIQUIDITY FOUND")
-        # debugger already logs rejection in the function
         return None
     
     sl, tp, tp_type = result
-    
-    # Calculate R:R for summary
-    risk = abs(entry - sl)
-    reward = abs(tp - entry)
-    rr_ratio = reward / risk if risk > 0 else 0
     
     sig = {
         "symbol": symbol,
@@ -1167,28 +686,8 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         "liquidity_sweep": liquidity_sweep,
         "momentum_ratio": momentum_ratio,
         "calc_values": calc_values,
-        "tp_type": tp_type,
-        "rr_ratio": rr_ratio
+        "tp_type": tp_type
     }
-    
-    # Log final success with debug summary
-    debugger.success(f"Signal generated successfully!", {
-        'entry': entry,
-        'sl': sl,
-        'tp': tp,
-        'rr_ratio': round(rr_ratio, 2),
-        'score': score,
-        'tp_type': tp_type
-    })
-    
-    # Log debug summary to file
-    debug_summary = debugger.get_summary()
-    debug_summary['signal_generated'] = True
-    debug_summary['final_score'] = score
-    debug_summary['rr_ratio'] = rr_ratio
-    
-    debug_logger.info(f"DEBUG SUMMARY: {debug_summary}", 
-                     extra={'symbol': symbol, 'timeframe': tf})
     
     log.info(f"✅ Signal {sig['symbol']} passed forced filter: Mom={momentum_val:.2f}, Disp={displacement_val:.2f}")
     return sig
@@ -1197,6 +696,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
 def update_tp_sl_live(sig: dict, df: pd.DataFrame):
     """
     REFINED: Only update if TP hasn't been hit AND structure invalidated
+    RomeOPT commits to liquidity objective - no chasing price
     """
     # TP LOCK: If TP already hit, do nothing
     if sig.get("tp_hit", 0) == 1:
@@ -1216,7 +716,7 @@ def update_tp_sl_live(sig: dict, df: pd.DataFrame):
         if df['high'].iloc[-1] > latest_ob["high"]:
             return None  # OB broken, close
     
-    # Structure still valid - keep original TP
+    # Structure still valid - keep original TP (RomeOPT doesn't chase)
     return sig
 
 # ---------------- SL CLUSTER ----------------
@@ -1240,55 +740,6 @@ async def log_signal(sig):
               datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"],
               str(sig.get("latest_ob","")), sig.get("tp_type", ""), 1))
         await db_conn.commit()
-
-# ---------------- DEBUG WEBHOOK ENDPOINTS ----------------
-@app.get("/debug/latest")
-async def get_latest_debug():
-    """Get latest debug information from log file"""
-    try:
-        with open(DEBUG_LOG_FILE, 'r') as f:
-            lines = f.readlines()[-100:]  # Last 100 lines
-        return {"debug_log": lines}
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.get("/debug/rejections")
-async def get_rejection_summary(hours: int = 24):
-    """Get summary of rejection reasons for the last N hours"""
-    try:
-        cutoff_time = time.time() - (hours * 3600)
-        rejections = defaultdict(int)
-        
-        with open(DEBUG_LOG_FILE, 'r') as f:
-            for line in f:
-                if "❌ REJECTED:" in line:
-                    # Extract rejection reason
-                    parts = line.split("❌ REJECTED:")
-                    if len(parts) > 1:
-                        reason = parts[1].split("|")[0].strip()
-                        rejections[reason] += 1
-        
-        return {"rejection_summary": dict(rejections)}
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.get("/debug/status")
-async def get_debug_status():
-    """Get debug system status"""
-    return {
-        "debug_mode": DEBUG_MODE,
-        "debug_log_file": DEBUG_LOG_FILE,
-        "log_file_exists": os.path.exists(DEBUG_LOG_FILE)
-    }
-
-# ---------------- WEBHOOK ENDPOINT ----------------
-@app.post("/webhook")
-async def webhook(request: Request):
-    token = request.headers.get("X-Auth","")
-    if token!=WEBHOOK_SECRET: raise HTTPException(403,"Invalid secret")
-    data = await request.json()
-    log.info("Webhook received: %s", data)
-    return {"ok":True}
 
 # ---------------- ROBUST MONITOR SIGNALS ----------------
 async def monitor_signals():
@@ -1394,16 +845,12 @@ async def scan_loop(exchange):
             top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")], key=lambda x:x[1], reverse=True)[:TOP_N]
             signals_found = 0
             for symbol,_ in top:
-                if deprioritized(symbol): 
-                    log.debug(f"Skipping {symbol} - deprioritized due to recent SL hits")
-                    continue
+                if deprioritized(symbol): continue
                 for tf in TIMEFRAMES:
                     key=f"{symbol}:{tf}"
-                    if key in last_signal_time and time.time()-last_signal_time[key]<60: 
-                        continue
+                    if key in last_signal_time and time.time()-last_signal_time[key]<60: continue
                     ohlcv = await fetch_ohlcv(exchange,symbol,tf,200)
-                    if not ohlcv: 
-                        continue
+                    if not ohlcv: continue
                     df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
                     for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
                     sig = await generate_signal_romeopt(exchange,df,symbol,tf)
@@ -1461,19 +908,26 @@ async def scan_loop(exchange):
                         last_signal_time[key]=time.time()
                         signals_found+=1
             log.info(f"📊 Scan complete: {signals_found} RomeOPT signals (TP LOCKED)")
-        except Exception as e: 
-            log.exception("scan error: %s", e)
+        except Exception as e: log.exception("scan error: %s", e)
         elapsed=time.time()-t0
         await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
+
+# ---------------- FASTAPI ----------------
+app = FastAPI()
+@app.post("/webhook")
+async def webhook(request: Request):
+    token = request.headers.get("X-Auth","")
+    if token!=WEBHOOK_SECRET: raise HTTPException(403,"Invalid secret")
+    data = await request.json()
+    log.info("Webhook received: %s", data)
+    return {"ok":True}
 
 # ---------------- MAIN ----------------
 async def main():
     await init_db()
     global exchange
     exchange = ccxt.okx({"enableRateLimit": True})
-    await tg("🏆 TRUE ROMEOPT SCANNER STARTED (ENHANCED DEBUGGING)")
-    await tg("🔍 DEBUG MODE: ON - Detailed logging enabled")
-    await tg("📊 DEBUG LOG: /app/data/debug_signals.log")
+    await tg("🏆 TRUE ROMEOPT SCANNER STARTED (ENHANCED SWEEP & OB DATA)")
     await tg("🎯 ENHANCED: Comprehensive liquidity sweep analysis")
     await tg("📊 ENHANCED: Detailed order block classification")
     await tg("🔒 TP LOCK: No recalculation after entry")
