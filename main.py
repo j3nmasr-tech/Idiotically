@@ -186,110 +186,187 @@ def force_filter_trade(momentum_value: float, displacement_value: float) -> bool
         return True
     return False
 
-# ---------------- SIMPLIFIED MARKET STATE ----------------
+# ---------------- REFINED ROMEOPT MARKET STATE ----------------
 def romeopt_market_state(df, atr_val):
     """
-    Simplified - RomeOPT doesn't need perfect imbalance classification
-    Just check for strong candles, but don't reject based on state
+    REFINED RomeOPT market state detection
+    Checks: Strong displacement + actual price movement
     """
     if len(df) < 3:
-        return "NEUTRAL"
+        return "BALANCED"
     
     last = df.iloc[-1]
+    prev = df.iloc[-2]
     
-    # Simple strong candle check (informational only)
     body_ratio = abs(last["close"] - last["open"]) / (last["high"] - last["low"] + 1e-8)
     candle_size = last["high"] - last["low"]
+    price_movement = abs(last["close"] - prev["close"])
     
-    if body_ratio > 0.7 and candle_size > atr_val * 0.8:
-        return "STRONG_CANDLE"
-    elif body_ratio > 0.5:
-        return "MODERATE_CANDLE"
-    else:
-        return "NEUTRAL"
+    # RomeOPT logic: Strong displacement with actual follow-through
+    strong_displacement = (
+        body_ratio > 0.7 and                    # Strong body
+        candle_size > atr_val * 1.2 and         # Large candle
+        price_movement > atr_val * 0.5          # Actual price movement
+    )
+    
+    return "IMBALANCED" if strong_displacement else "BALANCED"
 
-# ---------------- SIMPLIFIED ROMEOPT TP DECISION (ACCURATE VERSION) ----------------
+# ---------------- REFINED ROMEOPT INTERNAL LIQUIDITY ----------------
+def romeopt_internal_liquidity(df, side, atr_val, lookback=15):
+    """
+    REFINED RomeOPT internal liquidity detection
+    Uses ATR-based tolerance for visual clusters
+    """
+    if side == "SELL":
+        # For SELL: Look for obvious equal lows
+        lows = df['low'].iloc[-lookback:].dropna()
+        if len(lows) < 5:
+            return None
+        
+        # ATR-based tolerance (15% of ATR = visual clustering tolerance)
+        tolerance = atr_val * 0.15
+        
+        # Find potential cluster centers
+        potential_targets = []
+        for i in range(len(lows)):
+            current_low = lows.iloc[i]
+            # Count how many lows are within tolerance
+            nearby_count = (abs(lows - current_low) <= tolerance).sum()
+            if nearby_count >= 2:  # At least 2 lows form a visual cluster
+                potential_targets.append((current_low, nearby_count))
+        
+        if potential_targets:
+            # Choose the lowest price among clusters (most obvious stop pool)
+            best_target = min(potential_targets, key=lambda x: x[0])[0]
+            return best_target
+        
+    else:  # BUY
+        # For BUY: Look for obvious equal highs
+        highs = df['high'].iloc[-lookback:].dropna()
+        if len(highs) < 5:
+            return None
+        
+        tolerance = atr_val * 0.15
+        potential_targets = []
+        
+        for i in range(len(highs)):
+            current_high = highs.iloc[i]
+            nearby_count = (abs(highs - current_high) <= tolerance).sum()
+            if nearby_count >= 2:
+                potential_targets.append((current_high, nearby_count))
+        
+        if potential_targets:
+            # Choose the highest price among clusters
+            best_target = max(potential_targets, key=lambda x: x[0])[0]
+            return best_target
+    
+    return None  # No obvious visual liquidity cluster
+
+# ---------------- REFINED ROMEOPT EXTERNAL LIQUIDITY ----------------
+def romeopt_external_liquidity(df, side, lookback=50):
+    """
+    REFINED RomeOPT external liquidity detection
+    Simple: Range extremes (RomeOPT prefers guaranteed stops)
+    """
+    if side == "SELL":
+        # For SELL in trend: Range low (guaranteed stops below)
+        return df['low'].iloc[-lookback:].min()
+    else:  # BUY
+        # For BUY in trend: Range high (guaranteed stops above)
+        return df['high'].iloc[-lookback:].max()
+
+# ---------------- ROMEOPT TP DECISION (REFINED VERSION) ----------------
 def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
     """
-    SIMPLIFIED RomeOPT TP logic - Confirmation, NOT rejection
-    Only rule: TP = nearest obvious liquidity where price MUST go
+    REFINED RomeOPT TP logic with all fixes
     """
+    # Step 1: Determine market state
+    market_state = romeopt_market_state(df, atr_val)
     
-    # Step 1: Find nearest liquidity (REAL RomeOPT logic)
+    # Step 2: Find liquidity based on market state
     tp = None
     tp_type = ""
     
-    # Lookback period for finding swings
-    swing_lookback = 20  # Enough to see recent structure
+    if market_state == "BALANCED":
+        # RANGE: Look for internal liquidity clusters
+        tp = romeopt_internal_liquidity(df, side, atr_val)
+        if tp:
+            tp_type = f"RANGE: Visual {'Lows' if side == 'SELL' else 'Highs'} Cluster"
+    else:  # IMBALANCED
+        # TREND: Look for external range extremes
+        tp = romeopt_external_liquidity(df, side)
+        if tp:
+            tp_type = f"TREND: Range {'Low' if side == 'SELL' else 'High'}"
     
+    # REJECT if no obvious liquidity found
+    if tp is None:
+        log.debug(f"❌ No obvious liquidity found for {side} | Market: {market_state}")
+        return None
+    
+    # Step 3: Safety check - reject if recently swept
+    recent_candles = min(10, len(df))
+    if side == "SELL":
+        recent_touch = any(
+            abs(df['low'].iloc[-i] - tp) <= atr_val * 0.1  # Within 10% ATR
+            for i in range(1, recent_candles)
+        )
+    else:  # BUY
+        recent_touch = any(
+            abs(df['high'].iloc[-i] - tp) <= atr_val * 0.1
+            for i in range(1, recent_candles)
+        )
+    
+    if recent_touch:
+        log.debug(f"❌ Liquidity recently swept for {side} at {tp}")
+        return None
+    
+    # Step 4: Calculate SL (keep OB-based SL)
     if side == "BUY":
-        # For BUY: Find nearest HIGHER liquidity
-        # Option 1: Last swing high
-        highs = df['high'].iloc[-swing_lookback:-1]  # Exclude current candle
-        if len(highs) > 0:
-            swing_high = highs.max()
-            if swing_high > entry:  # Must be above entry
-                tp = swing_high
-                tp_type = "SWING_HIGH"
-        
-        # Option 2: Range high as fallback
-        if tp is None:
-            range_high = df['high'].iloc[-50:].max()
-            if range_high > entry:
-                tp = range_high
-                tp_type = "RANGE_HIGH"
-        
-        # Option 3: Small extension if nothing obvious
-        if tp is None:
-            tp = entry + (atr_val * 0.5)  # Small extension
-            tp_type = "ATR_EXTENSION"
-    
-    else:  # SELL
-        # For SELL: Find nearest LOWER liquidity
-        # Option 1: Last swing low
-        lows = df['low'].iloc[-swing_lookback:-1]  # Exclude current candle
-        if len(lows) > 0:
-            swing_low = lows.min()
-            if swing_low < entry:  # Must be below entry
-                tp = swing_low
-                tp_type = "SWING_LOW"
-        
-        # Option 2: Range low as fallback
-        if tp is None:
-            range_low = df['low'].iloc[-50:].min()
-            if range_low < entry:
-                tp = range_low
-                tp_type = "RANGE_LOW"
-        
-        # Option 3: Small extension if nothing obvious
-        if tp is None:
-            tp = entry - (atr_val * 0.5)
-            tp_type = "ATR_EXTENSION"
-    
-    # Step 2: Calculate SL (keep OB-based SL)
-    if side == "BUY":
-        sl = ob_zone["low"] - (atr_val * 0.15)  # Tighter SL for better RR
+        sl = ob_zone["low"] - (atr_val * 0.3)
         recent_low = df['low'].iloc[-10:].min()
-        sl = min(sl, recent_low - (atr_val * 0.15))
+        sl = min(sl, recent_low - (atr_val * 0.3))
         
-        # Ensure TP is above entry
+        # Ensure minimum risk
+        min_risk = atr_val * 0.5
+        risk = entry - sl
+        if risk < min_risk:
+            risk = min_risk
+            sl = entry - risk
+        
+        # Ensure TP is valid (above entry, at least 0.5R)
         if tp <= entry:
             log.debug(f"❌ TP {tp} not above entry {entry} for BUY")
             return None
+            
+        reward = tp - entry
+        if reward < risk * 0.5:
+            log.debug(f"❌ TP reward {reward/risk:.2f}R < 0.5R minimum")
+            return None
         
     else:  # SELL
-        sl = ob_zone["high"] + (atr_val * 0.15)
+        sl = ob_zone["high"] + (atr_val * 0.3)
         recent_high = df['high'].iloc[-10:].max()
-        sl = max(sl, recent_high + (atr_val * 0.15))
+        sl = max(sl, recent_high + (atr_val * 0.3))
         
-        # Ensure TP is below entry
+        min_risk = atr_val * 0.5
+        risk = sl - entry
+        if risk < min_risk:
+            risk = min_risk
+            sl = entry + risk
+        
+        # Ensure TP is valid (below entry, at least 0.5R)
         if tp >= entry:
             log.debug(f"❌ TP {tp} not below entry {entry} for SELL")
             return None
+            
+        reward = entry - tp
+        if reward < risk * 0.5:
+            log.debug(f"❌ TP reward {reward/risk:.2f}R < 0.5R minimum")
+            return None
     
-    log.info(f"✅ {side} {entry:.6f}")
+    log.info(f"✅ {side} {entry:.6f} | Market: {market_state}")
     log.info(f"   SL: {sl:.6f} | TP: {tp:.6f} | Type: {tp_type}")
-    log.info(f"   Risk: {abs(entry-sl):.6f} | R:R: {abs(tp-entry)/abs(entry-sl):.2f}:1")
+    log.info(f"   Risk: {risk:.6f} | R:R: {abs(tp-entry)/risk:.2f}:1")
     
     return sl, tp, tp_type
 
