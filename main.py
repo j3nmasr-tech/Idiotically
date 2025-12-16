@@ -47,10 +47,11 @@ OB_DISTANCE_MAX_THRESHOLD = 0.70  # Maximum OB distance allowed (in percentage)
 OB_DISTANCE_OPTIMAL_MAX = 0.50    # Optimal maximum distance (better entries)
 
 # ---------------- LIQUIDITY CONFIG ----------------
-LIQUIDITY_LOOKBACK = 100  # Candles to look back for liquidity
-MIN_TOUCHES_FOR_POOL = 3  # Minimum touches to consider a liquidity pool
-SWING_LOOKBACK = 5       # Candles each side for swing detection
-TOUCH_TOLERANCE_PCT = 0.1  # % tolerance for equal highs/lows
+# OPTIMIZED FOR RECENT LIQUIDITY (15m/30m/1h/4h)
+LIQUIDITY_LOOKBACK = 50    # ~2 days on 1h, perfect for recent liquidity
+MIN_TOUCHES_FOR_POOL = 2   # 2 touches = confirmed recent interest  
+SWING_LOOKBACK = 4         # Balanced: catches meaningful swings but not too slow
+TOUCH_TOLERANCE_PCT = 0.1  # 0.1% tolerance is standard
 
 # ---------------- TIMEFRAME MAPPING FOR TP ----------------
 def get_tp_timeframes(entry_tf: str) -> list:
