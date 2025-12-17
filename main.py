@@ -27,7 +27,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_PATH = "/app/data/romeopt_v2.db"
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
 TOP_N = int(os.getenv("TOP_N", 10))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 10))
 
