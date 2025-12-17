@@ -12,6 +12,7 @@ TRUE ROMEOPT SCANNER (Final Refined Version) - WITH ENHANCED SWEEP & OB DATA
 - Telegram alerts + SQLite logging
 - Forced Filter: Momentum ≥ 0.87 OR (Momentum ≥ 0.85 AND Displacement ≥ 0.80)
 - ENHANCED: Comprehensive liquidity sweep and order block data
+- ROMEOPT TP PRIORITY LADDER: Same TF → HTF (market-decided targets)
 """
 
 import os, time, asyncio, logging, datetime
@@ -39,6 +40,15 @@ CRITICAL_FACTORS_MIN = 2
 MOMENTUM_STRONG_THRESHOLD = 0.60
 MOMENTUM_GOOD_THRESHOLD = 0.55
 DISPLACEMENT_MIN_THRESHOLD = 0.50
+
+# ---------------- ROMEOPT TP TF PRIORITY LADDER ----------------
+TP_TF_PRIORITY = {
+    "1m": ["1m", "15m"],          # 1m → [1m] → 15m
+    "3m": ["3m", "15m", "30m"],   # 3m → [3m] → 15m → 30m
+    "5m": ["5m", "30m", "1h"],    # 5m → [5m] → 30m → 1h
+    "15m": ["15m", "1h", "4h"],   # 15m → [15m] → 1h → 4h
+    "30m": ["30m", "4h"]          # 30m → [30m] → 4h
+}
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -370,6 +380,64 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
     
     return sl, tp, tp_type
 
+# ---------------- ROMEOPT PRIORITY LADDER TP SELECTION ----------------
+async def find_valid_liquidity_tp(exchange, symbol: str, entry_tf: str, entry: float, side: str, ob_zone: dict):
+    """
+    RomeOPT TP selection (Priority Ladder):
+    1. Same TF first IF valid liquidity exists & unswept
+    2. Otherwise → step up through higher TFs in priority order
+    3. Stop at first valid liquidity target
+    4. Never force a fixed TF, never use percentages/distances
+    
+    Returns: (sl, tp, tp_type_with_tf) or None
+    """
+    # Get TF ladder for this entry timeframe
+    tf_ladder = TP_TF_PRIORITY.get(entry_tf, [entry_tf])
+    
+    for tf in tf_ladder:
+        # Fetch data for this timeframe
+        ohlcv = await fetch_ohlcv(exchange, symbol, tf, 200)
+        if not ohlcv or len(ohlcv) < 20:
+            continue
+        
+        df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
+        
+        # Calculate ATR for this TF
+        atr_val = float(atr(df, 14).iloc[-1])
+        
+        # Check market state on this TF
+        market_state = romeopt_market_state(df, atr_val)
+        
+        # Try to find liquidity on this TF
+        result = romeopt_tp_sl(entry, side, atr_val, ob_zone, df)
+        
+        if result:
+            sl, tp, tp_type = result
+            tf_source = f"{tf} → {tp_type}"
+            
+            # Additional validation: ensure liquidity hasn't been recently swept on THIS TF
+            recent_candles = min(10, len(df))
+            if side == "SELL":
+                recent_touch = any(
+                    abs(df['low'].iloc[-i] - tp) <= atr_val * 0.1
+                    for i in range(1, recent_candles)
+                )
+            else:  # BUY
+                recent_touch = any(
+                    abs(df['high'].iloc[-i] - tp) <= atr_val * 0.1
+                    for i in range(1, recent_candles)
+                )
+            
+            if not recent_touch:
+                log.info(f"✅ {side} TF {entry_tf} → Found valid liquidity on {tf} (Market: {market_state})")
+                log.info(f"   Entry TF: {entry_tf} | Liquidity TF: {tf}")
+                return sl, tp, tf_source
+            else:
+                log.debug(f"⚠️  {side} TF {entry_tf} → Liquidity on {tf} recently swept, trying next TF")
+    
+    log.info(f"❌ {side} TF {entry_tf} → No valid liquidity found across all TFs in ladder")
+    return None
+
 # ---------------- ENHANCED ORDER BLOCK DETECTION ----------------
 def find_latest_ob(df: pd.DataFrame, lookback=50):
     """
@@ -662,17 +730,26 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         return None
     reasons.append("Elite MTF Alignment ✅")
 
-    # ---------------- ROMEOPT TP CALCULATION ----------------
-    atr_val = float(atr(df, 14).iloc[-1])
-    result = romeopt_tp_sl(entry, side_str, atr_val, ob_zone, df)
-    
-    # REJECT if no valid TP found
+    # ---------------- ROMEOPT TP CALCULATION (PRIORITY LADDER) ----------------
+    result = await find_valid_liquidity_tp(
+        exchange=exchange,
+        symbol=symbol,
+        entry_tf=tf,
+        entry=entry,
+        side=side_str,
+        ob_zone=ob_zone
+    )
+
+    # REJECT if no valid TP found across all TFs
     if result is None:
-        reasons.append("❌ NO VALID LIQUIDITY FOUND")
+        reasons.append("❌ NO VALID LIQUIDITY (ALL TFs)")
         return None
+
+    sl, tp, tf_source = result
     
-    sl, tp, tp_type = result
-    
+    # Store original tp_type without TF prefix for backward compatibility
+    tp_type = tf_source.split("→")[-1].strip() if "→" in tf_source else tf_source
+
     sig = {
         "symbol": symbol,
         "side": side_str,
@@ -686,10 +763,12 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         "liquidity_sweep": liquidity_sweep,
         "momentum_ratio": momentum_ratio,
         "calc_values": calc_values,
-        "tp_type": tp_type
+        "tp_type": tp_type,
+        "tp_source_tf": tf_source  # Add TF source info
     }
     
     log.info(f"✅ Signal {sig['symbol']} passed forced filter: Mom={momentum_val:.2f}, Disp={displacement_val:.2f}")
+    log.info(f"   Entry TF: {tf} | Liquidity TF: {tf_source}")
     return sig
 
 # ---------------- REFINED UPDATE TP/SL LIVE ----------------
@@ -871,6 +950,13 @@ async def scan_loop(exchange):
                             f"Entry: {sig['entry']:.6f}",
                             f"Score: {sig['score']}/6",
                             f"",
+                            f"🎯 LIQUIDITY TARGET (Priority Ladder):",
+                            f"• Entry TF: {tf}",
+                            f"• Liquidity TF: {sig.get('tp_source_tf', 'N/A')}",
+                            f"• R:R: {rr:.2f}:1",
+                            f"SL: {sig.get('sl'):.6f}",
+                            f"TP: {sig.get('tp'):.6f}",
+                            f"",
                             f"📊 LIQUIDITY SWEEP DATA:",
                             f"• Type: {calc.get('sweep_type', 'NONE')}",
                             f"• Direction: {calc.get('sweep_direction', 'NONE')}",
@@ -892,15 +978,11 @@ async def scan_loop(exchange):
                             f"• Momentum: {calc.get('momentum_value', 0):.2f}",
                             f"• HTF: {calc.get('htf_direction', '?')}",
                             f"• Forced Filter: {'✅ PASS' if filter_passed else '❌ REJECT'}",
-                            f"• TP Type: {sig.get('tp_type', 'N/A')}",
                             f"",
-                            f"🎯 LIQUIDITY TARGET (R:R: {rr:.2f}:1):",
-                            f"SL: {sig.get('sl'):.6f}",
-                            f"TP: {sig.get('tp'):.6f}",
-                            f"",
-                            f"💎 ROMEOPT PHILOSOPHY:",
-                            f"One TP = One liquidity objective",
-                            f"TP LOCKED - No chasing price"
+                            f"💎 ROMEOPT PHILOSOPHY (Priority Ladder):",
+                            f"• 1st: Same TF liquidity (if valid & unswept)",
+                            f"• 2nd: Step up TF until valid liquidity found",
+                            f"• TP LOCKED - No chasing price"
                         ]
                         
                         await tg("\n".join(breakdown_lines))
@@ -928,11 +1010,11 @@ async def main():
     global exchange
     exchange = ccxt.okx({"enableRateLimit": True})
     await tg("🏆 TRUE ROMEOPT SCANNER STARTED (ENHANCED SWEEP & OB DATA)")
-    await tg("🎯 ENHANCED: Comprehensive liquidity sweep analysis")
+    await tg("🎯 ROMEOPT PRIORITY LADDER: Same TF → HTF liquidity targets")
     await tg("📊 ENHANCED: Detailed order block classification")
     await tg("🔒 TP LOCK: No recalculation after entry")
     await tg("⚡ EXTERNAL LIQUIDITY: Range extremes only")
-    await tg("💎 ROMEOPT CORE: Target where price MUST go")
+    await tg("💎 ROMEOPT CORE: Price decides the TF, not arbitrary rules")
     await asyncio.gather(scan_loop(exchange), monitor_signals())
 
 if __name__=="__main__":
