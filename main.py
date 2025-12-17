@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-TRUE ROMEOPT SCANNER - HIGHER TIMEFRAME TP EDITION (FINAL)
+TRUE ROMEOPT SCANNER - HIGHER TIMEFRAME TP EDITION (FINAL FIXED)
 - RomeOPT 6-step entry logic
 - TP SET ON HIGHER TIMEFRAME for structural liquidity
 - Entry TF → TP TF mapping: 1m→15m/30m, 3m→15m/30m, 5m→15m/30m, 15m→30m/1h, 30m→1h/4h
@@ -76,7 +76,13 @@ exchange = None
 last_signal_time = {}
 recent_sl = defaultdict(lambda: deque())
 
-# =============== TELEGRAM FUNCTIONS ===============
+# =============== HELPER FUNCTIONS ===============
+def format_price(value: Optional[float]) -> str:
+    """Format price with 6 decimals or return N/A"""
+    if value is None:
+        return "N/A"
+    return f"{value:.6f}"
+
 def escape_html(msg: str) -> str:
     """Escape HTML for Telegram messages"""
     if not msg:
@@ -787,7 +793,7 @@ async def log_signal_htf(sig: Dict):
         except Exception as e:
             log.error(f"Error logging signal: {e}")
 
-# =============== SIGNAL MONITORING ===============
+# =============== SIGNAL MONITORING (FIXED) ===============
 async def monitor_signals():
     """Monitor open signals for TP/SL hits"""
     while True:
@@ -836,13 +842,17 @@ async def monitor_signals():
                     
                     # Send alert and update if hits occurred
                     if hits:
+                        # FIXED: Use helper function for proper formatting
+                        sl_display = format_price(sl)
+                        tp_display = format_price(tp)
+                        
                         alert_msg = (
                             f"🎯 {symbol} {side} HIT\n"
                             f"Entry: {entry:.6f}\n"
                             f"Current: {last_price:.6f}\n"
                             f"Hits: {', '.join(hits)}\n"
-                            f"SL: {sl:.6f if sl else 'N/A'}\n"
-                            f"TP: {tp:.6f if tp else 'N/A'}"
+                            f"SL: {sl_display}\n"
+                            f"TP: {tp_display}"
                         )
                         await tg(alert_msg)
                         
@@ -983,8 +993,8 @@ async def send_htf_signal_alert(sig: Dict):
         f"• HTF Range: {htf_data.get('range_low', 0):.6f} - {htf_data.get('range_high', 0):.6f}",
         "",
         "<b>🎯 RISK MANAGEMENT:</b>",
-        f"SL: <code>{sig.get('sl', 0):.6f}</code>",
-        f"TP: <code>{sig.get('tp', 0):.6f}</code>",
+        f"SL: <code>{format_price(sig.get('sl'))}</code>",
+        f"TP: <code>{format_price(sig.get('tp'))}</code>",
         f"Risk: {abs(sig['entry'] - sig.get('sl', 0)):.6f}",
         f"Reward: {abs(sig.get('tp', 0) - sig['entry']):.6f}",
         f"R:R Ratio: {sig.get('rr_ratio', 0):.2f}:1",
