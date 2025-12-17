@@ -246,61 +246,95 @@ def create_dataframe(ohlcv):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
-# ---------------- STEP 1: HTF BIAS ----------------
+# ---------------- FIX: JSON SERIALIZATION HELPER ----------------
+def safe_json_serialize(obj):
+    """Convert numpy/pandas types to Python native types for JSON serialization"""
+    if isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64, np.float32, np.float16)):
+        return float(obj)
+    elif isinstance(obj, (np.ndarray, pd.Series)):
+        return obj.tolist()
+    elif isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+    elif isinstance(obj, pd.DataFrame):
+        return obj.to_dict(orient='records')
+    elif hasattr(obj, '__dict__'):
+        return obj.__dict__
+    elif isinstance(obj, dict):
+        return {k: safe_json_serialize(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [safe_json_serialize(item) for item in obj]
+    else:
+        return obj
+
+# ---------------- STEP 1: HTF BIAS (FIXED WITH 4H→1H FALLBACK) ----------------
 async def analyze_htf_bias(exchange, symbol: str) -> HTFContext:
     """
-    Step 1: HTF Bias (4H/1H)
+    Step 1: HTF Bias (4H/1H) - WITH PROPER 4H→1H FALLBACK
     - Identify range or trend
     - Mark HTF liquidity zones
     - Skip if "mid-range" with no alignment
     """
     
-    # Fetch 4H data (primary HTF)
-    ohlcv_4h = await fetch_ohlcv(exchange, symbol, "4h", 100)
-    if not ohlcv_4h or len(ohlcv_4h) < 30:
-        return HTFContext(bias="UNKNOWN", range_high=0, range_low=0, range_mid=0,
-                         premium_discount="UNKNOWN", liquidity_zones=[], structure=[])
+    # FIRST: Try 4H data (primary HTF)
+    ohlcv_htf = await fetch_ohlcv(exchange, symbol, "4h", 100)
+    timeframe_used = "4h"
     
-    df_4h = create_dataframe(ohlcv_4h)
-    current_price = float(df_4h["close"].iloc[-1])
+    # If 4H insufficient, fallback to 1H
+    if not ohlcv_htf or len(ohlcv_htf) < 30:
+        log.debug(f"{symbol}: 4H data insufficient, falling back to 1H...")
+        ohlcv_htf = await fetch_ohlcv(exchange, symbol, "1h", 100)
+        timeframe_used = "1h"
+        
+        # If 1H also insufficient, skip symbol
+        if not ohlcv_htf or len(ohlcv_htf) < 30:
+            return HTFContext(
+                bias="UNKNOWN", range_high=0, range_low=0, range_mid=0,
+                premium_discount="UNKNOWN", liquidity_zones=[], structure=[],
+                skip_reason="Insufficient HTF data (tried 4h and 1h)", valid=False
+            )
+    
+    df_htf = create_dataframe(ohlcv_htf)
+    current_price = float(df_htf["close"].iloc[-1])
     
     # Identify swing highs/lows (structure)
     swing_highs = []
     swing_lows = []
     
-    for i in range(3, len(df_4h) - 3):
-        high_i = df_4h["high"].iloc[i]
-        low_i = df_4h["low"].iloc[i]
+    for i in range(3, len(df_htf) - 3):
+        high_i = df_htf["high"].iloc[i]
+        low_i = df_htf["low"].iloc[i]
         
         # Check for swing high
-        if (high_i > df_4h["high"].iloc[i-1] and 
-            high_i > df_4h["high"].iloc[i-2] and
-            high_i > df_4h["high"].iloc[i+1] and
-            high_i > df_4h["high"].iloc[i+2]):
+        if (high_i > df_htf["high"].iloc[i-1] and 
+            high_i > df_htf["high"].iloc[i-2] and
+            high_i > df_htf["high"].iloc[i+1] and
+            high_i > df_htf["high"].iloc[i+2]):
             swing_highs.append({
                 "price": float(high_i),
-                "index": i,
-                "timestamp": df_4h["timestamp"].iloc[i]
+                "index": int(i),  # FIX: Convert numpy int to Python int
+                "timestamp": int(df_htf["timestamp"].iloc[i])  # FIX: Convert to int
             })
         
         # Check for swing low
-        if (low_i < df_4h["low"].iloc[i-1] and 
-            low_i < df_4h["low"].iloc[i-2] and
-            low_i < df_4h["low"].iloc[i+1] and
-            low_i < df_4h["low"].iloc[i+2]):
+        if (low_i < df_htf["low"].iloc[i-1] and 
+            low_i < df_htf["low"].iloc[i-2] and
+            low_i < df_htf["low"].iloc[i+1] and
+            low_i < df_htf["low"].iloc[i+2]):
             swing_lows.append({
                 "price": float(low_i),
-                "index": i,
-                "timestamp": df_4h["timestamp"].iloc[i]
+                "index": int(i),  # FIX: Convert numpy int to Python int
+                "timestamp": int(df_htf["timestamp"].iloc[i])  # FIX: Convert to int
             })
     
     # Define current range (last 20 periods)
-    if len(df_4h) >= 20:
-        recent_high = df_4h["high"].iloc[-20:].max()
-        recent_low = df_4h["low"].iloc[-20:].min()
+    if len(df_htf) >= 20:
+        recent_high = df_htf["high"].iloc[-20:].max()
+        recent_low = df_htf["low"].iloc[-20:].min()
     else:
-        recent_high = df_4h["high"].max()
-        recent_low = df_4h["low"].min()
+        recent_high = df_htf["high"].max()
+        recent_low = df_htf["low"].min()
     
     range_high = float(recent_high)
     range_low = float(recent_low)
@@ -341,13 +375,13 @@ async def analyze_htf_bias(exchange, symbol: str) -> HTFContext:
     liquidity_zones.append({
         "price": range_high,
         "type": "RANGE_HIGH",
-        "timeframe": "4h",
+        "timeframe": timeframe_used,  # Use actual timeframe used (4h or 1h)
         "strength": 3
     })
     liquidity_zones.append({
         "price": range_low,
         "type": "RANGE_LOW",
-        "timeframe": "4h",
+        "timeframe": timeframe_used,  # Use actual timeframe used (4h or 1h)
         "strength": 3
     })
     
@@ -356,7 +390,7 @@ async def analyze_htf_bias(exchange, symbol: str) -> HTFContext:
         liquidity_zones.append({
             "price": swing["price"],
             "type": "SWING_HIGH",
-            "timeframe": "4h",
+            "timeframe": timeframe_used,  # Use actual timeframe used (4h or 1h)
             "strength": 2
         })
     
@@ -364,7 +398,7 @@ async def analyze_htf_bias(exchange, symbol: str) -> HTFContext:
         liquidity_zones.append({
             "price": swing["price"],
             "type": "SWING_LOW",
-            "timeframe": "4h",
+            "timeframe": timeframe_used,  # Use actual timeframe used (4h or 1h)
             "strength": 2
         })
     
@@ -462,7 +496,7 @@ async def map_liquidity(exchange, symbol: str, htf_context: HTFContext,
             "price": target["price"],
             "type": target["type"],
             "timeframe": target["timeframe"],
-            "strength": target.get("strength", 1),
+            "strength": int(target.get("strength", 1)),  # FIX: Convert to int
             "direction": "TO"
         })
     
@@ -471,26 +505,26 @@ async def map_liquidity(exchange, symbol: str, htf_context: HTFContext,
         # Find equal highs (clusters)
         high_values = df_1h["high"].iloc[-24:].values
         for val in np.unique(np.round(high_values, 4)):
-            count = np.sum(np.round(high_values, 4) == val)
+            count = int(np.sum(np.round(high_values, 4) == val))  # FIX: Convert to int
             if count >= 2:  # At least 2 touches
                 to_liquidity.append({
                     "price": float(val),
                     "type": "EQUAL_HIGH",
                     "timeframe": "1h",
-                    "strength": min(2, count),
+                    "strength": int(min(2, count)),  # FIX: Convert to int
                     "direction": "TO"
                 })
         
         # Find equal lows
         low_values = df_1h["low"].iloc[-24:].values
         for val in np.unique(np.round(low_values, 4)):
-            count = np.sum(np.round(low_values, 4) == val)
+            count = int(np.sum(np.round(low_values, 4) == val))  # FIX: Convert to int
             if count >= 2:
                 to_liquidity.append({
                     "price": float(val),
                     "type": "EQUAL_LOW",
                     "timeframe": "1h",
-                    "strength": min(2, count),
+                    "strength": int(min(2, count)),  # FIX: Convert to int
                     "direction": "TO"
                 })
     
@@ -562,12 +596,12 @@ async def analyze_sweep(exchange, symbol: str, htf_context: HTFContext) -> Sweep
             
             return SweepAnalysis(
                 type="HIGH_SWEEP",
-                candle_index=candle_idx,
+                candle_index=int(candle_idx),  # FIX: Convert to int
                 swept_price=float(candle["high"]),
                 previous_extreme=float(previous_high),
                 impulsive=impulsive,
                 fake_sweep=fake_sweep,
-                strength=strength
+                strength=float(strength)  # FIX: Ensure float
             )
         
         # Check for low sweep
@@ -593,12 +627,12 @@ async def analyze_sweep(exchange, symbol: str, htf_context: HTFContext) -> Sweep
             
             return SweepAnalysis(
                 type="LOW_SWEEP",
-                candle_index=candle_idx,
+                candle_index=int(candle_idx),  # FIX: Convert to int
                 swept_price=float(candle["low"]),
                 previous_extreme=float(previous_low),
                 impulsive=impulsive,
                 fake_sweep=fake_sweep,
-                strength=strength
+                strength=float(strength)  # FIX: Ensure float
             )
     
     return SweepAnalysis(type="NONE", candle_index=-1, swept_price=0, 
@@ -643,7 +677,7 @@ async def check_structure_shift(exchange, symbol: str, sweep: SweepAnalysis,
                 return StructureShift(
                     type="CHoCH",
                     confirmed=True,
-                    candle_index=sweep_idx + i + 1,
+                    candle_index=int(sweep_idx + i + 1),  # FIX: Convert to int
                     description="High sweep followed by break below recent low"
                 )
         
@@ -657,7 +691,7 @@ async def check_structure_shift(exchange, symbol: str, sweep: SweepAnalysis,
                 return StructureShift(
                     type="BOS",
                     confirmed=True,
-                    candle_index=sweep_idx + 3,
+                    candle_index=int(sweep_idx + 3),  # FIX: Convert to int
                     description="High sweep followed by new higher high"
                 )
     
@@ -671,7 +705,7 @@ async def check_structure_shift(exchange, symbol: str, sweep: SweepAnalysis,
                 return StructureShift(
                     type="CHoCH",
                     confirmed=True,
-                    candle_index=sweep_idx + i + 1,
+                    candle_index=int(sweep_idx + i + 1),  # FIX: Convert to int
                     description="Low sweep followed by break above recent high"
                 )
         
@@ -684,7 +718,7 @@ async def check_structure_shift(exchange, symbol: str, sweep: SweepAnalysis,
                 return StructureShift(
                     type="BOS",
                     confirmed=True,
-                    candle_index=sweep_idx + 3,
+                    candle_index=int(sweep_idx + 3),  # FIX: Convert to int
                     description="Low sweep followed by new lower low"
                 )
     
@@ -1084,12 +1118,12 @@ def calculate_probability(htf_context: HTFContext, liquidity_map: LiquidityMap,
                    structure_clarity + entry_precision)
     
     return ProbabilityScore(
-        htf_alignment=htf_alignment,
-        liquidity_quality=liquidity_quality,
-        sweep_strength=sweep_strength,
-        structure_clarity=structure_clarity,
-        entry_precision=entry_precision,
-        total_score=total_score
+        htf_alignment=float(htf_alignment),  # FIX: Ensure float
+        liquidity_quality=float(liquidity_quality),  # FIX: Ensure float
+        sweep_strength=float(sweep_strength),  # FIX: Ensure float
+        structure_clarity=float(structure_clarity),  # FIX: Ensure float
+        entry_precision=float(entry_precision),  # FIX: Ensure float
+        total_score=float(total_score)  # FIX: Ensure float
     )
 
 # ---------------- MAIN SCANNING LOGIC ----------------
@@ -1295,7 +1329,7 @@ Entry Precision: {setup['probability']['entry_precision']:.2f}
     
     await send_telegram(msg)
     
-    # Log to database
+    # FIX: Use safe_json_serialize for all JSON fields
     async with db_lock:
         await db_conn.execute("""
             INSERT INTO signals VALUES (
@@ -1317,45 +1351,45 @@ Entry Precision: {setup['probability']['entry_precision']:.2f}
             "timestamp": setup["timestamp"],
             "side": setup["side"],
             "htf_bias": setup["htf_bias"],
-            "htf_range_high": setup["htf_range_high"],
-            "htf_range_low": setup["htf_range_low"],
+            "htf_range_high": float(setup["htf_range_high"]),
+            "htf_range_low": float(setup["htf_range_low"]),
             "htf_premium_discount": setup["htf_premium_discount"],
-            "htf_liquidity_zones": json.dumps(setup["htf_liquidity_zones"]),
-            "htf_structure": json.dumps(setup["htf_structure"]),
-            "liquidity_from": json.dumps(setup["liquidity_from"]),
-            "liquidity_to": json.dumps(setup["liquidity_to"]),
+            "htf_liquidity_zones": json.dumps(safe_json_serialize(setup["htf_liquidity_zones"])),
+            "htf_structure": json.dumps(safe_json_serialize(setup["htf_structure"])),
+            "liquidity_from": json.dumps(safe_json_serialize(setup["liquidity_from"])),
+            "liquidity_to": json.dumps(safe_json_serialize(setup["liquidity_to"])),
             "has_clear_target": setup["has_clear_target"],
             "sweep_type": setup["sweep_type"],
-            "swept_price": setup["swept_price"],
+            "swept_price": float(setup["swept_price"]),
             "sweep_impulsive": setup["sweep_impulsive"],
-            "sweep_strength": setup["sweep_strength"],
+            "sweep_strength": float(setup["sweep_strength"]),
             "structure_shift_type": setup["structure_shift_type"],
             "structure_shift_confirmed": setup["structure_shift_confirmed"],
             "structure_description": setup["structure_description"],
             "entry_type": setup["entry_type"],
-            "entry_price": setup["entry_price"],
-            "entry_low": setup["entry_low"],
-            "entry_high": setup["entry_high"],
+            "entry_price": float(setup["entry_price"]),
+            "entry_low": float(setup["entry_low"]),
+            "entry_high": float(setup["entry_high"]),
             "entry_aligns_htf": setup["entry_aligns_htf"],
             "entry_reaction_confirmed": setup["entry_reaction_confirmed"],
-            "sl_price": setup["sl_price"],
+            "sl_price": float(setup["sl_price"]),
             "sl_invalidation_type": setup["sl_invalidation_type"],
-            "risk_amount": setup["risk_amount"],
-            "sl_distance_pct": setup["sl_distance_pct"],
-            "tp1_price": setup["tp1_price"],
+            "risk_amount": float(setup["risk_amount"]),
+            "sl_distance_pct": float(setup["sl_distance_pct"]),
+            "tp1_price": float(setup["tp1_price"]),
             "tp1_type": setup["tp1_type"],
-            "tp2_price": setup["tp2_price"],
+            "tp2_price": float(setup["tp2_price"]),
             "tp2_type": setup["tp2_type"],
-            "tp3_price": setup["tp3_price"],
+            "tp3_price": float(setup["tp3_price"]),
             "tp3_type": setup["tp3_type"],
-            "prob_htf_alignment": setup["probability"]["htf_alignment"],
-            "prob_liquidity_quality": setup["probability"]["liquidity_quality"],
-            "prob_sweep_strength": setup["probability"]["sweep_strength"],
-            "prob_structure_clarity": setup["probability"]["structure_clarity"],
-            "prob_entry_precision": setup["probability"]["entry_precision"],
-            "prob_total_score": setup["probability"]["total_score"],
-            "prob_acceptable": setup["probability"]["acceptable"],
-            "current_price": setup["current_price"]
+            "prob_htf_alignment": float(setup["probability"]["htf_alignment"]),
+            "prob_liquidity_quality": float(setup["probability"]["liquidity_quality"]),
+            "prob_sweep_strength": float(setup["probability"]["sweep_strength"]),
+            "prob_structure_clarity": float(setup["probability"]["structure_clarity"]),
+            "prob_entry_precision": float(setup["probability"]["entry_precision"]),
+            "prob_total_score": float(setup["probability"]["total_score"]),
+            "prob_acceptable": bool(setup["probability"]["acceptable"]),
+            "current_price": float(setup["current_price"])
         })
         await db_conn.commit()
 
