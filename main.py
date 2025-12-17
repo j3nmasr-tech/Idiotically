@@ -37,7 +37,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_PATH = "/app/data/romeopt_v2.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))  # Longer interval for HTF focus
-TOP_N = int(os.getenv("TOP_N", 40))
+TOP_N = int(os.getenv("TOP_N", 60))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 5))
 
 # ---------------- LOGGING ----------------
@@ -127,7 +127,7 @@ class ProbabilityScore:
     @property
     def acceptable(self) -> bool:
         """Accept if total >= 3.5 and all components > 0.5"""
-        return (self.total_score >= 3.0 and 
+        return (self.total_score >= 3.5 and 
                 all([self.htf_alignment >= 0.5,
                      self.liquidity_quality >= 0.5,
                      self.sweep_strength >= 0.5,
