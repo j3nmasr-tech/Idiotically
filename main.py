@@ -127,7 +127,7 @@ class ProbabilityScore:
     @property
     def acceptable(self) -> bool:
         """Accept if total >= 3.5 and all components > 0.5"""
-        return (self.total_score >= 3.5 and 
+        return (self.total_score >= 3.0 and 
                 all([self.htf_alignment >= 0.5,
                      self.liquidity_quality >= 0.5,
                      self.sweep_strength >= 0.5,
