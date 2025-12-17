@@ -2,14 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-TRUE ROMEOPT SCANNER - HIGHER TIMEFRAME TP EDITION (FINAL FIXED)
+TRUE ROMEOPT SCANNER - HIGHER TIMEFRAME TP EDITION (FINAL COMPACT)
 - RomeOPT 6-step entry logic
 - TP SET ON HIGHER TIMEFRAME for structural liquidity
 - Entry TF → TP TF mapping: 1m→15m/30m, 3m→15m/30m, 5m→15m/30m, 15m→30m/1h, 30m→1h/4h
 - External liquidity = range extremes on higher TF
 - Enhanced OB detection on higher timeframe
 - TP LOCK remains active
-- Complete and production-ready
+- Compact professional signal format
 """
 
 import os
@@ -113,7 +113,7 @@ async def tg(msg: str):
 
 # =============== DATABASE FUNCTIONS ===============
 async def init_db():
-    """Initialize database with complete schema"""
+    """Initialize database with complete schema and ensure all columns exist"""
     global db_conn
     
     try:
@@ -121,33 +121,80 @@ async def init_db():
         await db_conn.execute("PRAGMA journal_mode=WAL;")
         await db_conn.execute("PRAGMA synchronous=NORMAL;")
         
-        # Create main signals table
-        await db_conn.execute("""
-            CREATE TABLE IF NOT EXISTS signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                side TEXT NOT NULL,
-                entry REAL NOT NULL,
-                sl REAL,
-                tp REAL NOT NULL,
-                timestamp TEXT NOT NULL,
-                status TEXT DEFAULT 'OPEN',
-                reason TEXT,
-                score INTEGER,
-                tp_hit INTEGER DEFAULT 0,
-                latest_ob TEXT,
-                tp_type TEXT,
-                tp_locked INTEGER DEFAULT 1,
-                entry_tf TEXT,
-                tp_tf TEXT,
-                tp_distance_pips REAL,
-                tp_distance_percent REAL,
-                rr_ratio REAL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+        # Check if table exists
+        async with db_conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='signals'") as cursor:
+            table_exists = await cursor.fetchone()
         
-        # Create performance tracking table
+        if table_exists:
+            # Get existing columns
+            async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
+                existing_columns = await cursor.fetchall()
+                existing_column_names = [col[1] for col in existing_columns]
+            
+            # Define required columns
+            required_columns = [
+                ("id", "INTEGER PRIMARY KEY AUTOINCREMENT"),
+                ("symbol", "TEXT NOT NULL"),
+                ("side", "TEXT NOT NULL"),
+                ("entry", "REAL NOT NULL"),
+                ("sl", "REAL"),
+                ("tp", "REAL NOT NULL"),
+                ("timestamp", "TEXT NOT NULL"),
+                ("status", "TEXT DEFAULT 'OPEN'"),
+                ("reason", "TEXT"),
+                ("score", "INTEGER"),
+                ("tp_hit", "INTEGER DEFAULT 0"),
+                ("latest_ob", "TEXT"),
+                ("tp_type", "TEXT"),
+                ("tp_locked", "INTEGER DEFAULT 1"),
+                ("entry_tf", "TEXT"),
+                ("tp_tf", "TEXT"),
+                ("tp_distance_pips", "REAL"),
+                ("tp_distance_percent", "REAL"),
+                ("rr_ratio", "REAL"),
+                ("created_at", "TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+            ]
+            
+            # Add missing columns
+            for col_name, col_type in required_columns:
+                if col_name not in existing_column_names:
+                    try:
+                        await db_conn.execute(f"ALTER TABLE signals ADD COLUMN {col_name} {col_type}")
+                        log.info(f"✅ Added missing column: {col_name}")
+                    except Exception as e:
+                        log.warning(f"Could not add column {col_name}: {e}")
+            
+            await db_conn.commit()
+            log.info("✅ Database table updated successfully")
+        else:
+            # Create table if it doesn't exist
+            await db_conn.execute("""
+                CREATE TABLE signals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    entry REAL NOT NULL,
+                    sl REAL,
+                    tp REAL NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    status TEXT DEFAULT 'OPEN',
+                    reason TEXT,
+                    score INTEGER,
+                    tp_hit INTEGER DEFAULT 0,
+                    latest_ob TEXT,
+                    tp_type TEXT,
+                    tp_locked INTEGER DEFAULT 1,
+                    entry_tf TEXT,
+                    tp_tf TEXT,
+                    tp_distance_pips REAL,
+                    tp_distance_percent REAL,
+                    rr_ratio REAL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            log.info("✅ Database table created successfully")
+        
+        # Create performance tracking table if it doesn't exist
         await db_conn.execute("""
             CREATE TABLE IF NOT EXISTS performance (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -763,13 +810,22 @@ async def log_signal_htf(sig: Dict):
     """Log signal to database"""
     async with db_lock:
         try:
-            await db_conn.execute("""
-                INSERT INTO signals (
-                    symbol, side, entry, sl, tp, timestamp, status, reason, score,
-                    latest_ob, tp_type, tp_locked, entry_tf, tp_tf,
-                    tp_distance_pips, tp_distance_percent, rr_ratio
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
+            # First check if table has all required columns
+            async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
+                columns = await cursor.fetchall()
+                column_names = [col[1] for col in columns]
+            
+            # Prepare data with fallbacks for missing columns
+            htf_data = sig.get("htf_data", {})
+            
+            # Build the INSERT query dynamically based on available columns
+            insert_columns = [
+                "symbol", "side", "entry", "sl", "tp", "timestamp", 
+                "status", "reason", "score", "latest_ob", "tp_type", 
+                "tp_locked", "entry_tf", "tp_tf", "rr_ratio"
+            ]
+            
+            insert_values = [
                 sig["symbol"],
                 sig["side"],
                 sig["entry"],
@@ -784,21 +840,96 @@ async def log_signal_htf(sig: Dict):
                 1,
                 sig.get("entry_tf", ""),
                 sig.get("tp_tf", ""),
-                sig.get("htf_data", {}).get("distance_pips", 0),
-                sig.get("htf_data", {}).get("distance_percent", 0),
                 sig.get("rr_ratio", 0)
-            ))
+            ]
+            
+            # Add optional columns if they exist in the table
+            if "tp_distance_pips" in column_names:
+                insert_columns.append("tp_distance_pips")
+                insert_values.append(htf_data.get("distance_pips", 0))
+            
+            if "tp_distance_percent" in column_names:
+                insert_columns.append("tp_distance_percent")
+                insert_values.append(htf_data.get("distance_percent", 0))
+            
+            # Build and execute the query
+            columns_str = ", ".join(insert_columns)
+            placeholders = ", ".join(["?" for _ in insert_columns])
+            query = f"INSERT INTO signals ({columns_str}) VALUES ({placeholders})"
+            
+            await db_conn.execute(query, insert_values)
             await db_conn.commit()
             log.debug(f"Logged signal for {sig['symbol']}")
+            
         except Exception as e:
             log.error(f"Error logging signal: {e}")
+            # Try a simpler insert as fallback
+            try:
+                await db_conn.execute("""
+                    INSERT INTO signals (symbol, side, entry, sl, tp, timestamp, status, reason, score)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    sig["symbol"],
+                    sig["side"],
+                    sig["entry"],
+                    sig.get("sl"),
+                    sig.get("tp"),
+                    datetime.datetime.utcnow().isoformat(),
+                    "OPEN",
+                    sig.get("reason", ""),
+                    sig.get("score", 0)
+                ))
+                await db_conn.commit()
+                log.warning(f"Used fallback logging for {sig['symbol']}")
+            except Exception as e2:
+                log.error(f"Fallback logging also failed: {e2}")
 
-# =============== SIGNAL MONITORING (FIXED) ===============
+# =============== COMPACT SIGNAL ALERT FORMAT ===============
+async def send_compact_signal_alert(sig: Dict):
+    """Send compact, professional signal alert"""
+    
+    calc = sig.get("calc_values", {})
+    htf_data = sig.get("htf_data", {})
+    
+    # Key metrics
+    risk = abs(sig['entry'] - sig.get('sl', 0))
+    reward = abs(sig.get('tp', 0) - sig['entry'])
+    rr_ratio = sig.get('rr_ratio', 0)
+    
+    # Signal direction emoji
+    direction_emoji = "🟢" if sig['side'] == 'BUY' else "🔴"
+    
+    message_lines = [
+        f"<b>{direction_emoji} ROMEOPT SIGNAL</b>",
+        f"<code>{sig['symbol']} • {sig['side']} • Score: {sig.get('score', 0)}/6</code>",
+        "",
+        f"<b>Entry:</b> <code>{sig['entry']:.6f}</code>",
+        f"<b>TF:</b> {sig.get('entry_tf')} → {sig.get('tp_tf')}",
+        "",
+        f"<b>SL:</b> <code>{format_price(sig.get('sl'))}</code>",
+        f"<b>TP:</b> <code>{format_price(sig.get('tp'))}</code>",
+        "",
+        f"<b>Risk:</b> {risk:.6f}",
+        f"<b>Reward:</b> {reward:.6f}",
+        f"<b>R:R:</b> {rr_ratio:.2f}:1",
+        "",
+        f"<b>Displacement:</b> {calc.get('displacement_value', 0):.2f}",
+        f"<b>Momentum:</b> {calc.get('momentum_value', 0):.2f}",
+        f"<b>Sweep:</b> {calc.get('sweep_type', 'N/A')}",
+        "",
+        f"<i>HTF Target: {htf_data.get('liquidity_type', 'N/A')} • {htf_data.get('distance_percent', 0):.1f}% away</i>",
+        f"<i>{datetime.datetime.utcnow().strftime('%H:%M:%S')} UTC</i>"
+    ]
+    
+    await tg("\n".join(message_lines))
+
+# =============== SIGNAL MONITORING ===============
 async def monitor_signals():
     """Monitor open signals for TP/SL hits"""
     while True:
         try:
             async with db_lock:
+                # Use a simpler query that doesn't depend on optional columns
                 async with db_conn.execute(
                     "SELECT id, symbol, side, entry, sl, tp, tp_hit, status FROM signals WHERE status='OPEN'"
                 ) as cursor:
@@ -842,12 +973,21 @@ async def monitor_signals():
                     
                     # Send alert and update if hits occurred
                     if hits:
-                        # FIXED: Use helper function for proper formatting
+                        # Use helper function for proper formatting
                         sl_display = format_price(sl)
                         tp_display = format_price(tp)
                         
+                        # Determine hit emoji
+                        if "TP" in hits:
+                            hit_emoji = "🎯"
+                        elif "SL" in hits:
+                            hit_emoji = "💥"
+                        else:
+                            hit_emoji = "📌"
+                        
                         alert_msg = (
-                            f"🎯 {symbol} {side} HIT\n"
+                            f"{hit_emoji} <b>SIGNAL HIT</b>\n"
+                            f"<code>{symbol} {side}</code>\n"
                             f"Entry: {entry:.6f}\n"
                             f"Current: {last_price:.6f}\n"
                             f"Hits: {', '.join(hits)}\n"
@@ -943,8 +1083,8 @@ async def scan_loop_htf(exchange):
                     sig = await generate_signal_romeopt_htf(exchange, df, symbol, tf)
                     
                     if sig:
-                        # Send enhanced alert
-                        await send_htf_signal_alert(sig)
+                        # Send compact alert
+                        await send_compact_signal_alert(sig)
                         
                         # Log to database
                         await log_signal_htf(sig)
@@ -962,52 +1102,6 @@ async def scan_loop_htf(exchange):
         elapsed = time.time() - start_time
         sleep_time = max(1, SCAN_INTERVAL - elapsed)
         await asyncio.sleep(sleep_time)
-
-# =============== ENHANCED ALERT FORMAT ===============
-async def send_htf_signal_alert(sig: Dict):
-    """Send enhanced Telegram alert with HTF TP details"""
-    
-    calc = sig.get("calc_values", {})
-    htf_data = sig.get("htf_data", {})
-    
-    # Format message
-    message_lines = [
-        "🏆 <b>ROMEOPT HTF SIGNAL</b> 🏆",
-        "",
-        f"<b>🎯 {sig['symbol']} {sig['side']}</b>",
-        f"<b>📊 Timeframes:</b> {sig.get('entry_tf')} → {sig.get('tp_tf')}",
-        "",
-        "<b>💎 ENTRY DETAILS:</b>",
-        f"• Price: <code>{sig['entry']:.6f}</code>",
-        f"• Score: {sig.get('score', 0)}/6",
-        f"• Displacement: {calc.get('displacement_value', 0):.2f}",
-        f"• Momentum: {calc.get('momentum_value', 0):.2f}",
-        f"• Sweep: {calc.get('sweep_type', 'NONE')}",
-        f"• OB Strength: {calc.get('ob_strength', 'UNKNOWN')}",
-        "",
-        "<b>📈 HIGHER TIMEFRAME TARGET:</b>",
-        f"• TF: {htf_data.get('tf', 'N/A')}",
-        f"• Market State: {htf_data.get('market_state', 'N/A')}",
-        f"• Liquidity Type: {htf_data.get('liquidity_type', 'N/A')}",
-        f"• Distance: {htf_data.get('distance_percent', 0):.2f}%",
-        f"• HTF Range: {htf_data.get('range_low', 0):.6f} - {htf_data.get('range_high', 0):.6f}",
-        "",
-        "<b>🎯 RISK MANAGEMENT:</b>",
-        f"SL: <code>{format_price(sig.get('sl'))}</code>",
-        f"TP: <code>{format_price(sig.get('tp'))}</code>",
-        f"Risk: {abs(sig['entry'] - sig.get('sl', 0)):.6f}",
-        f"Reward: {abs(sig.get('tp', 0) - sig['entry']):.6f}",
-        f"R:R Ratio: {sig.get('rr_ratio', 0):.2f}:1",
-        "",
-        "<b>🔒 ROMEOPT PRINCIPLES:</b>",
-        "• TP LOCKED on HTF structural liquidity",
-        "• Entry TF micro-structure → HTF macro-target",
-        "• One objective, no price chasing",
-        "",
-        f"<i>Generated: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</i>"
-    ]
-    
-    await tg("\n".join(message_lines))
 
 # =============== FASTAPI WEBHOOK ===============
 app = FastAPI(title="RomeOPT HTF Scanner")
@@ -1080,19 +1174,16 @@ async def main():
         "• 15m → 30m/1h TP",
         "• 30m → 1h/4h TP",
         "",
-        "<b>📊 ENHANCED FEATURES:</b>",
-        "• Structural HTF liquidity targeting",
-        "• TP LOCKED (no price chasing)",
-        "• Enhanced order block analysis",
-        "• Comprehensive sweep detection",
-        "• Forced momentum filter",
+        "<b>📊 COMPACT SIGNAL FORMAT</b>",
+        "• Clean professional alerts",
+        "• All key info at a glance",
+        "• Mobile optimized",
         "",
-        "<b>🔧 SYSTEM READY</b>",
-        f"Scan Interval: {SCAN_INTERVAL}s",
-        f"Top Pairs: {TOP_N}",
-        f"Timeframes: {', '.join(TIMEFRAMES)}",
+        f"<b>Scan Interval:</b> {SCAN_INTERVAL}s",
+        f"<b>Top Pairs:</b> {TOP_N}",
+        f"<b>Timeframes:</b> {', '.join(TIMEFRAMES)}",
         "",
-        "<i>RomeOPT Philosophy: Target where price MUST go</i>"
+        "<i>🔒 TP locked on HTF liquidity • RomeOPT v2.0</i>"
     ]
     
     await tg("\n".join(startup_msg))
