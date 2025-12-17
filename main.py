@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ROMEOTPT SCANNER v2.1 - Multi-Timeframe Pairs + TP/SL Notifications
-Exact 8-step logic applied to multiple timeframe pairs
+ROMEOTPT SCANNER v2 - Exact 8-Step Implementation with TP/SL Tracking
+Maintains original logic exactly, adds trade tracking and notifications
 """
 
 import os
@@ -18,42 +18,32 @@ import pandas as pd
 import numpy as np
 from fastapi import FastAPI
 import uvicorn
-from typing import Dict, List, Optional, Tuple, Any, Set
+from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
-from collections import defaultdict
 
 # ---------------- CONFIG ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-DB_PATH = "/app/data/romeopt_v2_1.db"
+DB_PATH = "/app/data/romeopt_v2.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))
 TOP_N = int(os.getenv("TOP_N", 60))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 5))
 
-# ---------------- TIME FRAME PAIRS (Analysis → Entry) ----------------
-TIMEFRAME_PAIRS = [
-    {"analysis_tf": "15m", "entry_tf": "5m", "name": "15m→5m"},
-    {"analysis_tf": "30m", "entry_tf": "15m", "name": "30m→15m"},
-    {"analysis_tf": "1h", "entry_tf": "30m", "name": "1h→30m"},
-    {"analysis_tf": "4h", "entry_tf": "1h", "name": "4h→1h"},
-]
-
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-log = logging.getLogger("romeopt_v2_1")
+log = logging.getLogger("romeopt_v2")
 db_lock = asyncio.Lock()
 db_conn = None
 
 # ---------------- DATA STRUCTURES ----------------
 @dataclass
 class HTFContext:
-    """Step 1: HTF Bias output"""
-    bias: str  # "BULLISH", "BEARISH", "RANGING"
+    bias: str
     range_high: float
     range_low: float
     range_mid: float
-    premium_discount: str  # "PREMIUM", "DISCOUNT", "MIDDLE"
+    premium_discount: str
     liquidity_zones: List[Dict]
     structure: List[Dict]
     skip_reason: Optional[str] = None
@@ -61,15 +51,13 @@ class HTFContext:
 
 @dataclass
 class LiquidityMap:
-    """Step 2: Liquidity Map output"""
     from_liquidity: List[Dict]
     to_liquidity: List[Dict]
     has_clear_target: bool = False
 
 @dataclass
 class SweepAnalysis:
-    """Step 3: Liquidity Sweep output"""
-    type: str  # "HIGH_SWEEP", "LOW_SWEEP", "NONE"
+    type: str
     candle_index: int
     swept_price: float
     previous_extreme: float
@@ -79,16 +67,14 @@ class SweepAnalysis:
 
 @dataclass
 class StructureShift:
-    """Step 4: Structure Check output"""
-    type: str  # "CHoCH", "BOS", "NONE"
+    type: str
     confirmed: bool
     candle_index: int
     description: str = ""
 
 @dataclass
 class EntryZone:
-    """Step 5: Entry Zone output"""
-    type: str  # "ORDER_BLOCK", "FAIR_VALUE_GAP", "DISCOUNT", "PREMIUM"
+    type: str
     price: float
     low: float
     high: float
@@ -97,7 +83,6 @@ class EntryZone:
 
 @dataclass
 class RiskManagement:
-    """Step 6: Risk/SL output"""
     sl_price: float
     invalidation_type: str
     risk_amount: float
@@ -105,7 +90,6 @@ class RiskManagement:
 
 @dataclass
 class TakeProfitLevels:
-    """Step 7: Take Profit output"""
     tp1: float
     tp2: float
     tp3: float
@@ -115,7 +99,6 @@ class TakeProfitLevels:
 
 @dataclass
 class ProbabilityScore:
-    """Step 8: Probability Check output"""
     htf_alignment: float
     liquidity_quality: float
     sweep_strength: float
@@ -160,11 +143,7 @@ async def init_db():
             symbol TEXT,
             timestamp TEXT,
             side TEXT,
-            timeframe_pair TEXT,
-            analysis_tf TEXT,
-            entry_tf TEXT,
             
-            -- Step 1: HTF Bias
             htf_bias TEXT,
             htf_range_high REAL,
             htf_range_low REAL,
@@ -172,23 +151,19 @@ async def init_db():
             htf_liquidity_zones_json TEXT,
             htf_structure_json TEXT,
             
-            -- Step 2: Liquidity Map
             liquidity_from_json TEXT,
             liquidity_to_json TEXT,
             has_clear_target BOOLEAN,
             
-            -- Step 3: Liquidity Sweep
             sweep_type TEXT,
             swept_price REAL,
             sweep_impulsive BOOLEAN,
             sweep_strength REAL,
             
-            -- Step 4: Structure Check
             structure_shift_type TEXT,
             structure_shift_confirmed BOOLEAN,
             structure_description TEXT,
             
-            -- Step 5: Entry Zone
             entry_type TEXT,
             entry_price REAL,
             entry_low REAL,
@@ -196,13 +171,11 @@ async def init_db():
             entry_aligns_htf BOOLEAN,
             entry_reaction_confirmed BOOLEAN,
             
-            -- Step 6: Risk/SL
             sl_price REAL,
             sl_invalidation_type TEXT,
             risk_amount REAL,
             sl_distance_pct REAL,
             
-            -- Step 7: Take Profit
             tp1_price REAL,
             tp1_type TEXT,
             tp2_price REAL,
@@ -210,7 +183,6 @@ async def init_db():
             tp3_price REAL,
             tp3_type TEXT,
             
-            -- Step 8: Probability
             prob_htf_alignment REAL,
             prob_liquidity_quality REAL,
             prob_sweep_strength REAL,
@@ -219,20 +191,32 @@ async def init_db():
             prob_total_score REAL,
             prob_acceptable BOOLEAN,
             
-            -- Entry Details
             current_price REAL,
             status TEXT DEFAULT 'DETECTED',
-            tp_hit_time TEXT,
+            notes TEXT,
+            
+            trade_status TEXT DEFAULT 'ACTIVE',
+            tp1_hit_time TEXT,
+            tp2_hit_time TEXT,
+            tp3_hit_time TEXT,
             sl_hit_time TEXT,
-            notes TEXT
+            max_profit_pct REAL DEFAULT 0.0,
+            max_loss_pct REAL DEFAULT 0.0,
+            exit_price REAL,
+            result_pct REAL
         )
+    """)
+    
+    await db_conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_active_trades 
+        ON signals(symbol, trade_status) 
+        WHERE trade_status IN ('ACTIVE', 'TP1_HIT', 'TP2_HIT')
     """)
     
     await db_conn.commit()
 
-# ---------------- UTILS ----------------
+# ---------------- OHLCV UTILS ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit: int = 200):
-    """Fetch OHLCV with retry"""
     try:
         return await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     except Exception as e:
@@ -240,7 +224,6 @@ async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit: int = 200):
         return None
 
 def create_dataframe(ohlcv):
-    """Create DataFrame from OHLCV"""
     if not ohlcv:
         return None
     df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -248,8 +231,8 @@ def create_dataframe(ohlcv):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
+# ---------------- JSON SERIALIZATION HELPER ----------------
 def safe_json_serialize(obj):
-    """Convert numpy/pandas types to Python native types"""
     if isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
         return int(obj)
     elif isinstance(obj, (np.floating, np.float64, np.float32, np.float16)):
@@ -269,31 +252,22 @@ def safe_json_serialize(obj):
     else:
         return obj
 
-def get_tf_ms(tf: str) -> int:
-    """Convert timeframe string to milliseconds"""
-    tf_map = {
-        "1m": 60000,
-        "3m": 180000,
-        "5m": 300000,
-        "15m": 900000,
-        "30m": 1800000,
-        "1h": 3600000,
-        "4h": 14400000,
-    }
-    return tf_map.get(tf, 60000)
-
-# ---------------- STEP 1: HTF BIAS (FOR ANALYSIS TF) ----------------
-async def analyze_htf_bias(exchange, symbol: str, analysis_tf: str) -> HTFContext:
-    """Step 1: HTF Bias for the analysis timeframe"""
-    
-    ohlcv_htf = await fetch_ohlcv(exchange, symbol, analysis_tf, 100)
+# ---------------- STEP 1: HTF BIAS (4H/1H) ----------------
+async def analyze_htf_bias(exchange, symbol: str) -> HTFContext:
+    ohlcv_htf = await fetch_ohlcv(exchange, symbol, "4h", 100)
+    timeframe_used = "4h"
     
     if not ohlcv_htf or len(ohlcv_htf) < 30:
-        return HTFContext(
-            bias="UNKNOWN", range_high=0, range_low=0, range_mid=0,
-            premium_discount="UNKNOWN", liquidity_zones=[], structure=[],
-            skip_reason=f"Insufficient {analysis_tf} data", valid=False
-        )
+        log.debug(f"{symbol}: 4H data insufficient, falling back to 1H...")
+        ohlcv_htf = await fetch_ohlcv(exchange, symbol, "1h", 100)
+        timeframe_used = "1h"
+        
+        if not ohlcv_htf or len(ohlcv_htf) < 30:
+            return HTFContext(
+                bias="UNKNOWN", range_high=0, range_low=0, range_mid=0,
+                premium_discount="UNKNOWN", liquidity_zones=[], structure=[],
+                skip_reason="Insufficient HTF data (tried 4h and 1h)", valid=False
+            )
     
     df_htf = create_dataframe(ohlcv_htf)
     current_price = float(df_htf["close"].iloc[-1])
@@ -365,13 +339,13 @@ async def analyze_htf_bias(exchange, symbol: str, analysis_tf: str) -> HTFContex
     liquidity_zones.append({
         "price": range_high,
         "type": "RANGE_HIGH",
-        "timeframe": analysis_tf,
+        "timeframe": timeframe_used,
         "strength": 3
     })
     liquidity_zones.append({
         "price": range_low,
         "type": "RANGE_LOW",
-        "timeframe": analysis_tf,
+        "timeframe": timeframe_used,
         "strength": 3
     })
     
@@ -379,7 +353,7 @@ async def analyze_htf_bias(exchange, symbol: str, analysis_tf: str) -> HTFContex
         liquidity_zones.append({
             "price": swing["price"],
             "type": "SWING_HIGH",
-            "timeframe": analysis_tf,
+            "timeframe": timeframe_used,
             "strength": 2
         })
     
@@ -387,7 +361,7 @@ async def analyze_htf_bias(exchange, symbol: str, analysis_tf: str) -> HTFContex
         liquidity_zones.append({
             "price": swing["price"],
             "type": "SWING_LOW",
-            "timeframe": analysis_tf,
+            "timeframe": timeframe_used,
             "strength": 2
         })
     
@@ -395,7 +369,7 @@ async def analyze_htf_bias(exchange, symbol: str, analysis_tf: str) -> HTFContex
     valid = True
     
     if premium_discount == "MIDDLE" and bias == "RANGING":
-        skip_reason = "Price mid-range with no clear alignment"
+        skip_reason = "Price mid-range with no clear HTF alignment"
         valid = False
     elif range_height / range_low < 0.02:
         skip_reason = "Range too tight (<2%)"
@@ -415,17 +389,14 @@ async def analyze_htf_bias(exchange, symbol: str, analysis_tf: str) -> HTFContex
 
 # ---------------- STEP 2: LIQUIDITY MAP ----------------
 async def map_liquidity(exchange, symbol: str, htf_context: HTFContext, 
-                       current_price: float, entry_tf: str) -> LiquidityMap:
-    """Step 2: Liquidity Map using entry timeframe"""
-    
-    ohlcv_entry = await fetch_ohlcv(exchange, symbol, entry_tf, 100)
-    if not ohlcv_entry:
+                       current_price: float) -> LiquidityMap:
+    ohlcv_1h = await fetch_ohlcv(exchange, symbol, "1h", 100)
+    if not ohlcv_1h:
         return LiquidityMap(from_liquidity=[], to_liquidity=[], has_clear_target=False)
     
-    df_entry = create_dataframe(ohlcv_entry)
-    
+    df_1h = create_dataframe(ohlcv_1h)
     from_liquidity = []
-    recent_df = df_entry.iloc[-10:] if len(df_entry) >= 10 else df_entry
+    recent_df = df_1h.iloc[-10:] if len(df_1h) >= 10 else df_1h
     
     for i in range(len(recent_df) - 1):
         candle = recent_df.iloc[i]
@@ -435,7 +406,7 @@ async def map_liquidity(exchange, symbol: str, htf_context: HTFContext,
             from_liquidity.append({
                 "price": float(candle["high"]),
                 "type": "SWEPT_HIGH",
-                "timeframe": entry_tf,
+                "timeframe": "1h",
                 "direction": "FROM"
             })
         
@@ -443,7 +414,7 @@ async def map_liquidity(exchange, symbol: str, htf_context: HTFContext,
             from_liquidity.append({
                 "price": float(candle["low"]),
                 "type": "SWEPT_LOW",
-                "timeframe": entry_tf,
+                "timeframe": "1h",
                 "direction": "FROM"
             })
     
@@ -467,27 +438,27 @@ async def map_liquidity(exchange, symbol: str, htf_context: HTFContext,
             "direction": "TO"
         })
     
-    if len(df_entry) >= 24:
-        high_values = df_entry["high"].iloc[-24:].values
+    if len(df_1h) >= 24:
+        high_values = df_1h["high"].iloc[-24:].values
         for val in np.unique(np.round(high_values, 4)):
             count = int(np.sum(np.round(high_values, 4) == val))
             if count >= 2:
                 to_liquidity.append({
                     "price": float(val),
                     "type": "EQUAL_HIGH",
-                    "timeframe": entry_tf,
+                    "timeframe": "1h",
                     "strength": int(min(2, count)),
                     "direction": "TO"
                 })
         
-        low_values = df_entry["low"].iloc[-24:].values
+        low_values = df_1h["low"].iloc[-24:].values
         for val in np.unique(np.round(low_values, 4)):
             count = int(np.sum(np.round(low_values, 4) == val))
             if count >= 2:
                 to_liquidity.append({
                     "price": float(val),
                     "type": "EQUAL_LOW",
-                    "timeframe": entry_tf,
+                    "timeframe": "1h",
                     "strength": int(min(2, count)),
                     "direction": "TO"
                 })
@@ -501,23 +472,20 @@ async def map_liquidity(exchange, symbol: str, htf_context: HTFContext,
     )
 
 # ---------------- STEP 3: LIQUIDITY SWEEP ----------------
-async def analyze_sweep(exchange, symbol: str, analysis_tf: str, entry_tf: str) -> SweepAnalysis:
-    """Step 3: Sweep on analysis TF, impulsive check on entry TF"""
-    
-    ohlcv_analysis = await fetch_ohlcv(exchange, symbol, analysis_tf, 50)
-    if not ohlcv_analysis or len(ohlcv_analysis) < 10:
+async def analyze_sweep(exchange, symbol: str, htf_context: HTFContext) -> SweepAnalysis:
+    ohlcv_15m = await fetch_ohlcv(exchange, symbol, "15m", 50)
+    if not ohlcv_15m or len(ohlcv_15m) < 10:
         return SweepAnalysis(type="NONE", candle_index=-1, swept_price=0, 
                            previous_extreme=0, impulsive=False)
     
-    df_analysis = create_dataframe(ohlcv_analysis)
-    lookback = min(5, len(df_analysis))
+    df_15m = create_dataframe(ohlcv_15m)
+    lookback = min(5, len(df_15m))
     
     for i in range(-lookback, 0):
-        candle_idx = len(df_analysis) + i
-        candle = df_analysis.iloc[candle_idx]
-        
+        candle_idx = len(df_15m) + i
+        candle = df_15m.iloc[candle_idx]
         start_idx = max(0, candle_idx - 5)
-        prev_candles = df_analysis.iloc[start_idx:candle_idx]
+        prev_candles = df_15m.iloc[start_idx:candle_idx]
         
         if len(prev_candles) == 0:
             continue
@@ -526,14 +494,19 @@ async def analyze_sweep(exchange, symbol: str, analysis_tf: str, entry_tf: str) 
         previous_low = prev_candles["low"].min()
         
         if candle["high"] > previous_high:
-            impulsive = await check_impulsive_on_entry_tf(exchange, symbol, entry_tf, 
-                                                         int(candle["timestamp"]), "HIGH")
+            body_size = abs(candle["close"] - candle["open"])
+            upper_wick = candle["high"] - max(candle["open"], candle["close"])
+            lower_wick = min(candle["open"], candle["close"]) - candle["low"]
+            total_wick = upper_wick + lower_wick
             
-            fake_sweep = False
+            impulsive = body_size > total_wick
+            
             if i < -1:
-                next_candle = df_analysis.iloc[candle_idx + 1]
+                next_candle = df_15m.iloc[candle_idx + 1]
                 fake_sweep = (next_candle["close"] < candle["close"] and 
                              next_candle["low"] < candle["low"])
+            else:
+                fake_sweep = False
             
             strength = 0.0
             if impulsive and not fake_sweep:
@@ -551,14 +524,19 @@ async def analyze_sweep(exchange, symbol: str, analysis_tf: str, entry_tf: str) 
             )
         
         elif candle["low"] < previous_low:
-            impulsive = await check_impulsive_on_entry_tf(exchange, symbol, entry_tf,
-                                                         int(candle["timestamp"]), "LOW")
+            body_size = abs(candle["close"] - candle["open"])
+            upper_wick = candle["high"] - max(candle["open"], candle["close"])
+            lower_wick = min(candle["open"], candle["close"]) - candle["low"]
+            total_wick = upper_wick + lower_wick
             
-            fake_sweep = False
+            impulsive = body_size > total_wick
+            
             if i < -1:
-                next_candle = df_analysis.iloc[candle_idx + 1]
+                next_candle = df_15m.iloc[candle_idx + 1]
                 fake_sweep = (next_candle["close"] > candle["close"] and 
                              next_candle["high"] > candle["high"])
+            else:
+                fake_sweep = False
             
             strength = 0.0
             if impulsive and not fake_sweep:
@@ -578,54 +556,27 @@ async def analyze_sweep(exchange, symbol: str, analysis_tf: str, entry_tf: str) 
     return SweepAnalysis(type="NONE", candle_index=-1, swept_price=0, 
                        previous_extreme=0, impulsive=False)
 
-async def check_impulsive_on_entry_tf(exchange, symbol: str, entry_tf: str, 
-                                     sweep_timestamp: int, sweep_type: str) -> bool:
-    """Check if sweep was impulsive on entry timeframe"""
-    ohlcv_entry = await fetch_ohlcv(exchange, symbol, entry_tf, 20)
-    if not ohlcv_entry:
-        return False
-    
-    df_entry = create_dataframe(ohlcv_entry)
-    
-    for i in range(len(df_entry)):
-        candle = df_entry.iloc[i]
-        candle_end_time = candle["timestamp"] + get_tf_ms(entry_tf)
-        
-        if candle["timestamp"] <= sweep_timestamp <= candle_end_time:
-            body_size = abs(candle["close"] - candle["open"])
-            upper_wick = candle["high"] - max(candle["open"], candle["close"])
-            lower_wick = min(candle["open"], candle["close"]) - candle["low"]
-            total_wick = upper_wick + lower_wick
-            
-            return bool(body_size > total_wick)
-    
-    return False
-
 # ---------------- STEP 4: STRUCTURE CHECK ----------------
 async def check_structure_shift(exchange, symbol: str, sweep: SweepAnalysis, 
                                htf_context: HTFContext) -> StructureShift:
-    """Step 4: Structure Check on analysis timeframe"""
-    
     if sweep.type == "NONE":
         return StructureShift(type="NONE", confirmed=False, candle_index=-1)
     
-    analysis_tf = htf_context.liquidity_zones[0]["timeframe"] if htf_context.liquidity_zones else "15m"
-    ohlcv_analysis = await fetch_ohlcv(exchange, symbol, analysis_tf, 50)
-    if not ohlcv_analysis:
+    ohlcv_15m = await fetch_ohlcv(exchange, symbol, "15m", 50)
+    if not ohlcv_15m:
         return StructureShift(type="NONE", confirmed=False, candle_index=-1)
     
-    df_analysis = create_dataframe(ohlcv_analysis)
+    df_15m = create_dataframe(ohlcv_15m)
     sweep_idx = sweep.candle_index
-    
-    if sweep_idx < 0 or sweep_idx >= len(df_analysis) - 3:
+    if sweep_idx < 0 or sweep_idx >= len(df_15m) - 3:
         return StructureShift(type="NONE", confirmed=False, candle_index=-1)
     
-    post_sweep_candles = df_analysis.iloc[sweep_idx + 1:]
+    post_sweep_candles = df_15m.iloc[sweep_idx + 1:]
     if len(post_sweep_candles) < 3:
         return StructureShift(type="NONE", confirmed=False, candle_index=-1)
     
     if sweep.type == "HIGH_SWEEP":
-        recent_low_before = df_analysis["low"].iloc[max(0, sweep_idx-5):sweep_idx].min()
+        recent_low_before = df_15m["low"].iloc[max(0, sweep_idx-5):sweep_idx].min()
         
         for i in range(len(post_sweep_candles)):
             candle = post_sweep_candles.iloc[i]
@@ -650,7 +601,7 @@ async def check_structure_shift(exchange, symbol: str, sweep: SweepAnalysis,
                 )
     
     elif sweep.type == "LOW_SWEEP":
-        recent_high_before = df_analysis["high"].iloc[max(0, sweep_idx-5):sweep_idx].max()
+        recent_high_before = df_15m["high"].iloc[max(0, sweep_idx-5):sweep_idx].max()
         
         for i in range(len(post_sweep_candles)):
             candle = post_sweep_candles.iloc[i]
@@ -679,15 +630,13 @@ async def check_structure_shift(exchange, symbol: str, sweep: SweepAnalysis,
 # ---------------- STEP 5: ENTRY ZONE ----------------
 async def find_entry_zone(exchange, symbol: str, htf_context: HTFContext,
                          sweep: SweepAnalysis, structure_shift: StructureShift,
-                         side: str, entry_tf: str) -> EntryZone:
-    """Step 5: Entry Zone on entry timeframe"""
-    
-    ohlcv_entry = await fetch_ohlcv(exchange, symbol, entry_tf, 100)
-    if not ohlcv_entry:
+                         side: str) -> EntryZone:
+    ohlcv_5m = await fetch_ohlcv(exchange, symbol, "5m", 100)
+    if not ohlcv_5m:
         return EntryZone(type="NONE", price=0, low=0, high=0, aligns_with_htf=False)
     
-    df_entry = create_dataframe(ohlcv_entry)
-    current_price = float(df_entry["close"].iloc[-1])
+    df_5m = create_dataframe(ohlcv_5m)
+    current_price = float(df_5m["close"].iloc[-1])
     
     if structure_shift.type == "CHoCH":
         entry_type = "ORDER_BLOCK"
@@ -702,23 +651,21 @@ async def find_entry_zone(exchange, symbol: str, htf_context: HTFContext,
             entry_type = "NONE"
     
     if entry_type == "ORDER_BLOCK":
-        for i in range(2, len(df_entry) - 1):
-            candle = df_entry.iloc[i]
-            next_candle = df_entry.iloc[i + 1]
+        for i in range(2, len(df_5m) - 1):
+            candle = df_5m.iloc[i]
+            next_candle = df_5m.iloc[i + 1]
             
             if side == "BUY":
                 if (candle["close"] < candle["open"] and 
                     next_candle["close"] > next_candle["open"]):
                     ob_low = min(candle["low"], next_candle["low"])
                     ob_high = next_candle["close"]
-                    
                     aligns = (htf_context.bias == "BULLISH" or 
                              htf_context.premium_discount == "DISCOUNT")
                     
                     if current_price <= ob_high and current_price >= ob_low * 0.995:
-                        current_candle = df_entry.iloc[-1]
-                        prev_candle = df_entry.iloc[-2] if len(df_entry) >= 2 else current_candle
-                        
+                        current_candle = df_5m.iloc[-1]
+                        prev_candle = df_5m.iloc[-2] if len(df_5m) >= 2 else current_candle
                         reaction = (current_candle["close"] > current_candle["open"] or
                                    (prev_candle["close"] > prev_candle["open"] and
                                     current_candle["close"] > prev_candle["close"]))
@@ -737,14 +684,12 @@ async def find_entry_zone(exchange, symbol: str, htf_context: HTFContext,
                     next_candle["close"] < next_candle["open"]):
                     ob_low = next_candle["close"]
                     ob_high = max(candle["high"], next_candle["high"])
-                    
                     aligns = (htf_context.bias == "BEARISH" or 
                              htf_context.premium_discount == "PREMIUM")
                     
                     if current_price >= ob_low and current_price <= ob_high * 1.005:
-                        current_candle = df_entry.iloc[-1]
-                        prev_candle = df_entry.iloc[-2] if len(df_entry) >= 2 else current_candle
-                        
+                        current_candle = df_5m.iloc[-1]
+                        prev_candle = df_5m.iloc[-2] if len(df_5m) >= 2 else current_candle
                         reaction = (current_candle["close"] < current_candle["open"] or
                                    (prev_candle["close"] < prev_candle["open"] and
                                     current_candle["close"] < prev_candle["close"]))
@@ -759,10 +704,10 @@ async def find_entry_zone(exchange, symbol: str, htf_context: HTFContext,
                         )
     
     elif entry_type == "FAIR_VALUE_GAP":
-        for i in range(1, len(df_entry) - 2):
-            candle1 = df_entry.iloc[i]
-            candle2 = df_entry.iloc[i + 1]
-            candle3 = df_entry.iloc[i + 2] if i + 2 < len(df_entry) else candle2
+        for i in range(1, len(df_5m) - 2):
+            candle1 = df_5m.iloc[i]
+            candle2 = df_5m.iloc[i + 1]
+            candle3 = df_5m.iloc[i + 2] if i + 2 < len(df_5m) else candle2
             
             if side == "BUY":
                 if candle2["low"] > candle1["high"]:
@@ -803,12 +748,11 @@ async def find_entry_zone(exchange, symbol: str, htf_context: HTFContext,
     elif entry_type in ["PREMIUM", "DISCOUNT"]:
         zone_price = htf_context.range_mid
         zone_width = (htf_context.range_high - htf_context.range_low) * 0.1
-        
         aligns = True
         
         if (side == "BUY" and entry_type == "DISCOUNT" and
             current_price <= htf_context.range_mid * 1.02):
-            reaction = df_entry["close"].iloc[-1] > df_entry["open"].iloc[-1]
+            reaction = df_5m["close"].iloc[-1] > df_5m["open"].iloc[-1]
             
             return EntryZone(
                 type="DISCOUNT",
@@ -821,7 +765,7 @@ async def find_entry_zone(exchange, symbol: str, htf_context: HTFContext,
         
         elif (side == "SELL" and entry_type == "PREMIUM" and
               current_price >= htf_context.range_mid * 0.98):
-            reaction = df_entry["close"].iloc[-1] < df_entry["open"].iloc[-1]
+            reaction = df_5m["close"].iloc[-1] < df_5m["open"].iloc[-1]
             
             return EntryZone(
                 type="PREMIUM",
@@ -837,8 +781,6 @@ async def find_entry_zone(exchange, symbol: str, htf_context: HTFContext,
 # ---------------- STEP 6: RISK/SL ----------------
 def calculate_risk_sl(entry_zone: EntryZone, sweep: SweepAnalysis,
                      htf_context: HTFContext, side: str) -> RiskManagement:
-    """Step 6: Risk/SL"""
-    
     entry_price = entry_zone.price
     sl_price = 0.0
     invalidation_type = ""
@@ -895,8 +837,6 @@ def calculate_risk_sl(entry_zone: EntryZone, sweep: SweepAnalysis,
 def calculate_take_profits(entry_price: float, side: str, 
                           liquidity_map: LiquidityMap,
                           htf_context: HTFContext) -> TakeProfitLevels:
-    """Step 7: Take Profit"""
-    
     if side == "BUY":
         potential_targets = [t for t in liquidity_map.to_liquidity 
                            if t["price"] > entry_price]
@@ -910,7 +850,7 @@ def calculate_take_profits(entry_price: float, side: str,
         htf_targets = [z for z in htf_context.liquidity_zones 
                       if z["price"] < entry_price and z["type"] != "RANGE_LOW"]
     
-    tp1_candidates = [t for t in potential_targets if t["timeframe"] in ["5m", "15m", "30m", "1h"]]
+    tp1_candidates = [t for t in potential_targets if t["timeframe"] == "1h"]
     if tp1_candidates:
         tp1_candidates.sort(key=lambda t: abs(t["price"] - entry_price))
         tp1 = tp1_candidates[0]["price"]
@@ -952,8 +892,6 @@ def calculate_take_profits(entry_price: float, side: str,
 def calculate_probability(htf_context: HTFContext, liquidity_map: LiquidityMap,
                          sweep: SweepAnalysis, structure_shift: StructureShift,
                          entry_zone: EntryZone, side: str) -> ProbabilityScore:
-    """Step 8: Probability Check"""
-    
     if htf_context.bias == side.upper() or htf_context.bias == "RANGING":
         htf_alignment = 1.0
     elif (htf_context.bias == "BULLISH" and side == "SELL") or \
@@ -1014,152 +952,309 @@ def calculate_probability(htf_context: HTFContext, liquidity_map: LiquidityMap,
         total_score=float(total_score)
     )
 
-# ---------------- TP/SL MONITORING ----------------
-async def monitor_tp_sl():
-    """Monitor active trades for TP/SL hits"""
-    while True:
-        try:
-            async with db_lock:
-                async with db_conn.execute(
-                    """SELECT id, symbol, side, entry_price, sl_price, 
-                       tp1_price, tp2_price, tp3_price, status 
-                       FROM signals WHERE status IN ('DETECTED', 'ACTIVE', 'TP1_HIT', 'TP2_HIT')"""
-                ) as cursor:
-                    active_trades = await cursor.fetchall()
-            
-            for trade in active_trades:
-                trade_id, symbol, side, entry, sl, tp1, tp2, tp3, status = trade
-                
-                try:
-                    # Create new exchange instance for thread safety
-                    exchange = ccxt.okx({"enableRateLimit": True, "options": {"defaultType": "spot"}})
-                    ticker = await exchange.fetch_ticker(symbol)
-                    current_price = ticker.get("last", 0)
-                    await exchange.close()
-                    
-                    if not current_price:
-                        continue
-                    
-                    new_status = status
-                    hit_time = datetime.datetime.utcnow().isoformat()
-                    
-                    if side == "BUY":
-                        if current_price <= sl and status not in ["SL_HIT", "TP3_HIT"]:
-                            new_status = "SL_HIT"
-                            await send_tp_sl_notification(trade_id, symbol, "SL", current_price, entry, hit_time)
-                        elif current_price >= tp3 and status != "TP3_HIT":
-                            new_status = "TP3_HIT"
-                            await send_tp_sl_notification(trade_id, symbol, "TP3", current_price, entry, hit_time)
-                        elif current_price >= tp2 and status not in ["TP2_HIT", "TP3_HIT", "SL_HIT"]:
-                            new_status = "TP2_HIT"
-                            await send_tp_sl_notification(trade_id, symbol, "TP2", current_price, entry, hit_time)
-                        elif current_price >= tp1 and status not in ["TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"]:
-                            new_status = "TP1_HIT"
-                            await send_tp_sl_notification(trade_id, symbol, "TP1", current_price, entry, hit_time)
-                    
-                    elif side == "SELL":
-                        if current_price >= sl and status not in ["SL_HIT", "TP3_HIT"]:
-                            new_status = "SL_HIT"
-                            await send_tp_sl_notification(trade_id, symbol, "SL", current_price, entry, hit_time)
-                        elif current_price <= tp3 and status != "TP3_HIT":
-                            new_status = "TP3_HIT"
-                            await send_tp_sl_notification(trade_id, symbol, "TP3", current_price, entry, hit_time)
-                        elif current_price <= tp2 and status not in ["TP2_HIT", "TP3_HIT", "SL_HIT"]:
-                            new_status = "TP2_HIT"
-                            await send_tp_sl_notification(trade_id, symbol, "TP2", current_price, entry, hit_time)
-                        elif current_price <= tp1 and status not in ["TP1_HIT", "TP2_HIT", "TP3_HIT", "SL_HIT"]:
-                            new_status = "TP1_HIT"
-                            await send_tp_sl_notification(trade_id, symbol, "TP1", current_price, entry, hit_time)
-                    
-                    if new_status != status:
-                        if "HIT" in new_status:
-                            field = "tp_hit_time" if "TP" in new_status else "sl_hit_time"
-                            async with db_lock:
-                                await db_conn.execute(
-                                    f"UPDATE signals SET status = ?, {field} = ? WHERE id = ?",
-                                    (new_status, hit_time, trade_id)
-                                )
-                                await db_conn.commit()
-                        else:
-                            async with db_lock:
-                                await db_conn.execute(
-                                    "UPDATE signals SET status = ? WHERE id = ?",
-                                    (new_status, trade_id)
-                                )
-                                await db_conn.commit()
-                            
-                except Exception as e:
-                    log.error(f"Error monitoring {symbol}: {e}")
-                    continue
-            
-            await asyncio.sleep(10)
-            
-        except Exception as e:
-            log.error(f"TP/SL monitor error: {e}")
-            await asyncio.sleep(30)
+# ---------------- TRADE TRACKING FUNCTIONS ----------------
+def calculate_time_in_trade(entry_time_str: str, short: bool = True) -> str:
+    try:
+        entry_time = datetime.datetime.fromisoformat(entry_time_str.replace('Z', '+00:00'))
+        now = datetime.datetime.utcnow()
+        delta = now - entry_time
+        
+        if short:
+            if delta.days > 0:
+                return f"{delta.days}d {delta.seconds // 3600}h"
+            elif delta.seconds >= 3600:
+                return f"{delta.seconds // 3600}h {(delta.seconds % 3600) // 60}m"
+            else:
+                return f"{delta.seconds // 60}m"
+        else:
+            return str(delta).split('.')[0]
+    except:
+        return "N/A"
 
-async def send_tp_sl_notification(trade_id: int, symbol: str, hit_type: str, 
-                                 current_price: float, entry_price: float, hit_time: str):
-    """Send TP/SL hit notification"""
-    
-    pnl_pct = ((current_price - entry_price) / entry_price * 100)
-    if "TP" in hit_type:
-        emoji = "✅"
-        action = f"TAKE PROFIT {hit_type.replace('TP', '')} HIT"
-        color = "🟢"
+async def send_tp_hit_alert(trade_id: int, symbol: str, side: str, entry_price: float,
+                           tp_level: int, tp_price: float, current_price: float,
+                           entry_time: str, max_profit_pct: float):
+    if side == "BUY":
+        profit_pct = (tp_price - entry_price) / entry_price * 100
     else:
-        emoji = "❌"
-        action = "STOP LOSS HIT"
-        color = "🔴"
-        pnl_pct = -abs(pnl_pct)
+        profit_pct = (entry_price - tp_price) / entry_price * 100
+    
+    emoji = "🎯" if tp_level == 1 else "🚀" if tp_level == 2 else "🏆"
     
     msg = f"""
-{emoji} <b>{color} TRADE UPDATE: {action}</b>
+{emoji} <b>TAKE PROFIT {tp_level} HIT!</b>
 
-<b>Signal ID:</b> #{trade_id}
+<b>Trade ID:</b> #{trade_id}
 <b>Symbol:</b> {symbol}
-<b>Type:</b> {hit_type}
+<b>Side:</b> {side}
 <b>Entry:</b> {entry_price:.8f}
-<b>Exit:</b> {current_price:.8f}
-<b>PnL:</b> {pnl_pct:+.2f}%
+<b>TP{tp_level}:</b> {tp_price:.8f}
+<b>Current:</b> {current_price:.8f}
 
-<i>Time: {hit_time}</i>
+<b>Profit:</b> {profit_pct:.2f}%
+<b>Max Profit Reached:</b> {max_profit_pct:.2f}%
+
+⏰ <b>Time in Trade:</b> {calculate_time_in_trade(entry_time)}
+
+✅ <b>TP{tp_level} achieved!</b>
 """
     
     await send_telegram(msg)
-    log.info(f"📢 {symbol}: {hit_type} hit at {current_price:.8f} ({pnl_pct:+.2f}%)")
+
+async def send_sl_hit_alert(trade_id: int, symbol: str, side: str, entry_price: float,
+                           sl_price: float, current_price: float, entry_time: str,
+                           max_profit_pct: float, max_loss_pct: float):
+    if side == "BUY":
+        loss_pct = (sl_price - entry_price) / entry_price * 100
+    else:
+        loss_pct = (entry_price - sl_price) / entry_price * 100
+    
+    msg = f"""
+🛑 <b>STOP LOSS HIT!</b>
+
+<b>Trade ID:</b> #{trade_id}
+<b>Symbol:</b> {symbol}
+<b>Side:</b> {side}
+<b>Entry:</b> {entry_price:.8f}
+<b>SL:</b> {sl_price:.8f}
+<b>Current:</b> {current_price:.8f}
+
+<b>Loss:</b> {loss_pct:.2f}%
+<b>Max Profit Reached:</b> {max_profit_pct:.2f}%
+<b>Max Loss Reached:</b> {max_loss_pct:.2f}%
+
+⏰ <b>Time in Trade:</b> {calculate_time_in_trade(entry_time)}
+
+📊 <b>Trade Closed</b>
+"""
+    
+    await send_telegram(msg)
+
+async def send_all_tps_hit_alert(trade_id: int, symbol: str, side: str, entry_price: float,
+                                tp3_price: float, current_price: float, entry_time: str,
+                                tp1_hit: str, tp2_hit: str, tp3_hit: str, max_profit_pct: float):
+    if side == "BUY":
+        total_profit_pct = (tp3_price - entry_price) / entry_price * 100
+    else:
+        total_profit_pct = (entry_price - tp3_price) / entry_price * 100
+    
+    msg = f"""
+🏆 <b>ALL TARGETS ACHIEVED! FULL WIN!</b>
+
+<b>Trade ID:</b> #{trade_id}
+<b>Symbol:</b> {symbol}
+<b>Side:</b> {side}
+<b>Entry:</b> {entry_price:.8f}
+<b>TP3:</b> {tp3_price:.8f}
+<b>Current:</b> {current_price:.8f}
+
+<b>Total Profit:</b> {total_profit_pct:.2f}%
+<b>Max Profit Reached:</b> {max_profit_pct:.2f}%
+
+⏰ <b>Trade Timeline:</b>
+• Entry: {entry_time}
+• TP1: {tp1_hit or 'N/A'}
+• TP2: {tp2_hit or 'N/A'}
+• TP3: {tp3_hit or 'N/A'}
+• Duration: {calculate_time_in_trade(entry_time, short=False)}
+
+🎯 <b>Perfect Trade Execution!</b>
+"""
+    
+    await send_telegram(msg)
+
+async def track_active_trades(exchange):
+    async with db_lock:
+        async with db_conn.execute(
+            """SELECT id, symbol, entry_price, side, tp1_price, tp2_price, 
+                      tp3_price, sl_price, timestamp, trade_status,
+                      max_profit_pct, max_loss_pct,
+                      tp1_hit_time, tp2_hit_time, tp3_hit_time, sl_hit_time
+               FROM signals 
+               WHERE trade_status IN ('ACTIVE', 'TP1_HIT', 'TP2_HIT')
+               ORDER BY timestamp DESC"""
+        ) as cursor:
+            active_trades = await cursor.fetchall()
+    
+    if not active_trades:
+        return
+    
+    log.info(f"📊 Tracking {len(active_trades)} active trades...")
+    
+    symbols = list(set([trade[1] for trade in active_trades]))
+    
+    for symbol in symbols:
+        try:
+            ticker = await exchange.fetch_ticker(symbol)
+            current_price = ticker.get("last", 0)
+            if not current_price:
+                continue
+            
+            symbol_trades = [t for t in active_trades if t[1] == symbol]
+            
+            for trade in symbol_trades:
+                await check_trade_hit(trade, current_price)
+                
+        except Exception as e:
+            log.error(f"Error tracking {symbol}: {e}")
+            continue
+
+async def check_trade_hit(trade_tuple, current_price: float):
+    (trade_id, symbol, entry_price, side, tp1, tp2, tp3, sl, 
+     entry_time, status, max_profit_pct, max_loss_pct,
+     tp1_hit, tp2_hit, tp3_hit, sl_hit) = trade_tuple
+    
+    if side == "BUY":
+        current_pct = (current_price - entry_price) / entry_price * 100
+        is_tp1 = current_price >= tp1
+        is_tp2 = current_price >= tp2
+        is_tp3 = current_price >= tp3
+        is_sl = current_price <= sl
+    else:
+        current_pct = (entry_price - current_price) / entry_price * 100
+        is_tp1 = current_price <= tp1
+        is_tp2 = current_price <= tp2
+        is_tp3 = current_price <= tp3
+        is_sl = current_price >= sl
+    
+    new_max_profit = max(max_profit_pct, current_pct)
+    new_max_loss = min(max_loss_pct, current_pct)
+    
+    updates_needed = False
+    new_status = status
+    now_time = datetime.datetime.utcnow().isoformat()
+    
+    tp1_hit_time = tp1_hit
+    tp2_hit_time = tp2_hit
+    tp3_hit_time = tp3_hit
+    sl_hit_time = sl_hit
+    
+    if is_sl and not sl_hit:
+        new_status = "SL_HIT"
+        sl_hit_time = now_time
+        await send_sl_hit_alert(trade_id, symbol, side, entry_price, sl, 
+                               current_price, entry_time, new_max_profit, new_max_loss)
+        updates_needed = True
+        
+    elif is_tp3 and not tp3_hit:
+        new_status = "TP3_HIT"
+        tp3_hit_time = now_time
+        if not tp1_hit:
+            tp1_hit_time = now_time
+        if not tp2_hit:
+            tp2_hit_time = now_time
+        await send_all_tps_hit_alert(trade_id, symbol, side, entry_price, tp3,
+                                    current_price, entry_time, tp1_hit_time, 
+                                    tp2_hit_time, now_time, new_max_profit)
+        updates_needed = True
+        
+    elif is_tp2 and not tp2_hit:
+        if status != "TP2_HIT":
+            new_status = "TP2_HIT"
+            tp2_hit_time = now_time
+            if not tp1_hit:
+                tp1_hit_time = now_time
+            await send_tp_hit_alert(trade_id, symbol, side, entry_price, 2, 
+                                   tp2, current_price, entry_time, new_max_profit)
+            updates_needed = True
+            
+    elif is_tp1 and not tp1_hit:
+        if status != "TP1_HIT":
+            new_status = "TP1_HIT"
+            tp1_hit_time = now_time
+            await send_tp_hit_alert(trade_id, symbol, side, entry_price, 1, 
+                                   tp1, current_price, entry_time, new_max_profit)
+            updates_needed = True
+    
+    if updates_needed or new_max_profit != max_profit_pct or new_max_loss != max_loss_pct:
+        await update_trade_status(
+            trade_id, new_status, 
+            tp1_hit_time=tp1_hit_time,
+            tp2_hit_time=tp2_hit_time,
+            tp3_hit_time=tp3_hit_time,
+            sl_hit_time=sl_hit_time,
+            max_profit_pct=new_max_profit,
+            max_loss_pct=new_max_loss,
+            exit_price=current_price if new_status in ["SL_HIT", "TP3_HIT"] else None,
+            result_pct=current_pct if new_status in ["SL_HIT", "TP3_HIT"] else None
+        )
+
+async def update_trade_status(trade_id: int, new_status: str, 
+                            tp1_hit_time: str = None,
+                            tp2_hit_time: str = None,
+                            tp3_hit_time: str = None,
+                            sl_hit_time: str = None,
+                            max_profit_pct: float = None,
+                            max_loss_pct: float = None,
+                            exit_price: float = None,
+                            result_pct: float = None):
+    async with db_lock:
+        updates = []
+        params = []
+        
+        updates.append("trade_status = ?")
+        params.append(new_status)
+        
+        if tp1_hit_time:
+            updates.append("tp1_hit_time = ?")
+            params.append(tp1_hit_time)
+        
+        if tp2_hit_time:
+            updates.append("tp2_hit_time = ?")
+            params.append(tp2_hit_time)
+        
+        if tp3_hit_time:
+            updates.append("tp3_hit_time = ?")
+            params.append(tp3_hit_time)
+        
+        if sl_hit_time:
+            updates.append("sl_hit_time = ?")
+            params.append(sl_hit_time)
+        
+        if max_profit_pct is not None:
+            updates.append("max_profit_pct = ?")
+            params.append(float(max_profit_pct))
+        
+        if max_loss_pct is not None:
+            updates.append("max_loss_pct = ?")
+            params.append(float(max_loss_pct))
+        
+        if exit_price is not None:
+            updates.append("exit_price = ?")
+            params.append(float(exit_price))
+        
+        if result_pct is not None:
+            updates.append("result_pct = ?")
+            params.append(float(result_pct))
+        
+        if updates:
+            query = f"UPDATE signals SET {', '.join(updates)} WHERE id = ?"
+            params.append(trade_id)
+            
+            await db_conn.execute(query, params)
+            await db_conn.commit()
+            
+            log.info(f"📝 Updated trade {trade_id} to {new_status}")
 
 # ---------------- MAIN SCANNING LOGIC ----------------
-async def scan_symbol_for_tf_pair(exchange, symbol: str, tf_pair: Dict) -> Optional[Dict]:
-    """Execute full 8-step process for one symbol on one TF pair"""
-    
-    analysis_tf = tf_pair["analysis_tf"]
-    entry_tf = tf_pair["entry_tf"]
-    pair_name = tf_pair["name"]
-    
+async def scan_symbol_full(exchange, symbol: str) -> Optional[Dict]:
     ticker = await exchange.fetch_ticker(symbol)
     current_price = ticker.get("last", 0)
     if not current_price:
         return None
     
-    log.debug(f"🔍 [{pair_name}] Scanning {symbol} at {current_price}")
+    log.debug(f"🔍 Scanning {symbol} at {current_price}")
     
-    # STEP 1: HTF BIAS
-    htf_context = await analyze_htf_bias(exchange, symbol, analysis_tf)
+    htf_context = await analyze_htf_bias(exchange, symbol)
     if not htf_context.valid:
-        log.debug(f"  [{pair_name}] {symbol}: Skipped HTF - {htf_context.skip_reason}")
         return None
     
-    # STEP 2: LIQUIDITY MAP
-    liquidity_map = await map_liquidity(exchange, symbol, htf_context, current_price, entry_tf)
+    liquidity_map = await map_liquidity(exchange, symbol, htf_context, current_price)
     if not liquidity_map.has_clear_target:
-        log.debug(f"  [{pair_name}] {symbol}: No clear liquidity targets")
         return None
     
-    # STEP 3: LIQUIDITY SWEEP
-    sweep = await analyze_sweep(exchange, symbol, analysis_tf, entry_tf)
+    sweep = await analyze_sweep(exchange, symbol, htf_context)
     if sweep.type == "NONE" or not sweep.impulsive or sweep.fake_sweep:
-        log.debug(f"  [{pair_name}] {symbol}: No valid sweep")
         return None
     
     if sweep.type == "HIGH_SWEEP":
@@ -1169,84 +1264,66 @@ async def scan_symbol_for_tf_pair(exchange, symbol: str, tf_pair: Dict) -> Optio
     else:
         return None
     
-    # STEP 4: STRUCTURE CHECK
     structure_shift = await check_structure_shift(exchange, symbol, sweep, htf_context)
     if not structure_shift.confirmed:
-        log.debug(f"  [{pair_name}] {symbol}: No structure shift")
         return None
     
-    # STEP 5: ENTRY ZONE
-    entry_zone = await find_entry_zone(exchange, symbol, htf_context, sweep, structure_shift, side, entry_tf)
+    entry_zone = await find_entry_zone(exchange, symbol, htf_context, sweep, structure_shift, side)
     if entry_zone.type == "NONE" or not entry_zone.candle_reaction:
-        log.debug(f"  [{pair_name}] {symbol}: No valid entry zone")
         return None
     
-    # STEP 6: RISK/SL
     risk_sl = calculate_risk_sl(entry_zone, sweep, htf_context, side)
     if risk_sl.sl_price == 0:
-        log.debug(f"  [{pair_name}] {symbol}: Failed to calculate SL")
         return None
     
-    # STEP 7: TAKE PROFIT
     tp_levels = calculate_take_profits(entry_zone.price, side, liquidity_map, htf_context)
     
-    # STEP 8: PROBABILITY CHECK
-    probability = calculate_probability(htf_context, liquidity_map, sweep, structure_shift, entry_zone, side)
+    probability = calculate_probability(
+        htf_context, liquidity_map, sweep, structure_shift, entry_zone, side
+    )
     
     if not probability.acceptable:
-        log.debug(f"  [{pair_name}] {symbol}: Probability too low ({probability.total_score:.2f}/5)")
         return None
     
-    log.info(f"✅ [{pair_name}] {symbol}: A+ Setup! Score: {probability.total_score:.2f}/5")
+    log.info(f"✅ {symbol}: A+ Setup detected! Score: {probability.total_score:.2f}/5")
     
     setup = {
         "symbol": symbol,
         "timestamp": datetime.datetime.utcnow().isoformat(),
         "side": side,
         "current_price": current_price,
-        "timeframe_pair": pair_name,
-        "analysis_tf": analysis_tf,
-        "entry_tf": entry_tf,
-        
         "htf_bias": htf_context.bias,
         "htf_range_high": htf_context.range_high,
         "htf_range_low": htf_context.range_low,
         "htf_premium_discount": htf_context.premium_discount,
         "htf_liquidity_zones": htf_context.liquidity_zones,
         "htf_structure": htf_context.structure,
-        
         "liquidity_from": liquidity_map.from_liquidity,
         "liquidity_to": liquidity_map.to_liquidity,
         "has_clear_target": liquidity_map.has_clear_target,
-        
         "sweep_type": sweep.type,
         "swept_price": sweep.swept_price,
         "sweep_impulsive": sweep.impulsive,
         "sweep_strength": sweep.strength,
-        
         "structure_shift_type": structure_shift.type,
         "structure_shift_confirmed": structure_shift.confirmed,
         "structure_description": structure_shift.description,
-        
         "entry_type": entry_zone.type,
         "entry_price": entry_zone.price,
         "entry_low": entry_zone.low,
         "entry_high": entry_zone.high,
         "entry_aligns_htf": entry_zone.aligns_with_htf,
         "entry_reaction_confirmed": entry_zone.candle_reaction,
-        
         "sl_price": risk_sl.sl_price,
         "sl_invalidation_type": risk_sl.invalidation_type,
         "risk_amount": risk_sl.risk_amount,
         "sl_distance_pct": risk_sl.sl_to_entry_distance,
-        
         "tp1_price": tp_levels.tp1,
         "tp1_type": tp_levels.tp1_type,
         "tp2_price": tp_levels.tp2,
         "tp2_type": tp_levels.tp2_type,
         "tp3_price": tp_levels.tp3,
         "tp3_type": tp_levels.tp3_type,
-        
         "probability": {
             "htf_alignment": probability.htf_alignment,
             "liquidity_quality": probability.liquidity_quality,
@@ -1260,24 +1337,32 @@ async def scan_symbol_for_tf_pair(exchange, symbol: str, tf_pair: Dict) -> Optio
     
     return setup
 
+# ---------------- SETUP ALERT ----------------
 async def send_setup_alert(setup: Dict):
-    """Format and send setup alert"""
-    
     entry = setup["entry_price"]
     sl = setup["sl_price"]
     tp1 = setup["tp1_price"]
+    
     risk = abs(entry - sl)
     reward_tp1 = abs(tp1 - entry)
     rr_ratio = reward_tp1 / risk if risk > 0 else 0
     
+    if setup["side"] == "BUY":
+        tp1_pct = (setup["tp1_price"] - entry) / entry * 100
+        tp2_pct = (setup["tp2_price"] - entry) / entry * 100
+        tp3_pct = (setup["tp3_price"] - entry) / entry * 100
+        sl_pct = (sl - entry) / entry * 100
+    else:
+        tp1_pct = (entry - setup["tp1_price"]) / entry * 100
+        tp2_pct = (entry - setup["tp2_price"]) / entry * 100
+        tp3_pct = (entry - setup["tp3_price"]) / entry * 100
+        sl_pct = (entry - sl) / entry * 100
+    
     msg = f"""
-🔥 <b>ROMEOTPT A+ SETUP - {setup['timeframe_pair']}</b>
+🔥 <b>ROMEOTPT A+ SETUP CONFIRMED</b>
 
 <b>Symbol:</b> {setup['symbol']}
 <b>Side:</b> {setup['side']}
-<b>Analysis TF:</b> {setup['analysis_tf']}
-<b>Entry TF:</b> {setup['entry_tf']}
-
 <b>Entry:</b> {setup['entry_price']:.8f}
 <b>Current:</b> {setup['current_price']:.8f}
 
@@ -1285,12 +1370,12 @@ async def send_setup_alert(setup: Dict):
 <b>RR Ratio:</b> {rr_ratio:.2f}:1
 
 🎯 <b>Targets:</b>
-TP1: {setup['tp1_price']:.8f} ({setup['tp1_type']})
-TP2: {setup['tp2_price']:.8f} ({setup['tp2_type']})
-TP3: {setup['tp3_price']:.8f} ({setup['tp3_type']})
+TP1: {setup['tp1_price']:.8f} ({tp1_pct:.2f}%)
+TP2: {setup['tp2_price']:.8f} ({tp2_pct:.2f}%)
+TP3: {setup['tp3_price']:.8f} ({tp3_pct:.2f}%)
 
 🛡️ <b>Risk:</b>
-SL: {setup['sl_price']:.8f} ({setup['sl_invalidation_type']})
+SL: {setup['sl_price']:.8f} ({sl_pct:.2f}%)
 Risk: {setup['risk_amount']:.8f} ({setup['sl_distance_pct']:.2f}%)
 
 📊 <b>Analysis:</b>
@@ -1299,7 +1384,15 @@ Risk: {setup['risk_amount']:.8f} ({setup['sl_distance_pct']:.2f}%)
 • Structure: {setup['structure_shift_type']}
 • Entry: {setup['entry_type']}
 
-✅ <b>TP/SL Monitoring ACTIVE - You will get updates automatically</b>
+✅ <b>Probability Components:</b>
+HTF Alignment: {setup['probability']['htf_alignment']:.2f}
+Liquidity Quality: {setup['probability']['liquidity_quality']:.2f}
+Sweep Strength: {setup['probability']['sweep_strength']:.2f}
+Structure Clarity: {setup['probability']['structure_clarity']:.2f}
+Entry Precision: {setup['probability']['entry_precision']:.2f}
+
+🔔 <b>Trade will be tracked automatically.</b>
+<i>TP/SL alerts will be sent when triggered.</i>
 
 <i>Detected: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}</i>
 """
@@ -1309,7 +1402,7 @@ Risk: {setup['risk_amount']:.8f} ({setup['sl_distance_pct']:.2f}%)
     async with db_lock:
         await db_conn.execute("""
             INSERT INTO signals VALUES (
-                NULL, :symbol, :timestamp, :side, :timeframe_pair, :analysis_tf, :entry_tf,
+                NULL, :symbol, :timestamp, :side,
                 :htf_bias, :htf_range_high, :htf_range_low, :htf_premium_discount,
                 :htf_liquidity_zones, :htf_structure,
                 :liquidity_from, :liquidity_to, :has_clear_target,
@@ -1320,15 +1413,13 @@ Risk: {setup['risk_amount']:.8f} ({setup['sl_distance_pct']:.2f}%)
                 :tp1_price, :tp1_type, :tp2_price, :tp2_type, :tp3_price, :tp3_type,
                 :prob_htf_alignment, :prob_liquidity_quality, :prob_sweep_strength,
                 :prob_structure_clarity, :prob_entry_precision, :prob_total_score, :prob_acceptable,
-                :current_price, 'DETECTED', NULL, NULL, ''
+                :current_price, 'DETECTED', '',
+                'ACTIVE', NULL, NULL, NULL, NULL, 0.0, 0.0, NULL, NULL
             )
         """, {
             "symbol": setup["symbol"],
             "timestamp": setup["timestamp"],
             "side": setup["side"],
-            "timeframe_pair": setup["timeframe_pair"],
-            "analysis_tf": setup["analysis_tf"],
-            "entry_tf": setup["entry_tf"],
             "htf_bias": setup["htf_bias"],
             "htf_range_high": float(setup["htf_range_high"]),
             "htf_range_low": float(setup["htf_range_low"]),
@@ -1340,17 +1431,17 @@ Risk: {setup['risk_amount']:.8f} ({setup['sl_distance_pct']:.2f}%)
             "has_clear_target": setup["has_clear_target"],
             "sweep_type": setup["sweep_type"],
             "swept_price": float(setup["swept_price"]),
-            "sweep_impulsive": bool(setup["sweep_impulsive"]),
+            "sweep_impulsive": setup["sweep_impulsive"],
             "sweep_strength": float(setup["sweep_strength"]),
             "structure_shift_type": setup["structure_shift_type"],
-            "structure_shift_confirmed": bool(setup["structure_shift_confirmed"]),
+            "structure_shift_confirmed": setup["structure_shift_confirmed"],
             "structure_description": setup["structure_description"],
             "entry_type": setup["entry_type"],
             "entry_price": float(setup["entry_price"]),
             "entry_low": float(setup["entry_low"]),
             "entry_high": float(setup["entry_high"]),
-            "entry_aligns_htf": bool(setup["entry_aligns_htf"]),
-            "entry_reaction_confirmed": bool(setup["entry_reaction_confirmed"]),
+            "entry_aligns_htf": setup["entry_aligns_htf"],
+            "entry_reaction_confirmed": setup["entry_reaction_confirmed"],
             "sl_price": float(setup["sl_price"]),
             "sl_invalidation_type": setup["sl_invalidation_type"],
             "risk_amount": float(setup["risk_amount"]),
@@ -1374,14 +1465,17 @@ Risk: {setup['risk_amount']:.8f} ({setup['sl_distance_pct']:.2f}%)
 
 # ---------------- MAIN SCANNER ----------------
 async def scanner_main(exchange):
-    """Main scanning loop"""
+    await send_telegram("🚀 ROMEOTPT v2 Scanner Started - With TP/SL Tracking")
     
-    await send_telegram("🚀 ROMEOTPT v2.1 Multi-TF Scanner Started")
-    await send_telegram("Timeframe Pairs: 15m→5m | 30m→15m | 1h→30m | 4h→1h")
-    await send_telegram("✅ TP/SL Monitoring ACTIVE - Automatic updates on hits")
+    async def tracking_loop():
+        while True:
+            try:
+                await track_active_trades(exchange)
+            except Exception as e:
+                log.error(f"Tracking error: {e}")
+            await asyncio.sleep(60)
     
-    # Start TP/SL monitoring in background
-    asyncio.create_task(monitor_tp_sl())
+    tracking_task = asyncio.create_task(tracking_loop())
     
     while True:
         try:
@@ -1392,23 +1486,22 @@ async def scanner_main(exchange):
             usdt_pairs.sort(key=lambda x: x[1], reverse=True)
             top_pairs = usdt_pairs[:TOP_N]
             
-            log.info(f"📊 Scanning {len(top_pairs)} symbols across {len(TIMEFRAME_PAIRS)} TF pairs...")
+            log.info(f"📊 Scanning {len(top_pairs)} symbols...")
             
             setups_found = 0
             for symbol, volume in top_pairs:
-                for tf_pair in TIMEFRAME_PAIRS:
-                    try:
-                        setup = await scan_symbol_for_tf_pair(exchange, symbol, tf_pair)
-                        if setup:
-                            await send_setup_alert(setup)
-                            setups_found += 1
-                            await asyncio.sleep(1)
-                    except Exception as e:
-                        log.error(f"Error scanning {symbol} on {tf_pair['name']}: {e}")
-                        continue
+                try:
+                    setup = await scan_symbol_full(exchange, symbol)
+                    if setup:
+                        await send_setup_alert(setup)
+                        setups_found += 1
+                        await asyncio.sleep(2)
+                except Exception as e:
+                    log.error(f"Error scanning {symbol}: {e}")
+                    continue
             
             if setups_found > 0:
-                log.info(f"✅ Found {setups_found} A+ setups across all TF pairs")
+                log.info(f"✅ Found {setups_found} A+ setups")
             else:
                 log.info("⏳ No setups found this scan")
             
@@ -1416,46 +1509,37 @@ async def scanner_main(exchange):
             log.exception(f"Scanner error: {e}")
         
         await asyncio.sleep(SCAN_INTERVAL)
+    
+    tracking_task.cancel()
 
 # ---------------- FASTAPI ----------------
 app = FastAPI()
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "scanner": "ROMEOTPT v2.1 Multi-TF"}
+    return {"status": "healthy", "scanner": "ROMEOTPT v2"}
 
-@app.get("/setups")
-async def get_setups(limit: int = 20, min_score: float = 3.5, status: str = None):
+@app.get("/active-trades")
+async def get_active_trades():
     async with db_lock:
-        query = """SELECT * FROM signals WHERE prob_total_score >= ? """
-        params = [min_score]
-        
-        if status:
-            query += " AND status = ?"
-            params.append(status)
-        
-        query += " ORDER BY timestamp DESC LIMIT ?"
-        params.append(limit)
-        
-        async with db_conn.execute(query, params) as cursor:
+        async with db_conn.execute(
+            """SELECT id, symbol, entry_price, side, tp1_price, tp2_price, 
+                      tp3_price, sl_price, timestamp, trade_status,
+                      max_profit_pct, max_loss_pct,
+                      tp1_hit_time, tp2_hit_time, tp3_hit_time, sl_hit_time
+               FROM signals 
+               WHERE trade_status IN ('ACTIVE', 'TP1_HIT', 'TP2_HIT')
+               ORDER BY timestamp DESC"""
+        ) as cursor:
             columns = [description[0] for description in cursor.description]
             rows = await cursor.fetchall()
         
-        setups = []
+        trades = []
         for row in rows:
-            setup = dict(zip(columns, row))
-            json_fields = ["htf_liquidity_zones_json", "htf_structure_json",
-                          "liquidity_from_json", "liquidity_to_json"]
-            for field in json_fields:
-                if setup.get(field):
-                    try:
-                        key = field.replace("_json", "")
-                        setup[key] = json.loads(setup[field])
-                    except:
-                        pass
-            setups.append(setup)
+            trade = dict(zip(columns, row))
+            trades.append(trade)
         
-        return {"setups": setups, "count": len(setups)}
+        return {"active_trades": trades, "count": len(trades)}
 
 # ---------------- MAIN ----------------
 async def main():
@@ -1474,12 +1558,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--http", action="store_true", help="Run HTTP server")
-    parser.add_argument("--single-tf", type=str, help="Run single TF pair (e.g., '15m→5m')")
     args = parser.parse_args()
-    
-    if args.single_tf:
-        TIMEFRAME_PAIRS = [p for p in TIMEFRAME_PAIRS if p["name"] == args.single_tf]
-        log.info(f"Running in single-TF mode: {args.single_tf}")
     
     if args.http:
         uvicorn.run(app, host="0.0.0.0", port=8000)
@@ -1487,7 +1566,7 @@ if __name__ == "__main__":
         try:
             asyncio.run(main())
         except KeyboardInterrupt:
-            log.info("Shutting down ROMEOTPT v2.1 scanner...")
+            log.info("Shutting down ROMEOTPT v2 scanner...")
         finally:
             if db_conn:
                 asyncio.run(db_conn.close())
