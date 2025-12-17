@@ -1,950 +1,1471 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-TRUE ROMEOPT SCANNER (Final Refined Version) - WITH ENHANCED SWEEP & OB DATA
-- RomeOPT 6-step entry logic
-- TRUE RomeOPT TP: ONE liquidity target, no TP ladders
-- Simple but accurate market state detection
-- ATR-based tolerance for liquidity detection
-- External liquidity = range extremes (not local swings)
-- TP LOCK: No recalculation after entry
-- Telegram alerts + SQLite logging
-- Forced Filter: Momentum ≥ 0.87 OR (Momentum ≥ 0.85 AND Displacement ≥ 0.80)
-- ENHANCED: Comprehensive liquidity sweep and order block data
+ROMEOTPT SCANNER v2 - Exact Step-by-Step Implementation
+Matches the 8-step process exactly
+
+Step 1: HTF Bias (4H/1H) → Range/Trend + Liquidity zones → Skip mid-range
+Step 2: Liquidity Map → FROM liquidity TO liquidity targets
+Step 3: Liquidity Sweep → Impulsive stop hunts only
+Step 4: Structure Check → CHoCH (reversal) or BOS (continuation)
+Step 5: Entry Zone → OB/FVG in premium/discount + HTF aligned
+Step 6: Risk/SL → Beyond invalidation (sweep, OB, structure)
+Step 7: Take Profit → TP1=internal, TP2=range, TP3=HTF liquidity
+Step 8: Probability Check → Combined score filters
 """
 
-import os, time, asyncio, logging, datetime
+import os
+import time
+import asyncio
+import logging
+import datetime
+import json
 import aiosqlite
 import httpx
 import ccxt.async_support as ccxt
 import pandas as pd
-from fastapi import FastAPI, Request, HTTPException
+import numpy as np
+from fastapi import FastAPI
 import uvicorn
-from collections import defaultdict, deque
+from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass
+from collections import defaultdict
 
 # ---------------- CONFIG ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
-DB_PATH = "/app/data/signals.db"
+DB_PATH = "/app/data/romeopt_v2.db"
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
-TOP_N = int(os.getenv("TOP_N", 60))
-TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
-MIN_SCORE = 4
-CRITICAL_FACTORS_MIN = 2
-
-# ---------------- FORCED FILTER PARAMETERS ----------------
-MOMENTUM_STRONG_THRESHOLD = 0.60
-MOMENTUM_GOOD_THRESHOLD = 0.55
-DISPLACEMENT_MIN_THRESHOLD = 0.50
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))  # Longer interval for HTF focus
+TOP_N = int(os.getenv("TOP_N", 40))
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 5))
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-log = logging.getLogger("romeopt_bot")
+log = logging.getLogger("romeopt_v2")
 db_lock = asyncio.Lock()
 db_conn = None
 
-# ---------------- TELEGRAM ----------------
-def escape_html(msg: str) -> str:
-    if not msg: return "-"
-    return str(msg).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+# ---------------- DATA STRUCTURES ----------------
+@dataclass
+class HTFContext:
+    """Step 1: HTF Bias output"""
+    bias: str  # "BULLISH", "BEARISH", "RANGING"
+    range_high: float
+    range_low: float
+    range_mid: float
+    premium_discount: str  # "PREMIUM", "DISCOUNT", "MIDDLE"
+    liquidity_zones: List[Dict]  # HTF liquidity levels
+    structure: List[Dict]  # Swing highs/lows
+    skip_reason: Optional[str] = None
+    valid: bool = False
 
-async def tg(msg: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
-    safe_msg = escape_html(msg)
+@dataclass
+class LiquidityMap:
+    """Step 2: Liquidity Map output"""
+    from_liquidity: List[Dict]  # Liquidity being moved FROM
+    to_liquidity: List[Dict]    # Liquidity targets TO move to
+    has_clear_target: bool = False
+
+@dataclass
+class SweepAnalysis:
+    """Step 3: Liquidity Sweep output"""
+    type: str  # "HIGH_SWEEP", "LOW_SWEEP", "NONE"
+    candle_index: int
+    swept_price: float
+    previous_extreme: float
+    impulsive: bool  # Body > wicks
+    fake_sweep: bool = False
+    strength: float = 0.0  # 0-1 score
+
+@dataclass
+class StructureShift:
+    """Step 4: Structure Check output"""
+    type: str  # "CHoCH" (reversal), "BOS" (continuation), "NONE"
+    confirmed: bool
+    candle_index: int
+    description: str = ""
+
+@dataclass
+class EntryZone:
+    """Step 5: Entry Zone output"""
+    type: str  # "ORDER_BLOCK", "FAIR_VALUE_GAP", "DISCOUNT", "PREMIUM"
+    price: float
+    low: float
+    high: float
+    aligns_with_htf: bool
+    candle_reaction: bool = False
+
+@dataclass
+class RiskManagement:
+    """Step 6: Risk/SL output"""
+    sl_price: float
+    invalidation_type: str  # "SWEEP", "ORDER_BLOCK", "STRUCTURE"
+    risk_amount: float
+    sl_to_entry_distance: float
+
+@dataclass
+class TakeProfitLevels:
+    """Step 7: Take Profit output"""
+    tp1: float  # Nearest internal liquidity
+    tp2: float  # Range boundary
+    tp3: float  # HTF liquidity
+    tp1_type: str = "INTERNAL_LIQUIDITY"
+    tp2_type: str = "RANGE_BOUNDARY"
+    tp3_type: str = "HTF_LIQUIDITY"
+
+@dataclass
+class ProbabilityScore:
+    """Step 8: Probability Check output"""
+    htf_alignment: float  # 0-1
+    liquidity_quality: float  # 0-1
+    sweep_strength: float  # 0-1
+    structure_clarity: float  # 0-1
+    entry_precision: float  # 0-1
+    total_score: float  # 0-5
+    
+    @property
+    def acceptable(self) -> bool:
+        """Accept if total >= 3.5 and all components > 0.5"""
+        return (self.total_score >= 3.5 and 
+                all([self.htf_alignment >= 0.5,
+                     self.liquidity_quality >= 0.5,
+                     self.sweep_strength >= 0.5,
+                     self.structure_clarity >= 0.5,
+                     self.entry_precision >= 0.5]))
+
+# ---------------- TELEGRAM ----------------
+async def send_telegram(msg: str, parse_mode="HTML"):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     async with httpx.AsyncClient() as client:
         try:
-            await client.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": safe_msg, "parse_mode":"HTML"})
+            await client.post(url, json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": msg,
+                "parse_mode": parse_mode
+            })
         except Exception as e:
             log.warning(f"Telegram send failed: {e}")
 
-# ---------------- COMPLETE DATABASE MIGRATION ----------------
-async def migrate_db():
-    """Complete database migration from old schema to new schema"""
-    global db_conn
-    
-    try:
-        # Check if table exists at all
-        async with db_conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='signals'") as cursor:
-            table_exists = await cursor.fetchone()
-        
-        if not table_exists:
-            log.info("Table 'signals' doesn't exist yet, will create new schema")
-            return
-        
-        # Get current columns
-        async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
-            columns = await cursor.fetchall()
-            column_names = [col[1] for col in columns]
-        
-        log.info(f"Current columns: {column_names}")
-        
-        # List of required columns for new schema
-        required_columns = {
-            'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
-            'symbol': 'TEXT',
-            'side': 'TEXT',
-            'entry': 'REAL',
-            'sl': 'REAL',
-            'tp': 'REAL',
-            'timestamp': 'TEXT',
-            'status': 'TEXT',
-            'reason': 'TEXT',
-            'score': 'INTEGER',
-            'tp_hit': 'INTEGER DEFAULT 0',
-            'latest_ob': 'TEXT',
-            'tp_type': 'TEXT',
-            'tp_locked': 'INTEGER DEFAULT 1'
-        }
-        
-        # Add missing columns
-        for col_name, col_type in required_columns.items():
-            if col_name not in column_names:
-                try:
-                    await db_conn.execute(f"ALTER TABLE signals ADD COLUMN {col_name} {col_type}")
-                    log.info(f"✅ Added missing column: {col_name}")
-                except Exception as e:
-                    log.warning(f"Could not add column {col_name}: {e}")
-        
-        # If old TP columns exist, migrate data from tp1 to tp
-        if 'tp1' in column_names and 'tp' in column_names:
-            # Check if tp column is empty but tp1 has data
-            async with db_conn.execute("SELECT COUNT(*) FROM signals WHERE tp IS NULL AND tp1 IS NOT NULL") as cursor:
-                count = await cursor.fetchone()
-                if count and count[0] > 0:
-                    log.info(f"🚀 Migrating {count[0]} records from tp1 to tp...")
-                    await db_conn.execute("UPDATE signals SET tp = tp1 WHERE tp IS NULL AND tp1 IS NOT NULL")
-                    
-                    # Also migrate tp1_hit to tp_hit if needed
-                    if 'tp1_hit' in column_names:
-                        await db_conn.execute("UPDATE signals SET tp_hit = tp1_hit WHERE tp_hit = 0 AND tp1_hit = 1")
-                    
-                    log.info("✅ Data migration complete")
-        
-        await db_conn.commit()
-        
-    except Exception as e:
-        log.error(f"Migration error: {e}")
-
-# ---------------- INIT DATABASE ----------------
+# ---------------- DATABASE ----------------
 async def init_db():
     global db_conn
     db_conn = await aiosqlite.connect(DB_PATH)
     await db_conn.execute("PRAGMA journal_mode=WAL;")
-    await db_conn.execute("PRAGMA synchronous=NORMAL;")
     
-    # Create table if it doesn't exist (NEW SCHEMA)
+    # Create signals table with step-by-step tracking
     await db_conn.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol TEXT,
-            side TEXT,
-            entry REAL,
-            sl REAL,
-            tp REAL,
             timestamp TEXT,
-            status TEXT,
-            reason TEXT,
-            score INTEGER,
-            tp_hit INTEGER DEFAULT 0,
-            latest_ob TEXT,
-            tp_type TEXT,
-            tp_locked INTEGER DEFAULT 1
-        );
+            side TEXT,
+            
+            -- Step 1: HTF Bias
+            htf_bias TEXT,
+            htf_range_high REAL,
+            htf_range_low REAL,
+            htf_premium_discount TEXT,
+            htf_liquidity_zones_json TEXT,
+            htf_structure_json TEXT,
+            
+            -- Step 2: Liquidity Map
+            liquidity_from_json TEXT,
+            liquidity_to_json TEXT,
+            has_clear_target BOOLEAN,
+            
+            -- Step 3: Liquidity Sweep
+            sweep_type TEXT,
+            swept_price REAL,
+            sweep_impulsive BOOLEAN,
+            sweep_strength REAL,
+            
+            -- Step 4: Structure Check
+            structure_shift_type TEXT,
+            structure_shift_confirmed BOOLEAN,
+            structure_description TEXT,
+            
+            -- Step 5: Entry Zone
+            entry_type TEXT,
+            entry_price REAL,
+            entry_low REAL,
+            entry_high REAL,
+            entry_aligns_htf BOOLEAN,
+            entry_reaction_confirmed BOOLEAN,
+            
+            -- Step 6: Risk/SL
+            sl_price REAL,
+            sl_invalidation_type TEXT,
+            risk_amount REAL,
+            sl_distance_pct REAL,
+            
+            -- Step 7: Take Profit
+            tp1_price REAL,
+            tp1_type TEXT,
+            tp2_price REAL,
+            tp2_type TEXT,
+            tp3_price REAL,
+            tp3_type TEXT,
+            
+            -- Step 8: Probability
+            prob_htf_alignment REAL,
+            prob_liquidity_quality REAL,
+            prob_sweep_strength REAL,
+            prob_structure_clarity REAL,
+            prob_entry_precision REAL,
+            prob_total_score REAL,
+            prob_acceptable BOOLEAN,
+            
+            -- Entry Details
+            current_price REAL,
+            status TEXT DEFAULT 'DETECTED',
+            notes TEXT
+        )
     """)
-    await db_conn.commit()
     
-    # Run complete migration
-    await migrate_db()
+    await db_conn.commit()
 
-# ---------------- OHLCV ----------------
-async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
+# ---------------- OHLCV UTILS ----------------
+async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit: int = 200):
+    """Fetch OHLCV with retry"""
     try:
         return await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     except Exception as e:
-        log.debug("fetch_ohlcv failed for %s %s: %s", symbol, timeframe, e)
+        log.debug(f"Failed to fetch {symbol} {timeframe}: {e}")
         return None
 
-# ---------------- INDICATORS ----------------
-def atr(df: pd.DataFrame, period=14):
-    high, low, close = df["high"], df["low"], df["close"]
-    tr = pd.DataFrame({
-        "h-l": high - low,
-        "h-pc": (high - close.shift(1)).abs(),
-        "l-pc": (low - close.shift(1)).abs()
-    }).max(axis=1)
-    return tr.rolling(period, min_periods=1).mean()
+def create_dataframe(ohlcv):
+    """Create DataFrame from OHLCV"""
+    if not ohlcv:
+        return None
+    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
 
-# ---------------- FORCED FILTER FUNCTION ----------------
-def force_filter_trade(momentum_value: float, displacement_value: float) -> bool:
-    if momentum_value >= MOMENTUM_STRONG_THRESHOLD:
-        return True
-    if momentum_value >= MOMENTUM_GOOD_THRESHOLD and displacement_value >= DISPLACEMENT_MIN_THRESHOLD:
-        return True
-    return False
-
-# ---------------- REFINED ROMEOPT MARKET STATE ----------------
-def romeopt_market_state(df, atr_val):
+# ---------------- STEP 1: HTF BIAS ----------------
+async def analyze_htf_bias(exchange, symbol: str) -> HTFContext:
     """
-    REFINED RomeOPT market state detection
-    Checks: Strong displacement + actual price movement
+    Step 1: HTF Bias (4H/1H)
+    - Identify range or trend
+    - Mark HTF liquidity zones
+    - Skip if "mid-range" with no alignment
     """
-    if len(df) < 3:
-        return "BALANCED"
     
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
+    # Fetch 4H data (primary HTF)
+    ohlcv_4h = await fetch_ohlcv(exchange, symbol, "4h", 100)
+    if not ohlcv_4h or len(ohlcv_4h) < 30:
+        return HTFContext(bias="UNKNOWN", range_high=0, range_low=0, range_mid=0,
+                         premium_discount="UNKNOWN", liquidity_zones=[], structure=[])
     
-    body_ratio = abs(last["close"] - last["open"]) / (last["high"] - last["low"] + 1e-8)
-    candle_size = last["high"] - last["low"]
-    price_movement = abs(last["close"] - prev["close"])
+    df_4h = create_dataframe(ohlcv_4h)
+    current_price = float(df_4h["close"].iloc[-1])
     
-    # RomeOPT logic: Strong displacement with actual follow-through
-    strong_displacement = (
-        body_ratio > 0.7 and                    # Strong body
-        candle_size > atr_val * 1.2 and         # Large candle
-        price_movement > atr_val * 0.5          # Actual price movement
+    # Identify swing highs/lows (structure)
+    swing_highs = []
+    swing_lows = []
+    
+    for i in range(3, len(df_4h) - 3):
+        high_i = df_4h["high"].iloc[i]
+        low_i = df_4h["low"].iloc[i]
+        
+        # Check for swing high
+        if (high_i > df_4h["high"].iloc[i-1] and 
+            high_i > df_4h["high"].iloc[i-2] and
+            high_i > df_4h["high"].iloc[i+1] and
+            high_i > df_4h["high"].iloc[i+2]):
+            swing_highs.append({
+                "price": float(high_i),
+                "index": i,
+                "timestamp": df_4h["timestamp"].iloc[i]
+            })
+        
+        # Check for swing low
+        if (low_i < df_4h["low"].iloc[i-1] and 
+            low_i < df_4h["low"].iloc[i-2] and
+            low_i < df_4h["low"].iloc[i+1] and
+            low_i < df_4h["low"].iloc[i+2]):
+            swing_lows.append({
+                "price": float(low_i),
+                "index": i,
+                "timestamp": df_4h["timestamp"].iloc[i]
+            })
+    
+    # Define current range (last 20 periods)
+    if len(df_4h) >= 20:
+        recent_high = df_4h["high"].iloc[-20:].max()
+        recent_low = df_4h["low"].iloc[-20:].min()
+    else:
+        recent_high = df_4h["high"].max()
+        recent_low = df_4h["low"].min()
+    
+    range_high = float(recent_high)
+    range_low = float(recent_low)
+    range_mid = (range_high + range_low) / 2
+    
+    # Determine bias (simplified)
+    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+        # Check for higher highs/lower lows
+        last_two_highs = sorted([h["price"] for h in swing_highs[-2:]], reverse=True)
+        last_two_lows = sorted([l["price"] for l in swing_lows[-2:]])
+        
+        if last_two_highs[0] > last_two_highs[1] and last_two_lows[0] < last_two_lows[1]:
+            bias = "BULLISH"
+        elif last_two_highs[0] < last_two_highs[1] and last_two_lows[0] > last_two_lows[1]:
+            bias = "BEARISH"
+        else:
+            bias = "RANGING"
+    else:
+        bias = "RANGING"
+    
+    # Premium/Discount (relative to 50% of range)
+    range_height = range_high - range_low
+    if range_height > 0:
+        position_pct = (current_price - range_low) / range_height * 100
+        if position_pct > 60:
+            premium_discount = "PREMIUM"
+        elif position_pct < 40:
+            premium_discount = "DISCOUNT"
+        else:
+            premium_discount = "MIDDLE"
+    else:
+        premium_discount = "MIDDLE"
+    
+    # Mark HTF liquidity zones
+    liquidity_zones = []
+    
+    # Range boundaries
+    liquidity_zones.append({
+        "price": range_high,
+        "type": "RANGE_HIGH",
+        "timeframe": "4h",
+        "strength": 3
+    })
+    liquidity_zones.append({
+        "price": range_low,
+        "type": "RANGE_LOW",
+        "timeframe": "4h",
+        "strength": 3
+    })
+    
+    # Recent swing points
+    for swing in swing_highs[-3:]:
+        liquidity_zones.append({
+            "price": swing["price"],
+            "type": "SWING_HIGH",
+            "timeframe": "4h",
+            "strength": 2
+        })
+    
+    for swing in swing_lows[-3:]:
+        liquidity_zones.append({
+            "price": swing["price"],
+            "type": "SWING_LOW",
+            "timeframe": "4h",
+            "strength": 2
+        })
+    
+    # Check if we should skip (mid-range with no alignment)
+    skip_reason = None
+    valid = True
+    
+    if premium_discount == "MIDDLE" and bias == "RANGING":
+        skip_reason = "Price mid-range with no clear HTF alignment"
+        valid = False
+    elif range_height / range_low < 0.02:  # Very tight range
+        skip_reason = "Range too tight (<2%)"
+        valid = False
+    
+    context = HTFContext(
+        bias=bias,
+        range_high=range_high,
+        range_low=range_low,
+        range_mid=range_mid,
+        premium_discount=premium_discount,
+        liquidity_zones=liquidity_zones,
+        structure=swing_highs[-5:] + swing_lows[-5:],  # Last 5 of each
+        skip_reason=skip_reason,
+        valid=valid
     )
     
-    return "IMBALANCED" if strong_displacement else "BALANCED"
+    return context
 
-# ---------------- REFINED ROMEOPT INTERNAL LIQUIDITY ----------------
-def romeopt_internal_liquidity(df, side, atr_val, lookback=15):
+# ---------------- STEP 2: LIQUIDITY MAP ----------------
+async def map_liquidity(exchange, symbol: str, htf_context: HTFContext, 
+                       current_price: float) -> LiquidityMap:
     """
-    REFINED RomeOPT internal liquidity detection
-    Uses ATR-based tolerance for visual clusters
+    Step 2: Liquidity Map
+    - Identify where price is moving FROM
+    - Identify where price needs to move TO
+    - Must have clear targets
     """
-    if side == "SELL":
-        # For SELL: Look for obvious equal lows
-        lows = df['low'].iloc[-lookback:].dropna()
-        if len(lows) < 5:
-            return None
-        
-        # ATR-based tolerance (15% of ATR = visual clustering tolerance)
-        tolerance = atr_val * 0.15
-        
-        # Find potential cluster centers
-        potential_targets = []
-        for i in range(len(lows)):
-            current_low = lows.iloc[i]
-            # Count how many lows are within tolerance
-            nearby_count = (abs(lows - current_low) <= tolerance).sum()
-            if nearby_count >= 2:  # At least 2 lows form a visual cluster
-                potential_targets.append((current_low, nearby_count))
-        
-        if potential_targets:
-            # Choose the lowest price among clusters (most obvious stop pool)
-            best_target = min(potential_targets, key=lambda x: x[0])[0]
-            return best_target
-        
-    else:  # BUY
-        # For BUY: Look for obvious equal highs
-        highs = df['high'].iloc[-lookback:].dropna()
-        if len(highs) < 5:
-            return None
-        
-        tolerance = atr_val * 0.15
-        potential_targets = []
-        
-        for i in range(len(highs)):
-            current_high = highs.iloc[i]
-            nearby_count = (abs(highs - current_high) <= tolerance).sum()
-            if nearby_count >= 2:
-                potential_targets.append((current_high, nearby_count))
-        
-        if potential_targets:
-            # Choose the highest price among clusters
-            best_target = max(potential_targets, key=lambda x: x[0])[0]
-            return best_target
     
-    return None  # No obvious visual liquidity cluster
+    # Fetch 1H for more granular liquidity
+    ohlcv_1h = await fetch_ohlcv(exchange, symbol, "1h", 100)
+    if not ohlcv_1h:
+        return LiquidityMap(from_liquidity=[], to_liquidity=[], has_clear_target=False)
+    
+    df_1h = create_dataframe(ohlcv_1h)
+    
+    # FROM liquidity: Recent extremes that were likely taken
+    from_liquidity = []
+    
+    # Check last 10 candles for swept levels
+    recent_df = df_1h.iloc[-10:] if len(df_1h) >= 10 else df_1h
+    
+    for i in range(len(recent_df) - 1):
+        candle = recent_df.iloc[i]
+        next_candle = recent_df.iloc[i + 1] if i + 1 < len(recent_df) else candle
+        
+        # High sweep detection
+        if candle["high"] > recent_df["high"].iloc[max(0, i-5):i].max() and next_candle["close"] < candle["close"]:
+            from_liquidity.append({
+                "price": float(candle["high"]),
+                "type": "SWEPT_HIGH",
+                "timeframe": "1h",
+                "direction": "FROM"
+            })
+        
+        # Low sweep detection
+        if candle["low"] < recent_df["low"].iloc[max(0, i-5):i].min() and next_candle["close"] > candle["close"]:
+            from_liquidity.append({
+                "price": float(candle["low"]),
+                "type": "SWEPT_LOW",
+                "timeframe": "1h",
+                "direction": "FROM"
+            })
+    
+    # TO liquidity: Targets based on HTF context
+    to_liquidity = []
+    
+    # Sort HTF liquidity zones by distance from current price
+    sorted_zones = sorted(htf_context.liquidity_zones, 
+                         key=lambda z: abs(z["price"] - current_price))
+    
+    # Filter for relevant targets based on bias
+    if htf_context.bias == "BULLISH":
+        # Targets above current price
+        targets = [z for z in sorted_zones if z["price"] > current_price]
+    elif htf_context.bias == "BEARISH":
+        # Targets below current price
+        targets = [z for z in sorted_zones if z["price"] < current_price]
+    else:
+        # Ranging - targets at range boundaries
+        targets = [z for z in sorted_zones if z["type"] in ["RANGE_HIGH", "RANGE_LOW"]]
+    
+    # Take top 3 targets
+    for target in targets[:3]:
+        to_liquidity.append({
+            "price": target["price"],
+            "type": target["type"],
+            "timeframe": target["timeframe"],
+            "strength": target.get("strength", 1),
+            "direction": "TO"
+        })
+    
+    # Also add internal liquidity (equal highs/lows on 1H)
+    if len(df_1h) >= 24:
+        # Find equal highs (clusters)
+        high_values = df_1h["high"].iloc[-24:].values
+        for val in np.unique(np.round(high_values, 4)):
+            count = np.sum(np.round(high_values, 4) == val)
+            if count >= 2:  # At least 2 touches
+                to_liquidity.append({
+                    "price": float(val),
+                    "type": "EQUAL_HIGH",
+                    "timeframe": "1h",
+                    "strength": min(2, count),
+                    "direction": "TO"
+                })
+        
+        # Find equal lows
+        low_values = df_1h["low"].iloc[-24:].values
+        for val in np.unique(np.round(low_values, 4)):
+            count = np.sum(np.round(low_values, 4) == val)
+            if count >= 2:
+                to_liquidity.append({
+                    "price": float(val),
+                    "type": "EQUAL_LOW",
+                    "timeframe": "1h",
+                    "strength": min(2, count),
+                    "direction": "TO"
+                })
+    
+    has_clear_target = len(to_liquidity) > 0 and len(from_liquidity) > 0
+    
+    return LiquidityMap(
+        from_liquidity=from_liquidity,
+        to_liquidity=to_liquidity,
+        has_clear_target=has_clear_target
+    )
 
-# ---------------- REFINED ROMEOPT EXTERNAL LIQUIDITY ----------------
-def romeopt_external_liquidity(df, side, lookback=50):
+# ---------------- STEP 3: LIQUIDITY SWEEP ----------------
+async def analyze_sweep(exchange, symbol: str, htf_context: HTFContext) -> SweepAnalysis:
     """
-    REFINED RomeOPT external liquidity detection
-    Simple: Range extremes (RomeOPT prefers guaranteed stops)
+    Step 3: Liquidity Sweep
+    - Has price swept a stop above/below liquidity?
+    - Sweep must have impulsive body
+    - Reject fake sweeps or wicks
     """
-    if side == "SELL":
-        # For SELL in trend: Range low (guaranteed stops below)
-        return df['low'].iloc[-lookback:].min()
-    else:  # BUY
-        # For BUY in trend: Range high (guaranteed stops above)
-        return df['high'].iloc[-lookback:].max()
+    
+    # Use 15m for sweep detection (execution TF)
+    ohlcv_15m = await fetch_ohlcv(exchange, symbol, "15m", 50)
+    if not ohlcv_15m or len(ohlcv_15m) < 10:
+        return SweepAnalysis(type="NONE", candle_index=-1, swept_price=0, 
+                           previous_extreme=0, impulsive=False)
+    
+    df_15m = create_dataframe(ohlcv_15m)
+    
+    # Look for sweeps in last 5 candles
+    lookback = min(5, len(df_15m))
+    
+    for i in range(-lookback, 0):
+        candle_idx = len(df_15m) + i
+        candle = df_15m.iloc[candle_idx]
+        
+        # Get previous candles (5 before this one)
+        start_idx = max(0, candle_idx - 5)
+        prev_candles = df_15m.iloc[start_idx:candle_idx]
+        
+        if len(prev_candles) == 0:
+            continue
+        
+        previous_high = prev_candles["high"].max()
+        previous_low = prev_candles["low"].min()
+        
+        # Check for high sweep
+        if candle["high"] > previous_high:
+            # Check if impulsive (body > wicks)
+            body_size = abs(candle["close"] - candle["open"])
+            upper_wick = candle["high"] - max(candle["open"], candle["close"])
+            lower_wick = min(candle["open"], candle["close"]) - candle["low"]
+            total_wick = upper_wick + lower_wick
+            
+            impulsive = body_size > total_wick
+            
+            # Check for fake sweep (quick reversal)
+            if i < -1:  # Not the most recent candle
+                next_candle = df_15m.iloc[candle_idx + 1]
+                fake_sweep = (next_candle["close"] < candle["close"] and 
+                             next_candle["low"] < candle["low"])
+            else:
+                fake_sweep = False
+            
+            strength = 0.0
+            if impulsive and not fake_sweep:
+                # Strength based on how much it exceeded previous high
+                extension = (candle["high"] - previous_high) / previous_high
+                strength = min(1.0, extension * 100)  # Normalize
+            
+            return SweepAnalysis(
+                type="HIGH_SWEEP",
+                candle_index=candle_idx,
+                swept_price=float(candle["high"]),
+                previous_extreme=float(previous_high),
+                impulsive=impulsive,
+                fake_sweep=fake_sweep,
+                strength=strength
+            )
+        
+        # Check for low sweep
+        elif candle["low"] < previous_low:
+            body_size = abs(candle["close"] - candle["open"])
+            upper_wick = candle["high"] - max(candle["open"], candle["close"])
+            lower_wick = min(candle["open"], candle["close"]) - candle["low"]
+            total_wick = upper_wick + lower_wick
+            
+            impulsive = body_size > total_wick
+            
+            if i < -1:
+                next_candle = df_15m.iloc[candle_idx + 1]
+                fake_sweep = (next_candle["close"] > candle["close"] and 
+                             next_candle["high"] > candle["high"])
+            else:
+                fake_sweep = False
+            
+            strength = 0.0
+            if impulsive and not fake_sweep:
+                extension = (previous_low - candle["low"]) / previous_low
+                strength = min(1.0, extension * 100)
+            
+            return SweepAnalysis(
+                type="LOW_SWEEP",
+                candle_index=candle_idx,
+                swept_price=float(candle["low"]),
+                previous_extreme=float(previous_low),
+                impulsive=impulsive,
+                fake_sweep=fake_sweep,
+                strength=strength
+            )
+    
+    return SweepAnalysis(type="NONE", candle_index=-1, swept_price=0, 
+                       previous_extreme=0, impulsive=False)
 
-# ---------------- ROMEOPT TP DECISION (REFINED VERSION) ----------------
-def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
+# ---------------- STEP 4: STRUCTURE CHECK ----------------
+async def check_structure_shift(exchange, symbol: str, sweep: SweepAnalysis, 
+                               htf_context: HTFContext) -> StructureShift:
     """
-    REFINED RomeOPT TP logic with all fixes
+    Step 4: Structure Check
+    - Post-sweep, is there CHoCH (reversal) or BOS (continuation)?
+    - No structure shift → reject
     """
-    # Step 1: Determine market state
-    market_state = romeopt_market_state(df, atr_val)
     
-    # Step 2: Find liquidity based on market state
-    tp = None
-    tp_type = ""
+    if sweep.type == "NONE":
+        return StructureShift(type="NONE", confirmed=False, candle_index=-1)
     
-    if market_state == "BALANCED":
-        # RANGE: Look for internal liquidity clusters
-        tp = romeopt_internal_liquidity(df, side, atr_val)
-        if tp:
-            tp_type = f"RANGE: Visual {'Lows' if side == 'SELL' else 'Highs'} Cluster"
-    else:  # IMBALANCED
-        # TREND: Look for external range extremes
-        tp = romeopt_external_liquidity(df, side)
-        if tp:
-            tp_type = f"TREND: Range {'Low' if side == 'SELL' else 'High'}"
+    # Fetch 15m data for structure analysis
+    ohlcv_15m = await fetch_ohlcv(exchange, symbol, "15m", 50)
+    if not ohlcv_15m:
+        return StructureShift(type="NONE", confirmed=False, candle_index=-1)
     
-    # REJECT if no obvious liquidity found
-    if tp is None:
-        log.debug(f"❌ No obvious liquidity found for {side} | Market: {market_state}")
-        return None
+    df_15m = create_dataframe(ohlcv_15m)
     
-    # Step 3: Safety check - reject if recently swept
-    recent_candles = min(10, len(df))
-    if side == "SELL":
-        recent_touch = any(
-            abs(df['low'].iloc[-i] - tp) <= atr_val * 0.1  # Within 10% ATR
-            for i in range(1, recent_candles)
-        )
-    else:  # BUY
-        recent_touch = any(
-            abs(df['high'].iloc[-i] - tp) <= atr_val * 0.1
-            for i in range(1, recent_candles)
-        )
+    # Get candles after the sweep
+    sweep_idx = sweep.candle_index
+    if sweep_idx < 0 or sweep_idx >= len(df_15m) - 3:
+        return StructureShift(type="NONE", confirmed=False, candle_index=-1)
     
-    if recent_touch:
-        log.debug(f"❌ Liquidity recently swept for {side} at {tp}")
-        return None
+    post_sweep_candles = df_15m.iloc[sweep_idx + 1:]
+    if len(post_sweep_candles) < 3:
+        return StructureShift(type="NONE", confirmed=False, candle_index=-1)
     
-    # Step 4: Calculate SL (keep OB-based SL)
+    # Check for CHoCH (reversal after sweep)
+    if sweep.type == "HIGH_SWEEP":
+        # For high sweep, CHoCH = price breaks below recent low
+        recent_low_before = df_15m["low"].iloc[max(0, sweep_idx-5):sweep_idx].min()
+        
+        for i in range(len(post_sweep_candles)):
+            candle = post_sweep_candles.iloc[i]
+            if candle["low"] < recent_low_before:
+                return StructureShift(
+                    type="CHoCH",
+                    confirmed=True,
+                    candle_index=sweep_idx + i + 1,
+                    description="High sweep followed by break below recent low"
+                )
+        
+        # Check for BOS (continuation - new higher high after pullback)
+        if len(post_sweep_candles) >= 5:
+            # Look for pullback then new high
+            pullback_low = post_sweep_candles["low"].iloc[:3].min()
+            subsequent_high = post_sweep_candles["high"].iloc[3:].max()
+            
+            if subsequent_high > sweep.swept_price:
+                return StructureShift(
+                    type="BOS",
+                    confirmed=True,
+                    candle_index=sweep_idx + 3,
+                    description="High sweep followed by new higher high"
+                )
+    
+    elif sweep.type == "LOW_SWEEP":
+        # For low sweep, CHoCH = price breaks above recent high
+        recent_high_before = df_15m["high"].iloc[max(0, sweep_idx-5):sweep_idx].max()
+        
+        for i in range(len(post_sweep_candles)):
+            candle = post_sweep_candles.iloc[i]
+            if candle["high"] > recent_high_before:
+                return StructureShift(
+                    type="CHoCH",
+                    confirmed=True,
+                    candle_index=sweep_idx + i + 1,
+                    description="Low sweep followed by break above recent high"
+                )
+        
+        # Check for BOS (continuation - new lower low after pullback)
+        if len(post_sweep_candles) >= 5:
+            pullback_high = post_sweep_candles["high"].iloc[:3].max()
+            subsequent_low = post_sweep_candles["low"].iloc[3:].min()
+            
+            if subsequent_low < sweep.swept_price:
+                return StructureShift(
+                    type="BOS",
+                    confirmed=True,
+                    candle_index=sweep_idx + 3,
+                    description="Low sweep followed by new lower low"
+                )
+    
+    return StructureShift(type="NONE", confirmed=False, candle_index=-1)
+
+# ---------------- STEP 5: ENTRY ZONE ----------------
+async def find_entry_zone(exchange, symbol: str, htf_context: HTFContext,
+                         sweep: SweepAnalysis, structure_shift: StructureShift,
+                         side: str) -> EntryZone:
+    """
+    Step 5: Entry Zone
+    - Return to OB or FVG in premium/discount zone
+    - Align with HTF bias
+    - Candle reaction must confirm
+    """
+    
+    # Fetch 5m data for precise entry
+    ohlcv_5m = await fetch_ohlcv(exchange, symbol, "5m", 100)
+    if not ohlcv_5m:
+        return EntryZone(type="NONE", price=0, low=0, high=0, aligns_with_htf=False)
+    
+    df_5m = create_dataframe(ohlcv_5m)
+    current_price = float(df_5m["close"].iloc[-1])
+    
+    # Determine expected entry type based on sweep and structure
+    if structure_shift.type == "CHoCH":
+        # Reversal setup - look for OB
+        entry_type = "ORDER_BLOCK"
+    elif structure_shift.type == "BOS":
+        # Continuation setup - look for FVG
+        entry_type = "FAIR_VALUE_GAP"
+    else:
+        # Based on premium/discount
+        if htf_context.premium_discount == "DISCOUNT":
+            entry_type = "DISCOUNT"
+        elif htf_context.premium_discount == "PREMIUM":
+            entry_type = "PREMIUM"
+        else:
+            entry_type = "NONE"
+    
+    # Find Order Blocks (simplified detection)
+    if entry_type == "ORDER_BLOCK":
+        # Look for last opposing candle before displacement
+        for i in range(2, len(df_5m) - 1):
+            candle = df_5m.iloc[i]
+            next_candle = df_5m.iloc[i + 1]
+            
+            # Bullish OB (bearish candle before bullish displacement)
+            if side == "BUY":
+                if (candle["close"] < candle["open"] and 
+                    next_candle["close"] > next_candle["open"]):
+                    # Check if in discount zone
+                    ob_low = min(candle["low"], next_candle["low"])
+                    ob_high = next_candle["close"]
+                    
+                    # Check alignment with HTF
+                    aligns = (htf_context.bias == "BULLISH" or 
+                             htf_context.premium_discount == "DISCOUNT")
+                    
+                    # Check if price is currently in or near OB
+                    if current_price <= ob_high and current_price >= ob_low * 0.995:
+                        # Check candle reaction (current or previous candle)
+                        current_candle = df_5m.iloc[-1]
+                        prev_candle = df_5m.iloc[-2] if len(df_5m) >= 2 else current_candle
+                        
+                        # Bullish reaction for buy
+                        reaction = (current_candle["close"] > current_candle["open"] or
+                                   (prev_candle["close"] > prev_candle["open"] and
+                                    current_candle["close"] > prev_candle["close"]))
+                        
+                        return EntryZone(
+                            type="ORDER_BLOCK",
+                            price=float((ob_low + ob_high) / 2),
+                            low=float(ob_low),
+                            high=float(ob_high),
+                            aligns_with_htf=aligns,
+                            candle_reaction=reaction
+                        )
+            
+            # Bearish OB (bullish candle before bearish displacement)
+            elif side == "SELL":
+                if (candle["close"] > candle["open"] and 
+                    next_candle["close"] < next_candle["open"]):
+                    ob_low = next_candle["close"]
+                    ob_high = max(candle["high"], next_candle["high"])
+                    
+                    aligns = (htf_context.bias == "BEARISH" or 
+                             htf_context.premium_discount == "PREMIUM")
+                    
+                    if current_price >= ob_low and current_price <= ob_high * 1.005:
+                        current_candle = df_5m.iloc[-1]
+                        prev_candle = df_5m.iloc[-2] if len(df_5m) >= 2 else current_candle
+                        
+                        # Bearish reaction for sell
+                        reaction = (current_candle["close"] < current_candle["open"] or
+                                   (prev_candle["close"] < prev_candle["open"] and
+                                    current_candle["close"] < prev_candle["close"]))
+                        
+                        return EntryZone(
+                            type="ORDER_BLOCK",
+                            price=float((ob_low + ob_high) / 2),
+                            low=float(ob_low),
+                            high=float(ob_high),
+                            aligns_with_htf=aligns,
+                            candle_reaction=reaction
+                        )
+    
+    # Find Fair Value Gaps
+    elif entry_type == "FAIR_VALUE_GAP":
+        for i in range(1, len(df_5m) - 2):
+            candle1 = df_5m.iloc[i]
+            candle2 = df_5m.iloc[i + 1]
+            candle3 = df_5m.iloc[i + 2] if i + 2 < len(df_5m) else candle2
+            
+            # Bullish FVG
+            if side == "BUY":
+                if candle2["low"] > candle1["high"]:
+                    fvg_low = candle1["high"]
+                    fvg_high = candle2["low"]
+                    
+                    # Check if price has returned to FVG
+                    if current_price <= fvg_high and current_price >= fvg_low:
+                        aligns = (htf_context.bias == "BULLISH")
+                        reaction = candle3["close"] > candle3["open"]
+                        
+                        return EntryZone(
+                            type="FAIR_VALUE_GAP",
+                            price=float((fvg_low + fvg_high) / 2),
+                            low=float(fvg_low),
+                            high=float(fvg_high),
+                            aligns_with_htf=aligns,
+                            candle_reaction=reaction
+                        )
+            
+            # Bearish FVG
+            elif side == "SELL":
+                if candle2["high"] < candle1["low"]:
+                    fvg_low = candle2["high"]
+                    fvg_high = candle1["low"]
+                    
+                    if current_price >= fvg_low and current_price <= fvg_high:
+                        aligns = (htf_context.bias == "BEARISH")
+                        reaction = candle3["close"] < candle3["open"]
+                        
+                        return EntryZone(
+                            type="FAIR_VALUE_GAP",
+                            price=float((fvg_low + fvg_high) / 2),
+                            low=float(fvg_low),
+                            high=float(fvg_high),
+                            aligns_with_htf=aligns,
+                            candle_reaction=reaction
+                        )
+    
+    # Premium/Discount zone entry
+    elif entry_type in ["PREMIUM", "DISCOUNT"]:
+        zone_price = htf_context.range_mid
+        zone_width = (htf_context.range_high - htf_context.range_low) * 0.1
+        
+        aligns = True  # Always aligns if we're in correct zone
+        
+        # Check if price is in zone
+        if (side == "BUY" and entry_type == "DISCOUNT" and
+            current_price <= htf_context.range_mid * 1.02):
+            reaction = df_5m["close"].iloc[-1] > df_5m["open"].iloc[-1]
+            
+            return EntryZone(
+                type="DISCOUNT",
+                price=float(zone_price),
+                low=float(zone_price - zone_width),
+                high=float(zone_price + zone_width),
+                aligns_with_htf=aligns,
+                candle_reaction=reaction
+            )
+        
+        elif (side == "SELL" and entry_type == "PREMIUM" and
+              current_price >= htf_context.range_mid * 0.98):
+            reaction = df_5m["close"].iloc[-1] < df_5m["open"].iloc[-1]
+            
+            return EntryZone(
+                type="PREMIUM",
+                price=float(zone_price),
+                low=float(zone_price - zone_width),
+                high=float(zone_price + zone_width),
+                aligns_with_htf=aligns,
+                candle_reaction=reaction
+            )
+    
+    return EntryZone(type="NONE", price=0, low=0, high=0, aligns_with_htf=False)
+
+# ---------------- STEP 6: RISK/SL ----------------
+def calculate_risk_sl(entry_zone: EntryZone, sweep: SweepAnalysis,
+                     htf_context: HTFContext, side: str) -> RiskManagement:
+    """
+    Step 6: Risk/SL
+    - Place SL beyond invalidation zone (sweep, OB, or structure)
+    - Never arbitrary or % fixed
+    """
+    
+    entry_price = entry_zone.price
+    
+    # Determine invalidation type and price
+    sl_price = 0.0
+    invalidation_type = ""
+    
+    # Priority 1: Beyond swept level
+    if sweep.type != "NONE" and sweep.swept_price > 0:
+        if side == "BUY" and sweep.type == "LOW_SWEEP":
+            sl_price = sweep.swept_price * 0.995  # Just below sweep
+            invalidation_type = "SWEEP"
+        elif side == "SELL" and sweep.type == "HIGH_SWEEP":
+            sl_price = sweep.swept_price * 1.005  # Just above sweep
+            invalidation_type = "SWEEP"
+    
+    # Priority 2: Beyond order block
+    if invalidation_type == "" and entry_zone.type == "ORDER_BLOCK":
+        if side == "BUY":
+            sl_price = entry_zone.low * 0.995
+            invalidation_type = "ORDER_BLOCK"
+        elif side == "SELL":
+            sl_price = entry_zone.high * 1.005
+            invalidation_type = "ORDER_BLOCK"
+    
+    # Priority 3: Beyond structure
+    if invalidation_type == "":
+        # Use recent swing as invalidation
+        if side == "BUY" and htf_context.structure:
+            # Find nearest swing low below entry
+            swing_lows = [s for s in htf_context.structure if "low" in str(s.get("type", "")).lower()]
+            if swing_lows:
+                recent_swing_low = min([s.get("price", entry_price * 0.9) for s in swing_lows])
+                sl_price = recent_swing_low * 0.995
+                invalidation_type = "STRUCTURE"
+        elif side == "SELL" and htf_context.structure:
+            swing_highs = [s for s in htf_context.structure if "high" in str(s.get("type", "")).lower()]
+            if swing_highs:
+                recent_swing_high = max([s.get("price", entry_price * 1.1) for s in swing_highs])
+                sl_price = recent_swing_high * 1.005
+                invalidation_type = "STRUCTURE"
+    
+    # Fallback: ATR-based if no other method works
+    if invalidation_type == "":
+        # Simplified ATR approximation
+        atr_approx = entry_price * 0.02  # 2% as rough ATR
+        if side == "BUY":
+            sl_price = entry_price - (atr_approx * 1.5)
+        else:
+            sl_price = entry_price + (atr_approx * 1.5)
+        invalidation_type = "ATR_FALLBACK"
+    
+    risk_amount = abs(entry_price - sl_price)
+    distance_pct = (risk_amount / entry_price) * 100
+    
+    return RiskManagement(
+        sl_price=float(sl_price),
+        invalidation_type=invalidation_type,
+        risk_amount=float(risk_amount),
+        sl_to_entry_distance=float(distance_pct)
+    )
+
+# ---------------- STEP 7: TAKE PROFIT ----------------
+def calculate_take_profits(entry_price: float, side: str, 
+                          liquidity_map: LiquidityMap,
+                          htf_context: HTFContext) -> TakeProfitLevels:
+    """
+    Step 7: Take Profit
+    - TP1 = nearest internal liquidity
+    - TP2 = range boundary
+    - TP3 = HTF liquidity
+    """
+    
+    # Filter liquidity targets based on side
     if side == "BUY":
-        sl = ob_zone["low"] - (atr_val * 0.3)
-        recent_low = df['low'].iloc[-10:].min()
-        sl = min(sl, recent_low - (atr_val * 0.3))
-        
-        # Ensure minimum risk
-        min_risk = atr_val * 0.5
-        risk = entry - sl
-        if risk < min_risk:
-            risk = min_risk
-            sl = entry - risk
-        
-        # Ensure TP is valid (above entry, at least 0.5R)
-        if tp <= entry:
-            log.debug(f"❌ TP {tp} not above entry {entry} for BUY")
-            return None
-            
-        reward = tp - entry
-        if reward < risk * 0.5:
-            log.debug(f"❌ TP reward {reward/risk:.2f}R < 0.5R minimum")
-            return None
-        
+        # Targets above entry
+        potential_targets = [t for t in liquidity_map.to_liquidity 
+                           if t["price"] > entry_price]
+        range_boundary = htf_context.range_high
+        htf_targets = [z for z in htf_context.liquidity_zones 
+                      if z["price"] > entry_price and z["type"] != "RANGE_HIGH"]
     else:  # SELL
-        sl = ob_zone["high"] + (atr_val * 0.3)
-        recent_high = df['high'].iloc[-10:].max()
-        sl = max(sl, recent_high + (atr_val * 0.3))
-        
-        min_risk = atr_val * 0.5
-        risk = sl - entry
-        if risk < min_risk:
-            risk = min_risk
-            sl = entry + risk
-        
-        # Ensure TP is valid (below entry, at least 0.5R)
-        if tp >= entry:
-            log.debug(f"❌ TP {tp} not below entry {entry} for SELL")
-            return None
-            
-        reward = entry - tp
-        if reward < risk * 0.5:
-            log.debug(f"❌ TP reward {reward/risk:.2f}R < 0.5R minimum")
-            return None
+        # Targets below entry
+        potential_targets = [t for t in liquidity_map.to_liquidity 
+                           if t["price"] < entry_price]
+        range_boundary = htf_context.range_low
+        htf_targets = [z for z in htf_context.liquidity_zones 
+                      if z["price"] < entry_price and z["type"] != "RANGE_LOW"]
     
-    log.info(f"✅ {side} {entry:.6f} | Market: {market_state}")
-    log.info(f"   SL: {sl:.6f} | TP: {tp:.6f} | Type: {tp_type}")
-    log.info(f"   Risk: {risk:.6f} | R:R: {abs(tp-entry)/risk:.2f}:1")
-    
-    return sl, tp, tp_type
-
-# ---------------- ENHANCED ORDER BLOCK DETECTION ----------------
-def find_latest_ob(df: pd.DataFrame, lookback=50):
-    """
-    Enhanced Order Block detection with detailed classification
-    Returns comprehensive OB data
-    """
-    blocks = []
-    
-    # Look for order blocks in the specified lookback
-    for i in range(max(2, len(df) - lookback), len(df) - 1):
-        candle = df.iloc[i]
-        prev_candle = df.iloc[i-1]
-        
-        # Bullish Order Block: Bearish candle followed by bullish candle
-        if (prev_candle["close"] < prev_candle["open"] and  # Previous bearish
-            candle["close"] > candle["open"] and            # Current bullish
-            candle["close"] > prev_candle["close"]):        # Closes above previous close
-            
-            block = {
-                "type": "BULLISH_OB",
-                "index": i,
-                "timestamp": candle.name if hasattr(candle, 'name') else i,
-                "low": min(candle["low"], prev_candle["low"]),
-                "high": max(candle["close"], prev_candle["close"]),
-                "body_low": min(candle["open"], candle["close"]),
-                "body_high": max(candle["open"], candle["close"]),
-                "volume": candle["vol"] if "vol" in candle else 0,
-                "candle_size": candle["high"] - candle["low"],
-                "body_size": abs(candle["close"] - candle["open"]),
-                "wick_ratio": (candle["high"] - max(candle["open"], candle["close"])) / 
-                              (candle["high"] - candle["low"]) if (candle["high"] - candle["low"]) > 0 else 0
-            }
-            blocks.append(block)
-        
-        # Bearish Order Block: Bullish candle followed by bearish candle
-        elif (prev_candle["close"] > prev_candle["open"] and  # Previous bullish
-              candle["close"] < candle["open"] and            # Current bearish
-              candle["close"] < prev_candle["close"]):        # Closes below previous close
-            
-            block = {
-                "type": "BEARISH_OB",
-                "index": i,
-                "timestamp": candle.name if hasattr(candle, 'name') else i,
-                "low": min(candle["close"], prev_candle["close"]),
-                "high": max(candle["high"], prev_candle["high"]),
-                "body_low": min(candle["open"], candle["close"]),
-                "body_high": max(candle["open"], candle["close"]),
-                "volume": candle["vol"] if "vol" in candle else 0,
-                "candle_size": candle["high"] - candle["low"],
-                "body_size": abs(candle["close"] - candle["open"]),
-                "wick_ratio": (min(candle["open"], candle["close"]) - candle["low"]) / 
-                              (candle["high"] - candle["low"]) if (candle["high"] - candle["low"]) > 0 else 0
-            }
-            blocks.append(block)
-    
-    # Return the most recent order block if any exist
-    if blocks:
-        latest_block = max(blocks, key=lambda x: x["index"])
-        
-        # Add classification based on strength
-        body_ratio = latest_block["body_size"] / latest_block["candle_size"] if latest_block["candle_size"] > 0 else 0
-        if body_ratio >= 0.7:
-            latest_block["strength"] = "STRONG"
-        elif body_ratio >= 0.5:
-            latest_block["strength"] = "MODERATE"
+    # TP1: Nearest internal liquidity (1H timeframe)
+    tp1_candidates = [t for t in potential_targets if t["timeframe"] == "1h"]
+    if tp1_candidates:
+        # Sort by distance from entry
+        tp1_candidates.sort(key=lambda t: abs(t["price"] - entry_price))
+        tp1 = tp1_candidates[0]["price"]
+        tp1_type = tp1_candidates[0]["type"]
+    else:
+        # Fallback: 1:1 risk:reward
+        if side == "BUY":
+            tp1 = entry_price * 1.02
         else:
-            latest_block["strength"] = "WEAK"
-        
-        # Check if OB has been tested
-        if latest_block["type"] == "BULLISH_OB":
-            subsequent_candles = df.iloc[latest_block["index"]+1:min(latest_block["index"]+10, len(df))]
-            latest_block["tested"] = any(candle["low"] <= latest_block["high"] for _, candle in subsequent_candles.iterrows())
-        else:  # BEARISH_OB
-            subsequent_candles = df.iloc[latest_block["index"]+1:min(latest_block["index"]+10, len(df))]
-            latest_block["tested"] = any(candle["high"] >= latest_block["low"] for _, candle in subsequent_candles.iterrows())
-        
-        return latest_block
+            tp1 = entry_price * 0.98
+        tp1_type = "RISK_REWARD_1_1"
     
-    return None
-
-# ---------------- REST OF SIGNAL GENERATION ----------------
-async def elite_tf_alignment(exchange, symbol: str, side: str):
-    tfs = ["15m","1h","4h"]
-    for tf in tfs:
-        ohlcv = await fetch_ohlcv(exchange, symbol, tf, 50)
-        if not ohlcv or len(ohlcv) < 10: return False
-        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-        if len(df) < 5: return False
-        trend = df["close"].iloc[-1] - df["close"].iloc[-5]
-        trend_side = "BUY" if trend>0 else "SELL"
-        if trend_side != side:
-            return False
-    return True
-
-async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
-    if df is None or len(df) < 20: return None
-    last = df.iloc[-1]
-    prev5 = df.iloc[-6:-1]
-    score = 0
-    reasons = []
+    # TP2: Range boundary
+    tp2 = range_boundary
+    tp2_type = "RANGE_BOUNDARY"
     
-    calc_values = {}
-
-    # Step 1: ENHANCED Liquidity Sweep Detection
-    lookback_period = 20
-    high_lookback = df['high'].iloc[-lookback_period:-1]
-    low_lookback = df['low'].iloc[-lookback_period:-1]
-    
-    # Check for sweeping previous highs/lows with more precision
-    sweep_high = last["high"] > high_lookback.max()
-    sweep_low = last["low"] < low_lookback.min()
-    
-    # Check if sweep was respected (price closed back inside range)
-    respected_high_sweep = False
-    respected_low_sweep = False
-    sweep_strength = 0.0
-    
-    if sweep_high:
-        # Calculate how much it swept the high
-        sweep_amount = last["high"] - high_lookback.max()
-        candle_range = last["high"] - last["low"]
-        if candle_range > 0:
-            sweep_strength = sweep_amount / candle_range
-        # Check if closed below the swept level (respected)
-        if last["close"] < high_lookback.max():
-            respected_high_sweep = True
-    
-    if sweep_low:
-        # Calculate how much it swept the low
-        sweep_amount = low_lookback.min() - last["low"]
-        candle_range = last["high"] - last["low"]
-        if candle_range > 0:
-            sweep_strength = sweep_amount / candle_range
-        # Check if closed above the swept level (respected)
-        if last["close"] > low_lookback.min():
-            respected_low_sweep = True
-    
-    has_sweep = (sweep_high and respected_high_sweep) or (sweep_low and respected_low_sweep)
-    
-    liquidity_sweep = 2 if has_sweep else 0
-    score += liquidity_sweep
-    
-    # Enhanced sweep type classification
-    if sweep_high and respected_high_sweep:
-        sweep_type = "HIGH_SWEEP_RESPECTED"
-        sweep_direction = "BEARISH"
-    elif sweep_low and respected_low_sweep:
-        sweep_type = "LOW_SWEEP_RESPECTED"
-        sweep_direction = "BULLISH"
-    elif sweep_high:
-        sweep_type = "HIGH_SWEEP_UNRESPECTED"
-        sweep_direction = "NEUTRAL"
-    elif sweep_low:
-        sweep_type = "LOW_SWEEP_UNRESPECTED"
-        sweep_direction = "NEUTRAL"
+    # TP3: HTF liquidity (beyond range)
+    if htf_targets:
+        # Sort by strength (higher is better)
+        htf_targets.sort(key=lambda z: z.get("strength", 0), reverse=True)
+        tp3 = htf_targets[0]["price"]
+        tp3_type = htf_targets[0]["type"]
     else:
-        sweep_type = "NONE"
-        sweep_direction = "NONE"
-    
-    reasons.append(f"Liquidity Sweep +{liquidity_sweep} ({sweep_type})")
-    calc_values["sweep_type"] = sweep_type
-    calc_values["sweep_direction"] = sweep_direction
-    calc_values["sweep_score"] = liquidity_sweep
-    calc_values["sweep_strength"] = round(sweep_strength, 2) if has_sweep else 0
-    calc_values["sweep_respected"] = respected_high_sweep or respected_low_sweep
-    calc_values["swept_level"] = float(high_lookback.max()) if sweep_high else (float(low_lookback.min()) if sweep_low else 0.0)
-
-    # Step 2: Displacement
-    displacement = abs(last["close"] - last["open"]) / (last["high"] - last["low"] + 1e-8)
-    calc_values["displacement_value"] = round(displacement, 2)
-    has_disp = displacement > 0.6
-    if has_disp:
-        score += 2; reasons.append(f"Displacement +2 ({displacement:.2f})")
-    else:
-        reasons.append(f"Displacement +0 ({displacement:.2f})")
-
-    # Step 3 & 4: ENHANCED Order Block & Zone
-    ob_zone = find_latest_ob(df, lookback=30)
-    
-    if ob_zone:
-        ob_type = "bullish" if ob_zone["type"] == "BULLISH_OB" else "bearish"
-        zone_approach = 0
-        
-        # Enhanced zone approach check
-        if ob_type == "bullish":
-            # For bullish OB, check if price is approaching from above
-            distance_to_ob = (last["close"] - ob_zone["high"]) / (ob_zone["high"] - ob_zone["low"] + 1e-8)
-            if last["close"] <= ob_zone["high"] or distance_to_ob < 0.1:
-                score += 1
-                zone_approach = 1
-                approach_status = f"APPROACHING (dist: {distance_to_ob:.2%})"
-            else:
-                approach_status = f"FAR ({distance_to_ob:.2%} away)"
-        else:  # bearish
-            # For bearish OB, check if price is approaching from below
-            distance_to_ob = (ob_zone["low"] - last["close"]) / (ob_zone["high"] - ob_zone["low"] + 1e-8)
-            if last["close"] >= ob_zone["low"] or distance_to_ob < 0.1:
-                score += 1
-                zone_approach = 1
-                approach_status = f"APPROACHING (dist: {distance_to_ob:.2%})"
-            else:
-                approach_status = f"FAR ({distance_to_ob:.2%} away)"
-        
-        reasons.append(f"Zone Approach +{zone_approach} ({approach_status})")
-        
-        # Store comprehensive OB data
-        calc_values["zone_approach"] = zone_approach
-        calc_values["ob_type"] = ob_type
-        calc_values["ob_strength"] = ob_zone.get("strength", "UNKNOWN")
-        calc_values["ob_tested"] = ob_zone.get("tested", False)
-        calc_values["ob_low"] = round(ob_zone["low"], 6)
-        calc_values["ob_high"] = round(ob_zone["high"], 6)
-        calc_values["ob_body_low"] = round(ob_zone.get("body_low", ob_zone["low"]), 6)
-        calc_values["ob_body_high"] = round(ob_zone.get("body_high", ob_zone["high"]), 6)
-        calc_values["ob_candle_size"] = round(ob_zone.get("candle_size", 0), 6)
-        calc_values["ob_body_ratio"] = round(ob_zone.get("body_size", 0) / ob_zone.get("candle_size", 1) if ob_zone.get("candle_size", 0) > 0 else 0, 2)
-        calc_values["ob_volume"] = ob_zone.get("volume", 0)
-        calc_values["distance_to_ob"] = round(distance_to_ob, 4)
-    else:
-        reasons.append("Zone Approach +0 (No OB detected)")
-        ob_type = None
-        calc_values["zone_approach"] = 0
-        calc_values["ob_type"] = "NONE"
-
-    # Step 5: HTF Alignment
-    tf_map={"1m":"15m","3m":"30m","5m":"1h","15m":"4h","30m":"1h"}
-    htf=tf_map.get(tf,"15m")
-    ohlcv_htf = await fetch_ohlcv(exchange, symbol, htf, 50)
-    htf_alignment = 0
-    htf_trend_value = 0
-    if ohlcv_htf and len(ohlcv_htf) >= 5:
-        df_htf = pd.DataFrame(ohlcv_htf, columns=["ts","open","high","low","close","vol"])
-        if len(df_htf) >= 5:
-            trend = df_htf["close"].iloc[-1] - df_htf["close"].iloc[-5]
-            htf_trend_value = round(trend, 6)
-            htf_dir = "bullish" if trend>0 else "bearish"
-            if ob_type and htf_dir==ob_type:
-                score+=1; htf_alignment=1; reasons.append(f"HTF Alignment +1 ({htf_dir} {trend:+.6f})")
-            else:
-                reasons.append(f"HTF Alignment +0 ({htf_dir} {trend:+.6f})")
-            calc_values["htf_trend"] = htf_trend_value
-            calc_values["htf_direction"] = htf_dir
+        # Extended target (2x range distance)
+        if side == "BUY":
+            range_distance = htf_context.range_high - htf_context.range_low
+            tp3 = htf_context.range_high + (range_distance * 0.5)
+            tp3_type = "EXTENDED_TARGET"
         else:
-            reasons.append("HTF Alignment ? (insufficient data)")
-            calc_values["htf_trend"] = 0
-            calc_values["htf_direction"] = "UNKNOWN"
+            range_distance = htf_context.range_high - htf_context.range_low
+            tp3 = htf_context.range_low - (range_distance * 0.5)
+            tp3_type = "EXTENDED_TARGET"
+    
+    return TakeProfitLevels(
+        tp1=float(tp1),
+        tp1_type=tp1_type,
+        tp2=float(tp2),
+        tp2_type=tp2_type,
+        tp3=float(tp3),
+        tp3_type=tp3_type
+    )
+
+# ---------------- STEP 8: PROBABILITY CHECK ----------------
+def calculate_probability(htf_context: HTFContext, liquidity_map: LiquidityMap,
+                         sweep: SweepAnalysis, structure_shift: StructureShift,
+                         entry_zone: EntryZone, side: str) -> ProbabilityScore:
+    """
+    Step 8: Probability Check
+    - Combine: HTF alignment + liquidity quality + sweep strength + structure clarity + entry precision
+    """
+    
+    # 1. HTF Alignment (0-1)
+    if htf_context.bias == side.upper() or htf_context.bias == "RANGING":
+        htf_alignment = 1.0
+    elif (htf_context.bias == "BULLISH" and side == "SELL") or \
+         (htf_context.bias == "BEARISH" and side == "BUY"):
+        htf_alignment = 0.3  # Counter-trend
     else:
-        reasons.append("HTF Alignment ? (no data)")
-        calc_values["htf_trend"] = 0
-        calc_values["htf_direction"] = "UNKNOWN"
-
-    # Step 6: MOMENTUM
-    momentum_ratio = abs(last["close"]-last["open"])/(last["high"]-last["low"]+1e-8)
-    calc_values["momentum_value"] = round(momentum_ratio, 2)
+        htf_alignment = 0.5
     
-    if ob_type=="bullish" and momentum_ratio>=0.8 and last["close"]>last["open"]:
-        score+=1; reasons.append(f"Momentum +1 ({momentum_ratio:.2f})")
-        calc_values["momentum_score"] = 1
-    elif ob_type=="bearish" and momentum_ratio>=0.8 and last["close"]<last["open"]:
-        score+=1; reasons.append(f"Momentum +1 ({momentum_ratio:.2f})")
-        calc_values["momentum_score"] = 1
+    # Premium/discount alignment
+    if (side == "BUY" and htf_context.premium_discount == "DISCOUNT") or \
+       (side == "SELL" and htf_context.premium_discount == "PREMIUM"):
+        htf_alignment = min(1.0, htf_alignment + 0.2)
+    
+    # 2. Liquidity Quality (0-1)
+    if liquidity_map.has_clear_target:
+        # Count quality targets
+        quality_targets = sum(1 for t in liquidity_map.to_liquidity 
+                            if t.get("strength", 0) >= 2)
+        liquidity_quality = min(1.0, quality_targets / 3.0)
     else:
-        reasons.append(f"Momentum +0 ({momentum_ratio:.2f})")
-        calc_values["momentum_score"] = 0
-
-    if not ob_type: return None
-    side_str = "BUY" if ob_type=="bullish" else "SELL"
-    entry = float(last["close"])
-
-    # ---------------- CRITICAL FILTERS ----------------
-    critical_score = htf_alignment + liquidity_sweep
-    if critical_score < CRITICAL_FACTORS_MIN: return None
-    if score < MIN_SCORE: return None
-    if not has_disp: return None
-    if htf_alignment != 1: return None
-
-    # ---------------- FORCED FILTER ----------------
-    displacement_val = calc_values["displacement_value"]
-    momentum_val = calc_values["momentum_value"]
+        liquidity_quality = 0.2
     
-    if not force_filter_trade(momentum_val, displacement_val):
-        reasons.append(f"❌ FORCED FILTER REJECTED: Mom={momentum_val:.2f}, Disp={displacement_val:.2f}")
+    # 3. Sweep Strength (0-1)
+    sweep_strength = sweep.strength
+    if sweep.impulsive:
+        sweep_strength = min(1.0, sweep_strength + 0.3)
+    if sweep.fake_sweep:
+        sweep_strength = max(0.0, sweep_strength - 0.5)
+    
+    # 4. Structure Clarity (0-1)
+    if structure_shift.confirmed:
+        if structure_shift.type == "CHoCH":
+            structure_clarity = 0.9  # Reversals are clear
+        elif structure_shift.type == "BOS":
+            structure_clarity = 0.8  # Continuations
+        else:
+            structure_clarity = 0.6
+    else:
+        structure_clarity = 0.2
+    
+    # 5. Entry Precision (0-1)
+    if entry_zone.type in ["ORDER_BLOCK", "FAIR_VALUE_GAP"]:
+        entry_precision = 0.8
+        if entry_zone.aligns_with_htf:
+            entry_precision = min(1.0, entry_precision + 0.1)
+        if entry_zone.candle_reaction:
+            entry_precision = min(1.0, entry_precision + 0.1)
+    elif entry_zone.type in ["PREMIUM", "DISCOUNT"]:
+        entry_precision = 0.6
+        if entry_zone.candle_reaction:
+            entry_precision = 0.7
+    else:
+        entry_precision = 0.2
+    
+    total_score = (htf_alignment + liquidity_quality + sweep_strength + 
+                   structure_clarity + entry_precision)
+    
+    return ProbabilityScore(
+        htf_alignment=htf_alignment,
+        liquidity_quality=liquidity_quality,
+        sweep_strength=sweep_strength,
+        structure_clarity=structure_clarity,
+        entry_precision=entry_precision,
+        total_score=total_score
+    )
+
+# ---------------- MAIN SCANNING LOGIC ----------------
+async def scan_symbol_full(exchange, symbol: str) -> Optional[Dict]:
+    """
+    Execute full 8-step scanning process for one symbol
+    """
+    
+    # Get current price
+    ticker = await exchange.fetch_ticker(symbol)
+    current_price = ticker.get("last", 0)
+    if not current_price:
         return None
     
-    filter_reason = "Mom≥0.87" if momentum_val >= MOMENTUM_STRONG_THRESHOLD else "Mom≥0.85 & Disp≥0.80"
-    reasons.append(f"✅ FORCED FILTER PASSED: {filter_reason}")
-
-    # ---------------- ELITE MTF CONFIRMATION ----------------
-    if not await elite_tf_alignment(exchange, symbol, side_str):
-        return None
-    reasons.append("Elite MTF Alignment ✅")
-
-    # ---------------- ROMEOPT TP CALCULATION ----------------
-    atr_val = float(atr(df, 14).iloc[-1])
-    result = romeopt_tp_sl(entry, side_str, atr_val, ob_zone, df)
+    log.debug(f"🔍 Scanning {symbol} at {current_price}")
     
-    # REJECT if no valid TP found
-    if result is None:
-        reasons.append("❌ NO VALID LIQUIDITY FOUND")
+    # --- STEP 1: HTF BIAS ---
+    htf_context = await analyze_htf_bias(exchange, symbol)
+    if not htf_context.valid:
+        log.debug(f"  {symbol}: Skipped HTF - {htf_context.skip_reason}")
         return None
     
-    sl, tp, tp_type = result
+    log.debug(f"  {symbol}: HTF {htf_context.bias} in {htf_context.premium_discount}")
     
-    sig = {
+    # --- STEP 2: LIQUIDITY MAP ---
+    liquidity_map = await map_liquidity(exchange, symbol, htf_context, current_price)
+    if not liquidity_map.has_clear_target:
+        log.debug(f"  {symbol}: No clear liquidity targets")
+        return None
+    
+    log.debug(f"  {symbol}: {len(liquidity_map.from_liquidity)} FROM, {len(liquidity_map.to_liquidity)} TO targets")
+    
+    # --- STEP 3: LIQUIDITY SWEEP ---
+    sweep = await analyze_sweep(exchange, symbol, htf_context)
+    if sweep.type == "NONE" or not sweep.impulsive or sweep.fake_sweep:
+        log.debug(f"  {symbol}: No valid sweep (type={sweep.type}, impulsive={sweep.impulsive}, fake={sweep.fake_sweep})")
+        return None
+    
+    log.debug(f"  {symbol}: {sweep.type} detected (strength={sweep.strength:.2f})")
+    
+    # Determine side based on sweep
+    if sweep.type == "HIGH_SWEEP":
+        side = "SELL"
+    elif sweep.type == "LOW_SWEEP":
+        side = "BUY"
+    else:
+        return None
+    
+    # --- STEP 4: STRUCTURE CHECK ---
+    structure_shift = await check_structure_shift(exchange, symbol, sweep, htf_context)
+    if not structure_shift.confirmed:
+        log.debug(f"  {symbol}: No structure shift after sweep")
+        return None
+    
+    log.debug(f"  {symbol}: Structure {structure_shift.type} confirmed")
+    
+    # --- STEP 5: ENTRY ZONE ---
+    entry_zone = await find_entry_zone(exchange, symbol, htf_context, sweep, structure_shift, side)
+    if entry_zone.type == "NONE" or not entry_zone.candle_reaction:
+        log.debug(f"  {symbol}: No valid entry zone (type={entry_zone.type}, reaction={entry_zone.candle_reaction})")
+        return None
+    
+    log.debug(f"  {symbol}: Entry {entry_zone.type} at {entry_zone.price:.8f}")
+    
+    # --- STEP 6: RISK/SL ---
+    risk_sl = calculate_risk_sl(entry_zone, sweep, htf_context, side)
+    if risk_sl.sl_price == 0:
+        log.debug(f"  {symbol}: Failed to calculate SL")
+        return None
+    
+    log.debug(f"  {symbol}: SL at {risk_sl.sl_price:.8f} ({risk_sl.invalidation_type})")
+    
+    # --- STEP 7: TAKE PROFIT ---
+    tp_levels = calculate_take_profits(entry_zone.price, side, liquidity_map, htf_context)
+    
+    # --- STEP 8: PROBABILITY CHECK ---
+    probability = calculate_probability(
+        htf_context, liquidity_map, sweep, structure_shift, entry_zone, side
+    )
+    
+    if not probability.acceptable:
+        log.debug(f"  {symbol}: Probability too low ({probability.total_score:.2f}/5)")
+        return None
+    
+    log.info(f"✅ {symbol}: A+ Setup detected! Score: {probability.total_score:.2f}/5")
+    
+    # --- COMPILE FINAL SETUP ---
+    setup = {
         "symbol": symbol,
-        "side": side_str,
-        "entry": entry,
-        "sl": sl,
-        "tp": tp,
-        "score": score,
-        "reason": "RomeOPT 6-Step",
-        "reason_list": reasons,
-        "htf_alignment": htf_alignment,
-        "liquidity_sweep": liquidity_sweep,
-        "momentum_ratio": momentum_ratio,
-        "calc_values": calc_values,
-        "tp_type": tp_type
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "side": side,
+        "current_price": current_price,
+        
+        # Step 1
+        "htf_bias": htf_context.bias,
+        "htf_range_high": htf_context.range_high,
+        "htf_range_low": htf_context.range_low,
+        "htf_premium_discount": htf_context.premium_discount,
+        "htf_liquidity_zones": htf_context.liquidity_zones,
+        "htf_structure": htf_context.structure,
+        
+        # Step 2
+        "liquidity_from": liquidity_map.from_liquidity,
+        "liquidity_to": liquidity_map.to_liquidity,
+        "has_clear_target": liquidity_map.has_clear_target,
+        
+        # Step 3
+        "sweep_type": sweep.type,
+        "swept_price": sweep.swept_price,
+        "sweep_impulsive": sweep.impulsive,
+        "sweep_strength": sweep.strength,
+        
+        # Step 4
+        "structure_shift_type": structure_shift.type,
+        "structure_shift_confirmed": structure_shift.confirmed,
+        "structure_description": structure_shift.description,
+        
+        # Step 5
+        "entry_type": entry_zone.type,
+        "entry_price": entry_zone.price,
+        "entry_low": entry_zone.low,
+        "entry_high": entry_zone.high,
+        "entry_aligns_htf": entry_zone.aligns_with_htf,
+        "entry_reaction_confirmed": entry_zone.candle_reaction,
+        
+        # Step 6
+        "sl_price": risk_sl.sl_price,
+        "sl_invalidation_type": risk_sl.invalidation_type,
+        "risk_amount": risk_sl.risk_amount,
+        "sl_distance_pct": risk_sl.sl_to_entry_distance,
+        
+        # Step 7
+        "tp1_price": tp_levels.tp1,
+        "tp1_type": tp_levels.tp1_type,
+        "tp2_price": tp_levels.tp2,
+        "tp2_type": tp_levels.tp2_type,
+        "tp3_price": tp_levels.tp3,
+        "tp3_type": tp_levels.tp3_type,
+        
+        # Step 8
+        "probability": {
+            "htf_alignment": probability.htf_alignment,
+            "liquidity_quality": probability.liquidity_quality,
+            "sweep_strength": probability.sweep_strength,
+            "structure_clarity": probability.structure_clarity,
+            "entry_precision": probability.entry_precision,
+            "total_score": probability.total_score,
+            "acceptable": probability.acceptable
+        }
     }
     
-    log.info(f"✅ Signal {sig['symbol']} passed forced filter: Mom={momentum_val:.2f}, Disp={displacement_val:.2f}")
-    return sig
+    return setup
 
-# ---------------- REFINED UPDATE TP/SL LIVE ----------------
-def update_tp_sl_live(sig: dict, df: pd.DataFrame):
-    """
-    REFINED: Only update if TP hasn't been hit AND structure invalidated
-    RomeOPT commits to liquidity objective - no chasing price
-    """
-    # TP LOCK: If TP already hit, do nothing
-    if sig.get("tp_hit", 0) == 1:
-        return sig
+# ---------------- ALERT FORMATTING ----------------
+async def send_setup_alert(setup: Dict):
+    """Format and send setup alert"""
     
-    # Only update if structure is completely invalid
-    latest_ob = find_latest_ob(df)
-    if not latest_ob:
-        # No OB anymore - structure invalid, close trade
-        return None
+    # Calculate RR ratios
+    entry = setup["entry_price"]
+    sl = setup["sl_price"]
+    tp1 = setup["tp1_price"]
     
-    # Check if price has taken out the OB (structure break)
-    if sig["side"] == "BUY":
-        if df['low'].iloc[-1] < latest_ob["low"]:
-            return None  # OB broken, close
-    else:  # SELL
-        if df['high'].iloc[-1] > latest_ob["high"]:
-            return None  # OB broken, close
+    risk = abs(entry - sl)
+    reward_tp1 = abs(tp1 - entry)
+    rr_ratio = reward_tp1 / risk if risk > 0 else 0
     
-    # Structure still valid - keep original TP (RomeOPT doesn't chase)
-    return sig
+    # Format message
+    msg = f"""
+🔥 <b>ROMEOTPT A+ SETUP CONFIRMED</b>
 
-# ---------------- SL CLUSTER ----------------
-recent_sl = defaultdict(lambda: deque())
-def record_sl_hit(symbol: str, lookback_minutes=30):
-    now = time.time(); dq = recent_sl[symbol]; dq.append(now)
-    cutoff = now - lookback_minutes*60
-    while dq and dq[0]<cutoff: dq.popleft()
-def deprioritized(symbol: str, threshold=3, lookback=30):
-    dq = recent_sl[symbol]; now=time.time(); cutoff=now-lookback*60
-    while dq and dq[0]<cutoff: dq.popleft()
-    return len(dq)>=threshold
+<b>Symbol:</b> {setup['symbol']}
+<b>Side:</b> {setup['side']}
+<b>Entry:</b> {setup['entry_price']:.8f}
+<b>Current:</b> {setup['current_price']:.8f}
 
-# ---------------- LOG SIGNAL ----------------
-async def log_signal(sig):
+<b>Probability Score:</b> {setup['probability']['total_score']:.2f}/5.0
+<b>RR Ratio:</b> {rr_ratio:.2f}:1
+
+🎯 <b>Targets:</b>
+TP1: {setup['tp1_price']:.8f} ({setup['tp1_type']})
+TP2: {setup['tp2_price']:.8f} ({setup['tp2_type']})
+TP3: {setup['tp3_price']:.8f} ({setup['tp3_type']})
+
+🛡️ <b>Risk:</b>
+SL: {setup['sl_price']:.8f} ({setup['sl_invalidation_type']})
+Risk: {setup['risk_amount']:.8f} ({setup['sl_distance_pct']:.2f}%)
+
+📊 <b>Analysis:</b>
+• HTF: {setup['htf_bias']} in {setup['htf_premium_discount']}
+• Sweep: {setup['sweep_type']} (strength: {setup['sweep_strength']:.2f})
+• Structure: {setup['structure_shift_type']}
+• Entry: {setup['entry_type']}
+
+✅ <b>Probability Components:</b>
+HTF Alignment: {setup['probability']['htf_alignment']:.2f}
+Liquidity Quality: {setup['probability']['liquidity_quality']:.2f}
+Sweep Strength: {setup['probability']['sweep_strength']:.2f}
+Structure Clarity: {setup['probability']['structure_clarity']:.2f}
+Entry Precision: {setup['probability']['entry_precision']:.2f}
+
+<i>Detected: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}</i>
+"""
+    
+    await send_telegram(msg)
+    
+    # Log to database
     async with db_lock:
         await db_conn.execute("""
-            INSERT INTO signals (symbol,side,entry,sl,tp,timestamp,status,reason,score,latest_ob,tp_type,tp_locked)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (sig["symbol"],sig["side"],sig["entry"],sig.get("sl"),sig.get("tp"),
-              datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"],
-              str(sig.get("latest_ob","")), sig.get("tp_type", ""), 1))
+            INSERT INTO signals VALUES (
+                NULL, :symbol, :timestamp, :side,
+                :htf_bias, :htf_range_high, :htf_range_low, :htf_premium_discount,
+                :htf_liquidity_zones, :htf_structure,
+                :liquidity_from, :liquidity_to, :has_clear_target,
+                :sweep_type, :swept_price, :sweep_impulsive, :sweep_strength,
+                :structure_shift_type, :structure_shift_confirmed, :structure_description,
+                :entry_type, :entry_price, :entry_low, :entry_high, :entry_aligns_htf, :entry_reaction_confirmed,
+                :sl_price, :sl_invalidation_type, :risk_amount, :sl_distance_pct,
+                :tp1_price, :tp1_type, :tp2_price, :tp2_type, :tp3_price, :tp3_type,
+                :prob_htf_alignment, :prob_liquidity_quality, :prob_sweep_strength,
+                :prob_structure_clarity, :prob_entry_precision, :prob_total_score, :prob_acceptable,
+                :current_price, 'DETECTED', ''
+            )
+        """, {
+            "symbol": setup["symbol"],
+            "timestamp": setup["timestamp"],
+            "side": setup["side"],
+            "htf_bias": setup["htf_bias"],
+            "htf_range_high": setup["htf_range_high"],
+            "htf_range_low": setup["htf_range_low"],
+            "htf_premium_discount": setup["htf_premium_discount"],
+            "htf_liquidity_zones": json.dumps(setup["htf_liquidity_zones"]),
+            "htf_structure": json.dumps(setup["htf_structure"]),
+            "liquidity_from": json.dumps(setup["liquidity_from"]),
+            "liquidity_to": json.dumps(setup["liquidity_to"]),
+            "has_clear_target": setup["has_clear_target"],
+            "sweep_type": setup["sweep_type"],
+            "swept_price": setup["swept_price"],
+            "sweep_impulsive": setup["sweep_impulsive"],
+            "sweep_strength": setup["sweep_strength"],
+            "structure_shift_type": setup["structure_shift_type"],
+            "structure_shift_confirmed": setup["structure_shift_confirmed"],
+            "structure_description": setup["structure_description"],
+            "entry_type": setup["entry_type"],
+            "entry_price": setup["entry_price"],
+            "entry_low": setup["entry_low"],
+            "entry_high": setup["entry_high"],
+            "entry_aligns_htf": setup["entry_aligns_htf"],
+            "entry_reaction_confirmed": setup["entry_reaction_confirmed"],
+            "sl_price": setup["sl_price"],
+            "sl_invalidation_type": setup["sl_invalidation_type"],
+            "risk_amount": setup["risk_amount"],
+            "sl_distance_pct": setup["sl_distance_pct"],
+            "tp1_price": setup["tp1_price"],
+            "tp1_type": setup["tp1_type"],
+            "tp2_price": setup["tp2_price"],
+            "tp2_type": setup["tp2_type"],
+            "tp3_price": setup["tp3_price"],
+            "tp3_type": setup["tp3_type"],
+            "prob_htf_alignment": setup["probability"]["htf_alignment"],
+            "prob_liquidity_quality": setup["probability"]["liquidity_quality"],
+            "prob_sweep_strength": setup["probability"]["sweep_strength"],
+            "prob_structure_clarity": setup["probability"]["structure_clarity"],
+            "prob_entry_precision": setup["probability"]["entry_precision"],
+            "prob_total_score": setup["probability"]["total_score"],
+            "prob_acceptable": setup["probability"]["acceptable"],
+            "current_price": setup["current_price"]
+        })
         await db_conn.commit()
 
-# ---------------- ROBUST MONITOR SIGNALS ----------------
-async def monitor_signals():
+# ---------------- MAIN SCANNER ----------------
+async def scanner_main(exchange):
+    """Main scanning loop"""
+    
+    await send_telegram("🚀 ROMEOTPT v2 Scanner Started - 8-Step Exact Match")
+    await send_telegram("Step 1: HTF Bias → 2: Liquidity Map → 3: Sweep → 4: Structure → 5: Entry → 6: SL → 7: TP → 8: Probability")
+    
     while True:
         try:
-            async with db_lock:
-                # Get current columns to build dynamic query
-                async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
-                    columns = await cursor.fetchall()
-                    column_names = [col[1] for col in columns]
-                
-                # Build query with fallback for missing columns
-                select_fields = []
-                if 'id' in column_names:
-                    select_fields.append('id')
-                if 'symbol' in column_names:
-                    select_fields.append('symbol')
-                if 'side' in column_names:
-                    select_fields.append('side')
-                if 'entry' in column_names:
-                    select_fields.append('entry')
-                if 'sl' in column_names:
-                    select_fields.append('sl')
-                if 'tp' in column_names:
-                    select_fields.append('tp')
-                else:
-                    select_fields.append('NULL as tp')  # Fallback
-                
-                if 'tp_hit' in column_names:
-                    select_fields.append('tp_hit')
-                else:
-                    select_fields.append('0 as tp_hit')  # Default value
-                
-                if 'status' in column_names:
-                    select_fields.append('status')
-                
-                query = f"SELECT {','.join(select_fields)} FROM signals WHERE status='OPEN'"
-                
-                async with db_conn.execute(query) as cursor:
-                    async for row in cursor:
-                        # Map row to variables based on query structure
-                        row_dict = dict(zip(select_fields, row))
-                        
-                        sig_id = row_dict.get('id')
-                        symbol = row_dict.get('symbol')
-                        side = row_dict.get('side')
-                        entry = row_dict.get('entry')
-                        sl = row_dict.get('sl')
-                        tp = row_dict.get('tp')
-                        tp_hit = row_dict.get('tp_hit', 0)
-                        status = row_dict.get('status')
-                        
-                        if not all([sig_id, symbol, side, entry]):
-                            continue
-                        
-                        # Check if TP already hit
-                        if tp_hit == 1:
-                            continue
-                        
-                        ticker = await exchange.fetch_ticker(symbol)
-                        last_price = ticker.get("last")
-                        if last_price is None: 
-                            continue
-
-                        # RomeOPT: TP LOCK - Don't recalculate unless structure broken
-                        hits = []
-                        new_tp_hit = tp_hit
-                        new_status = status
-                        
-                        if side == "BUY":
-                            if not tp_hit and tp is not None and last_price >= tp:
-                                hits.append("TP"); new_tp_hit = 1
-                            if sl is not None and last_price <= sl:
-                                hits.append("SL"); new_status = "CLOSED"
-                        else:
-                            if not tp_hit and tp is not None and last_price <= tp:
-                                hits.append("TP"); new_tp_hit = 1
-                            if sl is not None and last_price >= sl:
-                                hits.append("SL"); new_status = "CLOSED"
-
-                        if hits:
-                            await tg(f"🎯 {symbol} {side} HIT\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP:{tp}")
-
-                        if "SL" in hits:
-                            record_sl_hit(symbol)
-                        
-                        # Only update if something changed
-                        if new_tp_hit != tp_hit or new_status != status:
-                            await db_conn.execute("UPDATE signals SET tp_hit=?,status=? WHERE id=?",
-                                                 (new_tp_hit, new_status, sig_id))
-                await db_conn.commit()
-        except Exception as e: 
-            log.exception("monitor error: %s", e)
-        await asyncio.sleep(SCAN_INTERVAL)
-
-# ---------------- SCAN LOOP ----------------
-last_signal_time = {}
-async def scan_loop(exchange):
-    while True:
-        t0=time.time()
-        try:
+            # Get top volume pairs
             tickers = await exchange.fetch_tickers()
-            top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")], key=lambda x:x[1], reverse=True)[:TOP_N]
-            signals_found = 0
-            for symbol,_ in top:
-                if deprioritized(symbol): continue
-                for tf in TIMEFRAMES:
-                    key=f"{symbol}:{tf}"
-                    if key in last_signal_time and time.time()-last_signal_time[key]<60: continue
-                    ohlcv = await fetch_ohlcv(exchange,symbol,tf,200)
-                    if not ohlcv: continue
-                    df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
-                    for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
-                    sig = await generate_signal_romeopt(exchange,df,symbol,tf)
-                    if sig:
-                        calc = sig.get("calc_values", {})
-                        momentum_val = calc.get("momentum_value", 0)
-                        displacement_val = calc.get("displacement_value", 0)
-                        
-                        filter_passed = force_filter_trade(momentum_val, displacement_val)
-                        
-                        # Calculate R:R
-                        risk = abs(sig["entry"] - sig.get("sl", 0))
-                        reward = abs(sig.get("tp", 0) - sig["entry"])
-                        rr = reward / risk if risk > 0 else 0
-                        
-                        breakdown_lines = [
-                            f"🏆 ROMEOPT SIGNAL: {sig['symbol']} ({tf}) {sig['side']}",
-                            f"Entry: {sig['entry']:.6f}",
-                            f"Score: {sig['score']}/6",
-                            f"",
-                            f"📊 LIQUIDITY SWEEP DATA:",
-                            f"• Type: {calc.get('sweep_type', 'NONE')}",
-                            f"• Direction: {calc.get('sweep_direction', 'NONE')}",
-                            f"• Strength: {calc.get('sweep_strength', 0):.2f}",
-                            f"• Respected: {'✅' if calc.get('sweep_respected', False) else '❌'}",
-                            f"• Swept Level: {calc.get('swept_level', 0):.6f}",
-                            f"",
-                            f"📊 ORDER BLOCK DATA:",
-                            f"• Type: {calc.get('ob_type', 'NONE')}",
-                            f"• Strength: {calc.get('ob_strength', 'UNKNOWN')}",
-                            f"• Tested: {'✅' if calc.get('ob_tested', False) else '❌'}",
-                            f"• Range: {calc.get('ob_low', 0):.6f} - {calc.get('ob_high', 0):.6f}",
-                            f"• Body: {calc.get('ob_body_low', 0):.6f} - {calc.get('ob_body_high', 0):.6f}",
-                            f"• Body Ratio: {calc.get('ob_body_ratio', 0):.2f}",
-                            f"• Distance: {calc.get('distance_to_ob', 0):.2%}",
-                            f"",
-                            f"📊 CORE METRICS:",
-                            f"• Displacement: {calc.get('displacement_value', 0):.2f}",
-                            f"• Momentum: {calc.get('momentum_value', 0):.2f}",
-                            f"• HTF: {calc.get('htf_direction', '?')}",
-                            f"• Forced Filter: {'✅ PASS' if filter_passed else '❌ REJECT'}",
-                            f"• TP Type: {sig.get('tp_type', 'N/A')}",
-                            f"",
-                            f"🎯 LIQUIDITY TARGET (R:R: {rr:.2f}:1):",
-                            f"SL: {sig.get('sl'):.6f}",
-                            f"TP: {sig.get('tp'):.6f}",
-                            f"",
-                            f"💎 ROMEOPT PHILOSOPHY:",
-                            f"One TP = One liquidity objective",
-                            f"TP LOCKED - No chasing price"
-                        ]
-                        
-                        await tg("\n".join(breakdown_lines))
-                        await log_signal(sig)
-                        last_signal_time[key]=time.time()
-                        signals_found+=1
-            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals (TP LOCKED)")
-        except Exception as e: log.exception("scan error: %s", e)
-        elapsed=time.time()-t0
-        await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
+            usdt_pairs = [(s, v.get("quoteVolume", 0)) 
+                         for s, v in tickers.items() 
+                         if s.endswith("/USDT")]
+            usdt_pairs.sort(key=lambda x: x[1], reverse=True)
+            top_pairs = usdt_pairs[:TOP_N]
+            
+            log.info(f"📊 Scanning {len(top_pairs)} symbols...")
+            
+            setups_found = 0
+            for symbol, volume in top_pairs:
+                try:
+                    setup = await scan_symbol_full(exchange, symbol)
+                    if setup:
+                        await send_setup_alert(setup)
+                        setups_found += 1
+                        # Rate limiting
+                        await asyncio.sleep(2)
+                except Exception as e:
+                    log.error(f"Error scanning {symbol}: {e}")
+                    continue
+            
+            if setups_found > 0:
+                log.info(f"✅ Found {setups_found} A+ setups")
+            else:
+                log.info("⏳ No setups found this scan")
+            
+        except Exception as e:
+            log.exception(f"Scanner error: {e}")
+        
+        await asyncio.sleep(SCAN_INTERVAL)
 
 # ---------------- FASTAPI ----------------
 app = FastAPI()
-@app.post("/webhook")
-async def webhook(request: Request):
-    token = request.headers.get("X-Auth","")
-    if token!=WEBHOOK_SECRET: raise HTTPException(403,"Invalid secret")
-    data = await request.json()
-    log.info("Webhook received: %s", data)
-    return {"ok":True}
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "scanner": "ROMEOTPT v2"}
+
+@app.get("/setups")
+async def get_setups(limit: int = 20, min_score: float = 3.5):
+    async with db_lock:
+        async with db_conn.execute(
+            """SELECT * FROM signals 
+               WHERE prob_total_score >= ? 
+               ORDER BY timestamp DESC LIMIT ?""",
+            (min_score, limit)
+        ) as cursor:
+            columns = [description[0] for description in cursor.description]
+            rows = await cursor.fetchall()
+        
+        setups = []
+        for row in rows:
+            setup = dict(zip(columns, row))
+            # Parse JSON fields
+            json_fields = ["htf_liquidity_zones_json", "htf_structure_json",
+                          "liquidity_from_json", "liquidity_to_json"]
+            for field in json_fields:
+                if setup.get(field):
+                    try:
+                        key = field.replace("_json", "")
+                        setup[key] = json.loads(setup[field])
+                    except:
+                        pass
+            setups.append(setup)
+        
+        return {"setups": setups, "count": len(setups)}
 
 # ---------------- MAIN ----------------
 async def main():
+    global db_conn
+    
+    # Initialize
     await init_db()
-    global exchange
-    exchange = ccxt.okx({"enableRateLimit": True})
-    await tg("🏆 TRUE ROMEOPT SCANNER STARTED (ENHANCED SWEEP & OB DATA)")
-    await tg("🎯 ENHANCED: Comprehensive liquidity sweep analysis")
-    await tg("📊 ENHANCED: Detailed order block classification")
-    await tg("🔒 TP LOCK: No recalculation after entry")
-    await tg("⚡ EXTERNAL LIQUIDITY: Range extremes only")
-    await tg("💎 ROMEOPT CORE: Target where price MUST go")
-    await asyncio.gather(scan_loop(exchange), monitor_signals())
+    
+    # Create exchange
+    exchange = ccxt.okx({
+        "enableRateLimit": True,
+        "options": {"defaultType": "spot"}
+    })
+    
+    # Start scanner
+    await scanner_main(exchange)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     import argparse
-    p=argparse.ArgumentParser()
-    p.add_argument("--http", action="store_true")
-    args=p.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--http", action="store_true", help="Run HTTP server")
+    args = parser.parse_args()
+    
     if args.http:
-        uvicorn.run(app, host="0.0.0.0", port=9000)
+        uvicorn.run(app, host="0.0.0.0", port=8000)
     else:
         try:
             asyncio.run(main())
+        except KeyboardInterrupt:
+            log.info("Shutting down ROMEOTPT v2 scanner...")
         finally:
             if db_conn:
                 asyncio.run(db_conn.close())
