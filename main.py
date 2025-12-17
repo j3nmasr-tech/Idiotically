@@ -29,7 +29,7 @@ DB_PATH = "/app/data/romeopt_v2.db"
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))
 TOP_N = int(os.getenv("TOP_N", 60))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 5))
-MIN_SCORE = 2.0  # Changed from 3.5 to 2.0
+MIN_SCORE = 1.0  # Changed from 3.5 to 2.0
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
