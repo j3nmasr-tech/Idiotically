@@ -13,6 +13,7 @@ TRUE ROMEOPT SCANNER (Final Refined Version) - WITH ENHANCED SWEEP & OB DATA
 - Forced Filter: Momentum ≥ 0.87 OR (Momentum ≥ 0.85 AND Displacement ≥ 0.80)
 - ENHANCED: Comprehensive liquidity sweep and order block data
 - ROMEOPT TP PRIORITY LADDER: Same TF → HTF (market-decided targets)
+- FALLBACK: Market structure swing points when no obvious liquidity exists
 """
 
 import os, time, asyncio, logging, datetime
@@ -195,6 +196,47 @@ def force_filter_trade(momentum_value: float, displacement_value: float) -> bool
     if momentum_value >= MOMENTUM_GOOD_THRESHOLD and displacement_value >= DISPLACEMENT_MIN_THRESHOLD:
         return True
     return False
+
+# ---------------- MARKET STRUCTURE SWING POINTS ----------------
+def find_market_structure_swing(df: pd.DataFrame, side: str, lookback=50):
+    """
+    Fallback: Find market structure swing points
+    For SELL: Most recent swing high
+    For BUY: Most recent swing low
+    Returns None if no clear structure
+    """
+    if len(df) < 20:
+        return None
+    
+    if side == "SELL":
+        # Find swing highs (peak with lower highs on both sides)
+        highs = df['high'].values
+        swing_highs = []
+        
+        for i in range(2, min(len(highs)-2, lookback)):
+            if (highs[i] > highs[i-1] and highs[i] > highs[i-2] and
+                highs[i] > highs[i+1] and highs[i] > highs[i+2]):
+                swing_highs.append((i, highs[i]))
+        
+        if swing_highs:
+            # Return the most recent swing high
+            return max(swing_highs, key=lambda x: x[0])[1]
+    
+    else:  # BUY
+        # Find swing lows (trough with higher lows on both sides)
+        lows = df['low'].values
+        swing_lows = []
+        
+        for i in range(2, min(len(lows)-2, lookback)):
+            if (lows[i] < lows[i-1] and lows[i] < lows[i-2] and
+                lows[i] < lows[i+1] and lows[i] < lows[i+2]):
+                swing_lows.append((i, lows[i]))
+        
+        if swing_lows:
+            # Return the most recent swing low
+            return max(swing_lows, key=lambda x: x[0])[1]
+    
+    return None
 
 # ---------------- REFINED ROMEOPT MARKET STATE ----------------
 def romeopt_market_state(df, atr_val):
@@ -380,35 +422,30 @@ def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
     
     return sl, tp, tp_type
 
-# ---------------- ROMEOPT PRIORITY LADDER TP SELECTION ----------------
+# ---------------- ROMEOPT PRIORITY LADDER TP SELECTION WITH FALLBACK ----------------
 async def find_valid_liquidity_tp(exchange, symbol: str, entry_tf: str, entry: float, side: str, ob_zone: dict):
     """
-    RomeOPT TP selection (Priority Ladder):
+    RomeOPT TP selection (Priority Ladder with Fallback):
     1. Same TF first IF valid liquidity exists & unswept
     2. Otherwise → step up through higher TFs in priority order
     3. Stop at first valid liquidity target
-    4. Never force a fixed TF, never use percentages/distances
-    
-    Returns: (sl, tp, tp_type_with_tf) or None
+    4. FALLBACK: If no liquidity found, use market structure swing points
     """
-    # Get TF ladder for this entry timeframe
     tf_ladder = TP_TF_PRIORITY.get(entry_tf, [entry_tf])
     
+    # PHASE 1: Try all TFs for RomeOPT liquidity (PRIMARY)
     for tf in tf_ladder:
-        # Fetch data for this timeframe
         ohlcv = await fetch_ohlcv(exchange, symbol, tf, 200)
         if not ohlcv or len(ohlcv) < 20:
             continue
         
         df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
-        
-        # Calculate ATR for this TF
         atr_val = float(atr(df, 14).iloc[-1])
         
         # Check market state on this TF
         market_state = romeopt_market_state(df, atr_val)
         
-        # Try to find liquidity on this TF
+        # Try to find RomeOPT liquidity on this TF
         result = romeopt_tp_sl(entry, side, atr_val, ob_zone, df)
         
         if result:
@@ -429,13 +466,93 @@ async def find_valid_liquidity_tp(exchange, symbol: str, entry_tf: str, entry: f
                 )
             
             if not recent_touch:
-                log.info(f"✅ {side} TF {entry_tf} → Found valid liquidity on {tf} (Market: {market_state})")
+                log.info(f"✅ {side} TF {entry_tf} → Found RomeOPT liquidity on {tf} (Market: {market_state})")
                 log.info(f"   Entry TF: {entry_tf} | Liquidity TF: {tf}")
                 return sl, tp, tf_source
             else:
                 log.debug(f"⚠️  {side} TF {entry_tf} → Liquidity on {tf} recently swept, trying next TF")
     
-    log.info(f"❌ {side} TF {entry_tf} → No valid liquidity found across all TFs in ladder")
+    # PHASE 2: FALLBACK - No RomeOPT liquidity found, try market structure swing points
+    log.info(f"⚠️  {side} TF {entry_tf} → No RomeOPT liquidity found, trying market structure fallback")
+    
+    for tf in tf_ladder:
+        ohlcv = await fetch_ohlcv(exchange, symbol, tf, 200)
+        if not ohlcv or len(ohlcv) < 20:
+            continue
+        
+        df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "vol"])
+        atr_val = float(atr(df, 14).iloc[-1])
+        
+        # Find market structure swing point
+        swing_point = find_market_structure_swing(df, side)
+        
+        if swing_point is None:
+            continue
+        
+        # Validate swing point makes sense for the trade
+        if side == "BUY":
+            if swing_point >= entry:  # Swing low shouldn't be above entry for BUY
+                log.debug(f"❌ Fallback: Swing low {swing_point:.6f} ≥ entry {entry:.6f} for BUY")
+                continue
+            
+            # Calculate SL (same RomeOPT logic)
+            sl = ob_zone["low"] - (atr_val * 0.3)
+            recent_low = df['low'].iloc[-10:].min()
+            sl = min(sl, recent_low - (atr_val * 0.3))
+            
+            # Ensure minimum risk
+            min_risk = atr_val * 0.5
+            risk = entry - sl
+            if risk < min_risk:
+                risk = min_risk
+                sl = entry - risk
+            
+            # Check for minimum R:R (0.5:1)
+            reward = entry - swing_point
+            if reward < risk * 0.5:
+                log.debug(f"❌ Fallback: Reward {reward:.6f} < 0.5R ({risk*0.5:.6f}) for BUY")
+                continue
+            
+            # Ensure TP is below entry
+            if swing_point >= entry:
+                log.debug(f"❌ Fallback: TP {swing_point:.6f} ≥ entry {entry:.6f} for BUY")
+                continue
+                
+        else:  # SELL
+            if swing_point <= entry:  # Swing high shouldn't be below entry for SELL
+                log.debug(f"❌ Fallback: Swing high {swing_point:.6f} ≤ entry {entry:.6f} for SELL")
+                continue
+            
+            # Calculate SL (same RomeOPT logic)
+            sl = ob_zone["high"] + (atr_val * 0.3)
+            recent_high = df['high'].iloc[-10:].max()
+            sl = max(sl, recent_high + (atr_val * 0.3))
+            
+            min_risk = atr_val * 0.5
+            risk = sl - entry
+            if risk < min_risk:
+                risk = min_risk
+                sl = entry + risk
+            
+            # Check for minimum R:R
+            reward = swing_point - entry
+            if reward < risk * 0.5:
+                log.debug(f"❌ Fallback: Reward {reward:.6f} < 0.5R ({risk*0.5:.6f}) for SELL")
+                continue
+            
+            # Ensure TP is above entry
+            if swing_point <= entry:
+                log.debug(f"❌ Fallback: TP {swing_point:.6f} ≤ entry {entry:.6f} for SELL")
+                continue
+        
+        # All checks passed - use this swing point as fallback TP
+        tp_type = f"{tf} → MARKET STRUCTURE Swing {'Low' if side == 'BUY' else 'High'}"
+        log.info(f"⚠️  {side} TF {entry_tf} → Using MARKET STRUCTURE fallback on {tf}")
+        log.info(f"   Swing Point: {swing_point:.6f} | SL: {sl:.6f} | R:R: {abs(swing_point-entry)/risk:.2f}:1")
+        
+        return sl, swing_point, tp_type
+    
+    log.info(f"❌ {side} TF {entry_tf} → No valid target found (RomeOPT or Market Structure)")
     return None
 
 # ---------------- ENHANCED ORDER BLOCK DETECTION ----------------
@@ -730,7 +847,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         return None
     reasons.append("Elite MTF Alignment ✅")
 
-    # ---------------- ROMEOPT TP CALCULATION (PRIORITY LADDER) ----------------
+    # ---------------- ROMEOPT TP CALCULATION (PRIORITY LADDER WITH FALLBACK) ----------------
     result = await find_valid_liquidity_tp(
         exchange=exchange,
         symbol=symbol,
@@ -742,13 +859,13 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
 
     # REJECT if no valid TP found across all TFs
     if result is None:
-        reasons.append("❌ NO VALID LIQUIDITY (ALL TFs)")
+        reasons.append("❌ NO VALID TARGET (RomeOPT or Market Structure)")
         return None
 
     sl, tp, tf_source = result
     
-    # Store original tp_type without TF prefix for backward compatibility
-    tp_type = tf_source.split("→")[-1].strip() if "→" in tf_source else tf_source
+    # Store TP type (extract from source)
+    tp_type = tf_source.split("→")[-1].strip()
 
     sig = {
         "symbol": symbol,
@@ -768,7 +885,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     }
     
     log.info(f"✅ Signal {sig['symbol']} passed forced filter: Mom={momentum_val:.2f}, Disp={displacement_val:.2f}")
-    log.info(f"   Entry TF: {tf} | Liquidity TF: {tf_source}")
+    log.info(f"   Entry TF: {tf} | Target Source: {tf_source}")
     return sig
 
 # ---------------- REFINED UPDATE TP/SL LIVE ----------------
@@ -945,14 +1062,24 @@ async def scan_loop(exchange):
                         reward = abs(sig.get("tp", 0) - sig["entry"])
                         rr = reward / risk if risk > 0 else 0
                         
+                        # Determine target type for display
+                        tp_source = sig.get('tp_source_tf', '')
+                        if "MARKET STRUCTURE" in tp_source:
+                            target_type = "🎯 MARKET STRUCTURE FALLBACK (Swing Point)"
+                            target_note = "⚠️ Using market structure swing point (no RomeOPT liquidity found)"
+                        else:
+                            target_type = "🎯 ROMEOPT LIQUIDITY TARGET (Priority Ladder)"
+                            target_note = "✅ Found obvious RomeOPT liquidity cluster"
+                        
                         breakdown_lines = [
                             f"🏆 ROMEOPT SIGNAL: {sig['symbol']} ({tf}) {sig['side']}",
                             f"Entry: {sig['entry']:.6f}",
                             f"Score: {sig['score']}/6",
                             f"",
-                            f"🎯 LIQUIDITY TARGET (Priority Ladder):",
+                            f"{target_type}:",
                             f"• Entry TF: {tf}",
-                            f"• Liquidity TF: {sig.get('tp_source_tf', 'N/A')}",
+                            f"• Target Source: {tp_source}",
+                            f"• {target_note}",
                             f"• R:R: {rr:.2f}:1",
                             f"SL: {sig.get('sl'):.6f}",
                             f"TP: {sig.get('tp'):.6f}",
@@ -979,17 +1106,17 @@ async def scan_loop(exchange):
                             f"• HTF: {calc.get('htf_direction', '?')}",
                             f"• Forced Filter: {'✅ PASS' if filter_passed else '❌ REJECT'}",
                             f"",
-                            f"💎 ROMEOPT PHILOSOPHY (Priority Ladder):",
-                            f"• 1st: Same TF liquidity (if valid & unswept)",
-                            f"• 2nd: Step up TF until valid liquidity found",
-                            f"• TP LOCKED - No chasing price"
+                            f"💎 ROMEOPT PHILOSOPHY:",
+                            f"• 1st Priority: Find obvious liquidity clusters",
+                            f"• Fallback: Use market structure swing points",
+                            f"• TP LOCKED: No chasing price after entry"
                         ]
                         
                         await tg("\n".join(breakdown_lines))
                         await log_signal(sig)
                         last_signal_time[key]=time.time()
                         signals_found+=1
-            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals (TP LOCKED)")
+            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals")
         except Exception as e: log.exception("scan error: %s", e)
         elapsed=time.time()-t0
         await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
@@ -1011,10 +1138,10 @@ async def main():
     exchange = ccxt.okx({"enableRateLimit": True})
     await tg("🏆 TRUE ROMEOPT SCANNER STARTED (ENHANCED SWEEP & OB DATA)")
     await tg("🎯 ROMEOPT PRIORITY LADDER: Same TF → HTF liquidity targets")
+    await tg("🔄 FALLBACK: Market structure swing points when no liquidity")
     await tg("📊 ENHANCED: Detailed order block classification")
     await tg("🔒 TP LOCK: No recalculation after entry")
-    await tg("⚡ EXTERNAL LIQUIDITY: Range extremes only")
-    await tg("💎 ROMEOPT CORE: Price decides the TF, not arbitrary rules")
+    await tg("💎 ROMEOPT CORE: Price decides the target, not arbitrary rules")
     await asyncio.gather(scan_loop(exchange), monitor_signals())
 
 if __name__=="__main__":
