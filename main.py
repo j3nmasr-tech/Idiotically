@@ -143,63 +143,87 @@ async def init_db():
     global db_conn
     db_conn = await aiosqlite.connect(DB_PATH)
     await db_conn.execute("PRAGMA journal_mode=WAL;")
-    await db_conn.execute("""
-        CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT,
-            timestamp TEXT,
-            side TEXT,
-            entry_timeframe TEXT,
-            htf_bias TEXT,
-            htf_range_high REAL,
-            htf_range_low REAL,
-            htf_premium_discount TEXT,
-            htf_liquidity_zones_json TEXT,
-            htf_structure_json TEXT,
-            liquidity_from_json TEXT,
-            liquidity_to_json TEXT,
-            has_clear_target BOOLEAN,
-            sweep_type TEXT,
-            swept_price REAL,
-            sweep_impulsive BOOLEAN,
-            sweep_strength REAL,
-            structure_shift_type TEXT,
-            structure_shift_confirmed BOOLEAN,
-            structure_description TEXT,
-            entry_type TEXT,
-            entry_price REAL,
-            entry_low REAL,
-            entry_high REAL,
-            entry_aligns_htf BOOLEAN,
-            entry_reaction_confirmed BOOLEAN,
-            sl_price REAL,
-            sl_invalidation_type TEXT,
-            risk_amount REAL,
-            sl_distance_pct REAL,
-            tp1_price REAL,
-            tp1_type TEXT,
-            tp2_price REAL,
-            tp2_type TEXT,
-            tp3_price REAL,
-            tp3_type TEXT,
-            prob_htf_alignment REAL,
-            prob_liquidity_quality REAL,
-            prob_sweep_strength REAL,
-            prob_structure_clarity REAL,
-            prob_entry_precision REAL,
-            prob_total_score REAL,
-            prob_acceptable BOOLEAN,
-            current_price REAL,
-            status TEXT DEFAULT 'DETECTED',
-            tp_hit INTEGER DEFAULT 0,
-            tp_hit_price REAL,
-            tp_hit_time TEXT,
-            sl_hit INTEGER DEFAULT 0,
-            sl_hit_price REAL,
-            sl_hit_time TEXT,
-            notes TEXT
-        )
-    """)
+    
+    # Check if table exists and has old schema
+    async with db_conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='signals'") as cursor:
+        table_exists = await cursor.fetchone()
+    
+    if table_exists:
+        # Check if we need to add new columns
+        async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
+            columns = await cursor.fetchall()
+            column_names = [col[1] for col in columns]
+            
+            # Add missing columns if they don't exist
+            if 'tp_hit' not in column_names:
+                await db_conn.execute("ALTER TABLE signals ADD COLUMN tp_hit INTEGER DEFAULT 0")
+                await db_conn.execute("ALTER TABLE signals ADD COLUMN tp_hit_price REAL")
+                await db_conn.execute("ALTER TABLE signals ADD COLUMN tp_hit_time TEXT")
+                await db_conn.execute("ALTER TABLE signals ADD COLUMN sl_hit INTEGER DEFAULT 0")
+                await db_conn.execute("ALTER TABLE signals ADD COLUMN sl_hit_price REAL")
+                await db_conn.execute("ALTER TABLE signals ADD COLUMN sl_hit_time TEXT")
+                log.info("Added TP/SL tracking columns to existing table")
+    else:
+        # Create new table with full schema
+        await db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
+                timestamp TEXT,
+                side TEXT,
+                entry_timeframe TEXT,
+                htf_bias TEXT,
+                htf_range_high REAL,
+                htf_range_low REAL,
+                htf_premium_discount TEXT,
+                htf_liquidity_zones_json TEXT,
+                htf_structure_json TEXT,
+                liquidity_from_json TEXT,
+                liquidity_to_json TEXT,
+                has_clear_target BOOLEAN,
+                sweep_type TEXT,
+                swept_price REAL,
+                sweep_impulsive BOOLEAN,
+                sweep_strength REAL,
+                structure_shift_type TEXT,
+                structure_shift_confirmed BOOLEAN,
+                structure_description TEXT,
+                entry_type TEXT,
+                entry_price REAL,
+                entry_low REAL,
+                entry_high REAL,
+                entry_aligns_htf BOOLEAN,
+                entry_reaction_confirmed BOOLEAN,
+                sl_price REAL,
+                sl_invalidation_type TEXT,
+                risk_amount REAL,
+                sl_distance_pct REAL,
+                tp1_price REAL,
+                tp1_type TEXT,
+                tp2_price REAL,
+                tp2_type TEXT,
+                tp3_price REAL,
+                tp3_type TEXT,
+                prob_htf_alignment REAL,
+                prob_liquidity_quality REAL,
+                prob_sweep_strength REAL,
+                prob_structure_clarity REAL,
+                prob_entry_precision REAL,
+                prob_total_score REAL,
+                prob_acceptable BOOLEAN,
+                current_price REAL,
+                status TEXT DEFAULT 'DETECTED',
+                tp_hit INTEGER DEFAULT 0,
+                tp_hit_price REAL,
+                tp_hit_time TEXT,
+                sl_hit INTEGER DEFAULT 0,
+                sl_hit_price REAL,
+                sl_hit_time TEXT,
+                notes TEXT
+            )
+        """)
+        log.info("Created new signals table with TP/SL tracking")
+    
     await db_conn.commit()
 
 # ---------------- OHLCV UTILS ----------------
@@ -1056,20 +1080,20 @@ async def monitor_tp_sl(exchange):
                             tp_hit_price = tp1_price
                     
                     # Check for SL hit
-                    sl_hit = 0
-                    sl_hit_price = 0.0
+                    sl_hit_flag = 0
+                    sl_hit_price_val = 0.0
                     
                     if side == "BUY":
                         if current_price <= sl_price:
-                            sl_hit = 1
-                            sl_hit_price = sl_price
+                            sl_hit_flag = 1
+                            sl_hit_price_val = sl_price
                     else:  # SELL
                         if current_price >= sl_price:
-                            sl_hit = 1
-                            sl_hit_price = sl_price
+                            sl_hit_flag = 1
+                            sl_hit_price_val = sl_price
                     
                     # Update database if TP or SL hit
-                    if tp_hit_level > 0 or sl_hit > 0:
+                    if tp_hit_level > 0 or sl_hit_flag > 0:
                         async with db_lock:
                             if tp_hit_level > 0:
                                 await db_conn.execute(
@@ -1100,7 +1124,7 @@ async def monitor_tp_sl(exchange):
                                 await send_telegram(tp_msg)
                                 log.info(f"TP{ tp_hit_level } hit for {symbol} at {tp_hit_price:.8f}")
                             
-                            elif sl_hit > 0:
+                            elif sl_hit_flag > 0:
                                 await db_conn.execute(
                                     """UPDATE signals 
                                        SET sl_hit = ?, 
@@ -1108,14 +1132,14 @@ async def monitor_tp_sl(exchange):
                                            sl_hit_time = ?,
                                            status = 'SL_HIT'
                                        WHERE id = ?""",
-                                    (sl_hit, sl_hit_price, now, signal_id)
+                                    (sl_hit_flag, sl_hit_price_val, now, signal_id)
                                 )
                                 
                                 # Send Telegram notification for SL hit
                                 sl_msg = f"""
 🛑 <b>STOP LOSS HIT - {symbol}</b>
 
-<b>SL Price:</b> {sl_hit_price:.8f}
+<b>SL Price:</b> {sl_hit_price_val:.8f}
 <b>Entry Price:</b> {entry_price:.8f}
 <b>Current Price:</b> {current_price:.8f}
 <b>Side:</b> {side}
@@ -1126,7 +1150,7 @@ async def monitor_tp_sl(exchange):
 <i>Time: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}</i>
 """
                                 await send_telegram(sl_msg)
-                                log.info(f"SL hit for {symbol} at {sl_hit_price:.8f}")
+                                log.info(f"SL hit for {symbol} at {sl_hit_price_val:.8f}")
                             
                             await db_conn.commit()
                 
