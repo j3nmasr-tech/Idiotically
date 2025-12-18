@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ROMEOTPT SCANNER v2.1 - EXACT FIXES FOR REMAINING PROBLEMS
-Implementing EXACTLY the 5 critical fixes specified.
+ROMEOTPT SCANNER v2.1 - WITH TP/SL UPDATES
+Implementing EXACTLY the 5 critical fixes specified + TP/SL tracking
 """
 
 import os
@@ -191,6 +191,12 @@ async def init_db():
             prob_acceptable BOOLEAN,
             current_price REAL,
             status TEXT DEFAULT 'DETECTED',
+            tp_hit INTEGER DEFAULT 0,
+            tp_hit_price REAL,
+            tp_hit_time TEXT,
+            sl_hit INTEGER DEFAULT 0,
+            sl_hit_price REAL,
+            sl_hit_time TEXT,
             notes TEXT
         )
     """)
@@ -234,9 +240,6 @@ def safe_json_serialize(obj):
 
 # ---------------- STEP 1: HTF BIAS ----------------
 async def analyze_htf_bias(exchange, symbol: str, entry_timeframe: str) -> HTFContext:
-    """
-    EXACT: Uses bias TF from TF_LADDER exactly as specified
-    """
     if entry_timeframe not in TF_LADDER:
         return HTFContext(
             bias="UNKNOWN", range_high=0, range_low=0, range_mid=0,
@@ -377,9 +380,6 @@ async def analyze_htf_bias(exchange, symbol: str, entry_timeframe: str) -> HTFCo
 # ---------------- STEP 2: LIQUIDITY MAP ----------------
 async def map_liquidity(exchange, symbol: str, htf_context: HTFContext, 
                        current_price: float, entry_timeframe: str) -> LiquidityMap:
-    """
-    EXACT FIX 1: Liquidity "FROM" requires meaningful liquidity (not random micro highs/lows)
-    """
     if entry_timeframe not in TF_LADDER:
         return LiquidityMap(from_liquidity=[], to_liquidity=[], has_clear_target=False)
     
@@ -616,9 +616,6 @@ async def analyze_sweep(exchange, symbol: str, htf_context: HTFContext, entry_ti
 # ---------------- STEP 4: STRUCTURE CHECK ----------------
 async def check_structure_shift(exchange, symbol: str, sweep: SweepAnalysis, 
                                htf_context: HTFContext, entry_timeframe: str) -> StructureShift:
-    """
-    EXACT FIX 2: TF-aware structure lookback (NOT too short for 30m)
-    """
     if sweep.type == "NONE" or entry_timeframe not in TF_LADDER:
         return StructureShift(type="NONE", confirmed=False, candle_index=-1)
     
@@ -713,9 +710,6 @@ async def check_structure_shift(exchange, symbol: str, sweep: SweepAnalysis,
 async def find_entry_zone(exchange, symbol: str, htf_context: HTFContext,
                          sweep: SweepAnalysis, structure_shift: StructureShift,
                          side: str, entry_timeframe: str) -> EntryZone:
-    """
-    EXACT FIX 3: Entry OB detection is time-reversed (scan from structure, not entire history)
-    """
     if entry_timeframe not in TF_LADDER:
         return EntryZone(type="NONE", price=0, low=0, high=0, aligns_with_htf=False)
     
@@ -1003,6 +997,148 @@ def calculate_probability(htf_context: HTFContext, liquidity_map: LiquidityMap,
         total_score=float(total_score)
     )
 
+# ---------------- NEW: TP/SL MONITORING ----------------
+async def monitor_tp_sl(exchange):
+    """
+    Monitor existing signals for TP/SL hits
+    """
+    while True:
+        try:
+            async with db_lock:
+                # Get all active signals (status = 'DETECTED' and no TP/SL hit yet)
+                async with db_conn.execute(
+                    """SELECT id, symbol, side, entry_price, sl_price, 
+                              tp1_price, tp2_price, tp3_price, status,
+                              tp_hit, sl_hit 
+                       FROM signals 
+                       WHERE status = 'DETECTED' 
+                       AND tp_hit = 0 
+                       AND sl_hit = 0
+                       ORDER BY timestamp DESC LIMIT 50"""
+                ) as cursor:
+                    active_signals = await cursor.fetchall()
+            
+            for signal in active_signals:
+                signal_id, symbol, side, entry_price, sl_price, tp1_price, tp2_price, tp3_price, status, tp_hit, sl_hit = signal
+                
+                # Get current price
+                try:
+                    ticker = await exchange.fetch_ticker(symbol)
+                    current_price = ticker.get("last", 0)
+                    if not current_price:
+                        continue
+                    
+                    now = datetime.datetime.utcnow().isoformat()
+                    
+                    # Check for TP hits
+                    tp_hit_level = 0
+                    tp_hit_price = 0.0
+                    
+                    if side == "BUY":
+                        if current_price >= tp3_price:
+                            tp_hit_level = 3
+                            tp_hit_price = tp3_price
+                        elif current_price >= tp2_price:
+                            tp_hit_level = 2
+                            tp_hit_price = tp2_price
+                        elif current_price >= tp1_price:
+                            tp_hit_level = 1
+                            tp_hit_price = tp1_price
+                    else:  # SELL
+                        if current_price <= tp3_price:
+                            tp_hit_level = 3
+                            tp_hit_price = tp3_price
+                        elif current_price <= tp2_price:
+                            tp_hit_level = 2
+                            tp_hit_price = tp2_price
+                        elif current_price <= tp1_price:
+                            tp_hit_level = 1
+                            tp_hit_price = tp1_price
+                    
+                    # Check for SL hit
+                    sl_hit = 0
+                    sl_hit_price = 0.0
+                    
+                    if side == "BUY":
+                        if current_price <= sl_price:
+                            sl_hit = 1
+                            sl_hit_price = sl_price
+                    else:  # SELL
+                        if current_price >= sl_price:
+                            sl_hit = 1
+                            sl_hit_price = sl_price
+                    
+                    # Update database if TP or SL hit
+                    if tp_hit_level > 0 or sl_hit > 0:
+                        async with db_lock:
+                            if tp_hit_level > 0:
+                                await db_conn.execute(
+                                    """UPDATE signals 
+                                       SET tp_hit = ?, 
+                                           tp_hit_price = ?,
+                                           tp_hit_time = ?,
+                                           status = 'TP_HIT'
+                                       WHERE id = ?""",
+                                    (tp_hit_level, tp_hit_price, now, signal_id)
+                                )
+                                
+                                # Send Telegram notification for TP hit
+                                tp_msg = f"""
+🎯 <b>TAKE PROFIT HIT - {symbol}</b>
+
+<b>TP Level:</b> {tp_hit_level}
+<b>TP Price:</b> {tp_hit_price:.8f}
+<b>Entry Price:</b> {entry_price:.8f}
+<b>Current Price:</b> {current_price:.8f}
+<b>Side:</b> {side}
+
+<b>Profit:</b> {abs(current_price - entry_price):.8f}
+<b>Profit %:</b> {abs((current_price - entry_price) / entry_price * 100):.2f}%
+
+<i>Time: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}</i>
+"""
+                                await send_telegram(tp_msg)
+                                log.info(f"TP{ tp_hit_level } hit for {symbol} at {tp_hit_price:.8f}")
+                            
+                            elif sl_hit > 0:
+                                await db_conn.execute(
+                                    """UPDATE signals 
+                                       SET sl_hit = ?, 
+                                           sl_hit_price = ?,
+                                           sl_hit_time = ?,
+                                           status = 'SL_HIT'
+                                       WHERE id = ?""",
+                                    (sl_hit, sl_hit_price, now, signal_id)
+                                )
+                                
+                                # Send Telegram notification for SL hit
+                                sl_msg = f"""
+🛑 <b>STOP LOSS HIT - {symbol}</b>
+
+<b>SL Price:</b> {sl_hit_price:.8f}
+<b>Entry Price:</b> {entry_price:.8f}
+<b>Current Price:</b> {current_price:.8f}
+<b>Side:</b> {side}
+
+<b>Loss:</b> {abs(current_price - entry_price):.8f}
+<b>Loss %:</b> {abs((current_price - entry_price) / entry_price * 100):.2f}%
+
+<i>Time: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}</i>
+"""
+                                await send_telegram(sl_msg)
+                                log.info(f"SL hit for {symbol} at {sl_hit_price:.8f}")
+                            
+                            await db_conn.commit()
+                
+                except Exception as e:
+                    log.error(f"Error monitoring {symbol}: {e}")
+                    continue
+        
+        except Exception as e:
+            log.error(f"Error in TP/SL monitor: {e}")
+        
+        await asyncio.sleep(30)  # Check every 30 seconds
+
 # ---------------- MAIN SCANNING LOGIC ----------------
 async def scan_symbol(exchange, symbol: str, entry_timeframe: str = "15m") -> Optional[Dict]:
     if entry_timeframe not in TF_LADDER:
@@ -1205,7 +1341,7 @@ Entry Precision: {setup['probability']['entry_precision']:.2f}
                 :tp1_price, :tp1_type, :tp2_price, :tp2_type, :tp3_price, :tp3_type,
                 :prob_htf_alignment, :prob_liquidity_quality, :prob_sweep_strength,
                 :prob_structure_clarity, :prob_entry_precision, :prob_total_score, :prob_acceptable,
-                :current_price, 'DETECTED', ''
+                :current_price, 'DETECTED', 0, NULL, NULL, 0, NULL, NULL, ''
             )
         """, {
             "symbol": setup["symbol"],
@@ -1260,17 +1396,23 @@ app = FastAPI()
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "scanner": "ROMEOTPT v2.1 Fixed"}
+    return {"status": "healthy", "scanner": "ROMEOTPT v2.1 Fixed with TP/SL tracking"}
 
 @app.get("/setups")
-async def get_setups(limit: int = 20, min_score: float = 3.3):
+async def get_setups(limit: int = 20, min_score: float = 3.3, status: str = None):
     async with db_lock:
-        async with db_conn.execute(
-            """SELECT * FROM signals 
-               WHERE prob_total_score >= ? 
-               ORDER BY timestamp DESC LIMIT ?""",
-            (min_score, limit)
-        ) as cursor:
+        query = """SELECT * FROM signals 
+                   WHERE prob_total_score >= ? """
+        params = [min_score]
+        
+        if status:
+            query += " AND status = ? "
+            params.append(status)
+        
+        query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
+        
+        async with db_conn.execute(query, params) as cursor:
             columns = [description[0] for description in cursor.description]
             rows = await cursor.fetchall()
         
@@ -1290,6 +1432,40 @@ async def get_setups(limit: int = 20, min_score: float = 3.3):
         
         return {"setups": setups, "count": len(setups)}
 
+@app.get("/stats")
+async def get_stats():
+    async with db_lock:
+        # Get total signals
+        async with db_conn.execute("SELECT COUNT(*) FROM signals") as cursor:
+            total = (await cursor.fetchone())[0]
+        
+        # Get TP hits
+        async with db_conn.execute("SELECT COUNT(*) FROM signals WHERE tp_hit > 0") as cursor:
+            tp_hits = (await cursor.fetchone())[0]
+        
+        # Get SL hits
+        async with db_conn.execute("SELECT COUNT(*) FROM signals WHERE sl_hit > 0") as cursor:
+            sl_hits = (await cursor.fetchone())[0]
+        
+        # Get active signals
+        async with db_conn.execute("SELECT COUNT(*) FROM signals WHERE status = 'DETECTED'") as cursor:
+            active = (await cursor.fetchone())[0]
+        
+        # Get win rate
+        if total > 0:
+            win_rate = (tp_hits / (tp_hits + sl_hits)) * 100 if (tp_hits + sl_hits) > 0 else 0
+        else:
+            win_rate = 0
+        
+        return {
+            "total_signals": total,
+            "tp_hits": tp_hits,
+            "sl_hits": sl_hits,
+            "active_signals": active,
+            "win_rate": f"{win_rate:.2f}%",
+            "scanner_status": "running"
+        }
+
 # ---------------- MAIN ----------------
 async def main():
     global db_conn
@@ -1300,6 +1476,11 @@ async def main():
         "options": {"defaultType": "spot"}
     })
     
+    # Start TP/SL monitoring task
+    monitor_task = asyncio.create_task(monitor_tp_sl(exchange))
+    log.info("Started TP/SL monitoring task")
+    
+    # Start scanners for all timeframes
     tasks = []
     for timeframe in ["1m", "3m", "5m", "15m", "30m"]:
         task = asyncio.create_task(scanner_main(exchange, entry_timeframe=timeframe))
@@ -1307,7 +1488,8 @@ async def main():
         log.info(f"Started scanner for timeframe: {timeframe}")
         await asyncio.sleep(1)
     
-    await asyncio.gather(*tasks)
+    # Wait for all tasks
+    await asyncio.gather(monitor_task, *tasks)
 
 if __name__ == "__main__":
     import argparse
