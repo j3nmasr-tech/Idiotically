@@ -37,7 +37,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_PATH = "/app/data/romeopt_v2.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))  # Longer interval for HTF focus
-TOP_N = int(os.getenv("TOP_N", 60))
+TOP_N = int(os.getenv("TOP_N", 30))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 5))
 
 # ---------------- LOGGING ----------------
