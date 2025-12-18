@@ -37,7 +37,7 @@ log = logging.getLogger("romeopt_v2")
 db_lock = asyncio.Lock()
 db_conn = None
 
-# ---------------- TIME FRAME LADDER ----------------
+# ---------------- DYNAMIC TF LADDER ----------------
 TF_LADDER = {
     "1m":  {"structure": "1m",  "sweep": "3m",  "liquidity": "15m", "bias": "1h"},
     "3m":  {"structure": "3m",  "sweep": "5m",  "liquidity": "15m", "bias": "1h"},
@@ -150,6 +150,7 @@ async def init_db():
             symbol TEXT,
             timestamp TEXT,
             side TEXT,
+            entry_timeframe TEXT,
             htf_bias TEXT,
             htf_range_high REAL,
             htf_range_low REAL,
@@ -235,9 +236,8 @@ def safe_json_serialize(obj):
 # ---------------- STEP 1: HTF BIAS ----------------
 async def analyze_htf_bias(exchange, symbol: str, entry_timeframe: str) -> HTFContext:
     """
-    FIXED: Uses appropriate HTF based on TF_LADDER
+    DYNAMIC: Uses appropriate HTF based on entry timeframe from TF_LADDER
     """
-    # Get bias timeframe from ladder
     if entry_timeframe not in TF_LADDER:
         return HTFContext(
             bias="UNKNOWN", range_high=0, range_low=0, range_mid=0,
@@ -379,10 +379,8 @@ async def analyze_htf_bias(exchange, symbol: str, entry_timeframe: str) -> HTFCo
 async def map_liquidity(exchange, symbol: str, htf_context: HTFContext, 
                        current_price: float, entry_timeframe: str) -> LiquidityMap:
     """
-    FIXED: Uses appropriate liquidity TF from TF_LADDER
-    LTF-heavy: 1m→15m, 3m→15m, 5m→30m, 15m→1h, 30m→4h
+    DYNAMIC: Uses appropriate liquidity TF from TF_LADDER
     """
-    # Get liquidity TF from ladder
     if entry_timeframe not in TF_LADDER:
         return LiquidityMap(from_liquidity=[], to_liquidity=[], has_clear_target=False)
     
@@ -419,7 +417,7 @@ async def map_liquidity(exchange, symbol: str, htf_context: HTFContext,
     
     to_liquidity = []
     
-    # LTF equal highs/lows (nearest magnets)
+    # LTF equal highs/lows (nearest magnets) - NOW DYNAMIC BASED ON ENTRY TF
     if len(df) >= 24:
         high_values = df["high"].iloc[-24:].values
         for val in np.unique(np.round(high_values, 4)):
@@ -470,7 +468,7 @@ async def map_liquidity(exchange, symbol: str, htf_context: HTFContext,
 # ---------------- STEP 3: LIQUIDITY SWEEP ----------------
 async def analyze_sweep(exchange, symbol: str, htf_context: HTFContext, entry_timeframe: str) -> SweepAnalysis:
     """
-    FIX 1: Less strict sweep detection
+    FIX 1: Less strict sweep detection + DYNAMIC TF
     Accepts partial body sweeps OR follow-through confirmation
     Uses sweep TF from TF_LADDER
     """
@@ -530,7 +528,7 @@ async def analyze_sweep(exchange, symbol: str, htf_context: HTFContext, entry_ti
                     strength = min(1.0, strength + 0.2)
             
             return SweepAnalysis(
-                type="HIGH_SWEEP",
+                type="HIGH_SWEep",
                 candle_index=int(candle_idx),
                 swept_price=float(candle["high"]),
                 previous_extreme=float(previous_high),
@@ -582,7 +580,7 @@ async def analyze_sweep(exchange, symbol: str, htf_context: HTFContext, entry_ti
 async def check_structure_shift(exchange, symbol: str, sweep: SweepAnalysis, 
                                htf_context: HTFContext, entry_timeframe: str) -> StructureShift:
     """
-    FIX 2: Immediate structure detection
+    FIX 2: Immediate structure detection + DYNAMIC TF
     Allows CHoCH/BOS on same candle or within 2 candles
     Uses structure TF from TF_LADDER
     """
@@ -681,6 +679,9 @@ async def check_structure_shift(exchange, symbol: str, sweep: SweepAnalysis,
 async def find_entry_zone(exchange, symbol: str, htf_context: HTFContext,
                          sweep: SweepAnalysis, structure_shift: StructureShift,
                          side: str, entry_timeframe: str) -> EntryZone:
+    """
+    DYNAMIC: Uses entry timeframe (not hardcoded 5m)
+    """
     if entry_timeframe not in TF_LADDER:
         return EntryZone(type="NONE", price=0, low=0, high=0, aligns_with_htf=False)
     
@@ -947,7 +948,7 @@ def calculate_probability(htf_context: HTFContext, liquidity_map: LiquidityMap,
 # ---------------- MAIN SCANNING LOGIC ----------------
 async def scan_symbol(exchange, symbol: str, entry_timeframe: str = "15m") -> Optional[Dict]:
     """
-    TF-AGNOSTIC scanner - works on ANY timeframe using TF_LADDER
+    TF-AGNOSTIC scanner - uses TF_LADDER for dynamic timeframe scaling
     """
     
     if entry_timeframe not in TF_LADDER:
@@ -961,24 +962,24 @@ async def scan_symbol(exchange, symbol: str, entry_timeframe: str = "15m") -> Op
     
     log.debug(f"🔍 Scanning {symbol} on {entry_timeframe} at {current_price}")
     
-    # Step 1: HTF Bias (uses bias TF from ladder)
+    # Step 1: HTF Bias (dynamic from TF_LADDER)
     htf_context = await analyze_htf_bias(exchange, symbol, entry_timeframe)
     if not htf_context.valid:
         return None
     
-    # Step 2: Liquidity Map (uses liquidity TF from ladder)
+    # Step 2: Liquidity Map (dynamic from TF_LADDER)
     liquidity_map = await map_liquidity(exchange, symbol, htf_context, current_price, entry_timeframe)
     if not liquidity_map.has_clear_target:
         return None
     
-    # Step 3: Sweep (uses sweep TF from ladder)
+    # Step 3: Sweep (dynamic from TF_LADDER)
     sweep = await analyze_sweep(exchange, symbol, htf_context, entry_timeframe)
     if sweep.type == "NONE":
         return None
     
     side = "SELL" if sweep.type == "HIGH_SWEEP" else "BUY"
     
-    # Step 4: Structure (uses structure TF from ladder)
+    # Step 4: Structure (dynamic from TF_LADDER)
     structure_shift = await check_structure_shift(exchange, symbol, sweep, htf_context, entry_timeframe)
     if not structure_shift.confirmed:
         return None
@@ -1067,7 +1068,6 @@ async def scan_symbol(exchange, symbol: str, entry_timeframe: str = "15m") -> Op
 async def scanner_main(exchange, entry_timeframe: str = "15m"):
     """
     Main scanner - works on specified timeframe using TF_LADDER
-    Can be called with any timeframe: "1m", "3m", "5m", "15m", "30m"
     """
     
     await send_telegram(f"🚀 ROMEOTPT Scanner Started ({entry_timeframe})")
@@ -1157,7 +1157,7 @@ Entry Precision: {setup['probability']['entry_precision']:.2f}
     async with db_lock:
         await db_conn.execute("""
             INSERT INTO signals VALUES (
-                NULL, :symbol, :timestamp, :side,
+                NULL, :symbol, :timestamp, :side, :entry_timeframe,
                 :htf_bias, :htf_range_high, :htf_range_low, :htf_premium_discount,
                 :htf_liquidity_zones, :htf_structure,
                 :liquidity_from, :liquidity_to, :has_clear_target,
@@ -1174,6 +1174,7 @@ Entry Precision: {setup['probability']['entry_precision']:.2f}
             "symbol": setup["symbol"],
             "timestamp": setup["timestamp"],
             "side": setup["side"],
+            "entry_timeframe": setup["timeframe"],
             "htf_bias": setup["htf_bias"],
             "htf_range_high": float(setup["htf_range_high"]),
             "htf_range_low": float(setup["htf_range_low"]),
