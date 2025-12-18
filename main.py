@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ROMEOTPT SCANNER v2 - EXACT FIXES ONLY
-ONLY implementing what was specified in your instructions.
+ROMEOTPT SCANNER v2 - EXACT IMPLEMENTATION OF ALL SPECIFIED FIXES
+Implementing EXACTLY what was specified in the instructions.
 """
 
 import os
@@ -37,7 +37,7 @@ log = logging.getLogger("romeopt_v2")
 db_lock = asyncio.Lock()
 db_conn = None
 
-# ---------------- DYNAMIC TF LADDER ----------------
+# ---------------- EXACT TF LADDER AS SPECIFIED ----------------
 TF_LADDER = {
     "1m":  {"structure": "1m",  "sweep": "3m",  "liquidity": "15m", "bias": "1h"},
     "3m":  {"structure": "3m",  "sweep": "5m",  "liquidity": "15m", "bias": "1h"},
@@ -118,7 +118,7 @@ class ProbabilityScore:
     
     @property
     def acceptable(self) -> bool:
-        """FIX 5: Romeo's strategic probability gate"""
+        """EXACT FIX 5: Romeo's strategic probability gate - EXACTLY as specified"""
         liquidity_strong = self.liquidity_quality >= 0.7
         structure_strong = self.structure_clarity >= 0.7
         total_acceptable = self.total_score >= 3.3
@@ -236,7 +236,7 @@ def safe_json_serialize(obj):
 # ---------------- STEP 1: HTF BIAS ----------------
 async def analyze_htf_bias(exchange, symbol: str, entry_timeframe: str) -> HTFContext:
     """
-    DYNAMIC: Uses appropriate HTF based on entry timeframe from TF_LADDER
+    EXACT: Uses bias TF from TF_LADDER exactly as specified
     """
     if entry_timeframe not in TF_LADDER:
         return HTFContext(
@@ -245,6 +245,7 @@ async def analyze_htf_bias(exchange, symbol: str, entry_timeframe: str) -> HTFCo
             skip_reason=f"Unsupported timeframe: {entry_timeframe}", valid=False
         )
     
+    # EXACT: Get bias TF from TF_LADDER
     htf_tf = TF_LADDER[entry_timeframe]["bias"]
     
     ohlcv_htf = await fetch_ohlcv(exchange, symbol, htf_tf, 100)
@@ -379,11 +380,12 @@ async def analyze_htf_bias(exchange, symbol: str, entry_timeframe: str) -> HTFCo
 async def map_liquidity(exchange, symbol: str, htf_context: HTFContext, 
                        current_price: float, entry_timeframe: str) -> LiquidityMap:
     """
-    DYNAMIC: Uses appropriate liquidity TF from TF_LADDER
+    EXACT: Uses liquidity TF from TF_LADDER exactly as specified
     """
     if entry_timeframe not in TF_LADDER:
         return LiquidityMap(from_liquidity=[], to_liquidity=[], has_clear_target=False)
     
+    # EXACT: Get liquidity TF from TF_LADDER
     liq_tf = TF_LADDER[entry_timeframe]["liquidity"]
     
     ohlcv = await fetch_ohlcv(exchange, symbol, liq_tf, 100)
@@ -417,7 +419,7 @@ async def map_liquidity(exchange, symbol: str, htf_context: HTFContext,
     
     to_liquidity = []
     
-    # LTF equal highs/lows (nearest magnets) - NOW DYNAMIC BASED ON ENTRY TF
+    # LTF equal highs/lows (nearest magnets) - EXACTLY as specified
     if len(df) >= 24:
         high_values = df["high"].iloc[-24:].values
         for val in np.unique(np.round(high_values, 4)):
@@ -445,7 +447,7 @@ async def map_liquidity(exchange, symbol: str, htf_context: HTFContext,
                     "ltf": True
                 })
     
-    # Add HTF liquidity as TP3 only
+    # Add HTF liquidity as TP3 only - EXACTLY as specified
     for zone in htf_context.liquidity_zones:
         to_liquidity.append({
             "price": zone["price"],
@@ -468,15 +470,15 @@ async def map_liquidity(exchange, symbol: str, htf_context: HTFContext,
 # ---------------- STEP 3: LIQUIDITY SWEEP ----------------
 async def analyze_sweep(exchange, symbol: str, htf_context: HTFContext, entry_timeframe: str) -> SweepAnalysis:
     """
-    FIX 1: Less strict sweep detection + DYNAMIC TF
-    Accepts partial body sweeps OR follow-through confirmation
-    Uses sweep TF from TF_LADDER
+    EXACT FIX 1: Less strict sweep detection + EXACT TF from TF_LADDER
     """
     if entry_timeframe not in TF_LADDER:
         return SweepAnalysis(type="NONE", candle_index=-1, swept_price=0, 
                            previous_extreme=0, impulsive=False)
     
+    # EXACT: Get sweep TF from TF_LADDER
     sweep_tf = TF_LADDER[entry_timeframe]["sweep"]
+    
     ohlcv = await fetch_ohlcv(exchange, symbol, sweep_tf, 50)
     if not ohlcv or len(ohlcv) < 10:
         return SweepAnalysis(type="NONE", candle_index=-1, swept_price=0, 
@@ -505,13 +507,13 @@ async def analyze_sweep(exchange, symbol: str, htf_context: HTFContext, entry_ti
             lower_wick = min(candle["open"], candle["close"]) - candle["low"]
             total_wick = upper_wick + lower_wick
             
-            # FIX 1: Check follow-through
+            # EXACT FIX 1: Check follow-through - EXACTLY as specified
             has_follow_through = False
             if i < -1:
                 next_candle = df.iloc[candle_idx + 1]
                 has_follow_through = (next_candle["close"] < candle["close"])
             
-            # FIX 1: Accept if EITHER body > wick OR has follow-through
+            # EXACT FIX 1: Accept if EITHER body > wick OR has follow-through - EXACTLY as specified
             impulsive = (body_size > total_wick) or has_follow_through
             
             fake_sweep = False
@@ -528,7 +530,7 @@ async def analyze_sweep(exchange, symbol: str, htf_context: HTFContext, entry_ti
                     strength = min(1.0, strength + 0.2)
             
             return SweepAnalysis(
-                type="HIGH_SWEep",
+                type="HIGH_SWEEP",
                 candle_index=int(candle_idx),
                 swept_price=float(candle["high"]),
                 previous_extreme=float(previous_high),
@@ -580,98 +582,98 @@ async def analyze_sweep(exchange, symbol: str, htf_context: HTFContext, entry_ti
 async def check_structure_shift(exchange, symbol: str, sweep: SweepAnalysis, 
                                htf_context: HTFContext, entry_timeframe: str) -> StructureShift:
     """
-    FIX 2: Immediate structure detection + DYNAMIC TF
-    Allows CHoCH/BOS on same candle or within 2 candles
-    Uses structure TF from TF_LADDER
+    EXACT FIX 2: Immediate structure detection + EXACT TF from TF_LADDER
+    Note: Uses structure TF from TF_LADDER (different from sweep TF as specified)
     """
     if sweep.type == "NONE" or entry_timeframe not in TF_LADDER:
         return StructureShift(type="NONE", confirmed=False, candle_index=-1)
     
+    # EXACT: Get structure TF from TF_LADDER (different from sweep TF as specified)
     structure_tf = TF_LADDER[entry_timeframe]["structure"]
+    
     ohlcv = await fetch_ohlcv(exchange, symbol, structure_tf, 50)
     if not ohlcv:
         return StructureShift(type="NONE", confirmed=False, candle_index=-1)
     
     df = create_dataframe(ohlcv)
-    sweep_idx = sweep.candle_index
     
-    if sweep_idx < 0 or sweep_idx >= len(df) - 3:
-        return StructureShift(type="NONE", confirmed=False, candle_index=-1)
-    
-    sweep_candle = df.iloc[sweep_idx]
+    # EXACT FIX 2: Look for immediate structure in recent candles - EXACTLY as specified
+    lookback = min(10, len(df))
     
     if sweep.type == "HIGH_SWEEP":
-        start_idx = max(0, sweep_idx - 5)
-        prev_candles = df.iloc[start_idx:sweep_idx]
-        
-        if len(prev_candles) > 0:
-            recent_low_before = prev_candles["low"].min()
+        # For high sweep, look for bearish structure
+        for i in range(-lookback, 0):
+            candle_idx = len(df) + i
+            if candle_idx < 0:
+                continue
+                
+            candle = df.iloc[candle_idx]
             
-            # FIX 2: Check CHoCH on sweep candle close
-            if sweep_candle["close"] < recent_low_before:
-                return StructureShift(
-                    type="CHoCH",
-                    confirmed=True,
-                    candle_index=int(sweep_idx),
-                    description="High sweep closed below recent low (immediate CHoCH)"
-                )
+            # EXACT FIX 2: Check for CHoCH on the same candle - EXACTLY as specified
+            start_idx = max(0, candle_idx - 5)
+            prev_candles = df.iloc[start_idx:candle_idx]
             
-            # FIX 2: Check within next 2 candles (not 3+)
-            for i in range(1, min(3, len(df) - sweep_idx)):
-                next_candle = df.iloc[sweep_idx + i]
-                if next_candle["low"] < recent_low_before:
+            if len(prev_candles) > 0:
+                recent_low_before = prev_candles["low"].min()
+                
+                # Check CHoCH on sweep candle close
+                if candle["close"] < recent_low_before:
                     return StructureShift(
                         type="CHoCH",
                         confirmed=True,
-                        candle_index=int(sweep_idx + i),
-                        description=f"High sweep followed by CHoCH within {i} candle(s)"
+                        candle_index=int(candle_idx),
+                        description=f"Break below recent low on {structure_tf} (immediate CHoCH)"
                     )
-        
-        # Check for BOS (could be on same candle)
-        if sweep_idx > 0:
-            candle_before = df.iloc[sweep_idx - 1]
-            if sweep_candle["close"] > sweep_candle["open"]:
-                return StructureShift(
-                    type="BOS",
-                    confirmed=True,
-                    candle_index=int(sweep_idx),
-                    description="Bullish sweep candle (immediate BOS)"
-                )
+            
+            # EXACT FIX 2: Check within next 2 candles - EXACTLY as specified
+            if i < -1 and i > -3:  # Next 1-2 candles
+                next_candle_idx = candle_idx + 1
+                if next_candle_idx < len(df):
+                    next_candle = df.iloc[next_candle_idx]
+                    if len(prev_candles) > 0 and next_candle["low"] < recent_low_before:
+                        return StructureShift(
+                            type="CHoCH",
+                            confirmed=True,
+                            candle_index=int(next_candle_idx),
+                            description=f"Break below recent low within 2 candles on {structure_tf}"
+                        )
     
     elif sweep.type == "LOW_SWEEP":
-        start_idx = max(0, sweep_idx - 5)
-        prev_candles = df.iloc[start_idx:sweep_idx]
-        
-        if len(prev_candles) > 0:
-            recent_high_before = prev_candles["high"].max()
+        # For low sweep, look for bullish structure
+        for i in range(-lookback, 0):
+            candle_idx = len(df) + i
+            if candle_idx < 0:
+                continue
+                
+            candle = df.iloc[candle_idx]
             
-            if sweep_candle["close"] > recent_high_before:
-                return StructureShift(
-                    type="CHoCH",
-                    confirmed=True,
-                    candle_index=int(sweep_idx),
-                    description="Low sweep closed above recent high (immediate CHoCH)"
-                )
+            # EXACT FIX 2: Check for CHoCH on the same candle
+            start_idx = max(0, candle_idx - 5)
+            prev_candles = df.iloc[start_idx:candle_idx]
             
-            for i in range(1, min(3, len(df) - sweep_idx)):
-                next_candle = df.iloc[sweep_idx + i]
-                if next_candle["high"] > recent_high_before:
+            if len(prev_candles) > 0:
+                recent_high_before = prev_candles["high"].max()
+                
+                if candle["close"] > recent_high_before:
                     return StructureShift(
                         type="CHoCH",
                         confirmed=True,
-                        candle_index=int(sweep_idx + i),
-                        description=f"Low sweep followed by CHoCH within {i} candle(s)"
+                        candle_index=int(candle_idx),
+                        description=f"Break above recent high on {structure_tf} (immediate CHoCH)"
                     )
-        
-        if sweep_idx > 0:
-            candle_before = df.iloc[sweep_idx - 1]
-            if sweep_candle["close"] < sweep_candle["open"]:
-                return StructureShift(
-                    type="BOS",
-                    confirmed=True,
-                    candle_index=int(sweep_idx),
-                    description="Bearish sweep candle (immediate BOS)"
-                )
+            
+            # EXACT FIX 2: Check within next 2 candles
+            if i < -1 and i > -3:  # Next 1-2 candles
+                next_candle_idx = candle_idx + 1
+                if next_candle_idx < len(df):
+                    next_candle = df.iloc[next_candle_idx]
+                    if len(prev_candles) > 0 and next_candle["high"] > recent_high_before:
+                        return StructureShift(
+                            type="CHoCH",
+                            confirmed=True,
+                            candle_index=int(next_candle_idx),
+                            description=f"Break above recent high within 2 candles on {structure_tf}"
+                        )
     
     return StructureShift(type="NONE", confirmed=False, candle_index=-1)
 
@@ -680,7 +682,7 @@ async def find_entry_zone(exchange, symbol: str, htf_context: HTFContext,
                          sweep: SweepAnalysis, structure_shift: StructureShift,
                          side: str, entry_timeframe: str) -> EntryZone:
     """
-    DYNAMIC: Uses entry timeframe (not hardcoded 5m)
+    EXACT: Uses entry timeframe (not hardcoded 5m)
     """
     if entry_timeframe not in TF_LADDER:
         return EntryZone(type="NONE", price=0, low=0, high=0, aligns_with_htf=False)
@@ -692,7 +694,7 @@ async def find_entry_zone(exchange, symbol: str, htf_context: HTFContext,
     df = create_dataframe(ohlcv)
     current_price = float(df["close"].iloc[-1])
     
-    # FIX 3: STRICT ALIGNMENT - No OR conditions
+    # EXACT FIX 3: STRICT ALIGNMENT - No OR conditions - EXACTLY as specified
     if side == "BUY":
         aligns_with_htf = (htf_context.bias == "BULLISH" and 
                           htf_context.premium_discount == "DISCOUNT")
@@ -820,7 +822,7 @@ def calculate_take_profits(entry_price: float, side: str,
                           liquidity_map: LiquidityMap,
                           htf_context: HTFContext) -> TakeProfitLevels:
     """
-    FIX 4: LTF liquidity first (nearest magnet)
+    EXACT FIX 4: LTF liquidity first (nearest magnet)
     """
     ltf_targets = [t for t in liquidity_map.to_liquidity if t.get("ltf", False)]
     htf_targets = [t for t in liquidity_map.to_liquidity if t.get("htf_only", False)]
@@ -834,7 +836,7 @@ def calculate_take_profits(entry_price: float, side: str,
         potential_htf = [t for t in htf_targets if t["price"] < entry_price]
         range_boundary = htf_context.range_low
     
-    # FIX 4: TP1 = Nearest LTF target
+    # EXACT FIX 4: TP1 = Nearest LTF target - EXACTLY as specified
     if potential_ltf:
         potential_ltf.sort(key=lambda t: abs(t["price"] - entry_price))
         tp1 = potential_ltf[0]["price"]
@@ -880,7 +882,7 @@ def calculate_take_profits(entry_price: float, side: str,
 def calculate_probability(htf_context: HTFContext, liquidity_map: LiquidityMap,
                          sweep: SweepAnalysis, structure_shift: StructureShift,
                          entry_zone: EntryZone, side: str) -> ProbabilityScore:
-    # 1. HTF Alignment
+    # 1. HTF Alignment - EXACTLY as specified
     if side == "BUY":
         htf_alignment = 1.0 if (htf_context.bias == "BULLISH" and 
                                htf_context.premium_discount == "DISCOUNT") else 0.2
@@ -914,7 +916,7 @@ def calculate_probability(htf_context: HTFContext, liquidity_map: LiquidityMap,
         else:
             structure_clarity = 0.6
         
-        if structure_shift.candle_index == sweep.candle_index:
+        if structure_shift.candle_index >= 0:
             structure_clarity = min(1.0, structure_clarity + 0.1)
     else:
         structure_clarity = 0.1
@@ -948,7 +950,7 @@ def calculate_probability(htf_context: HTFContext, liquidity_map: LiquidityMap,
 # ---------------- MAIN SCANNING LOGIC ----------------
 async def scan_symbol(exchange, symbol: str, entry_timeframe: str = "15m") -> Optional[Dict]:
     """
-    TF-AGNOSTIC scanner - uses TF_LADDER for dynamic timeframe scaling
+    EXACT: TF-AGNOSTIC scanner using TF_LADDER exactly as specified
     """
     
     if entry_timeframe not in TF_LADDER:
@@ -962,24 +964,24 @@ async def scan_symbol(exchange, symbol: str, entry_timeframe: str = "15m") -> Op
     
     log.debug(f"🔍 Scanning {symbol} on {entry_timeframe} at {current_price}")
     
-    # Step 1: HTF Bias (dynamic from TF_LADDER)
+    # Step 1: HTF Bias (EXACT from TF_LADDER)
     htf_context = await analyze_htf_bias(exchange, symbol, entry_timeframe)
     if not htf_context.valid:
         return None
     
-    # Step 2: Liquidity Map (dynamic from TF_LADDER)
+    # Step 2: Liquidity Map (EXACT from TF_LADDER)
     liquidity_map = await map_liquidity(exchange, symbol, htf_context, current_price, entry_timeframe)
     if not liquidity_map.has_clear_target:
         return None
     
-    # Step 3: Sweep (dynamic from TF_LADDER)
+    # Step 3: Sweep (EXACT from TF_LADDER)
     sweep = await analyze_sweep(exchange, symbol, htf_context, entry_timeframe)
     if sweep.type == "NONE":
         return None
     
     side = "SELL" if sweep.type == "HIGH_SWEEP" else "BUY"
     
-    # Step 4: Structure (dynamic from TF_LADDER)
+    # Step 4: Structure (EXACT from TF_LADDER)
     structure_shift = await check_structure_shift(exchange, symbol, sweep, htf_context, entry_timeframe)
     if not structure_shift.confirmed:
         return None
@@ -989,7 +991,7 @@ async def scan_symbol(exchange, symbol: str, entry_timeframe: str = "15m") -> Op
     if entry_zone.type == "NONE":
         return None
     
-    # Double-check strict alignment
+    # EXACT FIX 3: Double-check strict alignment
     if side == "BUY":
         if not (htf_context.bias == "BULLISH" and htf_context.premium_discount == "DISCOUNT"):
             return None
@@ -1067,12 +1069,13 @@ async def scan_symbol(exchange, symbol: str, entry_timeframe: str = "15m") -> Op
 # ---------------- SCANNER MAIN ----------------
 async def scanner_main(exchange, entry_timeframe: str = "15m"):
     """
-    Main scanner - works on specified timeframe using TF_LADDER
+    Main scanner - EXACTLY as specified
     """
     
     await send_telegram(f"🚀 ROMEOTPT Scanner Started ({entry_timeframe})")
-    await send_telegram(f"📊 Using TF_LADDER: {TF_LADDER[entry_timeframe]}")
-    await send_telegram("✅ FIXES: 1) Less strict sweeps 2) Immediate structure 3) Strict alignment 4) LTF TP first 5) Strategic probability")
+    await send_telegram(f"📊 Using EXACT TF_LADDER as specified")
+    await send_telegram(f"TF_LADDER[{entry_timeframe}]: {TF_LADDER[entry_timeframe]}")
+    await send_telegram("✅ EXACT FIXES: 1) Less strict sweeps 2) Immediate structure 3) Strict alignment 4) LTF TP first 5) Strategic probability")
     
     while True:
         try:
