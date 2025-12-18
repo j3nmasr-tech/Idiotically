@@ -37,6 +37,15 @@ log = logging.getLogger("romeopt_v2")
 db_lock = asyncio.Lock()
 db_conn = None
 
+# ---------------- TIME FRAME LADDER ----------------
+TF_LADDER = {
+    "1m":  {"structure": "1m",  "sweep": "3m",  "liquidity": "15m", "bias": "1h"},
+    "3m":  {"structure": "3m",  "sweep": "5m",  "liquidity": "15m", "bias": "1h"},
+    "5m":  {"structure": "5m",  "sweep": "15m", "liquidity": "30m", "bias": "1h"},
+    "15m": {"structure": "15m", "sweep": "30m", "liquidity": "1h",  "bias": "4h"},
+    "30m": {"structure": "30m", "sweep": "1h",  "liquidity": "4h",  "bias": "4h"},
+}
+
 # ---------------- DATA STRUCTURES ----------------
 @dataclass
 class HTFContext:
@@ -226,14 +235,17 @@ def safe_json_serialize(obj):
 # ---------------- STEP 1: HTF BIAS ----------------
 async def analyze_htf_bias(exchange, symbol: str, entry_timeframe: str) -> HTFContext:
     """
-    FIXED: Uses appropriate HTF based on entry timeframe
-    1m/3m/5m → 1h, 15m/30m → 4h
+    FIXED: Uses appropriate HTF based on TF_LADDER
     """
-    # Determine HTF based on entry timeframe
-    if entry_timeframe in ["1m", "3m", "5m"]:
-        htf_tf = "1h"
-    else:  # 15m, 30m
-        htf_tf = "4h"
+    # Get bias timeframe from ladder
+    if entry_timeframe not in TF_LADDER:
+        return HTFContext(
+            bias="UNKNOWN", range_high=0, range_low=0, range_mid=0,
+            premium_discount="UNKNOWN", liquidity_zones=[], structure=[],
+            skip_reason=f"Unsupported timeframe: {entry_timeframe}", valid=False
+        )
+    
+    htf_tf = TF_LADDER[entry_timeframe]["bias"]
     
     ohlcv_htf = await fetch_ohlcv(exchange, symbol, htf_tf, 100)
     if not ohlcv_htf or len(ohlcv_htf) < 30:
@@ -264,7 +276,7 @@ async def analyze_htf_bias(exchange, symbol: str, entry_timeframe: str) -> HTFCo
             })
         
         if (low_i < df_htf["low"].iloc[i-1] and 
-            low_i < df_ltf["low"].iloc[i-2] and
+            low_i < df_htf["low"].iloc[i-2] and
             low_i < df_htf["low"].iloc[i+1] and
             low_i < df_htf["low"].iloc[i+2]):
             swing_lows.append({
@@ -367,18 +379,14 @@ async def analyze_htf_bias(exchange, symbol: str, entry_timeframe: str) -> HTFCo
 async def map_liquidity(exchange, symbol: str, htf_context: HTFContext, 
                        current_price: float, entry_timeframe: str) -> LiquidityMap:
     """
-    FIXED: Uses appropriate liquidity TF based on entry timeframe
-    LTF-heavy: 1m→3m, 3m→5m, 5m→15m, 15m→30m, 30m→1h
+    FIXED: Uses appropriate liquidity TF from TF_LADDER
+    LTF-heavy: 1m→15m, 3m→15m, 5m→30m, 15m→1h, 30m→4h
     """
-    # Determine liquidity TF
-    liquidity_tf_map = {
-        "1m": "3m",
-        "3m": "5m",
-        "5m": "15m",
-        "15m": "30m",
-        "30m": "1h"
-    }
-    liq_tf = liquidity_tf_map.get(entry_timeframe, "15m")
+    # Get liquidity TF from ladder
+    if entry_timeframe not in TF_LADDER:
+        return LiquidityMap(from_liquidity=[], to_liquidity=[], has_clear_target=False)
+    
+    liq_tf = TF_LADDER[entry_timeframe]["liquidity"]
     
     ohlcv = await fetch_ohlcv(exchange, symbol, liq_tf, 100)
     if not ohlcv:
@@ -464,8 +472,14 @@ async def analyze_sweep(exchange, symbol: str, htf_context: HTFContext, entry_ti
     """
     FIX 1: Less strict sweep detection
     Accepts partial body sweeps OR follow-through confirmation
+    Uses sweep TF from TF_LADDER
     """
-    ohlcv = await fetch_ohlcv(exchange, symbol, entry_timeframe, 50)
+    if entry_timeframe not in TF_LADDER:
+        return SweepAnalysis(type="NONE", candle_index=-1, swept_price=0, 
+                           previous_extreme=0, impulsive=False)
+    
+    sweep_tf = TF_LADDER[entry_timeframe]["sweep"]
+    ohlcv = await fetch_ohlcv(exchange, symbol, sweep_tf, 50)
     if not ohlcv or len(ohlcv) < 10:
         return SweepAnalysis(type="NONE", candle_index=-1, swept_price=0, 
                            previous_extreme=0, impulsive=False)
@@ -570,11 +584,13 @@ async def check_structure_shift(exchange, symbol: str, sweep: SweepAnalysis,
     """
     FIX 2: Immediate structure detection
     Allows CHoCH/BOS on same candle or within 2 candles
+    Uses structure TF from TF_LADDER
     """
-    if sweep.type == "NONE":
+    if sweep.type == "NONE" or entry_timeframe not in TF_LADDER:
         return StructureShift(type="NONE", confirmed=False, candle_index=-1)
     
-    ohlcv = await fetch_ohlcv(exchange, symbol, entry_timeframe, 50)
+    structure_tf = TF_LADDER[entry_timeframe]["structure"]
+    ohlcv = await fetch_ohlcv(exchange, symbol, structure_tf, 50)
     if not ohlcv:
         return StructureShift(type="NONE", confirmed=False, candle_index=-1)
     
@@ -665,6 +681,9 @@ async def check_structure_shift(exchange, symbol: str, sweep: SweepAnalysis,
 async def find_entry_zone(exchange, symbol: str, htf_context: HTFContext,
                          sweep: SweepAnalysis, structure_shift: StructureShift,
                          side: str, entry_timeframe: str) -> EntryZone:
+    if entry_timeframe not in TF_LADDER:
+        return EntryZone(type="NONE", price=0, low=0, high=0, aligns_with_htf=False)
+    
     ohlcv = await fetch_ohlcv(exchange, symbol, entry_timeframe, 100)
     if not ohlcv:
         return EntryZone(type="NONE", price=0, low=0, high=0, aligns_with_htf=False)
@@ -928,9 +947,12 @@ def calculate_probability(htf_context: HTFContext, liquidity_map: LiquidityMap,
 # ---------------- MAIN SCANNING LOGIC ----------------
 async def scan_symbol(exchange, symbol: str, entry_timeframe: str = "15m") -> Optional[Dict]:
     """
-    TF-AGNOSTIC scanner - works on ANY timeframe
-    Uses appropriate TFs based on entry timeframe
+    TF-AGNOSTIC scanner - works on ANY timeframe using TF_LADDER
     """
+    
+    if entry_timeframe not in TF_LADDER:
+        log.debug(f"Unsupported timeframe: {entry_timeframe}")
+        return None
     
     ticker = await exchange.fetch_ticker(symbol)
     current_price = ticker.get("last", 0)
@@ -939,29 +961,29 @@ async def scan_symbol(exchange, symbol: str, entry_timeframe: str = "15m") -> Op
     
     log.debug(f"🔍 Scanning {symbol} on {entry_timeframe} at {current_price}")
     
-    # Step 1: HTF Bias (dynamic based on entry TF)
+    # Step 1: HTF Bias (uses bias TF from ladder)
     htf_context = await analyze_htf_bias(exchange, symbol, entry_timeframe)
     if not htf_context.valid:
         return None
     
-    # Step 2: Liquidity Map (LTF-heavy, dynamic TF)
+    # Step 2: Liquidity Map (uses liquidity TF from ladder)
     liquidity_map = await map_liquidity(exchange, symbol, htf_context, current_price, entry_timeframe)
     if not liquidity_map.has_clear_target:
         return None
     
-    # Step 3: Sweep (on entry timeframe)
+    # Step 3: Sweep (uses sweep TF from ladder)
     sweep = await analyze_sweep(exchange, symbol, htf_context, entry_timeframe)
     if sweep.type == "NONE":
         return None
     
     side = "SELL" if sweep.type == "HIGH_SWEEP" else "BUY"
     
-    # Step 4: Structure (on entry timeframe)
+    # Step 4: Structure (uses structure TF from ladder)
     structure_shift = await check_structure_shift(exchange, symbol, sweep, htf_context, entry_timeframe)
     if not structure_shift.confirmed:
         return None
     
-    # Step 5: Entry Zone (on entry timeframe)
+    # Step 5: Entry Zone (uses entry timeframe)
     entry_zone = await find_entry_zone(exchange, symbol, htf_context, sweep, structure_shift, side, entry_timeframe)
     if entry_zone.type == "NONE":
         return None
@@ -1044,11 +1066,12 @@ async def scan_symbol(exchange, symbol: str, entry_timeframe: str = "15m") -> Op
 # ---------------- SCANNER MAIN ----------------
 async def scanner_main(exchange, entry_timeframe: str = "15m"):
     """
-    Main scanner - works on specified timeframe
+    Main scanner - works on specified timeframe using TF_LADDER
     Can be called with any timeframe: "1m", "3m", "5m", "15m", "30m"
     """
     
     await send_telegram(f"🚀 ROMEOTPT Scanner Started ({entry_timeframe})")
+    await send_telegram(f"📊 Using TF_LADDER: {TF_LADDER[entry_timeframe]}")
     await send_telegram("✅ FIXES: 1) Less strict sweeps 2) Immediate structure 3) Strict alignment 4) LTF TP first 5) Strategic probability")
     
     while True:
