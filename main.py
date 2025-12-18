@@ -46,7 +46,7 @@ TF_LADDER = {
     "30m": {"structure": "30m", "sweep": "1h",  "liquidity": "4h",  "bias": "4h"},
 }
 
-# ---------------- DATA STRUCTURES (SAME) ----------------
+# ---------------- DATA STRUCTURES ----------------
 @dataclass
 class HTFContext:
     bias: str
@@ -118,13 +118,12 @@ class ProbabilityScore:
     
     @property
     def acceptable(self) -> bool:
-        """EXACT FIX 5: Romeo's strategic probability gate - EXACTLY as specified"""
         liquidity_strong = self.liquidity_quality >= 0.7
         structure_strong = self.structure_clarity >= 0.7
         total_acceptable = self.total_score >= 3.3
         return liquidity_strong and structure_strong and total_acceptable
 
-# ---------------- TELEGRAM (SAME) ----------------
+# ---------------- TELEGRAM ----------------
 async def send_telegram(msg: str, parse_mode="HTML"):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -139,7 +138,7 @@ async def send_telegram(msg: str, parse_mode="HTML"):
         except Exception as e:
             log.warning(f"Telegram send failed: {e}")
 
-# ---------------- DATABASE (SAME) ----------------
+# ---------------- DATABASE ----------------
 async def init_db():
     global db_conn
     db_conn = await aiosqlite.connect(DB_PATH)
@@ -197,7 +196,7 @@ async def init_db():
     """)
     await db_conn.commit()
 
-# ---------------- OHLCV UTILS (SAME) ----------------
+# ---------------- OHLCV UTILS ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit: int = 200):
     try:
         return await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
@@ -233,7 +232,7 @@ def safe_json_serialize(obj):
     else:
         return obj
 
-# ---------------- STEP 1: HTF BIAS (SAME) ----------------
+# ---------------- STEP 1: HTF BIAS ----------------
 async def analyze_htf_bias(exchange, symbol: str, entry_timeframe: str) -> HTFContext:
     """
     EXACT: Uses bias TF from TF_LADDER exactly as specified
@@ -276,7 +275,7 @@ async def analyze_htf_bias(exchange, symbol: str, entry_timeframe: str) -> HTFCo
             })
         
         if (low_i < df_htf["low"].iloc[i-1] and 
-            low_i < df_ltf["low"].iloc[i-2] and
+            low_i < df_htf["low"].iloc[i-2] and
             low_i < df_htf["low"].iloc[i+1] and
             low_i < df_htf["low"].iloc[i+2]):
             swing_lows.append({
@@ -375,7 +374,7 @@ async def analyze_htf_bias(exchange, symbol: str, entry_timeframe: str) -> HTFCo
     
     return context
 
-# ---------------- STEP 2: LIQUIDITY MAP - FIX 1 APPLIED ----------------
+# ---------------- STEP 2: LIQUIDITY MAP ----------------
 async def map_liquidity(exchange, symbol: str, htf_context: HTFContext, 
                        current_price: float, entry_timeframe: str) -> LiquidityMap:
     """
@@ -395,19 +394,13 @@ async def map_liquidity(exchange, symbol: str, htf_context: HTFContext,
     from_liquidity = []
     recent_df = df.iloc[-10:] if len(df) >= 10 else df
     
-    # ❌ FIX 1 IMPLEMENTED: Check for meaningful liquidity, not random micro highs/lows
-    # Use a window to check for equal highs/lows or session extremes
     for i in range(len(recent_df) - 1):
         candle = recent_df.iloc[i]
         next_candle = recent_df.iloc[i + 1] if i + 1 < len(recent_df) else candle
         
-        # Check for swept high with follow-through
         if candle["high"] > recent_df["high"].iloc[max(0, i-5):i].max() and next_candle["close"] < candle["close"]:
-            
-            # 🟢 FIX 1: Check if this was meaningful liquidity (not just a random high)
             is_meaningful = False
             
-            # Check 1: Was it an equal high (multiple touches)?
             window_start = max(0, i-8)
             window_end = min(len(recent_df), i+1)
             window = recent_df.iloc[window_start:window_end]
@@ -416,21 +409,17 @@ async def map_liquidity(exchange, symbol: str, htf_context: HTFContext,
             if equal_highs_count >= 2:
                 is_meaningful = True
             
-            # Check 2: Was it a session high (using larger context)?
             if not is_meaningful and len(df) >= 24:
                 session_high = df["high"].iloc[-24:].max()
                 if np.abs(candle["high"] - session_high) / session_high < 0.001:
                     is_meaningful = True
             
-            # Check 3: Was it a prior swing high?
             if not is_meaningful and i > 2:
-                # Simple swing detection
                 if (candle["high"] > recent_df["high"].iloc[i-1] and 
                     candle["high"] > recent_df["high"].iloc[i-2] and
                     candle["high"] > recent_df["high"].iloc[max(0, i-3)]):
                     is_meaningful = True
             
-            # ✅ Only add if it was meaningful liquidity
             if is_meaningful:
                 from_liquidity.append({
                     "price": float(candle["high"]),
@@ -440,13 +429,9 @@ async def map_liquidity(exchange, symbol: str, htf_context: HTFContext,
                     "meaningful": True
                 })
         
-        # Check for swept low with follow-through
         if candle["low"] < recent_df["low"].iloc[max(0, i-5):i].min() and next_candle["close"] > candle["close"]:
-            
-            # 🟢 FIX 1: Check if this was meaningful liquidity
             is_meaningful = False
             
-            # Check 1: Was it an equal low?
             window_start = max(0, i-8)
             window_end = min(len(recent_df), i+1)
             window = recent_df.iloc[window_start:window_end]
@@ -455,20 +440,17 @@ async def map_liquidity(exchange, symbol: str, htf_context: HTFContext,
             if equal_lows_count >= 2:
                 is_meaningful = True
             
-            # Check 2: Was it a session low?
             if not is_meaningful and len(df) >= 24:
                 session_low = df["low"].iloc[-24:].min()
                 if np.abs(candle["low"] - session_low) / session_low < 0.001:
                     is_meaningful = True
             
-            # Check 3: Was it a prior swing low?
             if not is_meaningful and i > 2:
                 if (candle["low"] < recent_df["low"].iloc[i-1] and 
                     candle["low"] < recent_df["low"].iloc[i-2] and
                     candle["low"] < recent_df["low"].iloc[max(0, i-3)]):
                     is_meaningful = True
             
-            # ✅ Only add if it was meaningful liquidity
             if is_meaningful:
                 from_liquidity.append({
                     "price": float(candle["low"]),
@@ -480,7 +462,6 @@ async def map_liquidity(exchange, symbol: str, htf_context: HTFContext,
     
     to_liquidity = []
     
-    # LTF equal highs/lows (nearest magnets)
     if len(df) >= 24:
         high_values = df["high"].iloc[-24:].values
         for val in np.unique(np.round(high_values, 4)):
@@ -508,7 +489,6 @@ async def map_liquidity(exchange, symbol: str, htf_context: HTFContext,
                     "ltf": True
                 })
     
-    # Add HTF liquidity as TP3 only
     for zone in htf_context.liquidity_zones:
         to_liquidity.append({
             "price": zone["price"],
@@ -528,11 +508,8 @@ async def map_liquidity(exchange, symbol: str, htf_context: HTFContext,
         has_clear_target=has_clear_target
     )
 
-# ---------------- STEP 3: LIQUIDITY SWEEP (SAME) ----------------
+# ---------------- STEP 3: LIQUIDITY SWEEP ----------------
 async def analyze_sweep(exchange, symbol: str, htf_context: HTFContext, entry_timeframe: str) -> SweepAnalysis:
-    """
-    EXACT FIX 1: Less strict sweep detection + EXACT TF from TF_LADDER
-    """
     if entry_timeframe not in TF_LADDER:
         return SweepAnalysis(type="NONE", candle_index=-1, swept_price=0, 
                            previous_extreme=0, impulsive=False)
@@ -636,7 +613,7 @@ async def analyze_sweep(exchange, symbol: str, htf_context: HTFContext, entry_ti
     return SweepAnalysis(type="NONE", candle_index=-1, swept_price=0, 
                        previous_extreme=0, impulsive=False)
 
-# ---------------- STEP 4: STRUCTURE CHECK - FIX 2 APPLIED ----------------
+# ---------------- STEP 4: STRUCTURE CHECK ----------------
 async def check_structure_shift(exchange, symbol: str, sweep: SweepAnalysis, 
                                htf_context: HTFContext, entry_timeframe: str) -> StructureShift:
     """
@@ -647,18 +624,17 @@ async def check_structure_shift(exchange, symbol: str, sweep: SweepAnalysis,
     
     structure_tf = TF_LADDER[entry_timeframe]["structure"]
     
-    ohlcv = await fetch_ohlcv(exchange, symbol, structure_tf, 100)  # Fetch more data for longer lookback
+    ohlcv = await fetch_ohlcv(exchange, symbol, structure_tf, 100)
     if not ohlcv:
         return StructureShift(type="NONE", confirmed=False, candle_index=-1)
     
     df = create_dataframe(ohlcv)
     
-    # 🟢 FIX 2 IMPLEMENTED: TF-aware lookback (not fixed at 10)
     if structure_tf in ["1m", "3m"]:
         lookback = 12
     elif structure_tf in ["5m", "15m"]:
         lookback = 15
-    else:  # 30m and higher
+    else:
         lookback = 20
     
     lookback = min(lookback, len(df) - 1)
@@ -733,7 +709,7 @@ async def check_structure_shift(exchange, symbol: str, sweep: SweepAnalysis,
     
     return StructureShift(type="NONE", confirmed=False, candle_index=-1)
 
-# ---------------- STEP 5: ENTRY ZONE - FIX 3 APPLIED ----------------
+# ---------------- STEP 5: ENTRY ZONE ----------------
 async def find_entry_zone(exchange, symbol: str, htf_context: HTFContext,
                          sweep: SweepAnalysis, structure_shift: StructureShift,
                          side: str, entry_timeframe: str) -> EntryZone:
@@ -765,17 +741,12 @@ async def find_entry_zone(exchange, symbol: str, htf_context: HTFContext,
         entry_type = "NONE"
     
     if entry_type == "ORDER_BLOCK":
-        # 🟢 FIX 3 IMPLEMENTED: Scan backwards from structure, not entire history
-        # Use structure candle as reference point
         structure_candle_idx = structure_shift.candle_index
         
         if structure_candle_idx >= 0:
-            # Look for OB in the 10 candles BEFORE the structure shift
             start_idx = max(structure_candle_idx - 10, 0)
-            end_idx = structure_candle_idx + 1  # Include structure candle
+            end_idx = structure_candle_idx + 1
             
-            # ❌ OLD: for i in range(2, len(df) - 1):
-            # ✅ NEW: Scan only relevant window around structure shift
             for i in range(start_idx, end_idx):
                 if i + 1 >= len(df):
                     continue
@@ -784,18 +755,15 @@ async def find_entry_zone(exchange, symbol: str, htf_context: HTFContext,
                 next_candle = df.iloc[i + 1]
                 
                 if side == "BUY":
-                    # Bearish candle followed by bullish candle
                     if (candle["close"] < candle["open"] and 
                         next_candle["close"] > next_candle["open"]):
                         
                         ob_low = min(candle["low"], next_candle["low"])
                         ob_high = next_candle["close"]
                         
-                        # Check if current price is in or near the OB
                         price_in_ob = (current_price <= ob_high * 1.01 and 
                                       current_price >= ob_low * 0.99)
                         
-                        # Check if OB hasn't been mitigated (price didn't go below OB low after formation)
                         ob_mitigated = False
                         if i + 2 < len(df):
                             for j in range(i + 2, min(i + 8, len(df))):
@@ -821,7 +789,6 @@ async def find_entry_zone(exchange, symbol: str, htf_context: HTFContext,
                             )
                 
                 elif side == "SELL":
-                    # Bullish candle followed by bearish candle
                     if (candle["close"] > candle["open"] and 
                         next_candle["close"] < next_candle["open"]):
                         
@@ -857,7 +824,7 @@ async def find_entry_zone(exchange, symbol: str, htf_context: HTFContext,
     
     return EntryZone(type="NONE", price=0, low=0, high=0, aligns_with_htf=False)
 
-# ---------------- STEP 6: RISK/SL (SAME) ----------------
+# ---------------- STEP 6: RISK/SL ----------------
 def calculate_risk_sl(entry_zone: EntryZone, sweep: SweepAnalysis,
                      htf_context: HTFContext, side: str) -> RiskManagement:
     entry_price = entry_zone.price
@@ -912,13 +879,10 @@ def calculate_risk_sl(entry_zone: EntryZone, sweep: SweepAnalysis,
         sl_to_entry_distance=float(distance_pct)
     )
 
-# ---------------- STEP 7: TAKE PROFIT (SAME) ----------------
+# ---------------- STEP 7: TAKE PROFIT ----------------
 def calculate_take_profits(entry_price: float, side: str, 
                           liquidity_map: LiquidityMap,
                           htf_context: HTFContext) -> TakeProfitLevels:
-    """
-    EXACT FIX 4: LTF liquidity first (nearest magnet) - Already implemented
-    """
     ltf_targets = [t for t in liquidity_map.to_liquidity if t.get("ltf", False)]
     htf_targets = [t for t in liquidity_map.to_liquidity if t.get("htf_only", False)]
     
@@ -972,11 +936,10 @@ def calculate_take_profits(entry_price: float, side: str,
         tp3_type=tp3_type
     )
 
-# ---------------- STEP 8: PROBABILITY CHECK - FIX 4 APPLIED ----------------
+# ---------------- STEP 8: PROBABILITY CHECK ----------------
 def calculate_probability(htf_context: HTFContext, liquidity_map: LiquidityMap,
                          sweep: SweepAnalysis, structure_shift: StructureShift,
                          entry_zone: EntryZone, side: str) -> ProbabilityScore:
-    # 1. HTF Alignment
     if side == "BUY":
         htf_alignment = 1.0 if (htf_context.bias == "BULLISH" and 
                                htf_context.premium_discount == "DISCOUNT") else 0.2
@@ -984,31 +947,24 @@ def calculate_probability(htf_context: HTFContext, liquidity_map: LiquidityMap,
         htf_alignment = 1.0 if (htf_context.bias == "BEARISH" and 
                                htf_context.premium_discount == "PREMIUM") else 0.2
     
-    # 2. Liquidity Quality - 🟢 FIX 4 IMPLEMENTED: Prioritize nearest LTF target, not average
     ltf_targets = [t for t in liquidity_map.to_liquidity if t.get("ltf", False)]
     
     if ltf_targets:
-        # Sort by proximity to current price
         ltf_targets.sort(key=lambda t: abs(t["price"] - htf_context.range_mid))
-        
-        # Get the strongest nearest LTF target
         nearest_ltf = ltf_targets[0]
         liquidity_quality = min(1.0, nearest_ltf.get("strength", 1) / 2.0 * 1.5)
         
-        # Bonus for multiple LTF targets
         if len(ltf_targets) >= 2:
             liquidity_quality = min(1.0, liquidity_quality + 0.1)
     else:
         liquidity_quality = 0.1
     
-    # 3. Sweep Strength
     sweep_strength = sweep.strength
     if sweep.impulsive:
         sweep_strength = min(1.0, sweep_strength + 0.2)
     if sweep.fake_sweep:
         sweep_strength = max(0.3, sweep_strength - 0.3)
     
-    # 4. Structure Clarity
     if structure_shift.confirmed:
         if structure_shift.type == "CHoCH":
             structure_clarity = 0.9
@@ -1022,7 +978,6 @@ def calculate_probability(htf_context: HTFContext, liquidity_map: LiquidityMap,
     else:
         structure_clarity = 0.1
     
-    # 5. Entry Precision
     if entry_zone.type in ["ORDER_BLOCK", "FAIR_VALUE_GAP"]:
         entry_precision = 0.7
         if entry_zone.aligns_with_htf:
@@ -1048,12 +1003,8 @@ def calculate_probability(htf_context: HTFContext, liquidity_map: LiquidityMap,
         total_score=float(total_score)
     )
 
-# ---------------- MAIN SCANNING LOGIC - FIX 5 APPLIED ----------------
+# ---------------- MAIN SCANNING LOGIC ----------------
 async def scan_symbol(exchange, symbol: str, entry_timeframe: str = "15m") -> Optional[Dict]:
-    """
-    EXACT: TF-AGNOSTIC scanner using TF_LADDER exactly as specified
-    """
-    
     if entry_timeframe not in TF_LADDER:
         log.debug(f"Unsupported timeframe: {entry_timeframe}")
         return None
@@ -1065,34 +1016,28 @@ async def scan_symbol(exchange, symbol: str, entry_timeframe: str = "15m") -> Op
     
     log.debug(f"🔍 Scanning {symbol} on {entry_timeframe} at {current_price}")
     
-    # Step 1: HTF Bias (EXACT from TF_LADDER)
     htf_context = await analyze_htf_bias(exchange, symbol, entry_timeframe)
     if not htf_context.valid:
         return None
     
-    # Step 2: Liquidity Map (EXACT from TF_LADDER with FIX 1)
     liquidity_map = await map_liquidity(exchange, symbol, htf_context, current_price, entry_timeframe)
     if not liquidity_map.has_clear_target:
         return None
     
-    # Step 3: Sweep (EXACT from TF_LADDER)
     sweep = await analyze_sweep(exchange, symbol, htf_context, entry_timeframe)
     if sweep.type == "NONE":
         return None
     
     side = "SELL" if sweep.type == "HIGH_SWEEP" else "BUY"
     
-    # Step 4: Structure (EXACT from TF_LADDER with FIX 2)
     structure_shift = await check_structure_shift(exchange, symbol, sweep, htf_context, entry_timeframe)
     if not structure_shift.confirmed:
         return None
     
-    # Step 5: Entry Zone (uses entry timeframe with FIX 3)
     entry_zone = await find_entry_zone(exchange, symbol, htf_context, sweep, structure_shift, side, entry_timeframe)
     if entry_zone.type == "NONE":
         return None
     
-    # EXACT FIX 3: Double-check strict alignment
     if side == "BUY":
         if not (htf_context.bias == "BULLISH" and htf_context.premium_discount == "DISCOUNT"):
             return None
@@ -1100,13 +1045,8 @@ async def scan_symbol(exchange, symbol: str, entry_timeframe: str = "15m") -> Op
         if not (htf_context.bias == "BEARISH" and htf_context.premium_discount == "PREMIUM"):
             return None
     
-    # Step 6: Risk/SL
     risk_sl = calculate_risk_sl(entry_zone, sweep, htf_context, side)
-    
-    # Step 7: Take Profit
     tp_levels = calculate_take_profits(entry_zone.price, side, liquidity_map, htf_context)
-    
-    # Step 8: Probability (with FIX 4)
     probability = calculate_probability(
         htf_context, liquidity_map, sweep, structure_shift, entry_zone, side
     )
@@ -1167,16 +1107,9 @@ async def scan_symbol(exchange, symbol: str, entry_timeframe: str = "15m") -> Op
     
     return setup
 
-# ---------------- SCANNER MAIN - FIX 5 APPLIED ----------------
+# ---------------- SCANNER MAIN ----------------
 async def scanner_main(exchange, entry_timeframe: str = "15m"):
-    """
-    Main scanner - 🟢 FIX 5: Multiple TFs simultaneously (not just one)
-    """
-    
     await send_telegram(f"🚀 ROMEOTPT Scanner Started ({entry_timeframe})")
-    await send_telegram(f"📊 Using EXACT TF_LADDER as specified")
-    await send_telegram(f"TF_LADDER[{entry_timeframe}]: {TF_LADDER[entry_timeframe]}")
-    await send_telegram("✅ ALL 5 FIXES IMPLEMENTED: 1) Meaningful liquidity 2) TF-aware structure 3) OB near structure 4) LTF probability 5) Multi-TF scanning")
     
     while True:
         try:
@@ -1210,7 +1143,7 @@ async def scanner_main(exchange, entry_timeframe: str = "15m"):
         
         await asyncio.sleep(SCAN_INTERVAL)
 
-# ---------------- ALERT FORMATTING (SAME) ----------------
+# ---------------- ALERT FORMATTING ----------------
 async def send_setup_alert(setup: Dict):
     entry = setup["entry_price"]
     sl = setup["sl_price"]
@@ -1322,7 +1255,7 @@ Entry Precision: {setup['probability']['entry_precision']:.2f}
         })
         await db_conn.commit()
 
-# ---------------- FASTAPI (SAME) ----------------
+# ---------------- FASTAPI ----------------
 app = FastAPI()
 
 @app.get("/health")
@@ -1357,7 +1290,7 @@ async def get_setups(limit: int = 20, min_score: float = 3.3):
         
         return {"setups": setups, "count": len(setups)}
 
-# ---------------- MAIN - FIX 5 APPLIED ----------------
+# ---------------- MAIN ----------------
 async def main():
     global db_conn
     await init_db()
@@ -1367,13 +1300,12 @@ async def main():
         "options": {"defaultType": "spot"}
     })
     
-    # 🟢 FIX 5 IMPLEMENTED: Run scanner on ALL timeframes simultaneously
     tasks = []
     for timeframe in ["1m", "3m", "5m", "15m", "30m"]:
         task = asyncio.create_task(scanner_main(exchange, entry_timeframe=timeframe))
         tasks.append(task)
         log.info(f"Started scanner for timeframe: {timeframe}")
-        await asyncio.sleep(1)  # Stagger starts
+        await asyncio.sleep(1)
     
     await asyncio.gather(*tasks)
 
