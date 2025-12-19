@@ -28,7 +28,7 @@ DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v3_2.db")
 
 # Scanner settings
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 30))
-TOP_N = int(os.getenv("TOP_N", 10))
+TOP_N = int(os.getenv("TOP_N", 50))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 10))
 
 # Signal thresholds
@@ -1154,6 +1154,11 @@ async def outcome_aware_scanner(exchange):
             
             for symbol, data in tickers.items():
                 if symbol.endswith("/USDT"):
+                    # ============ ADDED STABLECOIN FILTER ============
+                    if symbol in ["USDC/USDT", "USDG/USDT"]:
+                        continue  # Skip stablecoin pairs
+                    # ==================================================
+                    
                     volume = data.get("quoteVolume", 0)
                     if isinstance(volume, (int, float)):
                         usdt_pairs.append((symbol, float(volume)))
