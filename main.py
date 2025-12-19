@@ -790,7 +790,9 @@ async def send_fast_alert(setup: Dict):
                 update_info = f"\n🔄 <b>Updated signal</b>"
         
         tp_targets = setup.get('tp_targets', [])
-        tp2_display = tp_targets[1] if len(tp_targets) > 1 else 'N/A'
+        # Format TP values separately to avoid f-string formatting errors
+        tp1_display = f"{tp_targets[0]:.8f}" if len(tp_targets) > 0 else 'N/A'
+        tp2_display = f"{tp_targets[1]:.8f}" if len(tp_targets) > 1 else 'N/A'
         
         msg = f"""
 {update_emoji}{tier_emoji} <b>ROMEOTPT - {quality.get('tier', 'C')} Tier</b>
@@ -801,8 +803,8 @@ async def send_fast_alert(setup: Dict):
 <b>Type:</b> {setup.get('entry_type', 'N/A')}{update_info}
 
 🎯 <b>Targets:</b>
-TP1: {tp_targets[0]:.8f if len(tp_targets) > 0 else 'N/A'}
-TP2: {tp2_display if isinstance(tp2_display, float) else tp2_display}
+TP1: {tp1_display}
+TP2: {tp2_display}
 
 🛡️ <b>Risk:</b>
 SL: {setup.get('sl_price', 0):.8f}
@@ -844,6 +846,8 @@ async def send_outcome_alert(symbol: str, outcome: Dict):
             time_str = f"{bars_held//60}h {bars_held%60}min"
         
         tp_targets = setup.get('tp_targets', [0])
+        # Format TP separately
+        tp_display = f"{tp_targets[0]:.8f}" if len(tp_targets) > 0 else 'N/A'
         
         msg = f"""
 {emoji} <b>{result_text}</b>
@@ -855,7 +859,7 @@ async def send_outcome_alert(symbol: str, outcome: Dict):
 
 ⏱️ <b>Held:</b> {time_str}
 📊 <b>Quality was:</b> {setup.get('quality', {}).get('tier', 'N/A')}
-🎯 <b>Target was:</b> {tp_targets[0]:.8f if len(tp_targets) > 0 else 'N/A'}
+🎯 <b>Target was:</b> {tp_display}
 🛡️ <b>SL was:</b> {setup.get('sl_price', 0):.8f}
 
 <i>Max favorable move: {outcome.get('max_favorable', 0):.2f}%</i>
