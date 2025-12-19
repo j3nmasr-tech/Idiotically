@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ROMEOTPT SCANNER v3.2 - COMPLETE & CORRECTED VERSION
+Two-layer architecture + Deduplication + Outcome Tracking
 """
 
 import os
@@ -784,6 +785,170 @@ async def send_deduped_alert(setup: Dict):
             log.debug(f"⏸️  Skipped alert for {symbol}: {reason}")
         return False
 
+# ---------------- DATABASE ----------------
+async def init_database():
+    """Initialize database with outcome tracking tables"""
+    # Create tables
+    await db_conn.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT,
+            timestamp TEXT,
+            side TEXT,
+            entry_price REAL,
+            sl_price REAL,
+            tp1 REAL,
+            tp2 REAL,
+            rr_ratio REAL,
+            quality_tier TEXT,
+            quality_score REAL,
+            current_price REAL,
+            status TEXT DEFAULT 'active',
+            alert_sent BOOLEAN DEFAULT 1,
+            closed_at TEXT,
+            closed_price REAL,
+            outcome TEXT,
+            pnl_pct REAL,
+            bars_held INTEGER,
+            max_favorable_pct REAL,
+            max_adverse_pct REAL
+        )
+    """)
+    
+    await db_conn.execute("""
+        CREATE TABLE IF NOT EXISTS signal_outcomes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id INTEGER,
+            symbol TEXT,
+            side TEXT,
+            entry_price REAL,
+            sl_price REAL,
+            tp1_price REAL,
+            tp2_price REAL,
+            quality_score REAL,
+            created_at TEXT,
+            status TEXT DEFAULT 'active',
+            closed_at TEXT,
+            closed_price REAL,
+            outcome_type TEXT,
+            pnl_pct REAL,
+            hold_time_minutes INTEGER,
+            max_favorable_pct REAL,
+            max_adverse_pct REAL,
+            FOREIGN KEY (signal_id) REFERENCES signals (id)
+        )
+    """)
+    
+    # Create indexes separately (SQLite syntax fix)
+    await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_time ON signals (symbol, timestamp)")
+    await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_status_time ON signals (status, timestamp)")
+    await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_outcome ON signals (outcome)")
+    await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_outcomes_symbol_status ON signal_outcomes (symbol, status)")
+    await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_outcomes_outcome_type ON signal_outcomes (outcome_type)")
+    
+    await db_conn.commit()
+    log.info("Database initialized with indexes")
+
+async def store_signal(setup: Dict):
+    """Store signal in database"""
+    async with db_lock:
+        try:
+            # Store in signals table
+            cursor = await db_conn.execute("""
+                INSERT INTO signals (
+                    symbol, timestamp, side, entry_price, sl_price, 
+                    tp1, tp2, rr_ratio, quality_tier, quality_score,
+                    current_price, status, alert_sent
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1)
+            """, (
+                setup["symbol"],
+                setup["timestamp"],
+                setup["side"],
+                setup["entry_price"],
+                setup["sl_price"],
+                setup["tp_targets"][0],
+                setup["tp_targets"][1] if len(setup["tp_targets"]) > 1 else None,
+                setup["rr_ratio"],
+                setup["quality"]["tier"],
+                setup["quality"]["total_score"],
+                setup["current_price"]
+            ))
+            
+            # Get the inserted ID
+            signal_id = cursor.lastrowid
+            
+            # Also store in outcomes table for tracking
+            await db_conn.execute("""
+                INSERT INTO signal_outcomes (
+                    signal_id, symbol, side, entry_price, sl_price, tp1_price,
+                    tp2_price, quality_score, created_at, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+            """, (
+                signal_id,
+                setup["symbol"],
+                setup["side"],
+                setup["entry_price"],
+                setup["sl_price"],
+                setup["tp_targets"][0],
+                setup["tp_targets"][1] if len(setup["tp_targets"]) > 1 else None,
+                setup["quality"]["total_score"],
+                setup["timestamp"]
+            ))
+            
+            await db_conn.commit()
+            log.debug(f"Stored signal for {setup['symbol']} with ID {signal_id}")
+            
+        except Exception as e:
+            log.error(f"Error storing signal {setup['symbol']}: {e}")
+
+async def store_outcome(symbol: str, outcome: Dict):
+    """Store signal outcome in database"""
+    async with db_lock:
+        try:
+            now = datetime.datetime.utcnow().isoformat()
+            
+            # Update signals table
+            await db_conn.execute("""
+                UPDATE signals 
+                SET status = 'closed', closed_at = ?, closed_price = ?, outcome = ?,
+                    pnl_pct = ?, bars_held = ?, max_favorable_pct = ?, max_adverse_pct = ?
+                WHERE symbol = ? AND status = 'active'
+                ORDER BY timestamp DESC LIMIT 1
+            """, (
+                now,
+                outcome['price'],
+                outcome['type'],
+                outcome['pnl_pct'],
+                outcome.get('bars_held', 0),
+                outcome.get('max_favorable', 0),
+                outcome.get('max_adverse', 0),
+                symbol
+            ))
+            
+            # Update signal_outcomes table
+            await db_conn.execute("""
+                UPDATE signal_outcomes 
+                SET status = 'closed', closed_at = ?, closed_price = ?, outcome_type = ?,
+                    pnl_pct = ?, hold_time_minutes = ?, max_favorable_pct = ?, max_adverse_pct = ?
+                WHERE symbol = ? AND status = 'active'
+                ORDER BY created_at DESC LIMIT 1
+            """, (
+                now,
+                outcome['price'],
+                outcome['type'],
+                outcome['pnl_pct'],
+                outcome.get('bars_held', 0),
+                outcome.get('max_favorable', 0),
+                outcome.get('max_adverse', 0),
+                symbol
+            ))
+            
+            await db_conn.commit()
+            log.info(f"Stored outcome for {symbol}: {outcome['type']}")
+            
+        except Exception as e:
+            log.error(f"Error storing outcome for {symbol}: {e}")
+
 # ---------------- OUTCOME CHECKER ----------------
 async def outcome_checker_task(exchange):
     """Background task to check signal outcomes"""
@@ -815,159 +980,6 @@ async def outcome_checker_task(exchange):
         except Exception as e:
             log.error(f"Outcome checker error: {e}")
             await asyncio.sleep(OUTCOME_CHECK_INTERVAL * 2)
-
-# ---------------- DATABASE ----------------
-async def init_database():
-    """Initialize database with outcome tracking tables"""
-    await db_conn.execute("""
-        CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT,
-            timestamp TEXT,
-            side TEXT,
-            entry_price REAL,
-            sl_price REAL,
-            tp1 REAL,
-            tp2 REAL,
-            rr_ratio REAL,
-            quality_tier TEXT,
-            quality_score REAL,
-            current_price REAL,
-            status TEXT DEFAULT 'active',
-            alert_sent BOOLEAN DEFAULT 1,
-            closed_at TEXT,
-            closed_price REAL,
-            outcome TEXT,
-            pnl_pct REAL,
-            bars_held INTEGER,
-            max_favorable_pct REAL,
-            max_adverse_pct REAL,
-            INDEX idx_symbol_time (symbol, timestamp),
-            INDEX idx_status_time (status, timestamp),
-            INDEX idx_outcome (outcome)
-        )
-    """)
-    
-    await db_conn.execute("""
-        CREATE TABLE IF NOT EXISTS signal_outcomes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            signal_id INTEGER,
-            symbol TEXT,
-            side TEXT,
-            entry_price REAL,
-            sl_price REAL,
-            tp1_price REAL,
-            tp2_price REAL,
-            quality_score REAL,
-            created_at TEXT,
-            status TEXT DEFAULT 'active',
-            closed_at TEXT,
-            closed_price REAL,
-            outcome_type TEXT,
-            pnl_pct REAL,
-            hold_time_minutes INTEGER,
-            max_favorable_pct REAL,
-            max_adverse_pct REAL,
-            FOREIGN KEY (signal_id) REFERENCES signals (id),
-            INDEX idx_symbol_status (symbol, status),
-            INDEX idx_outcome_type (outcome_type)
-        )
-    """)
-    
-    await db_conn.commit()
-    log.info("Database initialized")
-
-async def store_signal(setup: Dict):
-    """Store signal in database"""
-    async with db_lock:
-        try:
-            cursor = await db_conn.execute("""
-                INSERT INTO signals (
-                    symbol, timestamp, side, entry_price, sl_price, 
-                    tp1, tp2, rr_ratio, quality_tier, quality_score,
-                    current_price, status, alert_sent
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1)
-            """, (
-                setup["symbol"],
-                setup["timestamp"],
-                setup["side"],
-                setup["entry_price"],
-                setup["sl_price"],
-                setup["tp_targets"][0],
-                setup["tp_targets"][1] if len(setup["tp_targets"]) > 1 else None,
-                setup["rr_ratio"],
-                setup["quality"]["tier"],
-                setup["quality"]["total_score"],
-                setup["current_price"]
-            ))
-            
-            # Get the inserted ID correctly
-            signal_id = cursor.lastrowid
-            
-            await db_conn.execute("""
-                INSERT INTO signal_outcomes (
-                    signal_id, symbol, side, entry_price, sl_price, tp1_price,
-                    tp2_price, quality_score, created_at, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
-            """, (
-                signal_id,
-                setup["symbol"],
-                setup["side"],
-                setup["entry_price"],
-                setup["sl_price"],
-                setup["tp_targets"][0],
-                setup["tp_targets"][1] if len(setup["tp_targets"]) > 1 else None,
-                setup["quality"]["total_score"],
-                setup["timestamp"]
-            ))
-            
-            await db_conn.commit()
-        except Exception as e:
-            log.error(f"Error storing signal: {e}")
-
-async def store_outcome(symbol: str, outcome: Dict):
-    """Store signal outcome in database"""
-    async with db_lock:
-        try:
-            # Update signals table
-            await db_conn.execute("""
-                UPDATE signals 
-                SET status = 'closed', closed_at = ?, closed_price = ?, outcome = ?,
-                    pnl_pct = ?, bars_held = ?, max_favorable_pct = ?, max_adverse_pct = ?
-                WHERE symbol = ? AND status = 'active'
-                ORDER BY timestamp DESC LIMIT 1
-            """, (
-                datetime.datetime.utcnow().isoformat(),
-                outcome['price'],
-                outcome['type'],
-                outcome['pnl_pct'],
-                outcome.get('bars_held', 0),
-                outcome.get('max_favorable', 0),
-                outcome.get('max_adverse', 0),
-                symbol
-            ))
-            
-            # Update signal_outcomes table
-            await db_conn.execute("""
-                UPDATE signal_outcomes 
-                SET status = 'closed', closed_at = ?, closed_price = ?, outcome_type = ?,
-                    pnl_pct = ?, hold_time_minutes = ?, max_favorable_pct = ?, max_adverse_pct = ?
-                WHERE symbol = ? AND status = 'active'
-                ORDER BY created_at DESC LIMIT 1
-            """, (
-                datetime.datetime.utcnow().isoformat(),
-                outcome['price'],
-                outcome['type'],
-                outcome['pnl_pct'],
-                outcome.get('bars_held', 0),
-                outcome.get('max_favorable', 0),
-                outcome.get('max_adverse', 0),
-                symbol
-            ))
-            
-            await db_conn.commit()
-        except Exception as e:
-            log.error(f"Error storing outcome: {e}")
 
 # ---------------- SCANNER MAIN ----------------
 async def process_deduped_results(results) -> int:
@@ -1108,7 +1120,7 @@ async def get_outcome_stats(hours: int = 24):
             SELECT 
                 quality_tier,
                 COUNT(*) as count,
-                SUM(CASE WHEN outcome_type LIKE 'TP%' THEN 1 ELSE 0 END) as wins,
+                SUM(CASE WHEN outcome LIKE 'TP%' THEN 1 ELSE 0 END) as wins,
                 AVG(pnl_pct) as avg_pnl
             FROM signals 
             WHERE status = 'closed' 
@@ -1116,7 +1128,13 @@ async def get_outcome_stats(hours: int = 24):
             GROUP BY quality_tier
         """, (f"-{hours} hours",))
         rows = await cursor.fetchall()
-        tier_stats = {row[0]: {'count': row[1], 'wins': row[2], 'avg_pnl': row[3]} for row in rows}
+        tier_stats = {}
+        for row in rows:
+            tier_stats[row[0]] = {
+                'count': row[1],
+                'wins': row[2],
+                'avg_pnl': row[3]
+            }
     
     total = row[0] if row else 0
     wins = row[1] if row else 0
