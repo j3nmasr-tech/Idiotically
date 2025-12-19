@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ROMEOTPT SCANNER v2 - Exact Step-by-Step Implementation
-WITH TP/SL TRACKING (Added from Hybrid v3.0)
+Matches the 8-step process exactly
 
 Step 1: HTF Bias (4H/1H) → Range/Trend + Liquidity zones → Skip mid-range
 Step 2: Liquidity Map → FROM liquidity TO liquidity targets
@@ -37,7 +37,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_PATH = "/app/data/romeopt_v2.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))  # Longer interval for HTF focus
-TOP_N = int(os.getenv("TOP_N", 60))
+TOP_N = int(os.getenv("TOP_N", 40))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 5))
 
 # ---------------- LOGGING ----------------
@@ -150,111 +150,81 @@ async def send_telegram(msg: str, parse_mode="HTML"):
         except Exception as e:
             log.warning(f"Telegram send failed: {e}")
 
-# ---------------- DATABASE (WITH TP/SL TRACKING) ----------------
+# ---------------- DATABASE ----------------
 async def init_db():
     global db_conn
     db_conn = await aiosqlite.connect(DB_PATH)
     await db_conn.execute("PRAGMA journal_mode=WAL;")
     
-    # Check if table exists and has old schema
-    async with db_conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='signals'") as cursor:
-        table_exists = await cursor.fetchone()
-    
-    if table_exists:
-        # Check if we need to add new columns
-        async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
-            columns = await cursor.fetchall()
-            column_names = [col[1] for col in columns]
+    # Create signals table with step-by-step tracking
+    await db_conn.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT,
+            timestamp TEXT,
+            side TEXT,
             
-            # Add missing columns if they don't exist
-            if 'tp_hit' not in column_names:
-                await db_conn.execute("ALTER TABLE signals ADD COLUMN tp_hit INTEGER DEFAULT 0")
-                await db_conn.execute("ALTER TABLE signals ADD COLUMN tp_hit_price REAL")
-                await db_conn.execute("ALTER TABLE signals ADD COLUMN tp_hit_time TEXT")
-                await db_conn.execute("ALTER TABLE signals ADD COLUMN sl_hit INTEGER DEFAULT 0")
-                await db_conn.execute("ALTER TABLE signals ADD COLUMN sl_hit_price REAL")
-                await db_conn.execute("ALTER TABLE signals ADD COLUMN sl_hit_time TEXT")
-                log.info("Added TP/SL tracking columns to existing table")
-    else:
-        # Create new table with full schema including TP/SL tracking
-        await db_conn.execute("""
-            CREATE TABLE IF NOT EXISTS signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT,
-                timestamp TEXT,
-                side TEXT,
-                
-                -- Step 1: HTF Bias
-                htf_bias TEXT,
-                htf_range_high REAL,
-                htf_range_low REAL,
-                htf_premium_discount TEXT,
-                htf_liquidity_zones_json TEXT,
-                htf_structure_json TEXT,
-                
-                -- Step 2: Liquidity Map
-                liquidity_from_json TEXT,
-                liquidity_to_json TEXT,
-                has_clear_target BOOLEAN,
-                
-                -- Step 3: Liquidity Sweep
-                sweep_type TEXT,
-                swept_price REAL,
-                sweep_impulsive BOOLEAN,
-                sweep_strength REAL,
-                
-                -- Step 4: Structure Check
-                structure_shift_type TEXT,
-                structure_shift_confirmed BOOLEAN,
-                structure_description TEXT,
-                
-                -- Step 5: Entry Zone
-                entry_type TEXT,
-                entry_price REAL,
-                entry_low REAL,
-                entry_high REAL,
-                entry_aligns_htf BOOLEAN,
-                entry_reaction_confirmed BOOLEAN,
-                
-                -- Step 6: Risk/SL
-                sl_price REAL,
-                sl_invalidation_type TEXT,
-                risk_amount REAL,
-                sl_distance_pct REAL,
-                
-                -- Step 7: Take Profit
-                tp1_price REAL,
-                tp1_type TEXT,
-                tp2_price REAL,
-                tp2_type TEXT,
-                tp3_price REAL,
-                tp3_type TEXT,
-                
-                -- Step 8: Probability
-                prob_htf_alignment REAL,
-                prob_liquidity_quality REAL,
-                prob_sweep_strength REAL,
-                prob_structure_clarity REAL,
-                prob_entry_precision REAL,
-                prob_total_score REAL,
-                prob_acceptable BOOLEAN,
-                
-                -- Entry Details
-                current_price REAL,
-                status TEXT DEFAULT 'DETECTED',
-                
-                -- TP/SL Tracking (Added from Hybrid v3.0)
-                tp_hit INTEGER DEFAULT 0,
-                tp_hit_price REAL,
-                tp_hit_time TEXT,
-                sl_hit INTEGER DEFAULT 0,
-                sl_hit_price REAL,
-                sl_hit_time TEXT,
-                
-                notes TEXT
-            )
-        """)
-        log.info("Created new signals table with TP/SL tracking")
+            -- Step 1: HTF Bias
+            htf_bias TEXT,
+            htf_range_high REAL,
+            htf_range_low REAL,
+            htf_premium_discount TEXT,
+            htf_liquidity_zones_json TEXT,
+            htf_structure_json TEXT,
+            
+            -- Step 2: Liquidity Map
+            liquidity_from_json TEXT,
+            liquidity_to_json TEXT,
+            has_clear_target BOOLEAN,
+            
+            -- Step 3: Liquidity Sweep
+            sweep_type TEXT,
+            swept_price REAL,
+            sweep_impulsive BOOLEAN,
+            sweep_strength REAL,
+            
+            -- Step 4: Structure Check
+            structure_shift_type TEXT,
+            structure_shift_confirmed BOOLEAN,
+            structure_description TEXT,
+            
+            -- Step 5: Entry Zone
+            entry_type TEXT,
+            entry_price REAL,
+            entry_low REAL,
+            entry_high REAL,
+            entry_aligns_htf BOOLEAN,
+            entry_reaction_confirmed BOOLEAN,
+            
+            -- Step 6: Risk/SL
+            sl_price REAL,
+            sl_invalidation_type TEXT,
+            risk_amount REAL,
+            sl_distance_pct REAL,
+            
+            -- Step 7: Take Profit
+            tp1_price REAL,
+            tp1_type TEXT,
+            tp2_price REAL,
+            tp2_type TEXT,
+            tp3_price REAL,
+            tp3_type TEXT,
+            
+            -- Step 8: Probability
+            prob_htf_alignment REAL,
+            prob_liquidity_quality REAL,
+            prob_sweep_strength REAL,
+            prob_structure_clarity REAL,
+            prob_entry_precision REAL,
+            prob_total_score REAL,
+            prob_acceptable BOOLEAN,
+            
+            -- Entry Details
+            current_price REAL,
+            status TEXT DEFAULT 'DETECTED',
+            notes TEXT
+        )
+    """)
     
     await db_conn.commit()
 
@@ -1156,142 +1126,6 @@ def calculate_probability(htf_context: HTFContext, liquidity_map: LiquidityMap,
         total_score=float(total_score)  # FIX: Ensure float
     )
 
-# ---------------- TP/SL MONITORING (ADDED FROM HYBRID v3.0) ----------------
-async def monitor_tp_sl(exchange):
-    """Monitor existing signals for TP/SL hits"""
-    while True:
-        try:
-            async with db_lock:
-                async with db_conn.execute(
-                    """SELECT id, symbol, side, entry_price, sl_price, 
-                              tp1_price, tp2_price, tp3_price, status,
-                              tp_hit, sl_hit 
-                       FROM signals 
-                       WHERE status = 'DETECTED' 
-                       AND tp_hit = 0 
-                       AND sl_hit = 0
-                       ORDER BY timestamp DESC LIMIT 50"""
-                ) as cursor:
-                    active_signals = await cursor.fetchall()
-            
-            for signal in active_signals:
-                signal_id, symbol, side, entry_price, sl_price, tp1_price, tp2_price, tp3_price, status, tp_hit, sl_hit = signal
-                
-                try:
-                    ticker = await exchange.fetch_ticker(symbol)
-                    current_price = ticker.get("last", 0)
-                    if not current_price:
-                        continue
-                    
-                    now = datetime.datetime.utcnow().isoformat()
-                    
-                    # Check for TP hits
-                    tp_hit_level = 0
-                    tp_hit_price = 0.0
-                    
-                    if side == "BUY":
-                        if current_price >= tp3_price:
-                            tp_hit_level = 3
-                            tp_hit_price = tp3_price
-                        elif current_price >= tp2_price:
-                            tp_hit_level = 2
-                            tp_hit_price = tp2_price
-                        elif current_price >= tp1_price:
-                            tp_hit_level = 1
-                            tp_hit_price = tp1_price
-                    else:
-                        if current_price <= tp3_price:
-                            tp_hit_level = 3
-                            tp_hit_price = tp3_price
-                        elif current_price <= tp2_price:
-                            tp_hit_level = 2
-                            tp_hit_price = tp2_price
-                        elif current_price <= tp1_price:
-                            tp_hit_level = 1
-                            tp_hit_price = tp1_price
-                    
-                    # Check for SL hit
-                    sl_hit_flag = 0
-                    sl_hit_price_val = 0.0
-                    
-                    if side == "BUY":
-                        if current_price <= sl_price:
-                            sl_hit_flag = 1
-                            sl_hit_price_val = sl_price
-                    else:
-                        if current_price >= sl_price:
-                            sl_hit_flag = 1
-                            sl_hit_price_val = sl_price
-                    
-                    # Update database if TP or SL hit
-                    if tp_hit_level > 0 or sl_hit_flag > 0:
-                        async with db_lock:
-                            if tp_hit_level > 0:
-                                await db_conn.execute(
-                                    """UPDATE signals 
-                                       SET tp_hit = ?, 
-                                           tp_hit_price = ?,
-                                           tp_hit_time = ?,
-                                           status = 'TP_HIT'
-                                       WHERE id = ?""",
-                                    (tp_hit_level, tp_hit_price, now, signal_id)
-                                )
-                                
-                                tp_msg = f"""
-🎯 <b>TAKE PROFIT HIT - {symbol}</b>
-
-<b>TP Level:</b> {tp_hit_level}
-<b>TP Price:</b> {tp_hit_price:.8f}
-<b>Entry Price:</b> {entry_price:.8f}
-<b>Current Price:</b> {current_price:.8f}
-<b>Side:</b> {side}
-
-<b>Profit:</b> {abs(current_price - entry_price):.8f}
-<b>Profit %:</b> {abs((current_price - entry_price) / entry_price * 100):.2f}%
-
-<i>Time: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}</i>
-"""
-                                await send_telegram(tp_msg)
-                                log.info(f"TP{tp_hit_level} hit for {symbol} at {tp_hit_price:.8f}")
-                            
-                            elif sl_hit_flag > 0:
-                                await db_conn.execute(
-                                    """UPDATE signals 
-                                       SET sl_hit = ?, 
-                                           sl_hit_price = ?,
-                                           sl_hit_time = ?,
-                                           status = 'SL_HIT'
-                                       WHERE id = ?""",
-                                    (sl_hit_flag, sl_hit_price_val, now, signal_id)
-                                )
-                                
-                                sl_msg = f"""
-🛑 <b>STOP LOSS HIT - {symbol}</b>
-
-<b>SL Price:</b> {sl_hit_price_val:.8f}
-<b>Entry Price:</b> {entry_price:.8f}
-<b>Current Price:</b> {current_price:.8f}
-<b>Side:</b> {side}
-
-<b>Loss:</b> {abs(current_price - entry_price):.8f}
-<b>Loss %:</b> {abs((current_price - entry_price) / entry_price * 100):.2f}%
-
-<i>Time: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}</i>
-"""
-                                await send_telegram(sl_msg)
-                                log.info(f"SL hit for {symbol} at {sl_hit_price_val:.8f}")
-                            
-                            await db_conn.commit()
-                
-                except Exception as e:
-                    log.error(f"Error monitoring {symbol}: {e}")
-                    continue
-        
-        except Exception as e:
-            log.error(f"Error in TP/SL monitor: {e}")
-        
-        await asyncio.sleep(30)
-
 # ---------------- MAIN SCANNING LOGIC ----------------
 async def scan_symbol_full(exchange, symbol: str) -> Optional[Dict]:
     """
@@ -1510,10 +1344,7 @@ Entry Precision: {setup['probability']['entry_precision']:.2f}
                 :tp1_price, :tp1_type, :tp2_price, :tp2_type, :tp3_price, :tp3_type,
                 :prob_htf_alignment, :prob_liquidity_quality, :prob_sweep_strength,
                 :prob_structure_clarity, :prob_entry_precision, :prob_total_score, :prob_acceptable,
-                :current_price, 'DETECTED', 
-                :tp_hit, :tp_hit_price, :tp_hit_time,
-                :sl_hit, :sl_hit_price, :sl_hit_time,
-                ''
+                :current_price, 'DETECTED', ''
             )
         """, {
             "symbol": setup["symbol"],
@@ -1558,14 +1389,7 @@ Entry Precision: {setup['probability']['entry_precision']:.2f}
             "prob_entry_precision": float(setup["probability"]["entry_precision"]),
             "prob_total_score": float(setup["probability"]["total_score"]),
             "prob_acceptable": bool(setup["probability"]["acceptable"]),
-            "current_price": float(setup["current_price"]),
-            # TP/SL tracking columns (all initialized as None/0)
-            "tp_hit": 0,
-            "tp_hit_price": None,
-            "tp_hit_time": None,
-            "sl_hit": 0,
-            "sl_hit_price": None,
-            "sl_hit_time": None
+            "current_price": float(setup["current_price"])
         })
         await db_conn.commit()
 
@@ -1575,7 +1399,6 @@ async def scanner_main(exchange):
     
     await send_telegram("🚀 ROMEOTPT v2 Scanner Started - 8-Step Exact Match")
     await send_telegram("Step 1: HTF Bias → 2: Liquidity Map → 3: Sweep → 4: Structure → 5: Entry → 6: SL → 7: TP → 8: Probability")
-    await send_telegram("✅ TP/SL Tracking Enabled (from Hybrid v3.0)")
     
     while True:
         try:
@@ -1617,7 +1440,7 @@ app = FastAPI()
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "scanner": "ROMEOTPT v2", "tp_sl_tracking": "enabled"}
+    return {"status": "healthy", "scanner": "ROMEOTPT v2"}
 
 @app.get("/setups")
 async def get_setups(limit: int = 20, min_score: float = 3.5):
@@ -1648,46 +1471,11 @@ async def get_setups(limit: int = 20, min_score: float = 3.5):
         
         return {"setups": setups, "count": len(setups)}
 
-@app.get("/stats")
-async def get_stats():
-    async with db_lock:
-        # Total signals
-        async with db_conn.execute("SELECT COUNT(*) FROM signals") as cursor:
-            total = (await cursor.fetchone())[0]
-        
-        # TP hits
-        async with db_conn.execute("SELECT COUNT(*) FROM signals WHERE tp_hit > 0") as cursor:
-            tp_hits = (await cursor.fetchone())[0]
-        
-        # SL hits
-        async with db_conn.execute("SELECT COUNT(*) FROM signals WHERE sl_hit > 0") as cursor:
-            sl_hits = (await cursor.fetchone())[0]
-        
-        # Active signals
-        async with db_conn.execute("SELECT COUNT(*) FROM signals WHERE status = 'DETECTED'") as cursor:
-            active = (await cursor.fetchone())[0]
-        
-        # Win rate
-        if total > 0:
-            win_rate = (tp_hits / (tp_hits + sl_hits)) * 100 if (tp_hits + sl_hits) > 0 else 0
-        else:
-            win_rate = 0
-        
-        return {
-            "total_signals": total,
-            "tp_hits": tp_hits,
-            "sl_hits": sl_hits,
-            "active_signals": active,
-            "win_rate": f"{win_rate:.2f}%",
-            "scanner_status": "running",
-            "version": "v2 with TP/SL tracking"
-        }
-
 # ---------------- MAIN ----------------
 async def main():
     global db_conn
     
-    # Initialize database with TP/SL tracking
+    # Initialize
     await init_db()
     
     # Create exchange
@@ -1696,11 +1484,7 @@ async def main():
         "options": {"defaultType": "spot"}
     })
     
-    # Start TP/SL monitoring as background task
-    monitor_task = asyncio.create_task(monitor_tp_sl(exchange))
-    log.info("Started TP/SL monitoring task")
-    
-    # Start main scanner
+    # Start scanner
     await scanner_main(exchange)
 
 if __name__ == "__main__":
