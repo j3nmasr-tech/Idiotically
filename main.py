@@ -840,6 +840,42 @@ class RomeOPTEngine:
             return True
         return False
     
+    def calculate_romeopt_score(self, sweep: LiquiditySweep, ob: OrderBlock, 
+                              momentum: float, displacement: float,
+                              rr_ratio: float, use_htf: bool) -> int:
+        """Calculate 6-step RomeOPT score (0-6)"""
+        score = 0
+        
+        # Step 1: Liquidity Sweep (max 2 points)
+        if sweep.quality_score > 0.7:
+            score += 2
+        elif sweep.quality_score > 0.5:
+            score += 1
+        
+        # Step 2: Order Block (max 1 point)
+        if ob.strength in ["STRONG", "MODERATE"]:
+            score += 1
+        
+        # Step 3: Entry Approach (max 1 point)
+        # Entry is already validated in generate_romeopt_signal
+        score += 1
+        
+        # Step 4: Displacement (max 1 point)
+        if displacement >= self.config.DISPLACEMENT_MIN_THRESHOLD:
+            score += 1
+        
+        # Step 5: HTF Alignment (max 1 point)
+        if use_htf:
+            score += 1  # HTF alignment confirmed
+        
+        # Step 6: Risk/Reward (max 1 point)
+        if rr_ratio >= 1.0:
+            score += 1
+        elif rr_ratio >= 0.5:
+            score += 0.5  # Half point
+        
+        return min(6, int(score))
+    
     async def generate_romeopt_signal(self, symbol: str, timeframe: str) -> Optional[RomeOPTSignal]:
         """Generate a complete RomeOPT signal"""
         log.debug(f"Generating signal for {symbol} {timeframe}")
@@ -874,23 +910,18 @@ class RomeOPTEngine:
         
         side = "BUY" if ob.type == "BULLISH_OB" else "SELL"
         
-        # Check OB approach (FIXED - using old code logic)
+        # Check OB approach
         last_close = float(df['close'].iloc[-1])
         if side == "BUY":
-            # Calculate distance percentage (10% threshold like old code)
             distance_to_ob = (last_close - ob.high) / (ob.high - ob.low + 1e-8)
-            # Must be at or slightly above OB high, or within 10% distance
             if not (last_close <= ob.high or distance_to_ob < 0.1):
                 log.debug(f"Not approaching OB for BUY: price={last_close}, ob_high={ob.high}, distance={distance_to_ob:.2%}")
                 return None
-            log.debug(f"Approaching OB for BUY: price={last_close}, ob_high={ob.high}, distance={distance_to_ob:.2%}")
         else:
             distance_to_ob = (ob.low - last_close) / (ob.high - ob.low + 1e-8)
-            # Must be at or slightly below OB low, or within 10% distance
             if not (last_close >= ob.low or distance_to_ob < 0.1):
                 log.debug(f"Not approaching OB for SELL: price={last_close}, ob_low={ob.low}, distance={distance_to_ob:.2%}")
                 return None
-            log.debug(f"Approaching OB for SELL: price={last_close}, ob_low={ob.low}, distance={distance_to_ob:.2%}")
         
         # Momentum and displacement
         last = df.iloc[-1]
@@ -909,6 +940,7 @@ class RomeOPTEngine:
         atr_val = self._calculate_atr(df, self.config.ATR_PERIOD)
         entry = last_close
         
+        use_htf = self.should_use_htf_liquidity(timeframe)
         tp_sl_result = await self.calculate_romeopt_tp_sl(
             entry, side, df, ob, atr_val, symbol, timeframe
         )
@@ -919,27 +951,29 @@ class RomeOPTEngine:
         
         sl, tp, tp_type, htf_liquidity = tp_sl_result
         
-        # ========== CREATE SIGNAL ==========
-        # Simple score
-        score = 0
-        if sweep.quality_score > 0.6: 
-            score += 2
-        if ob.strength in ["STRONG", "MODERATE"]: 
-            score += 1
-        if momentum > 0.8: 
-            score += 1
-        score += 1  # HTF alignment assumed
+        # Calculate R:R
+        if side == "BUY":
+            risk = entry - sl
+            reward = tp - entry
+        else:
+            risk = sl - entry
+            reward = entry - tp
         
-        use_htf = self.should_use_htf_liquidity(timeframe)
-        liquidity_source = f"HTF ({self.get_htf_for_timeframe(timeframe)})" if use_htf else "Same TF"
+        rr_ratio = reward / risk if risk > 0 else 0
+        
+        # Calculate 6-step score
+        score = self.calculate_romeopt_score(sweep, ob, momentum, displacement, rr_ratio, use_htf)
+        
+        # Determine market state
+        market_state = self._determine_market_state(df, atr_val)
         
         reasons = [
-            f"RomeOPT 6-Step",
-            f"Liquidity Source: {liquidity_source}",
-            f"Sweep: {sweep.type}",
-            f"OB: {ob.type} ({ob.strength})",
-            f"Mom: {momentum:.2f} | Disp: {displacement:.2f}",
-            f"TP: {tp_type}",
+            f"RomeOPT_6Step",
+            f"Liquidity:{'HTF' if use_htf else 'SAME_TF'}",
+            f"Sweep:{sweep.type}",
+            f"OB:{ob.type}({ob.strength})",
+            f"Mom:{momentum:.2f}|Disp:{displacement:.2f}",
+            f"TP:{tp_type}",
         ]
         
         signal = RomeOPTSignal(
@@ -953,7 +987,7 @@ class RomeOPTEngine:
             reasons=reasons,
             liquidity_sweep=sweep,
             order_block=ob,
-            market_state=self._determine_market_state(df, atr_val),
+            market_state=market_state,
             tp_type=tp_type,
             tp_locked=True
         )
@@ -965,41 +999,45 @@ class RomeOPTEngine:
         await self.db.save_signal(signal)
         
         self.signals_generated += 1
-        log.info(f"✅ Signal generated: {symbol} {timeframe} {side} | Score: {score}")
+        log.info(f"Signal generated: {symbol} {timeframe} {side} | Score: {score}")
         
         return signal
     
     async def send_signal_notification(self, signal: RomeOPTSignal, htf_liquidity: Dict = None, use_htf: bool = False):
-        """Send Telegram notification"""
+        """Send Telegram notification with all sweep and OB data in minimal format"""
+        
+        # Determine liquidity source
         if use_htf and htf_liquidity:
             htf = htf_liquidity.get("timeframe", "N/A")
-            liquidity_info = f"HTF ({htf})"
+            liquidity_source = f"HTF({htf})"
+            target_type = htf_liquidity.get("target_type", "N/A")
         else:
-            liquidity_info = "Same TF"
+            liquidity_source = "SAME_TF"
+            target_type = signal.tp_type.split(":")[-1].strip() if ":" in signal.tp_type else signal.tp_type
         
+        # Calculate additional metrics
+        ob_range = signal.order_block.high - signal.order_block.low
+        entry_distance = abs(signal.entry - signal.order_block.low) if signal.side == "BUY" else abs(signal.order_block.high - signal.entry)
+        entry_proximity = (entry_distance / ob_range) if ob_range > 0 else 1.0
+        momentum = abs(signal.entry - signal.order_block.body_low) / (ob_range + 1e-8)
+        
+        # Build message with ALL sweep and OB data
         message = [
-            f"🏆 <b>ROMEOPT SIGNAL</b>",
-            f"",
-            f"<b>Pair:</b> {signal.symbol}",
-            f"<b>Side:</b> {signal.side}",
-            f"<b>TF:</b> {signal.timeframe}",
-            f"<b>Liquidity:</b> {liquidity_info}",
-            f"<b>Score:</b> {signal.score}/6",
-            f"",
-            f"<b>🎯 LEVELS:</b>",
-            f"Entry: <code>{signal.entry:.6f}</code>",
-            f"SL: <code>{signal.sl:.6f}</code>",
-            f"TP: <code>{signal.tp:.6f}</code>",
-            f"R:R: <code>{signal.risk_reward_ratio:.2f}:1</code>",
-            f"",
-            f"<b>⚡ RULES:</b>",
-            f"• 1m/3m/5m → HTF liquidity",
-            f"• 15m/30m → Same TF liquidity",
-            f"• TP LOCKED",
-            f"",
-            f"<i>Trust the liquidity objective</i>"
+            f"ROMEOPT {signal.symbol} {signal.side} {signal.timeframe} SCORE:{signal.score}/6",
+            f"SWEEP:{signal.liquidity_sweep.type} DIR:{signal.liquidity_sweep.direction}",
+            f"SWEPT_LEVEL:{signal.liquidity_sweep.swept_level:.6f} STR:{signal.liquidity_sweep.strength:.2f}",
+            f"RESPECTED:{signal.liquidity_sweep.respected} QUALITY:{signal.liquidity_sweep.quality_score:.2f}",
+            f"OB:{signal.order_block.type} STR:{signal.order_block.strength}",
+            f"OB_RANGE:{signal.order_block.low:.6f}-{signal.order_block.high:.6f}",
+            f"OB_BODY:{signal.order_block.body_low:.6f}-{signal.order_block.body_high:.6f}",
+            f"OB_WICK:{signal.order_block.wick_ratio:.2f} VOL:{signal.order_block.volume:.0f}",
+            f"OB_TESTED:{signal.order_block.tested} CONF:{signal.order_block.confluence_score}",
+            f"ENTRY:{signal.entry:.6f} OB_PROX:{entry_proximity:.1%} MOM:{momentum:.2f}",
+            f"LIQ_SRC:{liquidity_source} TP_TYPE:{target_type} STATE:{signal.market_state}",
+            f"SL:{signal.sl:.6f} TP:{signal.tp:.6f} RR:{signal.risk_reward_ratio:.2f}:1 TP_LOCKED"
         ]
         
+        # Send as one compact message
         await self.tg_bot.send_message("\n".join(message))
     
     # ==================== MONITORING ====================
@@ -1054,16 +1092,11 @@ class RomeOPTEngine:
                         if tp_hit_flag or sl_hit_flag:
                             await self.db.update_signal_status(signal_id, tp_hit_flag, sl_hit_flag)
                             
-                            alert_msg = [
-                                f"🎯 <b>{'TP' if tp_hit_flag else 'SL'} HIT</b>",
-                                f"",
-                                f"<b>Pair:</b> {symbol}",
-                                f"<b>Side:</b> {side}",
-                                f"Entry: <code>{entry:.6f}</code>",
-                                f"Exit: <code>{price:.6f}</code>",
-                            ]
+                            # Minimal SL/TP hit notification
+                            pnl_percent = ((price-entry)/entry*100) if side=='BUY' else ((entry-price)/entry*100)
+                            alert_msg = f"{'TP' if tp_hit_flag else 'SL'} HIT {symbol} {side} ENTRY:{entry:.6f} EXIT:{price:.6f} PNL:{pnl_percent:+.2f}%"
                             
-                            await self.tg_bot.send_message("\n".join(alert_msg))
+                            await self.tg_bot.send_message(alert_msg)
                             
                             if sl_hit_flag:
                                 self.record_sl_hit(symbol)
@@ -1080,7 +1113,7 @@ class RomeOPTEngine:
     # ==================== SCANNING ====================
     async def scan_markets(self):
         """Main scanning loop"""
-        await self.tg_bot.send_message(f"🔄 SCANNING STARTED | Top {self.config.TOP_N} pairs | TFs: {', '.join(self.config.TIMEFRAMES)}")
+        await self.tg_bot.send_message(f"SCANNING STARTED Top {self.config.TOP_N} pairs TFs:{','.join(self.config.TIMEFRAMES)}")
         log.info(f"Starting market scan for top {self.config.TOP_N} pairs")
         
         while True:
