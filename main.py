@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ROMEOTPT SCANNER v3.2 - COMPLETE & CORRECTED VERSION
+ROMEOTPT SCANNER v3.3 - CORE LIQUIDITY MODEL
 Two-layer architecture + Deduplication + Outcome Tracking
+WITH ROMEOTPT MUST-HAVE STEPS
 """
 
 import os
@@ -24,15 +25,15 @@ from dataclasses import dataclass
 # ---------------- CONFIG ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v3_2.db")
+DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v3_3.db")
 
 # Scanner settings
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 30))
-TOP_N = int(os.getenv("TOP_N", 5))
+TOP_N = int(os.getenv("TOP_N", 35))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 10))
 
 # Signal thresholds
-MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 0.0))
+MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 2.5))  # Minimum to be valid RomeOTPT
 
 # Deduplication settings
 SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 15))
@@ -43,13 +44,17 @@ PRICE_MOVEMENT_THRESHOLD = float(os.getenv("PRICE_MOVEMENT_THRESHOLD", 0.5))
 OUTCOME_CHECK_INTERVAL = int(os.getenv("OUTCOME_CHECK_INTERVAL", 60))
 MINIMUM_TRADE_HOLD_SECONDS = int(os.getenv("MINIMUM_TRADE_HOLD_SECONDS", 30))
 
+# Liquidity detection settings
+LIQUIDITY_SWEEP_MIN_PCT = float(os.getenv("LIQUIDITY_SWEEP_MIN_PCT", 0.3))  # Min 0.3% sweep
+LIQUIDITY_TARGET_MULTIPLIER = float(os.getenv("LIQUIDITY_TARGET_MULTIPLIER", 1.2))  # TP beyond liquidity
+
 # ---------------- LOGGING ----------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
-log = logging.getLogger("romeopt_v3_2")
+log = logging.getLogger("romeopt_v3_3")
 
 # ---------------- DATA STRUCTURES ----------------
 @dataclass
@@ -65,28 +70,56 @@ class SetupEligibility:
     disqualify_reason: str = ""
     
 @dataclass
+class LiquidityData:
+    """Liquidity mapping data"""
+    from_liquidity_price: float = 0.0  # Liquidity that was taken
+    to_liquidity_price: float = 0.0    # Next liquidity target
+    sweep_confirmed: bool = False      # Whether sweep actually happened
+    sweep_strength: float = 0.0        # 0.0-1.0 strength
+    liquidity_distance_pct: float = 0.0  # Distance to target liquidity
+    
+@dataclass
 class SetupQuality:
-    """LAYER 2: Quality metrics with 8-step tracking"""
-    sweep_strength: float = 0.0
+    """LAYER 2: Quality metrics with RomeOTPT MUST-HAVE steps"""
+    # Core RomeOTPT MUST-HAVE steps
+    liquidity_map_valid: bool = False      # STEP 1: Liquidity Map defined
+    liquidity_sweep_confirmed: bool = False # STEP 2: Liquidity Sweep confirmed
+    entry_zone_defined: bool = False       # STEP 3: Entry Zone + SL defined
+    take_profit_liquidity: bool = False    # STEP 4: TP at liquidity target
+    
+    # Additional quality metrics
     structure_shift: bool = False
-    from_liquidity_exists: bool = False
     confirmation_candle: bool = False
     htfc_alignment_score: float = 0.0
     total_score: float = 0.0
     
-    # 8-step tracking
-    eight_steps_status: Dict = None
+    # Liquidity data
+    liquidity_data: LiquidityData = None
     
     @property
     def quality_tier(self) -> str:
+        # Must have all 4 RomeOTPT steps to be valid
+        if not self.is_valid_romeopt:
+            return "INVALID"
+        
         if self.total_score >= 4.0:
             return "A+"
         elif self.total_score >= 3.0:
             return "A"
-        elif self.total_score >= 2.0:
+        elif self.total_score >= 2.5:
             return "B"
         else:
             return "C"
+    
+    @property
+    def is_valid_romeopt(self) -> bool:
+        """Check if setup has all RomeOTPT MUST-HAVE steps"""
+        return all([
+            self.liquidity_map_valid,      # STEP 1
+            self.liquidity_sweep_confirmed, # STEP 2
+            self.entry_zone_defined,       # STEP 3
+            self.take_profit_liquidity     # STEP 4
+        ])
 
 # ---------------- SIGNAL TRACKER ----------------
 class SignalTracker:
@@ -102,7 +135,10 @@ class SignalTracker:
             'sl_hits': 0,
             'expired': 0,
             'active': 0,
-            'win_rate': 0.0
+            'win_rate': 0.0,
+            'romeopt_signals': 0,
+            'romeopt_wins': 0,
+            'romeopt_win_rate': 0.0
         }
     
     def is_new_or_updated_signal(self, symbol: str, new_setup: Dict) -> Tuple[bool, str]:
@@ -151,18 +187,19 @@ class SignalTracker:
         if new_quality - old_quality >= 0.5:
             return True, f"Quality improved {old_quality:.2f}→{new_quality:.2f}"
         
-        # Check if entry type changed meaningfully
-        old_entry_type = old_setup.get('entry_type', '')
-        new_entry_type = new_setup.get('entry_type', '')
-        if (old_entry_type in ["DISCOUNT_ZONE", "BULLISH_ENGULFING"] and 
-            new_entry_type in ["PREMIUM_ZONE", "BEARISH_ENGULFING"]):
-            return True, "Entry type changed significantly"
+        # Check if RomeOTPT validity changed
+        old_valid = old_setup.get('quality', {}).get('is_valid_romeopt', False)
+        new_valid = new_setup.get('quality', {}).get('is_valid_romeopt', False)
+        if old_valid != new_valid:
+            return True, f"RomeOTPT validity changed: {old_valid}→{new_valid}"
         
-        # Check if RR improved significantly
-        old_rr = old_setup.get('rr_ratio', 0)
-        new_rr = new_setup.get('rr_ratio', 0)
-        if new_rr > old_rr * 1.2:
-            return True, f"RR improved {old_rr:.2f}→{new_rr:.2f}"
+        # Check if liquidity target changed
+        old_liquidity = old_setup.get('liquidity_data', {}).get('to_liquidity_price', 0)
+        new_liquidity = new_setup.get('liquidity_data', {}).get('to_liquidity_price', 0)
+        if old_liquidity > 0 and new_liquidity > 0:
+            liquidity_change_pct = abs(new_liquidity - old_liquidity) / old_liquidity * 100
+            if liquidity_change_pct > 2.0:  # 2% change in liquidity target
+                return True, f"Liquidity target changed {liquidity_change_pct:.1f}%"
         
         return False, "Same signal, minimal changes"
     
@@ -171,6 +208,8 @@ class SignalTracker:
         now = datetime.datetime.utcnow()
         
         if symbol not in self.active_signals:
+            is_romeopt = setup.get('quality', {}).get('is_valid_romeopt', False)
+            
             self.active_signals[symbol] = {
                 'setup': setup,
                 'first_seen': now,
@@ -182,10 +221,13 @@ class SignalTracker:
                 'highest_price': setup.get('current_price', 0),
                 'lowest_price': setup.get('current_price', 0),
                 'price_at_alert': setup.get('current_price', 0) if alerted else None,
-                'outcome_details': None
+                'outcome_details': None,
+                'is_romeopt': is_romeopt
             }
             self.outcome_stats['total_signals'] += 1
             self.outcome_stats['active'] += 1
+            if is_romeopt:
+                self.outcome_stats['romeopt_signals'] += 1
         else:
             # Update price extremes
             current_price = setup.get('current_price', 0)
@@ -303,8 +345,12 @@ class SignalTracker:
             self.outcome_stats['active'] -= 1
             if outcome['type'] == 'TP1_HIT':
                 self.outcome_stats['tp1_hits'] += 1
+                if signal.get('is_romeopt'):
+                    self.outcome_stats['romeopt_wins'] += 1
             elif outcome['type'] == 'TP2_HIT':
                 self.outcome_stats['tp2_hits'] += 1
+                if signal.get('is_romeopt'):
+                    self.outcome_stats['romeopt_wins'] += 1
             elif outcome['type'] == 'SL_HIT':
                 self.outcome_stats['sl_hits'] += 1
             
@@ -313,6 +359,11 @@ class SignalTracker:
             total_closed = wins + losses
             if total_closed > 0:
                 self.outcome_stats['win_rate'] = wins / total_closed * 100
+            
+            if self.outcome_stats['romeopt_signals'] > 0:
+                self.outcome_stats['romeopt_win_rate'] = (
+                    self.outcome_stats['romeopt_wins'] / self.outcome_stats['romeopt_signals'] * 100
+                )
             
             return outcome
         
@@ -351,6 +402,7 @@ class SignalTracker:
         
         buy_signals = 0
         sell_signals = 0
+        romeopt_signals = 0
         
         for signal in self.active_signals.values():
             setup = signal.get('setup', {})
@@ -358,9 +410,13 @@ class SignalTracker:
                 buy_signals += 1
             elif setup.get('side') == 'SELL':
                 sell_signals += 1
+            
+            if signal.get('is_romeopt'):
+                romeopt_signals += 1
         
         return {
             'active_signals': active_count,
+            'romeopt_signals': romeopt_signals,
             'total_history': len(self.signal_history),
             'signals_by_side': {
                 'BUY': buy_signals,
@@ -411,6 +467,111 @@ def create_dataframe(ohlcv):
     for col in ["open", "high", "low", "close"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
+
+def detect_liquidity_levels(df, side="BUY", lookback_bars=50):
+    """Detect liquidity levels (highs for sells, lows for buys)"""
+    if df is None or len(df) < lookback_bars:
+        return []
+    
+    if side == "BUY":
+        # For BUY: look for recent highs that were swept (liquidity taken)
+        highs = df['high'].values
+        liquidity_levels = []
+        
+        for i in range(len(highs) - 10, len(highs) - 1):
+            if highs[i] == max(highs[max(0, i-5):i+1]):
+                # Check if this high was swept
+                if i < len(highs) - 1 and highs[i+1] > highs[i]:
+                    liquidity_levels.append(float(highs[i]))
+        
+        return sorted(liquidity_levels, reverse=True)[:3]  # Top 3 levels
+    
+    else:  # SELL
+        # For SELL: look for recent lows that were swept
+        lows = df['low'].values
+        liquidity_levels = []
+        
+        for i in range(len(lows) - 10, len(lows) - 1):
+            if lows[i] == min(lows[max(0, i-5):i+1]):
+                # Check if this low was swept
+                if i < len(lows) - 1 and lows[i+1] < lows[i]:
+                    liquidity_levels.append(float(lows[i]))
+        
+        return sorted(liquidity_levels)[:3]  # Bottom 3 levels
+
+def detect_liquidity_sweep(df, side="BUY", lookback_bars=20):
+    """Detect if a liquidity sweep occurred"""
+    if df is None or len(df) < lookback_bars:
+        return False, 0.0
+    
+    if side == "BUY":
+        # For BUY: look for sweep of recent highs
+        recent_highs = df['high'].iloc[-lookback_bars:-5].values
+        current_lowest = df['low'].iloc[-5:].min()
+        
+        if len(recent_highs) > 0:
+            highest_recent = max(recent_highs)
+            sweep_pct = (highest_recent - current_lowest) / highest_recent * 100
+            
+            # Sweep occurred if price went below a recent high
+            sweep_detected = current_lowest < highest_recent
+            
+            return sweep_detected, sweep_pct
+    
+    else:  # SELL
+        # For SELL: look for sweep of recent lows
+        recent_lows = df['low'].iloc[-lookback_bars:-5].values
+        current_highest = df['high'].iloc[-5:].max()
+        
+        if len(recent_lows) > 0:
+            lowest_recent = min(recent_lows)
+            sweep_pct = (current_highest - lowest_recent) / lowest_recent * 100
+            
+            # Sweep occurred if price went above a recent low
+            sweep_detected = current_highest > lowest_recent
+            
+            return sweep_detected, sweep_pct
+    
+    return False, 0.0
+
+def find_next_liquidity_target(df, side="BUY", current_price=0.0, lookback_bars=100):
+    """Find the next liquidity target"""
+    if df is None or len(df) < lookback_bars:
+        return 0.0
+    
+    if side == "BUY":
+        # For BUY: find next significant high (liquidity above)
+        highs = df['high'].iloc[-lookback_bars:].values
+        
+        # Sort highs and find the next one above current price
+        highs_above = [h for h in highs if h > current_price]
+        if highs_above:
+            next_target = min(highs_above)
+            
+            # Find clusters of highs around this level
+            cluster_size = 0.005  # 0.5% cluster
+            cluster_highs = [h for h in highs if abs(h - next_target) / next_target <= cluster_size]
+            
+            if len(cluster_highs) >= 2:  # At least 2 highs in cluster
+                return float(np.mean(cluster_highs)) * LIQUIDITY_TARGET_MULTIPLIER
+    
+    else:  # SELL
+        # For SELL: find next significant low (liquidity below)
+        lows = df['low'].iloc[-lookback_bars:].values
+        
+        # Sort lows and find the next one below current price
+        lows_below = [l for l in lows if l < current_price]
+        if lows_below:
+            next_target = max(lows_below)
+            
+            # Find clusters of lows around this level
+            cluster_size = 0.005  # 0.5% cluster
+            cluster_lows = [l for l in lows if abs(l - next_target) / next_target <= cluster_size]
+            
+            if len(cluster_lows) >= 2:  # At least 2 lows in cluster
+                return float(np.mean(cluster_lows)) / LIQUIDITY_TARGET_MULTIPLIER
+    
+    return 0.0
 
 # ---------------- LAYER 1: FAST ELIGIBILITY CHECK ----------------
 async def check_eligibility_fast(exchange, symbol: str) -> SetupEligibility:
@@ -465,14 +626,6 @@ async def check_eligibility_fast(exchange, symbol: str) -> SetupEligibility:
         log.debug(f"Trend detection error for {symbol}: {e}")
         return SetupEligibility(eligible=False, disqualify_reason="Trend detection error")
     
-    # Get quick range
-    try:
-        range_high = float(df_1h['high'].iloc[-20:].max())
-        range_low = float(df_1h['low'].iloc[-20:].min())
-    except:
-        range_high = float(df_1h['high'].max())
-        range_low = float(df_1h['low'].min())
-    
     # Find entry zone (15m)
     ohlcv_15m = await fetch_ohlcv(exchange, symbol, "15m", 30)
     if not ohlcv_15m:
@@ -493,11 +646,11 @@ async def check_eligibility_fast(exchange, symbol: str) -> SetupEligibility:
         if side == "BUY":
             recent_low_15m = df_15m['low'].iloc[-5:].min()
             
-            if current_price <= recent_low_15m * 1.005:
+            if current_price <= recent_low_15m * 1.02:  # Within 2% of recent low
                 entry_price = current_price
                 entry_type = "DISCOUNT_ZONE"
                 entry_low = recent_low_15m * 0.995
-                entry_high = recent_low_15m * 1.01
+                entry_high = recent_low_15m * 1.02
                 entry_found = True
             
             if not entry_found and len(df_15m) >= 3:
@@ -516,10 +669,10 @@ async def check_eligibility_fast(exchange, symbol: str) -> SetupEligibility:
         else:  # SELL
             recent_high_15m = df_15m['high'].iloc[-5:].max()
             
-            if current_price >= recent_high_15m * 0.995:
+            if current_price >= recent_high_15m * 0.98:  # Within 2% of recent high
                 entry_price = current_price
                 entry_type = "PREMIUM_ZONE"
-                entry_low = recent_high_15m * 0.99
+                entry_low = recent_high_15m * 0.98
                 entry_high = recent_high_15m * 1.005
                 entry_found = True
             
@@ -545,30 +698,36 @@ async def check_eligibility_fast(exchange, symbol: str) -> SetupEligibility:
     # SL logic
     try:
         if side == "BUY":
-            sl_price = min(recent_low_15m * 0.995, entry_price * 0.99)
+            sl_price = min(recent_low_15m * 0.99, entry_price * 0.985)  # 1-1.5% SL
         else:
-            sl_price = max(recent_high_15m * 1.005, entry_price * 1.01)
+            sl_price = max(recent_high_15m * 1.01, entry_price * 1.015)  # 1-1.5% SL
     except:
         # Fallback SL
         if side == "BUY":
-            sl_price = entry_price * 0.99
+            sl_price = entry_price * 0.985
         else:
-            sl_price = entry_price * 1.01
+            sl_price = entry_price * 1.015
     
-    # TP targets
+    # TP targets (will be refined in Layer 2 with liquidity)
     tp_targets = []
     
     try:
         if side == "BUY":
+            # Initial TP based on recent structure
             recent_resistance = df_1h['high'].iloc[-10:].max()
-            tp_targets.append(float(recent_resistance))
+            tp_targets.append(float(recent_resistance * 1.01))  # Just above resistance
             
+            range_high = float(df_1h['high'].iloc[-20:].max())
+            range_low = float(df_1h['low'].iloc[-20:].min())
             range_height = range_high - range_low
             tp_targets.append(float(min(range_high + range_height * 0.5, entry_price * 1.03)))
         else:
+            # Initial TP based on recent structure
             recent_support = df_1h['low'].iloc[-10:].min()
-            tp_targets.append(float(recent_support))
+            tp_targets.append(float(recent_support * 0.99))  # Just below support
             
+            range_high = float(df_1h['high'].iloc[-20:].max())
+            range_low = float(df_1h['low'].iloc[-20:].min())
             range_height = range_high - range_low
             tp_targets.append(float(max(range_low - range_height * 0.5, entry_price * 0.97)))
     except:
@@ -598,53 +757,143 @@ async def check_eligibility_fast(exchange, symbol: str) -> SetupEligibility:
         tp_targets=tp_targets
     )
 
-# ---------------- LAYER 2: QUALITY ANALYSIS ----------------
+# ---------------- LAYER 2: QUALITY ANALYSIS WITH ROMEOTPT MUST-HAVE STEPS ----------------
 async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility) -> SetupQuality:
-    """LAYER 2: QUALITY ANALYSIS WITH 8-STEP TRACKING"""
+    """LAYER 2: QUALITY ANALYSIS WITH ROMEOTPT MUST-HAVE STEPS"""
     
     side = eligibility.side
     entry_type = eligibility.entry_type
     entry_price = eligibility.entry_price
-    current_price = entry_price  # Will be updated
     
-    # Initialize scores
-    sweep_strength = 0.0
+    # Initialize LiquidityData
+    liquidity_data = LiquidityData()
+    
+    # Get current price
+    ticker = await exchange.fetch_ticker(symbol)
+    current_price = ticker.get("last", entry_price)
+    
+    # Initialize quality metrics
     structure_shift = False
-    from_liquidity_exists = False
     confirmation_candle = False
     htfc_alignment_score = 0.0
     
-    # Initialize 8-step tracking
-    eight_steps = {
-        'step_1_htf_bias': False,
-        'step_2_zone_type': False,
-        'step_3_liquidity_sweep': False,
-        'step_4_structure_shift': False,
-        'step_5_from_liquidity': False,
-        'step_6_confirmation_candle': False,
-        'step_7_entry_zone': False,
-        'step_8_rr_ratio': False,
-        
-        # Details for display
-        'step_details': {
-            '1': 'HTF bias aligned with direction',
-            '2': 'Premium/Discount zone entry',
-            '3': 'Liquidity sweep detected',
-            '4': 'Market structure shift',
-            '5': 'FROM liquidity present',
-            '6': 'Confirmation candle formed',
-            '7': 'Price in valid entry zone',
-            '8': 'Risk/Reward ≥ 1.5:1'
-        }
-    }
-    
+    # ============ ROMEOTPT MUST-HAVE STEP 1: LIQUIDITY MAP ============
     try:
-        # Get current price for accurate checks
-        ticker = await exchange.fetch_ticker(symbol)
-        current_price = ticker.get("last", entry_price)
-        
-        # === STEP 1: HTF Bias Alignment ===
-        ohlcv_1h = await fetch_ohlcv(exchange, symbol, "1h", 30)
+        # Get 1H data for liquidity mapping
+        ohlcv_1h = await fetch_ohlcv(exchange, symbol, "1h", 100)
+        if ohlcv_1h:
+            df_1h = create_dataframe(ohlcv_1h)
+            if df_1h is not None and len(df_1h) >= 50:
+                # Detect FROM liquidity (recent highs/lows that were swept)
+                liquidity_levels = detect_liquidity_levels(df_1h, side, 50)
+                
+                if side == "BUY":
+                    # For BUY: FROM liquidity is recent highs that were swept
+                    if liquidity_levels:
+                        # Use the most recent significant high as FROM liquidity
+                        liquidity_data.from_liquidity_price = liquidity_levels[0]
+                        
+                        # Check if we're trading FROM that liquidity (price below recent high)
+                        if current_price < liquidity_data.from_liquidity_price:
+                            liquidity_map_valid = True
+                        else:
+                            liquidity_map_valid = False
+                    else:
+                        liquidity_map_valid = False
+                
+                else:  # SELL
+                    # For SELL: FROM liquidity is recent lows that were swept
+                    if liquidity_levels:
+                        # Use the most recent significant low as FROM liquidity
+                        liquidity_data.from_liquidity_price = liquidity_levels[0]
+                        
+                        # Check if we're trading FROM that liquidity (price above recent low)
+                        if current_price > liquidity_data.from_liquidity_price:
+                            liquidity_map_valid = True
+                        else:
+                            liquidity_map_valid = False
+                    else:
+                        liquidity_map_valid = False
+                
+                # Find TO liquidity (next target)
+                liquidity_data.to_liquidity_price = find_next_liquidity_target(
+                    df_1h, side, current_price, 100
+                )
+                
+                if liquidity_data.to_liquidity_price > 0:
+                    # Calculate distance to target liquidity
+                    if side == "BUY":
+                        liquidity_data.liquidity_distance_pct = (
+                            (liquidity_data.to_liquidity_price - current_price) / current_price * 100
+                        )
+                    else:
+                        liquidity_data.liquidity_distance_pct = (
+                            (current_price - liquidity_data.to_liquidity_price) / current_price * 100
+                        )
+                else:
+                    liquidity_map_valid = False
+            else:
+                liquidity_map_valid = False
+        else:
+            liquidity_map_valid = False
+    except Exception as e:
+        log.debug(f"Liquidity map error for {symbol}: {e}")
+        liquidity_map_valid = False
+    
+    # ============ ROMEOTPT MUST-HAVE STEP 2: LIQUIDITY SWEEP ============
+    try:
+        # Get 15m data for sweep detection
+        ohlcv_15m = await fetch_ohlcv(exchange, symbol, "15m", 30)
+        if ohlcv_15m:
+            df_15m = create_dataframe(ohlcv_15m)
+            if df_15m is not None and len(df_15m) >= 20:
+                sweep_detected, sweep_pct = detect_liquidity_sweep(df_15m, side, 20)
+                
+                liquidity_data.sweep_confirmed = sweep_detected
+                liquidity_data.sweep_strength = min(sweep_pct / 2.0, 1.0)  # Normalize to 0-1
+                
+                # Sweep must be at least LIQUIDITY_SWEEP_MIN_PCT%
+                liquidity_sweep_confirmed = (
+                    sweep_detected and 
+                    sweep_pct >= LIQUIDITY_SWEEP_MIN_PCT and
+                    liquidity_data.sweep_strength > 0.3
+                )
+            else:
+                liquidity_sweep_confirmed = False
+        else:
+            liquidity_sweep_confirmed = False
+    except Exception as e:
+        log.debug(f"Liquidity sweep error for {symbol}: {e}")
+        liquidity_sweep_confirmed = False
+    
+    # ============ ROMEOTPT MUST-HAVE STEP 3: ENTRY ZONE + SL ============
+    entry_zone_defined = (
+        eligibility.entry_type in ["DISCOUNT_ZONE", "BULLISH_ENGULFING", "PREMIUM_ZONE", "BEARISH_ENGULFING"] and
+        eligibility.sl_price > 0 and
+        abs(entry_price - eligibility.sl_price) / entry_price > 0.005  # SL must be meaningful (>0.5%)
+    )
+    
+    # ============ ROMEOTPT MUST-HAVE STEP 4: TAKE PROFIT AT LIQUIDITY TARGET ============
+    if liquidity_data.to_liquidity_price > 0:
+        # TP must be at or beyond liquidity target
+        if side == "BUY":
+            take_profit_liquidity = (
+                liquidity_data.to_liquidity_price > 0 and
+                eligibility.tp_targets and
+                any(tp >= liquidity_data.to_liquidity_price * 0.995 for tp in eligibility.tp_targets)
+            )
+        else:  # SELL
+            take_profit_liquidity = (
+                liquidity_data.to_liquidity_price > 0 and
+                eligibility.tp_targets and
+                any(tp <= liquidity_data.to_liquidity_price * 1.005 for tp in eligibility.tp_targets)
+            )
+    else:
+        take_profit_liquidity = False
+    
+    # ============ ADDITIONAL QUALITY METRICS ============
+    try:
+        # HTF Alignment
         if ohlcv_1h:
             df_1h = create_dataframe(ohlcv_1h)
             if df_1h is not None and len(df_1h) >= 20:
@@ -653,126 +902,54 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility) 
                 
                 if side == "BUY":
                     htfc_alignment_score = 1.0 if df_1h['ema_20'].iloc[-1] > df_1h['ema_50'].iloc[-1] else 0.5
-                    eight_steps['step_1_htf_bias'] = htfc_alignment_score >= 0.7
                 else:
                     htfc_alignment_score = 1.0 if df_1h['ema_20'].iloc[-1] < df_1h['ema_50'].iloc[-1] else 0.5
-                    eight_steps['step_1_htf_bias'] = htfc_alignment_score >= 0.7
         
-        # === STEP 2: Premium/Discount Zone ===
-        if side == "BUY" and entry_type in ["DISCOUNT_ZONE", "BULLISH_ENGULFING"]:
-            eight_steps['step_2_zone_type'] = True
-        elif side == "SELL" and entry_type in ["PREMIUM_ZONE", "BEARISH_ENGULFING"]:
-            eight_steps['step_2_zone_type'] = True
+        # Structure Shift
+        if ohlcv_1h and df_1h is not None and len(df_1h) >= 11:
+            if side == "BUY":
+                recent_high = df_1h['high'].iloc[-10:-1].max()
+                current_close = df_1h['close'].iloc[-1]
+                structure_shift = current_close > recent_high
+            else:
+                recent_low = df_1h['low'].iloc[-10:-1].min()
+                current_close = df_1h['close'].iloc[-1]
+                structure_shift = current_close < recent_low
         
-        # === STEP 3: Liquidity Sweep ===
-        ohlcv_15m = await fetch_ohlcv(exchange, symbol, "15m", 20)
-        if ohlcv_15m:
-            df_15m = create_dataframe(ohlcv_15m)
-            if df_15m is not None and len(df_15m) >= 10:
-                if side == "BUY":
-                    recent_low = df_15m['low'].iloc[-5:].min()
-                    prev_low = df_15m['low'].iloc[-10:-5].min()
-                    if recent_low < prev_low:
-                        sweep_strength = 0.7
-                        eight_steps['step_3_liquidity_sweep'] = True
-                        try:
-                            sweep_idx = df_15m['low'].idxmin()
-                            if sweep_idx < len(df_15m) - 1:
-                                sweep_candle = df_15m.iloc[sweep_idx]
-                                body_size = abs(sweep_candle['close'] - sweep_candle['open'])
-                                wick_size = sweep_candle['high'] - max(sweep_candle['open'], sweep_candle['close'])
-                                if body_size > wick_size:
-                                    sweep_strength = 1.0
-                        except:
-                            pass
-                else:
-                    recent_high = df_15m['high'].iloc[-5:].max()
-                    prev_high = df_15m['high'].iloc[-10:-5].max()
-                    if recent_high > prev_high:
-                        sweep_strength = 0.7
-                        eight_steps['step_3_liquidity_sweep'] = True
-                        try:
-                            sweep_idx = df_15m['high'].idxmax()
-                            if sweep_idx < len(df_15m) - 1:
-                                sweep_candle = df_15m.iloc[sweep_idx]
-                                body_size = abs(sweep_candle['close'] - sweep_candle['open'])
-                                wick_size = min(sweep_candle['open'], sweep_candle['close']) - sweep_candle['low']
-                                if body_size > wick_size:
-                                    sweep_strength = 1.0
-                        except:
-                            pass
-        
-        # === STEP 4: Structure Shift ===
-        if ohlcv_1h:
-            df_1h = create_dataframe(ohlcv_1h)
-            if df_1h is not None and len(df_1h) >= 11:
-                if side == "BUY":
-                    recent_high = df_1h['high'].iloc[-10:-1].max()
-                    current_close = df_1h['close'].iloc[-1]
-                    if current_close > recent_high:
-                        structure_shift = True
-                        eight_steps['step_4_structure_shift'] = True
-                else:
-                    recent_low = df_1h['low'].iloc[-10:-1].min()
-                    current_close = df_1h['close'].iloc[-1]
-                    if current_close < recent_low:
-                        structure_shift = True
-                        eight_steps['step_4_structure_shift'] = True
-        
-        # === STEP 5: FROM Liquidity ===
-        if sweep_strength > 0.5:
-            from_liquidity_exists = True
-            eight_steps['step_5_from_liquidity'] = True
-        
-        # === STEP 6: Confirmation Candle ===
+        # Confirmation Candle
         ohlcv_5m = await fetch_ohlcv(exchange, symbol, "5m", 5)
         if ohlcv_5m:
             df_5m = create_dataframe(ohlcv_5m)
             if df_5m is not None and len(df_5m) > 0:
                 if side == "BUY":
-                    if df_5m['close'].iloc[-1] > df_5m['open'].iloc[-1]:
-                        confirmation_candle = True
-                        eight_steps['step_6_confirmation_candle'] = True
+                    confirmation_candle = df_5m['close'].iloc[-1] > df_5m['open'].iloc[-1]
                 else:
-                    if df_5m['close'].iloc[-1] < df_5m['open'].iloc[-1]:
-                        confirmation_candle = True
-                        eight_steps['step_6_confirmation_candle'] = True
-        
-        # === STEP 7: Entry Zone ===
-        if entry_price > 0:
-            entry_zone_threshold = 0.02  # 2%
-            price_diff_pct = abs(current_price - entry_price) / entry_price * 100
-            eight_steps['step_7_entry_zone'] = price_diff_pct <= entry_zone_threshold
-        
-        # === STEP 8: Risk/Reward Ratio ===
-        risk = abs(eligibility.entry_price - eligibility.sl_price)
-        reward = abs(eligibility.tp_targets[0] - eligibility.entry_price)
-        rr_ratio = reward / risk if risk > 0 else 0
-        eight_steps['step_8_rr_ratio'] = rr_ratio >= 1.5
-        
-        # Store RR ratio for later use
-        eight_steps['rr_ratio'] = rr_ratio
-        
+                    confirmation_candle = df_5m['close'].iloc[-1] < df_5m['open'].iloc[-1]
+                    
     except Exception as e:
-        log.debug(f"Quality analysis error for {symbol}: {e}")
+        log.debug(f"Additional quality metrics error for {symbol}: {e}")
     
-    # Calculate total score (0-5)
+    # Calculate total score
     total_score = (
-        sweep_strength +
-        (1.0 if structure_shift else 0.0) +
-        (0.5 if from_liquidity_exists else 0.0) +
+        (1.0 if liquidity_map_valid else 0.0) +
+        (1.0 if liquidity_sweep_confirmed else 0.0) +
+        (1.0 if entry_zone_defined else 0.0) +
+        (1.0 if take_profit_liquidity else 0.0) +
+        (0.5 if structure_shift else 0.0) +
         (0.5 if confirmation_candle else 0.0) +
         htfc_alignment_score
     )
     
     return SetupQuality(
-        sweep_strength=sweep_strength,
+        liquidity_map_valid=liquidity_map_valid,
+        liquidity_sweep_confirmed=liquidity_sweep_confirmed,
+        entry_zone_defined=entry_zone_defined,
+        take_profit_liquidity=take_profit_liquidity,
         structure_shift=structure_shift,
-        from_liquidity_exists=from_liquidity_exists,
         confirmation_candle=confirmation_candle,
         htfc_alignment_score=htfc_alignment_score,
         total_score=total_score,
-        eight_steps_status=eight_steps
+        liquidity_data=liquidity_data
     )
 
 # ---------------- FAST SCANNING ----------------
@@ -786,16 +963,34 @@ async def scan_symbol_fast(exchange, symbol: str) -> Optional[Dict]:
         if not eligibility.eligible:
             return None
         
-        # LAYER 2: Quality analysis
+        # LAYER 2: Quality analysis with RomeOTPT MUST-HAVE steps
         quality = await analyze_quality(exchange, symbol, eligibility)
+        
+        # Only proceed if it's a valid RomeOTPT setup
+        if not quality.is_valid_romeopt:
+            log.debug(f"Skipping {symbol}: Not a valid RomeOTPT setup")
+            return None
         
         # Get current price
         ticker = await exchange.fetch_ticker(symbol)
         current_price = ticker.get("last", 0)
         
-        # Calculate RR
+        # Calculate RR based on liquidity target
         risk = abs(eligibility.entry_price - eligibility.sl_price)
-        reward = abs(eligibility.tp_targets[0] - eligibility.entry_price)
+        
+        # Use liquidity target as primary TP
+        if quality.liquidity_data and quality.liquidity_data.to_liquidity_price > 0:
+            primary_tp = quality.liquidity_data.to_liquidity_price
+            # Update TP targets to prioritize liquidity target
+            eligibility.tp_targets = [primary_tp]
+            if side == "BUY":
+                eligibility.tp_targets.append(primary_tp * 1.02)  # Second TP 2% beyond liquidity
+            else:
+                eligibility.tp_targets.append(primary_tp * 0.98)  # Second TP 2% beyond liquidity
+        else:
+            primary_tp = eligibility.tp_targets[0] if eligibility.tp_targets else 0
+        
+        reward = abs(primary_tp - eligibility.entry_price)
         rr_ratio = reward / risk if risk > 0 else 0
         
         setup = {
@@ -811,15 +1006,30 @@ async def scan_symbol_fast(exchange, symbol: str) -> Optional[Dict]:
             "reward": reward,
             "rr_ratio": rr_ratio,
             
+            # Liquidity data
+            "liquidity_data": {
+                "from_liquidity_price": quality.liquidity_data.from_liquidity_price if quality.liquidity_data else 0,
+                "to_liquidity_price": quality.liquidity_data.to_liquidity_price if quality.liquidity_data else 0,
+                "sweep_confirmed": quality.liquidity_data.sweep_confirmed if quality.liquidity_data else False,
+                "sweep_strength": quality.liquidity_data.sweep_strength if quality.liquidity_data else 0,
+                "liquidity_distance_pct": quality.liquidity_data.liquidity_distance_pct if quality.liquidity_data else 0
+            },
+            
             "quality": {
                 "tier": quality.quality_tier,
+                "is_valid_romeopt": quality.is_valid_romeopt,
                 "total_score": quality.total_score,
-                "sweep_strength": quality.sweep_strength,
+                
+                # RomeOTPT MUST-HAVE steps
+                "liquidity_map_valid": quality.liquidity_map_valid,
+                "liquidity_sweep_confirmed": quality.liquidity_sweep_confirmed,
+                "entry_zone_defined": quality.entry_zone_defined,
+                "take_profit_liquidity": quality.take_profit_liquidity,
+                
+                # Additional metrics
                 "structure_shift": quality.structure_shift,
-                "from_liquidity": quality.from_liquidity_exists,
                 "confirmation_candle": quality.confirmation_candle,
-                "htfc_alignment": quality.htfc_alignment_score,
-                "eight_steps": quality.eight_steps_status
+                "htfc_alignment": quality.htfc_alignment_score
             }
         }
         
@@ -830,13 +1040,12 @@ async def scan_symbol_fast(exchange, symbol: str) -> Optional[Dict]:
 
 # ---------------- ALERTS ----------------
 async def send_fast_alert(setup: Dict):
-    """Send concise, fast alerts with 8-step numerical display"""
+    """Send concise, fast alerts with RomeOTPT MUST-HAVE steps"""
     
     try:
         symbol = setup.get('symbol', 'UNKNOWN')
         quality = setup.get('quality', {})
-        eight_steps = quality.get('eight_steps', {})
-        step_details = eight_steps.get('step_details', {})
+        liquidity_data = setup.get('liquidity_data', {})
         
         # Check if this is an update
         is_update = symbol in signal_tracker.active_signals
@@ -846,8 +1055,14 @@ async def send_fast_alert(setup: Dict):
             "A+": "🔥",
             "A": "✅", 
             "B": "⚠️",
-            "C": "📊"
-        }.get(quality.get("tier", "C"), "📊")
+            "C": "📊",
+            "INVALID": "❌"
+        }.get(quality.get("tier", "INVALID"), "❌")
+        
+        # Only send alerts for valid RomeOTPT setups
+        if not quality.get('is_valid_romeopt', False):
+            log.debug(f"Skipping alert for {symbol}: Not a valid RomeOTPT setup")
+            return
         
         # Add update info if applicable
         update_info = ""
@@ -862,83 +1077,67 @@ async def send_fast_alert(setup: Dict):
                 update_info = f"\n🔄 <b>Updated signal</b>"
         
         tp_targets = setup.get('tp_targets', [])
-        # Format TP values separately to avoid f-string formatting errors
+        # Format TP values
         tp1_display = f"{tp_targets[0]:.8f}" if len(tp_targets) > 0 else 'N/A'
         tp2_display = f"{tp_targets[1]:.8f}" if len(tp_targets) > 1 else 'N/A'
         
-        # ============ 8-STEP NUMERICAL DISPLAY ============
-        # Build the 8-step checklist with pass/fail status
-        checklist_lines = []
-        
-        # Step 1: HTF Bias Alignment
-        step1_status = "✅ PASS" if eight_steps.get('step_1_htf_bias', False) else "❌ FAIL"
-        checklist_lines.append(f"1. {step1_status} - HTF bias aligned with direction")
-        
-        # Step 2: Premium/Discount Zone
-        step2_status = "✅ PASS" if eight_steps.get('step_2_zone_type', False) else "❌ FAIL"
-        checklist_lines.append(f"2. {step2_status} - Premium/Discount zone entry")
-        
-        # Step 3: Liquidity Sweep
-        step3_status = "✅ PASS" if eight_steps.get('step_3_liquidity_sweep', False) else "❌ FAIL"
-        sweep_score = quality.get('sweep_strength', 0)
-        checklist_lines.append(f"3. {step3_status} - Liquidity sweep detected (Score: {sweep_score:.2f})")
-        
-        # Step 4: Structure Shift
-        step4_status = "✅ PASS" if eight_steps.get('step_4_structure_shift', False) else "❌ FAIL"
-        checklist_lines.append(f"4. {step4_status} - Market structure shift")
-        
-        # Step 5: FROM Liquidity
-        step5_status = "✅ PASS" if eight_steps.get('step_5_from_liquidity', False) else "❌ FAIL"
-        checklist_lines.append(f"5. {step5_status} - FROM liquidity present")
-        
-        # Step 6: Confirmation Candle
-        step6_status = "✅ PASS" if eight_steps.get('step_6_confirmation_candle', False) else "❌ FAIL"
-        checklist_lines.append(f"6. {step6_status} - Confirmation candle formed")
-        
-        # Step 7: Entry Zone
-        step7_status = "✅ PASS" if eight_steps.get('step_7_entry_zone', False) else "❌ FAIL"
-        entry_price = setup.get('entry_price', 0)
-        current_price = setup.get('current_price', 0)
-        if entry_price > 0:
-            zone_diff = abs(current_price - entry_price) / entry_price * 100
-            checklist_lines.append(f"7. {step7_status} - Price in valid entry zone ({zone_diff:.2f}% from entry)")
-        
-        # Step 8: Risk/Reward Ratio
-        rr_ratio = setup.get('rr_ratio', 0)
-        step8_passed = rr_ratio >= 1.5
-        step8_status = "✅ PASS" if step8_passed else "⚠️ MARGINAL" if rr_ratio >= 1.0 else "❌ FAIL"
-        checklist_lines.append(f"8. {step8_status} - Risk/Reward ≥ 1.5:1 (Current: {rr_ratio:.2f}:1)")
-        
-        # Count passes
-        pass_count = sum([
-            eight_steps.get('step_1_htf_bias', False),
-            eight_steps.get('step_2_zone_type', False),
-            eight_steps.get('step_3_liquidity_sweep', False),
-            eight_steps.get('step_4_structure_shift', False),
-            eight_steps.get('step_5_from_liquidity', False),
-            eight_steps.get('step_6_confirmation_candle', False),
-            eight_steps.get('step_7_entry_zone', False),
-            step8_passed
-        ])
+        # ============ ROMEOTPT MUST-HAVE STEPS DISPLAY ============
+        # Build the RomeOTPT MUST-HAVE checklist
+        romeopt_steps = [
+            {
+                "number": "1️⃣",
+                "name": "LIQUIDITY MAP",
+                "status": quality.get('liquidity_map_valid', False),
+                "details": f"FROM: {liquidity_data.get('from_liquidity_price', 0):.8f} | TO: {liquidity_data.get('to_liquidity_price', 0):.8f}"
+            },
+            {
+                "number": "2️⃣",
+                "name": "LIQUIDITY SWEEP",
+                "status": quality.get('liquidity_sweep_confirmed', False),
+                "details": f"Sweep: {'✅' if liquidity_data.get('sweep_confirmed', False) else '❌'} | Strength: {liquidity_data.get('sweep_strength', 0):.2f}"
+            },
+            {
+                "number": "3️⃣",
+                "name": "ENTRY ZONE + SL",
+                "status": quality.get('entry_zone_defined', False),
+                "details": f"Type: {setup.get('entry_type', 'N/A')} | SL: {setup.get('sl_price', 0):.8f}"
+            },
+            {
+                "number": "4️⃣",
+                "name": "TAKE PROFIT AT LIQUIDITY",
+                "status": quality.get('take_profit_liquidity', False),
+                "details": f"TP1 at liquidity: {tp1_display}"
+            }
+        ]
         
         # Build checklist string
-        checklist = "📋 <b>8-STEP CHECKLIST:</b>\n"
-        for line in checklist_lines:
-            checklist += f"   {line}\n"
-        checklist += f"\n   📊 <b>SCORE:</b> {pass_count}/8 steps passed"
+        checklist = "🔴 <b>ROMEOTPT MUST-HAVE STEPS:</b>\n\n"
+        for step in romeopt_steps:
+            status_emoji = "✅" if step['status'] else "❌"
+            checklist += f"{step['number']} <b>{step['name']}</b> {status_emoji}\n"
+            checklist += f"   └─ {step['details']}\n"
+        
+        # Count passes
+        pass_count = sum(step['status'] for step in romeopt_steps)
+        checklist += f"\n📊 <b>ROMEOTPT SCORE:</b> {pass_count}/4 steps passed"
+        
+        # Additional liquidity info
+        liquidity_info = ""
+        if liquidity_data.get('liquidity_distance_pct', 0) > 0:
+            liquidity_info = f"\n🎯 <b>Liquidity Distance:</b> {liquidity_data.get('liquidity_distance_pct', 0):.2f}%"
         # ==========================================
         
         msg = f"""
-{update_emoji}{tier_emoji} <b>ROMEOTPT v3.2 - {quality.get('tier', 'C')} Tier</b>
+{update_emoji}{tier_emoji} <b>ROMEOTPT v3.3 - {quality.get('tier', 'INVALID')}</b>
 
 <b>🎯 {setup.get('symbol', 'UNKNOWN')}</b> | {setup.get('side', 'N/A')}
 <b>Entry:</b> {setup.get('entry_price', 0):.8f}
 <b>Current:</b> {setup.get('current_price', 0):.8f}
 <b>Type:</b> {setup.get('entry_type', 'N/A')}{update_info}
 
-{checklist}
+{checklist}{liquidity_info}
 
-🎯 <b>Targets:</b>
+🎯 <b>Targets (Liquidity Delivery):</b>
 TP1: {tp1_display}
 TP2: {tp2_display}
 
@@ -946,12 +1145,12 @@ TP2: {tp2_display}
 SL: {setup.get('sl_price', 0):.8f}
 RR: {setup.get('rr_ratio', 0):.2f}:1
 
-📈 <b>Quality Score:</b> {quality.get('total_score', 0):.2f}/5.0
-• Sweep Strength: {quality.get('sweep_strength', 0):.2f}
-• HTF Alignment: {quality.get('htfc_alignment', 0):.2f}
+📈 <b>Quality Score:</b> {quality.get('total_score', 0):.2f}/6.0
 • Structure Shift: {'✅' if quality.get('structure_shift', False) else '❌'}
 • Confirmation: {'✅' if quality.get('confirmation_candle', False) else '❌'}
+• HTF Alignment: {quality.get('htfc_alignment', 0):.2f}
 
+<i>ROMEOTPT: Liquidity delivery model | Without liquidity = no reason for price to move</i>
 <i>Detected: {datetime.datetime.utcnow().strftime('%H:%M:%S UTC')}</i>
 """
         
@@ -968,10 +1167,10 @@ async def send_outcome_alert(symbol: str, outcome: Dict):
         
         if outcome['type'] == 'TP1_HIT':
             emoji = "✅"
-            result_text = "TAKE PROFIT 1 HIT"
+            result_text = "LIQUIDITY DELIVERED - TP1 HIT"
         elif outcome['type'] == 'TP2_HIT':
             emoji = "🎯"
-            result_text = "TAKE PROFIT 2 HIT"
+            result_text = "LIQUIDITY DELIVERED - TP2 HIT"
         else:
             emoji = "❌"
             result_text = "STOP LOSS HIT"
@@ -983,11 +1182,15 @@ async def send_outcome_alert(symbol: str, outcome: Dict):
             time_str = f"{bars_held//60}h {bars_held%60}min"
         
         tp_targets = setup.get('tp_targets', [0])
-        # Format TP separately
         tp_display = f"{tp_targets[0]:.8f}" if len(tp_targets) > 0 else 'N/A'
         
+        # Check if this was a RomeOTPT setup
+        romeopt_status = ""
+        if signal.get('is_romeopt'):
+            romeopt_status = "\n🏛️ <b>ROMEOTPT SIGNAL</b>"
+        
         msg = f"""
-{emoji} <b>{result_text}</b>
+{emoji} <b>{result_text}</b>{romeopt_status}
 
 <b>{symbol}</b> | {setup.get('side', 'N/A')}
 <b>Entry:</b> {setup.get('entry_price', 0):.8f}
@@ -1016,17 +1219,21 @@ async def send_deduped_alert(setup: Dict):
         if not symbol:
             return False
         
+        # Only send alerts for valid RomeOTPT setups
+        if not setup.get('quality', {}).get('is_valid_romeopt', False):
+            return False
+        
         should_alert, reason = signal_tracker.is_new_or_updated_signal(symbol, setup)
         
         if should_alert:
             await send_fast_alert(setup)
             signal_tracker.update_signal(symbol, setup, alerted=True)
-            log.info(f"📨 Alert sent for {symbol}: {reason}")
+            log.info(f"🏛️ RomeOTPT alert sent for {symbol}: {reason}")
             return True
         else:
             signal_tracker.update_signal(symbol, setup, alerted=False)
             if np.random.random() < 0.01:
-                log.debug(f"⏸️  Skipped alert for {symbol}: {reason}")
+                log.debug(f"⏸️  Skipped RomeOTPT alert for {symbol}: {reason}")
             return False
     except Exception as e:
         log.error(f"Error in deduped alert for {setup.get('symbol', 'UNKNOWN')}: {e}")
@@ -1034,7 +1241,7 @@ async def send_deduped_alert(setup: Dict):
 
 # ---------------- DATABASE ----------------
 async def init_database():
-    """Initialize database with outcome tracking tables"""
+    """Initialize database with RomeOTPT tracking"""
     try:
         # Create tables
         await db_conn.execute("""
@@ -1050,6 +1257,7 @@ async def init_database():
                 rr_ratio REAL,
                 quality_tier TEXT,
                 quality_score REAL,
+                is_romeopt BOOLEAN DEFAULT 0,
                 current_price REAL,
                 status TEXT DEFAULT 'active',
                 alert_sent BOOLEAN DEFAULT 1,
@@ -1059,7 +1267,14 @@ async def init_database():
                 pnl_pct REAL,
                 bars_held INTEGER,
                 max_favorable_pct REAL,
-                max_adverse_pct REAL
+                max_adverse_pct REAL,
+                
+                -- Liquidity data
+                from_liquidity_price REAL,
+                to_liquidity_price REAL,
+                sweep_confirmed BOOLEAN,
+                sweep_strength REAL,
+                liquidity_distance_pct REAL
             )
         """)
         
@@ -1074,6 +1289,7 @@ async def init_database():
                 tp1_price REAL,
                 tp2_price REAL,
                 quality_score REAL,
+                is_romeopt BOOLEAN DEFAULT 0,
                 created_at TEXT,
                 status TEXT DEFAULT 'active',
                 closed_at TEXT,
@@ -1087,15 +1303,15 @@ async def init_database():
             )
         """)
         
-        # Create indexes separately (SQLite syntax fix)
+        # Create indexes
         await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_time ON signals (symbol, timestamp)")
         await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_status_time ON signals (status, timestamp)")
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_outcome ON signals (outcome)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_romeopt ON signals (is_romeopt)")
         await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_outcomes_symbol_status ON signal_outcomes (symbol, status)")
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_outcomes_outcome_type ON signal_outcomes (outcome_type)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_outcomes_romeopt ON signal_outcomes (is_romeopt)")
         
         await db_conn.commit()
-        log.info("Database initialized with indexes")
+        log.info("Database initialized with RomeOTPT tracking")
     except Exception as e:
         log.error(f"Error initializing database: {e}")
         raise
@@ -1105,14 +1321,18 @@ async def store_signal(setup: Dict):
     async with db_lock:
         try:
             tp_targets = setup.get("tp_targets", [])
+            liquidity_data = setup.get("liquidity_data", {})
+            quality = setup.get("quality", {})
             
             # Store in signals table
             cursor = await db_conn.execute("""
                 INSERT INTO signals (
                     symbol, timestamp, side, entry_price, sl_price, 
                     tp1, tp2, rr_ratio, quality_tier, quality_score,
-                    current_price, status, alert_sent
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1)
+                    is_romeopt, current_price, status, alert_sent,
+                    from_liquidity_price, to_liquidity_price,
+                    sweep_confirmed, sweep_strength, liquidity_distance_pct
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?, ?, ?, ?)
             """, (
                 setup.get("symbol", ""),
                 setup.get("timestamp", ""),
@@ -1122,9 +1342,15 @@ async def store_signal(setup: Dict):
                 tp_targets[0] if len(tp_targets) > 0 else None,
                 tp_targets[1] if len(tp_targets) > 1 else None,
                 setup.get("rr_ratio", 0),
-                setup.get("quality", {}).get("tier", "C"),
-                setup.get("quality", {}).get("total_score", 0),
-                setup.get("current_price", 0)
+                quality.get("tier", "INVALID"),
+                quality.get("total_score", 0),
+                1 if quality.get("is_valid_romeopt", False) else 0,
+                setup.get("current_price", 0),
+                liquidity_data.get("from_liquidity_price", 0),
+                liquidity_data.get("to_liquidity_price", 0),
+                1 if liquidity_data.get("sweep_confirmed", False) else 0,
+                liquidity_data.get("sweep_strength", 0),
+                liquidity_data.get("liquidity_distance_pct", 0)
             ))
             
             # Get the inserted ID
@@ -1134,8 +1360,8 @@ async def store_signal(setup: Dict):
             await db_conn.execute("""
                 INSERT INTO signal_outcomes (
                     signal_id, symbol, side, entry_price, sl_price, tp1_price,
-                    tp2_price, quality_score, created_at, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+                    tp2_price, quality_score, is_romeopt, created_at, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
             """, (
                 signal_id,
                 setup.get("symbol", ""),
@@ -1144,12 +1370,13 @@ async def store_signal(setup: Dict):
                 setup.get("sl_price", 0),
                 tp_targets[0] if len(tp_targets) > 0 else None,
                 tp_targets[1] if len(tp_targets) > 1 else None,
-                setup.get("quality", {}).get("total_score", 0),
+                quality.get("total_score", 0),
+                1 if quality.get("is_valid_romeopt", False) else 0,
                 setup.get("timestamp", "")
             ))
             
             await db_conn.commit()
-            log.debug(f"Stored signal for {setup.get('symbol', 'UNKNOWN')} with ID {signal_id}")
+            log.debug(f"Stored RomeOTPT signal for {setup.get('symbol', 'UNKNOWN')} with ID {signal_id}")
             
         except Exception as e:
             log.error(f"Error storing signal {setup.get('symbol', 'UNKNOWN')}: {e}")
@@ -1247,11 +1474,16 @@ async def process_deduped_results(results) -> int:
         if result:
             try:
                 quality_score = result.get("quality", {}).get("total_score", 0)
-                if quality_score >= MIN_QUALITY_SCORE:
+                is_romeopt = result.get("quality", {}).get("is_valid_romeopt", False)
+                
+                # Only process valid RomeOTPT setups
+                if is_romeopt and quality_score >= MIN_QUALITY_SCORE:
                     alerted = await send_deduped_alert(result)
                     if alerted:
                         alerts_sent += 1
                     await store_signal(result)
+                else:
+                    log.debug(f"Skipped non-RomeOTPT or low quality signal for {result.get('symbol', 'UNKNOWN')}")
             except Exception as e:
                 log.error(f"Error processing result: {e}")
     
@@ -1262,17 +1494,27 @@ async def outcome_aware_scanner(exchange):
     
     # Send startup message
     startup_msg = f"""
-🚀 <b>ROMEOTPT v3.2 STARTED</b>
+🏛️ <b>ROMEOTPT v3.3 - LIQUIDITY DELIVERY MODEL STARTED</b>
+
+<b>Core Principles:</b>
+• RomeOTPT is a liquidity delivery model
+• No liquidity = no reason for price to move
+• Trade is meaningless without liquidity map
+
+<b>MUST-HAVE STEPS:</b>
+1️⃣ Liquidity Map (FROM/TO liquidity)
+2️⃣ Liquidity Sweep (Confirmation)
+3️⃣ Entry Zone + SL (Controlled entry)
+4️⃣ Take Profit at Liquidity (Target)
 
 <b>Settings:</b>
 • Scan: {SCAN_INTERVAL}s
 • Top: {TOP_N} symbols
-• Cooldown: {SIGNAL_COOLDOWN_MINUTES}min
-• Validity: {SIGNAL_VALIDITY_HOURS}h
-• Outcome check: {OUTCOME_CHECK_INTERVAL}s
+• Min sweep: {LIQUIDITY_SWEEP_MIN_PCT}%
 • Min quality: {MIN_QUALITY_SCORE}
+• Cooldown: {SIGNAL_COOLDOWN_MINUTES}min
 
-<i>Now with 8-step numerical checklist display</i>
+<i>Only valid RomeOTPT setups will be alerted</i>
 """
     await send_telegram(startup_msg)
     
@@ -1304,7 +1546,7 @@ async def outcome_aware_scanner(exchange):
             
             stats = signal_tracker.get_stats()
             
-            log.info(f"🔄 Scan #{scan_cycle}: {len(symbols_to_scan)} symbols | Active: {stats.get('active_signals', 0)}")
+            log.info(f"🔄 Scan #{scan_cycle}: {len(symbols_to_scan)} symbols | Active: {stats.get('active_signals', 0)} | RomeOTPT: {stats.get('romeopt_signals', 0)}")
             
             # Log stats periodically
             if scan_cycle % 10 == 0:
@@ -1312,7 +1554,8 @@ async def outcome_aware_scanner(exchange):
                 total_closed = outcome_stats.get('tp1_hits', 0) + outcome_stats.get('tp2_hits', 0) + outcome_stats.get('sl_hits', 0)
                 if total_closed > 0:
                     win_rate = outcome_stats.get('win_rate', 0)
-                    log.info(f"📈 Stats: WR={win_rate:.1f}% | TP1={outcome_stats.get('tp1_hits', 0)} | SL={outcome_stats.get('sl_hits', 0)}")
+                    romeopt_win_rate = outcome_stats.get('romeopt_win_rate', 0)
+                    log.info(f"📈 Stats: All={win_rate:.1f}% | RomeOTPT={romeopt_win_rate:.1f}% | TP1={outcome_stats.get('tp1_hits', 0)} | SL={outcome_stats.get('sl_hits', 0)}")
             
             # Scan symbols
             alerts_this_scan = 0
@@ -1331,6 +1574,9 @@ async def outcome_aware_scanner(exchange):
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 alerts_this_scan += await process_deduped_results(results)
             
+            if alerts_this_scan > 0:
+                log.info(f"🏛️ Sent {alerts_this_scan} RomeOTPT alerts this scan")
+            
             await asyncio.sleep(SCAN_INTERVAL)
             
         except Exception as e:
@@ -1345,8 +1591,9 @@ async def health():
     stats = signal_tracker.get_stats()
     return {
         "status": "healthy", 
-        "version": "3.2",
+        "version": "3.3 - RomeOTPT Liquidity Model",
         "active_signals": stats.get('active_signals', 0),
+        "romeopt_signals": stats.get('romeopt_signals', 0),
         "outcome_stats": signal_tracker.outcome_stats
     }
 
@@ -1364,7 +1611,8 @@ async def get_active_signals():
             "tp1": setup.get('tp_targets', [0])[0] if len(setup.get('tp_targets', [])) > 0 else 0,
             "sl": setup.get('sl_price', 0),
             "quality": setup.get('quality', {}).get('total_score', 0),
-            "tier": setup.get('quality', {}).get('tier', 'C'),
+            "tier": setup.get('quality', {}).get('tier', 'INVALID'),
+            "is_romeopt": setup.get('quality', {}).get('is_valid_romeopt', False),
             "age_minutes": (datetime.datetime.utcnow() - data.get('first_seen', datetime.datetime.utcnow())).total_seconds() / 60
         })
     return {"active_signals": active, "count": len(active)}
@@ -1374,6 +1622,7 @@ async def get_outcome_stats(hours: int = 24):
     """Get outcome statistics"""
     async with db_lock:
         try:
+            # All signals
             cursor = await db_conn.execute("""
                 SELECT 
                     COUNT(*) as total,
@@ -1387,6 +1636,22 @@ async def get_outcome_stats(hours: int = 24):
             """, (f"-{hours} hours",))
             row = await cursor.fetchone()
             
+            # RomeOTPT signals only
+            cursor = await db_conn.execute("""
+                SELECT 
+                    COUNT(*) as total,
+                    SUM(CASE WHEN outcome_type LIKE 'TP%' THEN 1 ELSE 0 END) as wins,
+                    SUM(CASE WHEN outcome_type = 'SL_HIT' THEN 1 ELSE 0 END) as losses,
+                    AVG(pnl_pct) as avg_pnl,
+                    AVG(hold_time_minutes) as avg_hold_time
+                FROM signal_outcomes 
+                WHERE status = 'closed' 
+                AND is_romeopt = 1
+                AND closed_at > datetime('now', ?)
+            """, (f"-{hours} hours",))
+            romeopt_row = await cursor.fetchone()
+            
+            # By tier
             cursor = await db_conn.execute("""
                 SELECT 
                     quality_tier,
@@ -1414,14 +1679,27 @@ async def get_outcome_stats(hours: int = 24):
     total = row[0] if row else 0
     wins = row[1] if row else 0
     
+    romeopt_total = romeopt_row[0] if romeopt_row else 0
+    romeopt_wins = romeopt_row[1] if romeopt_row else 0
+    
     return {
         'period_hours': hours,
-        'total_signals': total,
-        'wins': wins,
-        'losses': row[2] if row else 0,
-        'win_rate': wins / total * 100 if total > 0 else 0,
-        'avg_pnl_pct': row[3] if row else 0,
-        'avg_hold_minutes': row[4] if row else 0,
+        'all_signals': {
+            'total': total,
+            'wins': wins,
+            'losses': row[2] if row else 0,
+            'win_rate': wins / total * 100 if total > 0 else 0,
+            'avg_pnl_pct': row[3] if row else 0,
+            'avg_hold_minutes': row[4] if row else 0
+        },
+        'romeopt_signals': {
+            'total': romeopt_total,
+            'wins': romeopt_wins,
+            'losses': romeopt_row[2] if romeopt_row else 0,
+            'win_rate': romeopt_wins / romeopt_total * 100 if romeopt_total > 0 else 0,
+            'avg_pnl_pct': romeopt_row[3] if romeopt_row else 0,
+            'avg_hold_minutes': romeopt_row[4] if romeopt_row else 0
+        },
         'by_tier': tier_stats,
         'memory_stats': signal_tracker.outcome_stats
     }
@@ -1434,7 +1712,7 @@ async def get_recent_outcomes(limit: int = 20):
             cursor = await db_conn.execute("""
                 SELECT s.symbol, s.side, s.entry_price, s.closed_price, 
                        s.outcome, s.pnl_pct, s.bars_held, s.quality_tier,
-                       s.timestamp, s.closed_at
+                       s.is_romeopt, s.timestamp, s.closed_at
                 FROM signals s
                 WHERE s.status = 'closed'
                 ORDER BY s.closed_at DESC
@@ -1475,11 +1753,11 @@ async def main():
             "timeout": 5000,
         })
         
-        log.info("🚀 ROMEOTPT v3.2 - COMPLETE")
+        log.info("🏛️ ROMEOTPT v3.3 - LIQUIDITY DELIVERY MODEL")
         log.info(f"Scan: {SCAN_INTERVAL}s | Top {TOP_N} symbols")
+        log.info(f"Min sweep: {LIQUIDITY_SWEEP_MIN_PCT}% | Min quality: {MIN_QUALITY_SCORE}")
         log.info(f"Cooldown: {SIGNAL_COOLDOWN_MINUTES}min | Validity: {SIGNAL_VALIDITY_HOURS}h")
-        log.info(f"Outcome check: {OUTCOME_CHECK_INTERVAL}s")
-        log.info(f"Now with 8-step numerical checklist display")
+        log.info(f"Only valid RomeOTPT setups will be alerted")
         
         # Start cleanup task
         asyncio.create_task(periodic_cleanup())
