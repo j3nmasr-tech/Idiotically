@@ -22,8 +22,8 @@ from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 
 # ---------------- CONFIG ----------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v3_2.db")
 
 # Scanner settings
@@ -66,13 +66,16 @@ class SetupEligibility:
     
 @dataclass
 class SetupQuality:
-    """LAYER 2: Quality metrics (FOR RANKING ONLY)"""
+    """LAYER 2: Quality metrics with 8-step tracking"""
     sweep_strength: float = 0.0
     structure_shift: bool = False
     from_liquidity_exists: bool = False
     confirmation_candle: bool = False
     htfc_alignment_score: float = 0.0
     total_score: float = 0.0
+    
+    # 8-step tracking
+    eight_steps_status: Dict = None
     
     @property
     def quality_tier(self) -> str:
@@ -597,9 +600,12 @@ async def check_eligibility_fast(exchange, symbol: str) -> SetupEligibility:
 
 # ---------------- LAYER 2: QUALITY ANALYSIS ----------------
 async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility) -> SetupQuality:
-    """LAYER 2: QUALITY ANALYSIS (FOR RANKING ONLY)"""
+    """LAYER 2: QUALITY ANALYSIS WITH 8-STEP TRACKING"""
     
     side = eligibility.side
+    entry_type = eligibility.entry_type
+    entry_price = eligibility.entry_price
+    current_price = entry_price  # Will be updated
     
     # Initialize scores
     sweep_strength = 0.0
@@ -608,8 +614,57 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility) 
     confirmation_candle = False
     htfc_alignment_score = 0.0
     
+    # Initialize 8-step tracking
+    eight_steps = {
+        'step_1_htf_bias': False,
+        'step_2_zone_type': False,
+        'step_3_liquidity_sweep': False,
+        'step_4_structure_shift': False,
+        'step_5_from_liquidity': False,
+        'step_6_confirmation_candle': False,
+        'step_7_entry_zone': False,
+        'step_8_rr_ratio': False,
+        
+        # Details for display
+        'step_details': {
+            '1': 'HTF bias aligned with direction',
+            '2': 'Premium/Discount zone entry',
+            '3': 'Liquidity sweep detected',
+            '4': 'Market structure shift',
+            '5': 'FROM liquidity present',
+            '6': 'Confirmation candle formed',
+            '7': 'Price in valid entry zone',
+            '8': 'Risk/Reward ≥ 1.5:1'
+        }
+    }
+    
     try:
-        # Sweep Strength Analysis
+        # Get current price for accurate checks
+        ticker = await exchange.fetch_ticker(symbol)
+        current_price = ticker.get("last", entry_price)
+        
+        # === STEP 1: HTF Bias Alignment ===
+        ohlcv_1h = await fetch_ohlcv(exchange, symbol, "1h", 30)
+        if ohlcv_1h:
+            df_1h = create_dataframe(ohlcv_1h)
+            if df_1h is not None and len(df_1h) >= 20:
+                df_1h['ema_20'] = df_1h['close'].ewm(span=20).mean()
+                df_1h['ema_50'] = df_1h['close'].ewm(span=50).mean()
+                
+                if side == "BUY":
+                    htfc_alignment_score = 1.0 if df_1h['ema_20'].iloc[-1] > df_1h['ema_50'].iloc[-1] else 0.5
+                    eight_steps['step_1_htf_bias'] = htfc_alignment_score >= 0.7
+                else:
+                    htfc_alignment_score = 1.0 if df_1h['ema_20'].iloc[-1] < df_1h['ema_50'].iloc[-1] else 0.5
+                    eight_steps['step_1_htf_bias'] = htfc_alignment_score >= 0.7
+        
+        # === STEP 2: Premium/Discount Zone ===
+        if side == "BUY" and entry_type in ["DISCOUNT_ZONE", "BULLISH_ENGULFING"]:
+            eight_steps['step_2_zone_type'] = True
+        elif side == "SELL" and entry_type in ["PREMIUM_ZONE", "BEARISH_ENGULFING"]:
+            eight_steps['step_2_zone_type'] = True
+        
+        # === STEP 3: Liquidity Sweep ===
         ohlcv_15m = await fetch_ohlcv(exchange, symbol, "15m", 20)
         if ohlcv_15m:
             df_15m = create_dataframe(ohlcv_15m)
@@ -619,6 +674,7 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility) 
                     prev_low = df_15m['low'].iloc[-10:-5].min()
                     if recent_low < prev_low:
                         sweep_strength = 0.7
+                        eight_steps['step_3_liquidity_sweep'] = True
                         try:
                             sweep_idx = df_15m['low'].idxmin()
                             if sweep_idx < len(df_15m) - 1:
@@ -634,6 +690,7 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility) 
                     prev_high = df_15m['high'].iloc[-10:-5].max()
                     if recent_high > prev_high:
                         sweep_strength = 0.7
+                        eight_steps['step_3_liquidity_sweep'] = True
                         try:
                             sweep_idx = df_15m['high'].idxmax()
                             if sweep_idx < len(df_15m) - 1:
@@ -645,8 +702,7 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility) 
                         except:
                             pass
         
-        # Structure Shift (OPTIONAL)
-        ohlcv_1h = await fetch_ohlcv(exchange, symbol, "1h", 30)
+        # === STEP 4: Structure Shift ===
         if ohlcv_1h:
             df_1h = create_dataframe(ohlcv_1h)
             if df_1h is not None and len(df_1h) >= 11:
@@ -655,17 +711,20 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility) 
                     current_close = df_1h['close'].iloc[-1]
                     if current_close > recent_high:
                         structure_shift = True
+                        eight_steps['step_4_structure_shift'] = True
                 else:
                     recent_low = df_1h['low'].iloc[-10:-1].min()
                     current_close = df_1h['close'].iloc[-1]
                     if current_close < recent_low:
                         structure_shift = True
+                        eight_steps['step_4_structure_shift'] = True
         
-        # FROM Liquidity (OPTIONAL)
+        # === STEP 5: FROM Liquidity ===
         if sweep_strength > 0.5:
             from_liquidity_exists = True
+            eight_steps['step_5_from_liquidity'] = True
         
-        # Confirmation Candle (OPTIONAL)
+        # === STEP 6: Confirmation Candle ===
         ohlcv_5m = await fetch_ohlcv(exchange, symbol, "5m", 5)
         if ohlcv_5m:
             df_5m = create_dataframe(ohlcv_5m)
@@ -673,18 +732,27 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility) 
                 if side == "BUY":
                     if df_5m['close'].iloc[-1] > df_5m['open'].iloc[-1]:
                         confirmation_candle = True
+                        eight_steps['step_6_confirmation_candle'] = True
                 else:
                     if df_5m['close'].iloc[-1] < df_5m['open'].iloc[-1]:
                         confirmation_candle = True
+                        eight_steps['step_6_confirmation_candle'] = True
         
-        # HTF + Premium/Discount Alignment
-        htfc_alignment_score = 0.5
+        # === STEP 7: Entry Zone ===
+        if entry_price > 0:
+            entry_zone_threshold = 0.02  # 2%
+            price_diff_pct = abs(current_price - entry_price) / entry_price * 100
+            eight_steps['step_7_entry_zone'] = price_diff_pct <= entry_zone_threshold
         
-        if eligibility.entry_type in ["DISCOUNT_ZONE", "BULLISH_ENGULFING"] and side == "BUY":
-            htfc_alignment_score = 0.8
-        elif eligibility.entry_type in ["PREMIUM_ZONE", "BEARISH_ENGULFING"] and side == "SELL":
-            htfc_alignment_score = 0.8
-            
+        # === STEP 8: Risk/Reward Ratio ===
+        risk = abs(eligibility.entry_price - eligibility.sl_price)
+        reward = abs(eligibility.tp_targets[0] - eligibility.entry_price)
+        rr_ratio = reward / risk if risk > 0 else 0
+        eight_steps['step_8_rr_ratio'] = rr_ratio >= 1.5
+        
+        # Store RR ratio for later use
+        eight_steps['rr_ratio'] = rr_ratio
+        
     except Exception as e:
         log.debug(f"Quality analysis error for {symbol}: {e}")
     
@@ -703,7 +771,8 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility) 
         from_liquidity_exists=from_liquidity_exists,
         confirmation_candle=confirmation_candle,
         htfc_alignment_score=htfc_alignment_score,
-        total_score=total_score
+        total_score=total_score,
+        eight_steps_status=eight_steps
     )
 
 # ---------------- FAST SCANNING ----------------
@@ -749,7 +818,8 @@ async def scan_symbol_fast(exchange, symbol: str) -> Optional[Dict]:
                 "structure_shift": quality.structure_shift,
                 "from_liquidity": quality.from_liquidity_exists,
                 "confirmation_candle": quality.confirmation_candle,
-                "htfc_alignment": quality.htfc_alignment_score
+                "htfc_alignment": quality.htfc_alignment_score,
+                "eight_steps": quality.eight_steps_status
             }
         }
         
@@ -760,11 +830,13 @@ async def scan_symbol_fast(exchange, symbol: str) -> Optional[Dict]:
 
 # ---------------- ALERTS ----------------
 async def send_fast_alert(setup: Dict):
-    """Send concise, fast alerts"""
+    """Send concise, fast alerts with 8-step numerical display"""
     
     try:
         symbol = setup.get('symbol', 'UNKNOWN')
         quality = setup.get('quality', {})
+        eight_steps = quality.get('eight_steps', {})
+        step_details = eight_steps.get('step_details', {})
         
         # Check if this is an update
         is_update = symbol in signal_tracker.active_signals
@@ -794,13 +866,77 @@ async def send_fast_alert(setup: Dict):
         tp1_display = f"{tp_targets[0]:.8f}" if len(tp_targets) > 0 else 'N/A'
         tp2_display = f"{tp_targets[1]:.8f}" if len(tp_targets) > 1 else 'N/A'
         
+        # ============ 8-STEP NUMERICAL DISPLAY ============
+        # Build the 8-step checklist with pass/fail status
+        checklist_lines = []
+        
+        # Step 1: HTF Bias Alignment
+        step1_status = "✅ PASS" if eight_steps.get('step_1_htf_bias', False) else "❌ FAIL"
+        checklist_lines.append(f"1. {step1_status} - HTF bias aligned with direction")
+        
+        # Step 2: Premium/Discount Zone
+        step2_status = "✅ PASS" if eight_steps.get('step_2_zone_type', False) else "❌ FAIL"
+        checklist_lines.append(f"2. {step2_status} - Premium/Discount zone entry")
+        
+        # Step 3: Liquidity Sweep
+        step3_status = "✅ PASS" if eight_steps.get('step_3_liquidity_sweep', False) else "❌ FAIL"
+        sweep_score = quality.get('sweep_strength', 0)
+        checklist_lines.append(f"3. {step3_status} - Liquidity sweep detected (Score: {sweep_score:.2f})")
+        
+        # Step 4: Structure Shift
+        step4_status = "✅ PASS" if eight_steps.get('step_4_structure_shift', False) else "❌ FAIL"
+        checklist_lines.append(f"4. {step4_status} - Market structure shift")
+        
+        # Step 5: FROM Liquidity
+        step5_status = "✅ PASS" if eight_steps.get('step_5_from_liquidity', False) else "❌ FAIL"
+        checklist_lines.append(f"5. {step5_status} - FROM liquidity present")
+        
+        # Step 6: Confirmation Candle
+        step6_status = "✅ PASS" if eight_steps.get('step_6_confirmation_candle', False) else "❌ FAIL"
+        checklist_lines.append(f"6. {step6_status} - Confirmation candle formed")
+        
+        # Step 7: Entry Zone
+        step7_status = "✅ PASS" if eight_steps.get('step_7_entry_zone', False) else "❌ FAIL"
+        entry_price = setup.get('entry_price', 0)
+        current_price = setup.get('current_price', 0)
+        if entry_price > 0:
+            zone_diff = abs(current_price - entry_price) / entry_price * 100
+            checklist_lines.append(f"7. {step7_status} - Price in valid entry zone ({zone_diff:.2f}% from entry)")
+        
+        # Step 8: Risk/Reward Ratio
+        rr_ratio = setup.get('rr_ratio', 0)
+        step8_passed = rr_ratio >= 1.5
+        step8_status = "✅ PASS" if step8_passed else "⚠️ MARGINAL" if rr_ratio >= 1.0 else "❌ FAIL"
+        checklist_lines.append(f"8. {step8_status} - Risk/Reward ≥ 1.5:1 (Current: {rr_ratio:.2f}:1)")
+        
+        # Count passes
+        pass_count = sum([
+            eight_steps.get('step_1_htf_bias', False),
+            eight_steps.get('step_2_zone_type', False),
+            eight_steps.get('step_3_liquidity_sweep', False),
+            eight_steps.get('step_4_structure_shift', False),
+            eight_steps.get('step_5_from_liquidity', False),
+            eight_steps.get('step_6_confirmation_candle', False),
+            eight_steps.get('step_7_entry_zone', False),
+            step8_passed
+        ])
+        
+        # Build checklist string
+        checklist = "📋 <b>8-STEP CHECKLIST:</b>\n"
+        for line in checklist_lines:
+            checklist += f"   {line}\n"
+        checklist += f"\n   📊 <b>SCORE:</b> {pass_count}/8 steps passed"
+        # ==========================================
+        
         msg = f"""
-{update_emoji}{tier_emoji} <b>ROMEOTPT - {quality.get('tier', 'C')} Tier</b>
+{update_emoji}{tier_emoji} <b>ROMEOTPT v3.2 - {quality.get('tier', 'C')} Tier</b>
 
-<b>{setup.get('symbol', 'UNKNOWN')}</b> | {setup.get('side', 'N/A')}
+<b>🎯 {setup.get('symbol', 'UNKNOWN')}</b> | {setup.get('side', 'N/A')}
 <b>Entry:</b> {setup.get('entry_price', 0):.8f}
 <b>Current:</b> {setup.get('current_price', 0):.8f}
 <b>Type:</b> {setup.get('entry_type', 'N/A')}{update_info}
+
+{checklist}
 
 🎯 <b>Targets:</b>
 TP1: {tp1_display}
@@ -811,9 +947,10 @@ SL: {setup.get('sl_price', 0):.8f}
 RR: {setup.get('rr_ratio', 0):.2f}:1
 
 📈 <b>Quality Score:</b> {quality.get('total_score', 0):.2f}/5.0
-• Sweep: {'✅' if quality.get('sweep_strength', 0) > 0.7 else '⚠️' if quality.get('sweep_strength', 0) > 0.3 else '❌'}
-• Structure: {'✅' if quality.get('structure_shift', False) else '⚠️'}
-• Confirmation: {'✅' if quality.get('confirmation_candle', False) else '⚠️'}
+• Sweep Strength: {quality.get('sweep_strength', 0):.2f}
+• HTF Alignment: {quality.get('htfc_alignment', 0):.2f}
+• Structure Shift: {'✅' if quality.get('structure_shift', False) else '❌'}
+• Confirmation: {'✅' if quality.get('confirmation_candle', False) else '❌'}
 
 <i>Detected: {datetime.datetime.utcnow().strftime('%H:%M:%S UTC')}</i>
 """
@@ -1135,7 +1272,7 @@ async def outcome_aware_scanner(exchange):
 • Outcome check: {OUTCOME_CHECK_INTERVAL}s
 • Min quality: {MIN_QUALITY_SCORE}
 
-<i>Layer 1: Eligibility only | Layer 2: Quality ranking</i>
+<i>Now with 8-step numerical checklist display</i>
 """
     await send_telegram(startup_msg)
     
@@ -1154,10 +1291,9 @@ async def outcome_aware_scanner(exchange):
             
             for symbol, data in tickers.items():
                 if symbol.endswith("/USDT"):
-                    # ============ ADDED STABLECOIN FILTER ============
+                    # Skip stablecoin pairs
                     if symbol in ["USDC/USDT", "USDG/USDT"]:
-                        continue  # Skip stablecoin pairs
-                    # ==================================================
+                        continue
                     
                     volume = data.get("quoteVolume", 0)
                     if isinstance(volume, (int, float)):
@@ -1343,6 +1479,7 @@ async def main():
         log.info(f"Scan: {SCAN_INTERVAL}s | Top {TOP_N} symbols")
         log.info(f"Cooldown: {SIGNAL_COOLDOWN_MINUTES}min | Validity: {SIGNAL_VALIDITY_HOURS}h")
         log.info(f"Outcome check: {OUTCOME_CHECK_INTERVAL}s")
+        log.info(f"Now with 8-step numerical checklist display")
         
         # Start cleanup task
         asyncio.create_task(periodic_cleanup())
