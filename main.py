@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ROMEOTPT SCANNER v3.2 - COMPLETE & CORRECTED VERSION
-Two-layer architecture + Deduplication + Outcome Tracking + Quality Breakdown
+Two-layer architecture + Deduplication + Outcome Tracking
 """
 
 import os
@@ -27,8 +27,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v3_2.db")
 
 # Scanner settings
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))
-TOP_N = int(os.getenv("TOP_N", 30))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 30))
+TOP_N = int(os.getenv("TOP_N", 10))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 10))
 
 # Signal thresholds
@@ -84,43 +84,6 @@ class SetupQuality:
             return "B"
         else:
             return "C"
-
-@dataclass
-class SignalDebugData:
-    """Complete debugging data for a signal"""
-    symbol: str
-    timestamp: datetime.datetime
-    
-    # Layer 1 calculations
-    eligibility_raw: Dict[str, Any] = None
-    entry_zone_calculation: Dict[str, Any] = None
-    sl_calculation: Dict[str, Any] = None
-    tp_calculation: Dict[str, Any] = None
-    
-    # Layer 2 calculations  
-    quality_raw: Dict[str, Any] = None
-    quality_components: Dict[str, Any] = None
-    
-    # Final setup
-    final_setup: Dict[str, Any] = None
-    
-    def to_json(self) -> str:
-        """Convert to JSON string"""
-        data = {
-            'symbol': self.symbol,
-            'timestamp': self.timestamp.isoformat(),
-            
-            'eligibility': self.eligibility_raw,
-            'entry_zone': self.entry_zone_calculation,
-            'stop_loss': self.sl_calculation,
-            'take_profit': self.tp_calculation,
-            
-            'quality': self.quality_raw,
-            'quality_components': self.quality_components,
-            
-            'final_setup': self.final_setup
-        }
-        return json.dumps(data, indent=2)
 
 # ---------------- SIGNAL TRACKER ----------------
 class SignalTracker:
@@ -743,432 +706,29 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility) 
         total_score=total_score
     )
 
-# ---------------- DEBUG VERSIONS (WITHOUT LOGIC CHANGES) ----------------
-async def check_eligibility_fast_with_debug(exchange, symbol: str, debug_data: SignalDebugData) -> SetupEligibility:
-    """Same logic as check_eligibility_fast but captures debug data"""
-    
-    # Get current price
-    try:
-        ticker = await exchange.fetch_ticker(symbol)
-        current_price = ticker.get("last", 0)
-        if current_price == 0:
-            return SetupEligibility(eligible=False, disqualify_reason="No price")
-    except Exception as e:
-        return SetupEligibility(eligible=False, disqualify_reason="Ticker error")
-    
-    # Quick HTF direction (1H)
-    ohlcv_1h = await fetch_ohlcv(exchange, symbol, "1h", 50)
-    
-    if not ohlcv_1h or len(ohlcv_1h) < 20:
-        return SetupEligibility(eligible=False, disqualify_reason="Insufficient data")
-    
-    df_1h = create_dataframe(ohlcv_1h)
-    if df_1h is None:
-        return SetupEligibility(eligible=False, disqualify_reason="Dataframe error")
-    
-    # Fast trend detection
-    try:
-        df_1h['ema_20'] = df_1h['close'].ewm(span=20).mean()
-        df_1h['ema_50'] = df_1h['close'].ewm(span=50).mean()
-        
-        latest_ema20 = df_1h['ema_20'].iloc[-1]
-        latest_ema50 = df_1h['ema_50'].iloc[-1]
-        latest_close = df_1h['close'].iloc[-1]
-        
-        # Determine bias
-        if latest_ema20 > latest_ema50 and latest_close > latest_ema20:
-            bias = "BULLISH"
-            side = "BUY"
-        elif latest_ema20 < latest_ema50 and latest_close < latest_ema20:
-            bias = "BEARISH"
-            side = "SELL"
-        else:
-            recent_high = df_1h['high'].iloc[-10:].max()
-            recent_low = df_1h['low'].iloc[-10:].min()
-            
-            if current_price > (recent_high + recent_low) / 2:
-                bias = "BULLISH"
-                side = "BUY"
-            else:
-                bias = "BEARISH"
-                side = "SELL"
-        
-    except Exception as e:
-        return SetupEligibility(eligible=False, disqualify_reason="Trend detection error")
-    
-    # Get quick range
-    try:
-        range_high = float(df_1h['high'].iloc[-20:].max())
-        range_low = float(df_1h['low'].iloc[-20:].min())
-    except:
-        range_high = float(df_1h['high'].max())
-        range_low = float(df_1h['low'].min())
-    
-    # Find entry zone (15m)
-    ohlcv_15m = await fetch_ohlcv(exchange, symbol, "15m", 30)
-    
-    if not ohlcv_15m:
-        return SetupEligibility(eligible=False, disqualify_reason="No 15m data")
-    
-    df_15m = create_dataframe(ohlcv_15m)
-    if df_15m is None:
-        return SetupEligibility(eligible=False, disqualify_reason="15m dataframe error")
-    
-    # Find recent OB/FVG (fast detection)
-    entry_found = False
-    entry_price = 0
-    entry_type = ""
-    entry_low = 0
-    entry_high = 0
+# ---------------- FAST SCANNING ----------------
+async def scan_symbol_fast(exchange, symbol: str) -> Optional[Dict]:
+    """ULTRA-FAST scanning: Layer 1 only, Layer 2 optional"""
     
     try:
-        if side == "BUY":
-            recent_low_15m = df_15m['low'].iloc[-5:].min()
-            
-            if current_price <= recent_low_15m * 1.005:
-                entry_price = current_price
-                entry_type = "DISCOUNT_ZONE"
-                entry_low = recent_low_15m * 0.995
-                entry_high = recent_low_15m * 1.01
-                entry_found = True
-            
-            if not entry_found and len(df_15m) >= 3:
-                last_candle = df_15m.iloc[-1]
-                prev_candle = df_15m.iloc[-2]
-                
-                if (prev_candle['close'] < prev_candle['open'] and 
-                    last_candle['close'] > last_candle['open'] and
-                    last_candle['close'] > prev_candle['close']):
-                    entry_price = last_candle['close']
-                    entry_type = "BULLISH_ENGULFING"
-                    entry_low = last_candle['low']
-                    entry_high = last_candle['high'] * 1.005
-                    entry_found = True
-                    
-        else:  # SELL
-            recent_high_15m = df_15m['high'].iloc[-5:].max()
-            
-            if current_price >= recent_high_15m * 0.995:
-                entry_price = current_price
-                entry_type = "PREMIUM_ZONE"
-                entry_low = recent_high_15m * 0.99
-                entry_high = recent_high_15m * 1.005
-                entry_found = True
-            
-            if not entry_found and len(df_15m) >= 3:
-                last_candle = df_15m.iloc[-1]
-                prev_candle = df_15m.iloc[-2]
-                
-                if (prev_candle['close'] > prev_candle['open'] and 
-                    last_candle['close'] < last_candle['open'] and
-                    last_candle['close'] < prev_candle['close']):
-                    entry_price = last_candle['close']
-                    entry_type = "BEARISH_ENGULFING"
-                    entry_low = last_candle['low'] * 0.995
-                    entry_high = last_candle['high']
-                    entry_found = True
-                    
-        debug_data.entry_zone_calculation = {
-            'entry_found': entry_found,
-            'entry_type': entry_type,
-            'entry_price': entry_price,
-            'zone_low': entry_low,
-            'zone_high': entry_high,
-            'current_in_zone': entry_low <= current_price <= entry_high,
-            'recent_low_15m': float(recent_low_15m) if side == "BUY" else None,
-            'recent_high_15m': float(recent_high_15m) if side == "SELL" else None
-        }
+        # LAYER 1: Eligibility check
+        eligibility = await check_eligibility_fast(exchange, symbol)
         
-    except Exception as e:
-        return SetupEligibility(eligible=False, disqualify_reason="Entry zone error")
-    
-    if not entry_found:
-        return SetupEligibility(eligible=False, disqualify_reason="No entry zone")
-    
-    # SL logic
-    try:
-        if side == "BUY":
-            sl_price = min(recent_low_15m * 0.995, entry_price * 0.99)
-        else:
-            sl_price = max(recent_high_15m * 1.005, entry_price * 1.01)
-    except:
-        # Fallback SL
-        if side == "BUY":
-            sl_price = entry_price * 0.99
-        else:
-            sl_price = entry_price * 1.01
-    
-    debug_data.sl_calculation = {
-        'sl_price': sl_price,
-        'sl_distance_pct': abs(entry_price - sl_price) / entry_price * 100,
-        'method': 'recent_extreme' if ('recent_low_15m' in locals() or 'recent_high_15m' in locals()) else 'percentage_fallback'
-    }
-    
-    # TP targets
-    tp_targets = []
-    
-    try:
-        if side == "BUY":
-            recent_resistance = df_1h['high'].iloc[-10:].max()
-            tp_targets.append(float(recent_resistance))
-            
-            range_height = range_high - range_low
-            tp_targets.append(float(min(range_high + range_height * 0.5, entry_price * 1.03)))
-        else:
-            recent_support = df_1h['low'].iloc[-10:].min()
-            tp_targets.append(float(recent_support))
-            
-            range_height = range_high - range_low
-            tp_targets.append(float(max(range_low - range_height * 0.5, entry_price * 0.97)))
-    except:
-        # Fallback TP
-        if side == "BUY":
-            tp_targets.append(entry_price * 1.02)
-            tp_targets.append(entry_price * 1.04)
-        else:
-            tp_targets.append(entry_price * 0.98)
-            tp_targets.append(entry_price * 0.96)
-    
-    debug_data.tp_calculation = {
-        'tp_targets': tp_targets,
-        'tp1_distance_pct': abs(tp_targets[0] - entry_price) / entry_price * 100 if len(tp_targets) > 0 else 0,
-        'method': 'recent_structure' if ('recent_resistance' in locals() or 'recent_support' in locals()) else 'percentage_fallback'
-    }
-    
-    entry_zone = {
-        "type": entry_type,
-        "price": entry_price,
-        "low": entry_low,
-        "high": entry_high,
-        "current_in_zone": entry_low <= current_price <= entry_high
-    }
-    
-    return SetupEligibility(
-        eligible=True,
-        side=side,
-        entry_price=entry_price,
-        entry_type=entry_type,
-        entry_zone=entry_zone,
-        sl_price=sl_price,
-        tp_targets=tp_targets
-    )
-
-async def analyze_quality_with_debug(exchange, symbol: str, eligibility: SetupEligibility, debug_data: SignalDebugData) -> SetupQuality:
-    """Same logic as analyze_quality but captures debug data"""
-    
-    side = eligibility.side
-    
-    # Initialize scores
-    sweep_strength = 0.0
-    structure_shift = False
-    from_liquidity_exists = False
-    confirmation_candle = False
-    htfc_alignment_score = 0.0
-    
-    quality_components = {
-        'sweep_strength': {'value': 0.0, 'details': {}},
-        'structure_shift': {'value': False, 'details': {}},
-        'from_liquidity': {'value': False, 'details': {}},
-        'confirmation_candle': {'value': False, 'details': {}},
-        'htfc_alignment': {'value': 0.0, 'details': {}}
-    }
-    
-    try:
-        # Sweep Strength Analysis
-        ohlcv_15m = await fetch_ohlcv(exchange, symbol, "15m", 20)
+        if not eligibility.eligible:
+            return None
         
-        if ohlcv_15m:
-            df_15m = create_dataframe(ohlcv_15m)
-            if df_15m is not None and len(df_15m) >= 10:
-                if side == "BUY":
-                    recent_low = df_15m['low'].iloc[-5:].min()
-                    prev_low = df_15m['low'].iloc[-10:-5].min()
-                    if recent_low < prev_low:
-                        sweep_strength = 0.7
-                        quality_components['sweep_strength']['details']['sweep_detected'] = True
-                        quality_components['sweep_strength']['details']['recent_low'] = float(recent_low)
-                        quality_components['sweep_strength']['details']['prev_low'] = float(prev_low)
-                        quality_components['sweep_strength']['details']['sweep_depth_pct'] = (prev_low - recent_low) / prev_low * 100 if prev_low > 0 else 0
-                        
-                        try:
-                            sweep_idx = df_15m['low'].idxmin()
-                            if sweep_idx < len(df_15m) - 1:
-                                sweep_candle = df_15m.iloc[sweep_idx]
-                                body_size = abs(sweep_candle['close'] - sweep_candle['open'])
-                                wick_size = sweep_candle['high'] - max(sweep_candle['open'], sweep_candle['close'])
-                                if body_size > wick_size:
-                                    sweep_strength = 1.0
-                                    quality_components['sweep_strength']['details']['strong_candle'] = True
-                                    quality_components['sweep_strength']['details']['body_vs_wick'] = body_size / wick_size if wick_size > 0 else 0
-                        except:
-                            pass
-                else:
-                    recent_high = df_15m['high'].iloc[-5:].max()
-                    prev_high = df_15m['high'].iloc[-10:-5].max()
-                    if recent_high > prev_high:
-                        sweep_strength = 0.7
-                        quality_components['sweep_strength']['details']['sweep_detected'] = True
-                        quality_components['sweep_strength']['details']['recent_high'] = float(recent_high)
-                        quality_components['sweep_strength']['details']['prev_high'] = float(prev_high)
-                        quality_components['sweep_strength']['details']['sweep_depth_pct'] = (recent_high - prev_high) / prev_high * 100 if prev_high > 0 else 0
-                        
-                        try:
-                            sweep_idx = df_15m['high'].idxmax()
-                            if sweep_idx < len(df_15m) - 1:
-                                sweep_candle = df_15m.iloc[sweep_idx]
-                                body_size = abs(sweep_candle['close'] - sweep_candle['open'])
-                                wick_size = min(sweep_candle['open'], sweep_candle['close']) - sweep_candle['low']
-                                if body_size > wick_size:
-                                    sweep_strength = 1.0
-                                    quality_components['sweep_strength']['details']['strong_candle'] = True
-                                    quality_components['sweep_strength']['details']['body_vs_wick'] = body_size / wick_size if wick_size > 0 else 0
-                        except:
-                            pass
+        # LAYER 2: Quality analysis
+        quality = await analyze_quality(exchange, symbol, eligibility)
         
-        quality_components['sweep_strength']['value'] = sweep_strength
-        
-        # Structure Shift (OPTIONAL)
-        ohlcv_1h = await fetch_ohlcv(exchange, symbol, "1h", 30)
-        if ohlcv_1h:
-            df_1h = create_dataframe(ohlcv_1h)
-            if df_1h is not None and len(df_1h) >= 11:
-                if side == "BUY":
-                    recent_high = df_1h['high'].iloc[-10:-1].max()
-                    current_close = df_1h['close'].iloc[-1]
-                    if current_close > recent_high:
-                        structure_shift = True
-                        quality_components['structure_shift']['details']['breakout'] = True
-                        quality_components['structure_shift']['details']['breakout_level'] = float(recent_high)
-                        quality_components['structure_shift']['details']['breakout_pct'] = (current_close - recent_high) / recent_high * 100 if recent_high > 0 else 0
-                else:
-                    recent_low = df_1h['low'].iloc[-10:-1].min()
-                    current_close = df_1h['close'].iloc[-1]
-                    if current_close < recent_low:
-                        structure_shift = True
-                        quality_components['structure_shift']['details']['breakdown'] = True
-                        quality_components['structure_shift']['details']['breakdown_level'] = float(recent_low)
-                        quality_components['structure_shift']['details']['breakdown_pct'] = (recent_low - current_close) / recent_low * 100 if recent_low > 0 else 0
-        
-        quality_components['structure_shift']['value'] = structure_shift
-        
-        # FROM Liquidity (OPTIONAL)
-        if sweep_strength > 0.5:
-            from_liquidity_exists = True
-            quality_components['from_liquidity']['details']['sweep_based'] = True
-        
-        quality_components['from_liquidity']['value'] = from_liquidity_exists
-        
-        # Confirmation Candle (OPTIONAL)
-        ohlcv_5m = await fetch_ohlcv(exchange, symbol, "5m", 5)
-        
-        if ohlcv_5m:
-            df_5m = create_dataframe(ohlcv_5m)
-            if df_5m is not None and len(df_5m) > 0:
-                if side == "BUY":
-                    if df_5m['close'].iloc[-1] > df_5m['open'].iloc[-1]:
-                        confirmation_candle = True
-                        quality_components['confirmation_candle']['details']['bullish_close'] = True
-                        quality_components['confirmation_candle']['details']['candle_size_pct'] = (df_5m['close'].iloc[-1] - df_5m['open'].iloc[-1]) / df_5m['open'].iloc[-1] * 100 if df_5m['open'].iloc[-1] > 0 else 0
-                else:
-                    if df_5m['close'].iloc[-1] < df_5m['open'].iloc[-1]:
-                        confirmation_candle = True
-                        quality_components['confirmation_candle']['details']['bearish_close'] = True
-                        quality_components['confirmation_candle']['details']['candle_size_pct'] = (df_5m['open'].iloc[-1] - df_5m['close'].iloc[-1]) / df_5m['open'].iloc[-1] * 100 if df_5m['open'].iloc[-1] > 0 else 0
-        
-        quality_components['confirmation_candle']['value'] = confirmation_candle
-        
-        # HTF + Premium/Discount Alignment
-        htfc_alignment_score = 0.5
-        
-        if eligibility.entry_type in ["DISCOUNT_ZONE", "BULLISH_ENGULFING"] and side == "BUY":
-            htfc_alignment_score = 0.8
-            quality_components['htfc_alignment']['details']['perfect_alignment'] = True
-            quality_components['htfc_alignment']['details']['entry_type'] = eligibility.entry_type
-            quality_components['htfc_alignment']['details']['side'] = side
-        elif eligibility.entry_type in ["PREMIUM_ZONE", "BEARISH_ENGULFING"] and side == "SELL":
-            htfc_alignment_score = 0.8
-            quality_components['htfc_alignment']['details']['perfect_alignment'] = True
-            quality_components['htfc_alignment']['details']['entry_type'] = eligibility.entry_type
-            quality_components['htfc_alignment']['details']['side'] = side
-        else:
-            quality_components['htfc_alignment']['details']['partial_alignment'] = True
-        
-        quality_components['htfc_alignment']['value'] = htfc_alignment_score
-            
-    except Exception as e:
-        quality_components['error'] = str(e)
-    
-    debug_data.quality_components = quality_components
-    
-    # Calculate total score (0-5)
-    total_score = (
-        sweep_strength +
-        (1.0 if structure_shift else 0.0) +
-        (0.5 if from_liquidity_exists else 0.0) +
-        (0.5 if confirmation_candle else 0.0) +
-        htfc_alignment_score
-    )
-    
-    return SetupQuality(
-        sweep_strength=sweep_strength,
-        structure_shift=structure_shift,
-        from_liquidity_exists=from_liquidity_exists,
-        confirmation_candle=confirmation_candle,
-        htfc_alignment_score=htfc_alignment_score,
-        total_score=total_score
-    )
-
-# ---------------- FAST SCANNING WITH DEBUG ----------------
-async def scan_symbol_fast_with_debug(exchange, symbol: str) -> Tuple[Optional[Dict], Optional[SignalDebugData]]:
-    """ULTRA-FAST scanning with debug data capture"""
-    
-    debug_data = SignalDebugData(
-        symbol=symbol,
-        timestamp=datetime.datetime.utcnow()
-    )
-    
-    try:
         # Get current price
         ticker = await exchange.fetch_ticker(symbol)
         current_price = ticker.get("last", 0)
-        if current_price == 0:
-            return None, debug_data
-        
-        # LAYER 1: Eligibility check with data capture
-        eligibility = await check_eligibility_fast_with_debug(exchange, symbol, debug_data)
-        
-        if not eligibility.eligible:
-            return None, debug_data
-        
-        debug_data.eligibility_raw = {
-            'eligible': eligibility.eligible,
-            'side': eligibility.side,
-            'entry_price': eligibility.entry_price,
-            'entry_type': eligibility.entry_type,
-            'sl_price': eligibility.sl_price,
-            'tp_targets': eligibility.tp_targets,
-            'disqualify_reason': eligibility.disqualify_reason
-        }
-        
-        # LAYER 2: Quality analysis with data capture
-        quality = await analyze_quality_with_debug(exchange, symbol, eligibility, debug_data)
-        
-        debug_data.quality_raw = {
-            'total_score': quality.total_score,
-            'tier': quality.quality_tier,
-            'sweep_strength': quality.sweep_strength,
-            'structure_shift': quality.structure_shift,
-            'from_liquidity': quality.from_liquidity_exists,
-            'confirmation_candle': quality.confirmation_candle,
-            'htfc_alignment': quality.htfc_alignment_score
-        }
         
         # Calculate RR
         risk = abs(eligibility.entry_price - eligibility.sl_price)
         reward = abs(eligibility.tp_targets[0] - eligibility.entry_price)
         rr_ratio = reward / risk if risk > 0 else 0
         
-        # Final setup
         setup = {
             "symbol": symbol,
             "timestamp": datetime.datetime.utcnow().isoformat(),
@@ -1193,12 +753,10 @@ async def scan_symbol_fast_with_debug(exchange, symbol: str) -> Tuple[Optional[D
             }
         }
         
-        debug_data.final_setup = setup
-        
-        return setup, debug_data
-        
+        return setup
     except Exception as e:
-        return None, debug_data
+        log.error(f"Error scanning {symbol}: {e}")
+        return None
 
 # ---------------- ALERTS ----------------
 async def send_fast_alert(setup: Dict):
@@ -1232,6 +790,7 @@ async def send_fast_alert(setup: Dict):
                 update_info = f"\n🔄 <b>Updated signal</b>"
         
         tp_targets = setup.get('tp_targets', [])
+        # Format TP values separately to avoid f-string formatting errors
         tp1_display = f"{tp_targets[0]:.8f}" if len(tp_targets) > 0 else 'N/A'
         tp2_display = f"{tp_targets[1]:.8f}" if len(tp_targets) > 1 else 'N/A'
         
@@ -1263,124 +822,6 @@ RR: {setup.get('rr_ratio', 0):.2f}:1
     except Exception as e:
         log.error(f"Error sending alert: {e}")
 
-async def send_fast_alert_with_breakdown(setup: Dict, debug_data: SignalDebugData):
-    """Send alert with quality breakdown in numerical format"""
-    
-    try:
-        symbol = setup.get('symbol', 'UNKNOWN')
-        quality = setup.get('quality', {})
-        
-        # Check if this is an update
-        is_update = symbol in signal_tracker.active_signals
-        update_emoji = "🔄" if is_update else "🆕"
-        
-        tier_emoji = {
-            "A+": "🔥",
-            "A": "✅", 
-            "B": "⚠️",
-            "C": "📊"
-        }.get(quality.get("tier", "C"), "📊")
-        
-        # Add update info if applicable
-        update_info = ""
-        if is_update:
-            old_signal = signal_tracker.active_signals.get(symbol, {})
-            old_setup = old_signal.get('setup', {})
-            old_quality = old_setup.get('quality', {}).get('total_score', 0)
-            new_quality = quality.get('total_score', 0)
-            if new_quality > old_quality:
-                update_info = f"\n📈 <b>Quality UP:</b> {old_quality:.2f} → {new_quality:.2f}"
-            elif old_quality > 0:
-                update_info = f"\n🔄 <b>Updated signal</b>"
-        
-        tp_targets = setup.get('tp_targets', [])
-        tp1_display = f"{tp_targets[0]:.8f}" if len(tp_targets) > 0 else 'N/A'
-        tp2_display = f"{tp_targets[1]:.8f}" if len(tp_targets) > 1 else 'N/A'
-        
-        # Get quality components from debug data
-        quality_components = debug_data.quality_components or {}
-        
-        # Extract numerical values
-        sweep_details = quality_components.get('sweep_strength', {}).get('details', {})
-        structure_details = quality_components.get('structure_shift', {}).get('details', {})
-        confirmation_details = quality_components.get('confirmation_candle', {}).get('details', {})
-        
-        # Sweep numerical data
-        sweep_value = quality.get('sweep_strength', 0)
-        sweep_depth = sweep_details.get('sweep_depth_pct', 0)
-        recent_level = sweep_details.get('recent_low') or sweep_details.get('recent_high', 0)
-        prev_level = sweep_details.get('prev_low') or sweep_details.get('prev_high', 0)
-        
-        # Structure numerical data
-        structure_value = 1.0 if quality.get('structure_shift', False) else 0.0
-        structure_level = structure_details.get('breakout_level') or structure_details.get('breakdown_level', 0)
-        structure_pct = structure_details.get('breakout_pct') or structure_details.get('breakdown_pct', 0)
-        
-        # Confirmation numerical data
-        confirmation_value = 0.5 if quality.get('confirmation_candle', False) else 0.0
-        candle_size = confirmation_details.get('candle_size_pct', 0)
-        
-        # Liquidity numerical data
-        liquidity_value = 0.5 if quality.get('from_liquidity', False) else 0.0
-        
-        # Alignment numerical data
-        alignment_value = quality.get('htfc_alignment', 0)
-        
-        # Total score
-        total_score = quality.get('total_score', 0)
-        
-        # Create numerical quality breakdown
-        quality_breakdown = f"""
-🔢 <b>QUALITY BREAKDOWN:</b>
-
-<b>Sweep Strength:</b> {sweep_value:.1f}/1.0
-• Depth: {sweep_depth:.2f}%
-• Recent: {recent_level:.8f}
-• Previous: {prev_level:.8f}
-
-<b>Structure Shift:</b> {structure_value:.1f}/1.0
-• Level: {structure_level:.8f}
-• Distance: {structure_pct:.2f}%
-
-<b>Confirmation Candle:</b> {confirmation_value:.1f}/0.5
-• Size: {candle_size:.2f}%
-
-<b>FROM Liquidity:</b> {liquidity_value:.1f}/0.5
-
-<b>HTF Alignment:</b> {alignment_value:.1f}/0.8
-
-<b>Total Score:</b> {total_score:.2f}/5.0
-<b>Tier:</b> {quality.get('tier', 'C')}
-"""
-        
-        msg = f"""
-{update_emoji}{tier_emoji} <b>ROMEOTPT - {quality.get('tier', 'C')} Tier</b>
-
-<b>{symbol}</b> | {setup.get('side', 'N/A')}
-<b>Entry:</b> {setup.get('entry_price', 0):.8f}
-<b>Current:</b> {setup.get('current_price', 0):.8f}
-<b>Type:</b> {setup.get('entry_type', 'N/A')}{update_info}
-
-🎯 <b>Targets:</b>
-TP1: {tp1_display}
-TP2: {tp2_display}
-
-🛡️ <b>Risk:</b>
-SL: {setup.get('sl_price', 0):.8f}
-RR: {setup.get('rr_ratio', 0):.2f}:1
-
-{quality_breakdown}
-
-<i>Detected: {datetime.datetime.utcnow().strftime('%H:%M:%S UTC')}</i>
-"""
-        
-        await send_telegram(msg)
-        
-    except Exception as e:
-        log.error(f"Error sending alert with breakdown: {e}")
-        # Fallback to simple alert if detailed one fails
-        await send_fast_alert(setup)
-
 async def send_outcome_alert(symbol: str, outcome: Dict):
     """Send alert when signal hits TP or SL"""
     
@@ -1405,6 +846,7 @@ async def send_outcome_alert(symbol: str, outcome: Dict):
             time_str = f"{bars_held//60}h {bars_held%60}min"
         
         tp_targets = setup.get('tp_targets', [0])
+        # Format TP separately
         tp_display = f"{tp_targets[0]:.8f}" if len(tp_targets) > 0 else 'N/A'
         
         msg = f"""
@@ -1451,27 +893,6 @@ async def send_deduped_alert(setup: Dict):
             return False
     except Exception as e:
         log.error(f"Error in deduped alert for {setup.get('symbol', 'UNKNOWN')}: {e}")
-        return False
-
-async def send_deduped_alert_with_breakdown(setup: Dict, debug_data: SignalDebugData) -> bool:
-    """Send alert with breakdown only if it's a new or meaningfully updated signal"""
-    try:
-        symbol = setup.get('symbol', '')
-        if not symbol:
-            return False
-        
-        should_alert, reason = signal_tracker.is_new_or_updated_signal(symbol, setup)
-        
-        if should_alert:
-            await send_fast_alert_with_breakdown(setup, debug_data)
-            signal_tracker.update_signal(symbol, setup, alerted=True)
-            log.info(f"📨 Alert sent for {symbol} with breakdown: {reason}")
-            return True
-        else:
-            signal_tracker.update_signal(symbol, setup, alerted=False)
-            return False
-    except Exception as e:
-        log.error(f"Error in deduped alert with breakdown for {setup.get('symbol', 'UNKNOWN')}: {e}")
         return False
 
 # ---------------- DATABASE ----------------
@@ -1699,30 +1120,6 @@ async def process_deduped_results(results) -> int:
     
     return alerts_sent
 
-async def process_deduped_results_with_breakdown(results) -> int:
-    """Process results with deduplication and quality breakdown"""
-    alerts_sent = 0
-    
-    for result in results:
-        if isinstance(result, Exception):
-            log.error(f"Task error: {result}")
-            continue
-            
-        if result and isinstance(result, tuple) and len(result) == 2:
-            setup, debug_data = result
-            if setup and debug_data:
-                try:
-                    quality_score = setup.get("quality", {}).get("total_score", 0)
-                    if quality_score >= MIN_QUALITY_SCORE:
-                        alerted = await send_deduped_alert_with_breakdown(setup, debug_data)
-                        if alerted:
-                            alerts_sent += 1
-                        await store_signal(setup)
-                except Exception as e:
-                    log.error(f"Error processing result: {e}")
-    
-    return alerts_sent
-
 async def outcome_aware_scanner(exchange):
     """Main scanner with outcome tracking"""
     
@@ -1738,7 +1135,7 @@ async def outcome_aware_scanner(exchange):
 • Outcome check: {OUTCOME_CHECK_INTERVAL}s
 • Min quality: {MIN_QUALITY_SCORE}
 
-<i>Layer 1: Eligibility only | Layer 2: Quality ranking | Numerical Quality Breakdown</i>
+<i>Layer 1: Eligibility only | Layer 2: Quality ranking</i>
 """
     await send_telegram(startup_msg)
     
@@ -1757,9 +1154,10 @@ async def outcome_aware_scanner(exchange):
             
             for symbol, data in tickers.items():
                 if symbol.endswith("/USDT"):
-                    # Skip stablecoin pairs
+                    # ============ ADDED STABLECOIN FILTER ============
                     if symbol in ["USDC/USDT", "USDG/USDT"]:
-                        continue
+                        continue  # Skip stablecoin pairs
+                    # ==================================================
                     
                     volume = data.get("quoteVolume", 0)
                     if isinstance(volume, (int, float)):
@@ -1780,22 +1178,22 @@ async def outcome_aware_scanner(exchange):
                     win_rate = outcome_stats.get('win_rate', 0)
                     log.info(f"📈 Stats: WR={win_rate:.1f}% | TP1={outcome_stats.get('tp1_hits', 0)} | SL={outcome_stats.get('sl_hits', 0)}")
             
-            # Scan symbols with breakdown
+            # Scan symbols
             alerts_this_scan = 0
             tasks = []
             
             for symbol in symbols_to_scan:
-                task = asyncio.create_task(scan_symbol_fast_with_debug(exchange, symbol))
+                task = asyncio.create_task(scan_symbol_fast(exchange, symbol))
                 tasks.append(task)
                 
                 if len(tasks) >= MAX_CONCURRENT:
                     results = await asyncio.gather(*tasks, return_exceptions=True)
-                    alerts_this_scan += await process_deduped_results_with_breakdown(results)
+                    alerts_this_scan += await process_deduped_results(results)
                     tasks = []
             
             if tasks:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
-                alerts_this_scan += await process_deduped_results_with_breakdown(results)
+                alerts_this_scan += await process_deduped_results(results)
             
             await asyncio.sleep(SCAN_INTERVAL)
             
@@ -1941,7 +1339,7 @@ async def main():
             "timeout": 5000,
         })
         
-        log.info("🚀 ROMEOTPT v3.2 - COMPLETE WITH NUMERICAL QUALITY BREAKDOWN")
+        log.info("🚀 ROMEOTPT v3.2 - COMPLETE")
         log.info(f"Scan: {SCAN_INTERVAL}s | Top {TOP_N} symbols")
         log.info(f"Cooldown: {SIGNAL_COOLDOWN_MINUTES}min | Validity: {SIGNAL_VALIDITY_HOURS}h")
         log.info(f"Outcome check: {OUTCOME_CHECK_INTERVAL}s")
