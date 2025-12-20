@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ROMEOTPT SCANNER v3.2 - COMPLETE & CORRECTED VERSION
-Two-layer architecture + Deduplication + Outcome Tracking + Debug Data Collection
+Two-layer architecture + Deduplication + Outcome Tracking + Quality Breakdown
 """
 
 import os
@@ -91,15 +91,8 @@ class SignalDebugData:
     symbol: str
     timestamp: datetime.datetime
     
-    # Market data snapshots
-    ticker_data: Dict[str, Any] = None
-    ohlcv_1h: List[List] = None
-    ohlcv_15m: List[List] = None
-    ohlcv_5m: List[List] = None
-    
     # Layer 1 calculations
     eligibility_raw: Dict[str, Any] = None
-    eligibility_metrics: Dict[str, Any] = None
     entry_zone_calculation: Dict[str, Any] = None
     sl_calculation: Dict[str, Any] = None
     tp_calculation: Dict[str, Any] = None
@@ -107,13 +100,6 @@ class SignalDebugData:
     # Layer 2 calculations  
     quality_raw: Dict[str, Any] = None
     quality_components: Dict[str, Any] = None
-    
-    # Decision points
-    decision_log: List[str] = None
-    disqualify_log: List[str] = None
-    
-    # Performance metrics
-    processing_times: Dict[str, float] = None
     
     # Final setup
     final_setup: Dict[str, Any] = None
@@ -124,23 +110,7 @@ class SignalDebugData:
             'symbol': self.symbol,
             'timestamp': self.timestamp.isoformat(),
             
-            # Truncate large data for display
-            'ticker_summary': {
-                'last': self.ticker_data.get('last') if self.ticker_data else None,
-                'bid': self.ticker_data.get('bid') if self.ticker_data else None,
-                'ask': self.ticker_data.get('ask') if self.ticker_data else None,
-                'volume': self.ticker_data.get('volume') if self.ticker_data else None,
-                'quoteVolume': self.ticker_data.get('quoteVolume') if self.ticker_data else None
-            },
-            
-            'ohlcv_summaries': {
-                '1h': self._summarize_ohlcv(self.ohlcv_1h, '1h') if self.ohlcv_1h else None,
-                '15m': self._summarize_ohlcv(self.ohlcv_15m, '15m') if self.ohlcv_15m else None,
-                '5m': self._summarize_ohlcv(self.ohlcv_5m, '5m') if self.ohlcv_5m else None
-            },
-            
             'eligibility': self.eligibility_raw,
-            'eligibility_metrics': self.eligibility_metrics,
             'entry_zone': self.entry_zone_calculation,
             'stop_loss': self.sl_calculation,
             'take_profit': self.tp_calculation,
@@ -148,39 +118,9 @@ class SignalDebugData:
             'quality': self.quality_raw,
             'quality_components': self.quality_components,
             
-            'decision_log': self.decision_log or [],
-            'disqualify_log': self.disqualify_log or [],
-            
-            'processing_times': self.processing_times or {},
-            
             'final_setup': self.final_setup
         }
         return json.dumps(data, indent=2)
-    
-    def _summarize_ohlcv(self, ohlcv: List[List], timeframe: str) -> Dict:
-        """Create summary of OHLCV data"""
-        if not ohlcv:
-            return None
-            
-        df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-        
-        return {
-            'timeframe': timeframe,
-            'candle_count': len(ohlcv),
-            'latest': {
-                'open': float(df['open'].iloc[-1]) if len(df) > 0 else 0,
-                'high': float(df['high'].iloc[-1]) if len(df) > 0 else 0,
-                'low': float(df['low'].iloc[-1]) if len(df) > 0 else 0,
-                'close': float(df['close'].iloc[-1]) if len(df) > 0 else 0,
-                'volume': float(df['volume'].iloc[-1]) if len(df) > 0 else 0
-            },
-            'recent_range': {
-                'high_5': float(df['high'].iloc[-5:].max()) if len(df) >= 5 else 0,
-                'low_5': float(df['low'].iloc[-5:].min()) if len(df) >= 5 else 0,
-                'high_10': float(df['high'].iloc[-10:].max()) if len(df) >= 10 else 0,
-                'low_10': float(df['low'].iloc[-10:].min()) if len(df) >= 10 else 0
-            }
-        }
 
 # ---------------- SIGNAL TRACKER ----------------
 class SignalTracker:
@@ -810,30 +750,20 @@ async def check_eligibility_fast_with_debug(exchange, symbol: str, debug_data: S
     # Get current price
     try:
         ticker = await exchange.fetch_ticker(symbol)
-        debug_data.ticker_data = ticker
         current_price = ticker.get("last", 0)
         if current_price == 0:
-            debug_data.disqualify_log = debug_data.disqualify_log or []
-            debug_data.disqualify_log.append("No price available")
             return SetupEligibility(eligible=False, disqualify_reason="No price")
     except Exception as e:
-        debug_data.disqualify_log = debug_data.disqualify_log or []
-        debug_data.disqualify_log.append(f"Ticker error: {str(e)}")
         return SetupEligibility(eligible=False, disqualify_reason="Ticker error")
     
     # Quick HTF direction (1H)
     ohlcv_1h = await fetch_ohlcv(exchange, symbol, "1h", 50)
-    debug_data.ohlcv_1h = ohlcv_1h
     
     if not ohlcv_1h or len(ohlcv_1h) < 20:
-        debug_data.disqualify_log = debug_data.disqualify_log or []
-        debug_data.disqualify_log.append(f"Insufficient 1H data: {len(ohlcv_1h) if ohlcv_1h else 0} candles")
         return SetupEligibility(eligible=False, disqualify_reason="Insufficient data")
     
     df_1h = create_dataframe(ohlcv_1h)
     if df_1h is None:
-        debug_data.disqualify_log = debug_data.disqualify_log or []
-        debug_data.disqualify_log.append("Failed to create 1H DataFrame")
         return SetupEligibility(eligible=False, disqualify_reason="Dataframe error")
     
     # Fast trend detection
@@ -862,21 +792,8 @@ async def check_eligibility_fast_with_debug(exchange, symbol: str, debug_data: S
             else:
                 bias = "BEARISH"
                 side = "SELL"
-                
-        debug_data.eligibility_metrics = {
-            'trend_detection': {
-                'bias': bias,
-                'side': side,
-                'ema_20': float(latest_ema20),
-                'ema_50': float(latest_ema50),
-                'price': float(latest_close),
-                'ema20_above_ema50': latest_ema20 > latest_ema50,
-                'price_above_ema20': latest_close > latest_ema20
-            }
-        }
         
     except Exception as e:
-        debug_data.eligibility_metrics = {'error': f'Trend detection: {str(e)}'}
         return SetupEligibility(eligible=False, disqualify_reason="Trend detection error")
     
     # Get quick range
@@ -887,26 +804,14 @@ async def check_eligibility_fast_with_debug(exchange, symbol: str, debug_data: S
         range_high = float(df_1h['high'].max())
         range_low = float(df_1h['low'].min())
     
-    if debug_data.eligibility_metrics and 'trend_detection' in debug_data.eligibility_metrics:
-        debug_data.eligibility_metrics['range'] = {
-            'high': range_high,
-            'low': range_low,
-            'range_pct': (range_high - range_low) / range_low * 100 if range_low > 0 else 0
-        }
-    
     # Find entry zone (15m)
     ohlcv_15m = await fetch_ohlcv(exchange, symbol, "15m", 30)
-    debug_data.ohlcv_15m = ohlcv_15m
     
     if not ohlcv_15m:
-        if debug_data.eligibility_metrics:
-            debug_data.eligibility_metrics['error'] = 'No 15m data'
         return SetupEligibility(eligible=False, disqualify_reason="No 15m data")
     
     df_15m = create_dataframe(ohlcv_15m)
     if df_15m is None:
-        if debug_data.eligibility_metrics:
-            debug_data.eligibility_metrics['error'] = '15m DataFrame error'
         return SetupEligibility(eligible=False, disqualify_reason="15m dataframe error")
     
     # Find recent OB/FVG (fast detection)
@@ -975,12 +880,9 @@ async def check_eligibility_fast_with_debug(exchange, symbol: str, debug_data: S
         }
         
     except Exception as e:
-        debug_data.entry_zone_calculation = {'error': str(e)}
         return SetupEligibility(eligible=False, disqualify_reason="Entry zone error")
     
     if not entry_found:
-        if debug_data.entry_zone_calculation:
-            debug_data.entry_zone_calculation['error'] = 'No entry zone found'
         return SetupEligibility(eligible=False, disqualify_reason="No entry zone")
     
     # SL logic
@@ -1158,7 +1060,6 @@ async def analyze_quality_with_debug(exchange, symbol: str, eligibility: SetupEl
         
         # Confirmation Candle (OPTIONAL)
         ohlcv_5m = await fetch_ohlcv(exchange, symbol, "5m", 5)
-        debug_data.ohlcv_5m = ohlcv_5m
         
         if ohlcv_5m:
             df_5m = create_dataframe(ohlcv_5m)
@@ -1223,31 +1124,20 @@ async def scan_symbol_fast_with_debug(exchange, symbol: str) -> Tuple[Optional[D
     
     debug_data = SignalDebugData(
         symbol=symbol,
-        timestamp=datetime.datetime.utcnow(),
-        decision_log=[],
-        disqualify_log=[],
-        processing_times={}
+        timestamp=datetime.datetime.utcnow()
     )
     
     try:
-        # Capture ticker data
-        ticker_start = time.time()
+        # Get current price
         ticker = await exchange.fetch_ticker(symbol)
-        debug_data.ticker_data = ticker
-        debug_data.processing_times['ticker_fetch'] = time.time() - ticker_start
-        
         current_price = ticker.get("last", 0)
         if current_price == 0:
-            debug_data.disqualify_log.append("No price available in ticker")
             return None, debug_data
         
         # LAYER 1: Eligibility check with data capture
-        eligibility_start = time.time()
         eligibility = await check_eligibility_fast_with_debug(exchange, symbol, debug_data)
-        debug_data.processing_times['eligibility_check'] = time.time() - eligibility_start
         
         if not eligibility.eligible:
-            debug_data.disqualify_log.append(f"Not eligible: {eligibility.disqualify_reason}")
             return None, debug_data
         
         debug_data.eligibility_raw = {
@@ -1260,12 +1150,8 @@ async def scan_symbol_fast_with_debug(exchange, symbol: str) -> Tuple[Optional[D
             'disqualify_reason': eligibility.disqualify_reason
         }
         
-        debug_data.decision_log.append(f"Eligibility passed: {eligibility.side} signal detected")
-        
         # LAYER 2: Quality analysis with data capture
-        quality_start = time.time()
         quality = await analyze_quality_with_debug(exchange, symbol, eligibility, debug_data)
-        debug_data.processing_times['quality_analysis'] = time.time() - quality_start
         
         debug_data.quality_raw = {
             'total_score': quality.total_score,
@@ -1276,8 +1162,6 @@ async def scan_symbol_fast_with_debug(exchange, symbol: str) -> Tuple[Optional[D
             'confirmation_candle': quality.confirmation_candle,
             'htfc_alignment': quality.htfc_alignment_score
         }
-        
-        debug_data.decision_log.append(f"Quality analysis: {quality.quality_tier} tier with score {quality.total_score:.2f}")
         
         # Calculate RR
         risk = abs(eligibility.entry_price - eligibility.sl_price)
@@ -1310,12 +1194,10 @@ async def scan_symbol_fast_with_debug(exchange, symbol: str) -> Tuple[Optional[D
         }
         
         debug_data.final_setup = setup
-        debug_data.decision_log.append(f"Final setup created with RR: {rr_ratio:.2f}:1")
         
         return setup, debug_data
         
     except Exception as e:
-        debug_data.decision_log.append(f"Error during scanning: {str(e)}")
         return None, debug_data
 
 # ---------------- ALERTS ----------------
@@ -1381,8 +1263,8 @@ RR: {setup.get('rr_ratio', 0):.2f}:1
     except Exception as e:
         log.error(f"Error sending alert: {e}")
 
-async def send_fast_alert_with_debug(setup: Dict, debug_data: SignalDebugData):
-    """Send concise alert with full breakdown link"""
+async def send_fast_alert_with_breakdown(setup: Dict, debug_data: SignalDebugData):
+    """Send alert with quality breakdown in numerical format"""
     
     try:
         symbol = setup.get('symbol', 'UNKNOWN')
@@ -1415,37 +1297,61 @@ async def send_fast_alert_with_debug(setup: Dict, debug_data: SignalDebugData):
         tp1_display = f"{tp_targets[0]:.8f}" if len(tp_targets) > 0 else 'N/A'
         tp2_display = f"{tp_targets[1]:.8f}" if len(tp_targets) > 1 else 'N/A'
         
-        # Get processing times
-        processing_times = debug_data.processing_times or {}
-        total_time = sum(processing_times.values()) * 1000 if processing_times else 0
+        # Get quality components from debug data
+        quality_components = debug_data.quality_components or {}
         
-        # Create debug data summary
-        debug_summary = f"""
-🧠 <b>DEBUG SUMMARY</b>
-• Eligibility check: {processing_times.get('eligibility_check', 0)*1000:.0f}ms
-• Quality analysis: {processing_times.get('quality_analysis', 0)*1000:.0f}ms
-• Total processing: {total_time:.0f}ms
-• Decision steps: {len(debug_data.decision_log or [])}
-• Disqualify checks: {len(debug_data.disqualify_log or [])}
+        # Extract numerical values
+        sweep_details = quality_components.get('sweep_strength', {}).get('details', {})
+        structure_details = quality_components.get('structure_shift', {}).get('details', {})
+        confirmation_details = quality_components.get('confirmation_candle', {}).get('details', {})
+        
+        # Sweep numerical data
+        sweep_value = quality.get('sweep_strength', 0)
+        sweep_depth = sweep_details.get('sweep_depth_pct', 0)
+        recent_level = sweep_details.get('recent_low') or sweep_details.get('recent_high', 0)
+        prev_level = sweep_details.get('prev_low') or sweep_details.get('prev_high', 0)
+        
+        # Structure numerical data
+        structure_value = 1.0 if quality.get('structure_shift', False) else 0.0
+        structure_level = structure_details.get('breakout_level') or structure_details.get('breakdown_level', 0)
+        structure_pct = structure_details.get('breakout_pct') or structure_details.get('breakdown_pct', 0)
+        
+        # Confirmation numerical data
+        confirmation_value = 0.5 if quality.get('confirmation_candle', False) else 0.0
+        candle_size = confirmation_details.get('candle_size_pct', 0)
+        
+        # Liquidity numerical data
+        liquidity_value = 0.5 if quality.get('from_liquidity', False) else 0.0
+        
+        # Alignment numerical data
+        alignment_value = quality.get('htfc_alignment', 0)
+        
+        # Total score
+        total_score = quality.get('total_score', 0)
+        
+        # Create numerical quality breakdown
+        quality_breakdown = f"""
+🔢 <b>QUALITY BREAKDOWN:</b>
+
+<b>Sweep Strength:</b> {sweep_value:.1f}/1.0
+• Depth: {sweep_depth:.2f}%
+• Recent: {recent_level:.8f}
+• Previous: {prev_level:.8f}
+
+<b>Structure Shift:</b> {structure_value:.1f}/1.0
+• Level: {structure_level:.8f}
+• Distance: {structure_pct:.2f}%
+
+<b>Confirmation Candle:</b> {confirmation_value:.1f}/0.5
+• Size: {candle_size:.2f}%
+
+<b>FROM Liquidity:</b> {liquidity_value:.1f}/0.5
+
+<b>HTF Alignment:</b> {alignment_value:.1f}/0.8
+
+<b>Total Score:</b> {total_score:.2f}/5.0
+<b>Tier:</b> {quality.get('tier', 'C')}
 """
-        
-        # Store debug data to file for later analysis
-        # Replace forward slashes with underscores in symbol for filename
-        safe_symbol = symbol.replace("/", "_")
-        debug_filename = f"debug_{safe_symbol}_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
-        debug_filepath = f"/app/data/debug/{debug_filename}"
-        
-        # Create debug directory if it doesn't exist
-        os.makedirs("/app/data/debug", exist_ok=True)
-        
-        # Save debug data
-        try:
-            with open(debug_filepath, 'w') as f:
-                f.write(debug_data.to_json())
-            debug_link = f"\n📊 <b>Full Analysis:</b> Saved to {debug_filename}"
-        except Exception as e:
-            log.error(f"Error saving debug data to file: {e}")
-            debug_link = f"\n📊 <b>Full Analysis:</b> Failed to save debug data"
         
         msg = f"""
 {update_emoji}{tier_emoji} <b>ROMEOTPT - {quality.get('tier', 'C')} Tier</b>
@@ -1463,24 +1369,17 @@ TP2: {tp2_display}
 SL: {setup.get('sl_price', 0):.8f}
 RR: {setup.get('rr_ratio', 0):.2f}:1
 
-📈 <b>Quality Score:</b> {quality.get('total_score', 0):.2f}/5.0
-• Sweep: {'✅' if quality.get('sweep_strength', 0) > 0.7 else '⚠️' if quality.get('sweep_strength', 0) > 0.3 else '❌'}
-• Structure: {'✅' if quality.get('structure_shift', False) else '⚠️'}
-• Confirmation: {'✅' if quality.get('confirmation_candle', False) else '⚠️'}
-
-{debug_summary}
-{debug_link}
+{quality_breakdown}
 
 <i>Detected: {datetime.datetime.utcnow().strftime('%H:%M:%S UTC')}</i>
 """
         
         await send_telegram(msg)
         
-        # Also store debug data reference in database
-        await store_debug_data_reference(symbol, debug_filename, setup)
-        
     except Exception as e:
-        log.error(f"Error sending alert with debug: {e}")
+        log.error(f"Error sending alert with breakdown: {e}")
+        # Fallback to simple alert if detailed one fails
+        await send_fast_alert(setup)
 
 async def send_outcome_alert(symbol: str, outcome: Dict):
     """Send alert when signal hits TP or SL"""
@@ -1554,8 +1453,8 @@ async def send_deduped_alert(setup: Dict):
         log.error(f"Error in deduped alert for {setup.get('symbol', 'UNKNOWN')}: {e}")
         return False
 
-async def send_deduped_alert_with_debug(setup: Dict, debug_data: SignalDebugData) -> bool:
-    """Send alert with debug data only if it's a new or meaningfully updated signal"""
+async def send_deduped_alert_with_breakdown(setup: Dict, debug_data: SignalDebugData) -> bool:
+    """Send alert with breakdown only if it's a new or meaningfully updated signal"""
     try:
         symbol = setup.get('symbol', '')
         if not symbol:
@@ -1564,51 +1463,18 @@ async def send_deduped_alert_with_debug(setup: Dict, debug_data: SignalDebugData
         should_alert, reason = signal_tracker.is_new_or_updated_signal(symbol, setup)
         
         if should_alert:
-            await send_fast_alert_with_debug(setup, debug_data)
+            await send_fast_alert_with_breakdown(setup, debug_data)
             signal_tracker.update_signal(symbol, setup, alerted=True)
-            log.info(f"📨 Alert sent for {symbol} with debug data: {reason}")
+            log.info(f"📨 Alert sent for {symbol} with breakdown: {reason}")
             return True
         else:
             signal_tracker.update_signal(symbol, setup, alerted=False)
-            # Still save debug data even if no alert
-            safe_symbol = symbol.replace("/", "_")
-            debug_filename = f"debug_noalert_{safe_symbol}_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
-            debug_filepath = f"/app/data/debug/{debug_filename}"
-            os.makedirs("/app/data/debug", exist_ok=True)
-            try:
-                with open(debug_filepath, 'w') as f:
-                    f.write(debug_data.to_json())
-                log.debug(f"⏸️  Skipped alert for {symbol}, saved debug data: {reason}")
-            except Exception as e:
-                log.error(f"Error saving no-alert debug data for {symbol}: {e}")
             return False
     except Exception as e:
-        log.error(f"Error in deduped alert with debug for {setup.get('symbol', 'UNKNOWN')}: {e}")
+        log.error(f"Error in deduped alert with breakdown for {setup.get('symbol', 'UNKNOWN')}: {e}")
         return False
 
 # ---------------- DATABASE ----------------
-async def store_debug_data_reference(symbol: str, debug_filename: str, setup: Dict):
-    """Store reference to debug data file in database"""
-    async with db_lock:
-        try:
-            await db_conn.execute("""
-                INSERT INTO debug_data_references (
-                    symbol, debug_filename, signal_timestamp, 
-                    entry_price, side, quality_tier, quality_score
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                symbol,
-                debug_filename,
-                setup.get('timestamp', ''),
-                setup.get('entry_price', 0),
-                setup.get('side', ''),
-                setup.get('quality', {}).get('tier', 'C'),
-                setup.get('quality', {}).get('total_score', 0)
-            ))
-            await db_conn.commit()
-        except Exception as e:
-            log.error(f"Error storing debug reference: {e}")
-
 async def init_database():
     """Initialize database with outcome tracking tables"""
     try:
@@ -1663,31 +1529,15 @@ async def init_database():
             )
         """)
         
-        # Add debug data references table
-        await db_conn.execute("""
-            CREATE TABLE IF NOT EXISTS debug_data_references (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT,
-                debug_filename TEXT,
-                signal_timestamp TEXT,
-                entry_price REAL,
-                side TEXT,
-                quality_tier TEXT,
-                quality_score REAL,
-                stored_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        
         # Create indexes separately (SQLite syntax fix)
         await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_time ON signals (symbol, timestamp)")
         await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_status_time ON signals (status, timestamp)")
         await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_outcome ON signals (outcome)")
         await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_outcomes_symbol_status ON signal_outcomes (symbol, status)")
         await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_outcomes_outcome_type ON signal_outcomes (outcome_type)")
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_debug_symbol_time ON debug_data_references (symbol, signal_timestamp)")
         
         await db_conn.commit()
-        log.info("Database initialized with indexes and debug tracking")
+        log.info("Database initialized with indexes")
     except Exception as e:
         log.error(f"Error initializing database: {e}")
         raise
@@ -1849,8 +1699,8 @@ async def process_deduped_results(results) -> int:
     
     return alerts_sent
 
-async def process_deduped_results_with_debug(results) -> int:
-    """Process results with deduplication and debug data"""
+async def process_deduped_results_with_breakdown(results) -> int:
+    """Process results with deduplication and quality breakdown"""
     alerts_sent = 0
     
     for result in results:
@@ -1864,7 +1714,7 @@ async def process_deduped_results_with_debug(results) -> int:
                 try:
                     quality_score = setup.get("quality", {}).get("total_score", 0)
                     if quality_score >= MIN_QUALITY_SCORE:
-                        alerted = await send_deduped_alert_with_debug(setup, debug_data)
+                        alerted = await send_deduped_alert_with_breakdown(setup, debug_data)
                         if alerted:
                             alerts_sent += 1
                         await store_signal(setup)
@@ -1888,7 +1738,7 @@ async def outcome_aware_scanner(exchange):
 • Outcome check: {OUTCOME_CHECK_INTERVAL}s
 • Min quality: {MIN_QUALITY_SCORE}
 
-<i>Layer 1: Eligibility only | Layer 2: Quality ranking | Full Debug Data Collection</i>
+<i>Layer 1: Eligibility only | Layer 2: Quality ranking | Numerical Quality Breakdown</i>
 """
     await send_telegram(startup_msg)
     
@@ -1930,7 +1780,7 @@ async def outcome_aware_scanner(exchange):
                     win_rate = outcome_stats.get('win_rate', 0)
                     log.info(f"📈 Stats: WR={win_rate:.1f}% | TP1={outcome_stats.get('tp1_hits', 0)} | SL={outcome_stats.get('sl_hits', 0)}")
             
-            # Scan symbols with debug data
+            # Scan symbols with breakdown
             alerts_this_scan = 0
             tasks = []
             
@@ -1940,12 +1790,12 @@ async def outcome_aware_scanner(exchange):
                 
                 if len(tasks) >= MAX_CONCURRENT:
                     results = await asyncio.gather(*tasks, return_exceptions=True)
-                    alerts_this_scan += await process_deduped_results_with_debug(results)
+                    alerts_this_scan += await process_deduped_results_with_breakdown(results)
                     tasks = []
             
             if tasks:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
-                alerts_this_scan += await process_deduped_results_with_debug(results)
+                alerts_this_scan += await process_deduped_results_with_breakdown(results)
             
             await asyncio.sleep(SCAN_INTERVAL)
             
@@ -1984,39 +1834,6 @@ async def get_active_signals():
             "age_minutes": (datetime.datetime.utcnow() - data.get('first_seen', datetime.datetime.utcnow())).total_seconds() / 60
         })
     return {"active_signals": active, "count": len(active)}
-
-@app.get("/debug/{symbol}")
-async def get_debug_data(symbol: str, limit: int = 10):
-    """Get debug data references for a symbol"""
-    async with db_lock:
-        try:
-            cursor = await db_conn.execute("""
-                SELECT debug_filename, signal_timestamp, entry_price, side, 
-                       quality_tier, quality_score, stored_at
-                FROM debug_data_references
-                WHERE symbol = ?
-                ORDER BY signal_timestamp DESC
-                LIMIT ?
-            """, (symbol, limit))
-            
-            rows = await cursor.fetchall()
-            debug_refs = []
-            
-            for row in rows:
-                debug_refs.append({
-                    'debug_filename': row[0],
-                    'signal_timestamp': row[1],
-                    'entry_price': row[2],
-                    'side': row[3],
-                    'quality_tier': row[4],
-                    'quality_score': row[5],
-                    'stored_at': row[6]
-                })
-            
-            return {"symbol": symbol, "debug_references": debug_refs, "count": len(debug_refs)}
-        except Exception as e:
-            log.error(f"Error fetching debug data: {e}")
-            return {"error": str(e)}
 
 @app.get("/outcomes/stats")
 async def get_outcome_stats(hours: int = 24):
@@ -2124,14 +1941,10 @@ async def main():
             "timeout": 5000,
         })
         
-        log.info("🚀 ROMEOTPT v3.2 - COMPLETE WITH DEBUG DATA")
+        log.info("🚀 ROMEOTPT v3.2 - COMPLETE WITH NUMERICAL QUALITY BREAKDOWN")
         log.info(f"Scan: {SCAN_INTERVAL}s | Top {TOP_N} symbols")
         log.info(f"Cooldown: {SIGNAL_COOLDOWN_MINUTES}min | Validity: {SIGNAL_VALIDITY_HOURS}h")
         log.info(f"Outcome check: {OUTCOME_CHECK_INTERVAL}s")
-        log.info(f"Debug data collection: ENABLED (saved to /app/data/debug/)")
-        
-        # Create debug directory
-        os.makedirs("/app/data/debug", exist_ok=True)
         
         # Start cleanup task
         asyncio.create_task(periodic_cleanup())
