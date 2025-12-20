@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ROMEOTPT SCANNER v3.2 - COMPLETE & CORRECTED VERSION
-Two-layer architecture + Deduplication + Outcome Tracking
+Two-layer architecture + Deduplication + Outcome Tracking + Debug Data Collection
 """
 
 import os
@@ -28,7 +28,7 @@ DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v3_2.db")
 
 # Scanner settings
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 30))
-TOP_N = int(os.getenv("TOP_N", 5))
+TOP_N = int(os.getenv("TOP_N", 30))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 10))
 
 # Signal thresholds
@@ -84,6 +84,103 @@ class SetupQuality:
             return "B"
         else:
             return "C"
+
+@dataclass
+class SignalDebugData:
+    """Complete debugging data for a signal"""
+    symbol: str
+    timestamp: datetime.datetime
+    
+    # Market data snapshots
+    ticker_data: Dict[str, Any] = None
+    ohlcv_1h: List[List] = None
+    ohlcv_15m: List[List] = None
+    ohlcv_5m: List[List] = None
+    
+    # Layer 1 calculations
+    eligibility_raw: Dict[str, Any] = None
+    eligibility_metrics: Dict[str, Any] = None
+    entry_zone_calculation: Dict[str, Any] = None
+    sl_calculation: Dict[str, Any] = None
+    tp_calculation: Dict[str, Any] = None
+    
+    # Layer 2 calculations  
+    quality_raw: Dict[str, Any] = None
+    quality_components: Dict[str, Any] = None
+    
+    # Decision points
+    decision_log: List[str] = None
+    disqualify_log: List[str] = None
+    
+    # Performance metrics
+    processing_times: Dict[str, float] = None
+    
+    # Final setup
+    final_setup: Dict[str, Any] = None
+    
+    def to_json(self) -> str:
+        """Convert to JSON string"""
+        data = {
+            'symbol': self.symbol,
+            'timestamp': self.timestamp.isoformat(),
+            
+            # Truncate large data for display
+            'ticker_summary': {
+                'last': self.ticker_data.get('last') if self.ticker_data else None,
+                'bid': self.ticker_data.get('bid') if self.ticker_data else None,
+                'ask': self.ticker_data.get('ask') if self.ticker_data else None,
+                'volume': self.ticker_data.get('volume') if self.ticker_data else None,
+                'quoteVolume': self.ticker_data.get('quoteVolume') if self.ticker_data else None
+            },
+            
+            'ohlcv_summaries': {
+                '1h': self._summarize_ohlcv(self.ohlcv_1h, '1h') if self.ohlcv_1h else None,
+                '15m': self._summarize_ohlcv(self.ohlcv_15m, '15m') if self.ohlcv_15m else None,
+                '5m': self._summarize_ohlcv(self.ohlcv_5m, '5m') if self.ohlcv_5m else None
+            },
+            
+            'eligibility': self.eligibility_raw,
+            'eligibility_metrics': self.eligibility_metrics,
+            'entry_zone': self.entry_zone_calculation,
+            'stop_loss': self.sl_calculation,
+            'take_profit': self.tp_calculation,
+            
+            'quality': self.quality_raw,
+            'quality_components': self.quality_components,
+            
+            'decision_log': self.decision_log or [],
+            'disqualify_log': self.disqualify_log or [],
+            
+            'processing_times': self.processing_times or {},
+            
+            'final_setup': self.final_setup
+        }
+        return json.dumps(data, indent=2)
+    
+    def _summarize_ohlcv(self, ohlcv: List[List], timeframe: str) -> Dict:
+        """Create summary of OHLCV data"""
+        if not ohlcv:
+            return None
+            
+        df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        
+        return {
+            'timeframe': timeframe,
+            'candle_count': len(ohlcv),
+            'latest': {
+                'open': float(df['open'].iloc[-1]) if len(df) > 0 else 0,
+                'high': float(df['high'].iloc[-1]) if len(df) > 0 else 0,
+                'low': float(df['low'].iloc[-1]) if len(df) > 0 else 0,
+                'close': float(df['close'].iloc[-1]) if len(df) > 0 else 0,
+                'volume': float(df['volume'].iloc[-1]) if len(df) > 0 else 0
+            },
+            'recent_range': {
+                'high_5': float(df['high'].iloc[-5:].max()) if len(df) >= 5 else 0,
+                'low_5': float(df['low'].iloc[-5:].min()) if len(df) >= 5 else 0,
+                'high_10': float(df['high'].iloc[-10:].max()) if len(df) >= 10 else 0,
+                'low_10': float(df['low'].iloc[-10:].min()) if len(df) >= 10 else 0
+            }
+        }
 
 # ---------------- SIGNAL TRACKER ----------------
 class SignalTracker:
@@ -706,29 +803,488 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility) 
         total_score=total_score
     )
 
-# ---------------- FAST SCANNING ----------------
-async def scan_symbol_fast(exchange, symbol: str) -> Optional[Dict]:
-    """ULTRA-FAST scanning: Layer 1 only, Layer 2 optional"""
+# ---------------- DEBUG VERSIONS (WITHOUT LOGIC CHANGES) ----------------
+async def check_eligibility_fast_with_debug(exchange, symbol: str, debug_data: SignalDebugData) -> SetupEligibility:
+    """Same logic as check_eligibility_fast but captures debug data"""
+    
+    # Get current price
+    try:
+        ticker = await exchange.fetch_ticker(symbol)
+        debug_data.ticker_data = ticker
+        current_price = ticker.get("last", 0)
+        if current_price == 0:
+            debug_data.disqualify_log = debug_data.disqualify_log or []
+            debug_data.disqualify_log.append("No price available")
+            return SetupEligibility(eligible=False, disqualify_reason="No price")
+    except Exception as e:
+        debug_data.disqualify_log = debug_data.disqualify_log or []
+        debug_data.disqualify_log.append(f"Ticker error: {str(e)}")
+        return SetupEligibility(eligible=False, disqualify_reason="Ticker error")
+    
+    # Quick HTF direction (1H)
+    ohlcv_1h = await fetch_ohlcv(exchange, symbol, "1h", 50)
+    debug_data.ohlcv_1h = ohlcv_1h
+    
+    if not ohlcv_1h or len(ohlcv_1h) < 20:
+        debug_data.disqualify_log = debug_data.disqualify_log or []
+        debug_data.disqualify_log.append(f"Insufficient 1H data: {len(ohlcv_1h) if ohlcv_1h else 0} candles")
+        return SetupEligibility(eligible=False, disqualify_reason="Insufficient data")
+    
+    df_1h = create_dataframe(ohlcv_1h)
+    if df_1h is None:
+        debug_data.disqualify_log = debug_data.disqualify_log or []
+        debug_data.disqualify_log.append("Failed to create 1H DataFrame")
+        return SetupEligibility(eligible=False, disqualify_reason="Dataframe error")
+    
+    # Fast trend detection
+    try:
+        df_1h['ema_20'] = df_1h['close'].ewm(span=20).mean()
+        df_1h['ema_50'] = df_1h['close'].ewm(span=50).mean()
+        
+        latest_ema20 = df_1h['ema_20'].iloc[-1]
+        latest_ema50 = df_1h['ema_50'].iloc[-1]
+        latest_close = df_1h['close'].iloc[-1]
+        
+        # Determine bias
+        if latest_ema20 > latest_ema50 and latest_close > latest_ema20:
+            bias = "BULLISH"
+            side = "BUY"
+        elif latest_ema20 < latest_ema50 and latest_close < latest_ema20:
+            bias = "BEARISH"
+            side = "SELL"
+        else:
+            recent_high = df_1h['high'].iloc[-10:].max()
+            recent_low = df_1h['low'].iloc[-10:].min()
+            
+            if current_price > (recent_high + recent_low) / 2:
+                bias = "BULLISH"
+                side = "BUY"
+            else:
+                bias = "BEARISH"
+                side = "SELL"
+                
+        debug_data.eligibility_metrics = {
+            'trend_detection': {
+                'bias': bias,
+                'side': side,
+                'ema_20': float(latest_ema20),
+                'ema_50': float(latest_ema50),
+                'price': float(latest_close),
+                'ema20_above_ema50': latest_ema20 > latest_ema50,
+                'price_above_ema20': latest_close > latest_ema20
+            }
+        }
+        
+    except Exception as e:
+        debug_data.eligibility_metrics = {'error': f'Trend detection: {str(e)}'}
+        return SetupEligibility(eligible=False, disqualify_reason="Trend detection error")
+    
+    # Get quick range
+    try:
+        range_high = float(df_1h['high'].iloc[-20:].max())
+        range_low = float(df_1h['low'].iloc[-20:].min())
+    except:
+        range_high = float(df_1h['high'].max())
+        range_low = float(df_1h['low'].min())
+    
+    if debug_data.eligibility_metrics and 'trend_detection' in debug_data.eligibility_metrics:
+        debug_data.eligibility_metrics['range'] = {
+            'high': range_high,
+            'low': range_low,
+            'range_pct': (range_high - range_low) / range_low * 100 if range_low > 0 else 0
+        }
+    
+    # Find entry zone (15m)
+    ohlcv_15m = await fetch_ohlcv(exchange, symbol, "15m", 30)
+    debug_data.ohlcv_15m = ohlcv_15m
+    
+    if not ohlcv_15m:
+        if debug_data.eligibility_metrics:
+            debug_data.eligibility_metrics['error'] = 'No 15m data'
+        return SetupEligibility(eligible=False, disqualify_reason="No 15m data")
+    
+    df_15m = create_dataframe(ohlcv_15m)
+    if df_15m is None:
+        if debug_data.eligibility_metrics:
+            debug_data.eligibility_metrics['error'] = '15m DataFrame error'
+        return SetupEligibility(eligible=False, disqualify_reason="15m dataframe error")
+    
+    # Find recent OB/FVG (fast detection)
+    entry_found = False
+    entry_price = 0
+    entry_type = ""
+    entry_low = 0
+    entry_high = 0
     
     try:
-        # LAYER 1: Eligibility check
-        eligibility = await check_eligibility_fast(exchange, symbol)
+        if side == "BUY":
+            recent_low_15m = df_15m['low'].iloc[-5:].min()
+            
+            if current_price <= recent_low_15m * 1.005:
+                entry_price = current_price
+                entry_type = "DISCOUNT_ZONE"
+                entry_low = recent_low_15m * 0.995
+                entry_high = recent_low_15m * 1.01
+                entry_found = True
+            
+            if not entry_found and len(df_15m) >= 3:
+                last_candle = df_15m.iloc[-1]
+                prev_candle = df_15m.iloc[-2]
+                
+                if (prev_candle['close'] < prev_candle['open'] and 
+                    last_candle['close'] > last_candle['open'] and
+                    last_candle['close'] > prev_candle['close']):
+                    entry_price = last_candle['close']
+                    entry_type = "BULLISH_ENGULFING"
+                    entry_low = last_candle['low']
+                    entry_high = last_candle['high'] * 1.005
+                    entry_found = True
+                    
+        else:  # SELL
+            recent_high_15m = df_15m['high'].iloc[-5:].max()
+            
+            if current_price >= recent_high_15m * 0.995:
+                entry_price = current_price
+                entry_type = "PREMIUM_ZONE"
+                entry_low = recent_high_15m * 0.99
+                entry_high = recent_high_15m * 1.005
+                entry_found = True
+            
+            if not entry_found and len(df_15m) >= 3:
+                last_candle = df_15m.iloc[-1]
+                prev_candle = df_15m.iloc[-2]
+                
+                if (prev_candle['close'] > prev_candle['open'] and 
+                    last_candle['close'] < last_candle['open'] and
+                    last_candle['close'] < prev_candle['close']):
+                    entry_price = last_candle['close']
+                    entry_type = "BEARISH_ENGULFING"
+                    entry_low = last_candle['low'] * 0.995
+                    entry_high = last_candle['high']
+                    entry_found = True
+                    
+        debug_data.entry_zone_calculation = {
+            'entry_found': entry_found,
+            'entry_type': entry_type,
+            'entry_price': entry_price,
+            'zone_low': entry_low,
+            'zone_high': entry_high,
+            'current_in_zone': entry_low <= current_price <= entry_high,
+            'recent_low_15m': float(recent_low_15m) if side == "BUY" else None,
+            'recent_high_15m': float(recent_high_15m) if side == "SELL" else None
+        }
+        
+    except Exception as e:
+        debug_data.entry_zone_calculation = {'error': str(e)}
+        return SetupEligibility(eligible=False, disqualify_reason="Entry zone error")
+    
+    if not entry_found:
+        if debug_data.entry_zone_calculation:
+            debug_data.entry_zone_calculation['error'] = 'No entry zone found'
+        return SetupEligibility(eligible=False, disqualify_reason="No entry zone")
+    
+    # SL logic
+    try:
+        if side == "BUY":
+            sl_price = min(recent_low_15m * 0.995, entry_price * 0.99)
+        else:
+            sl_price = max(recent_high_15m * 1.005, entry_price * 1.01)
+    except:
+        # Fallback SL
+        if side == "BUY":
+            sl_price = entry_price * 0.99
+        else:
+            sl_price = entry_price * 1.01
+    
+    debug_data.sl_calculation = {
+        'sl_price': sl_price,
+        'sl_distance_pct': abs(entry_price - sl_price) / entry_price * 100,
+        'method': 'recent_extreme' if ('recent_low_15m' in locals() or 'recent_high_15m' in locals()) else 'percentage_fallback'
+    }
+    
+    # TP targets
+    tp_targets = []
+    
+    try:
+        if side == "BUY":
+            recent_resistance = df_1h['high'].iloc[-10:].max()
+            tp_targets.append(float(recent_resistance))
+            
+            range_height = range_high - range_low
+            tp_targets.append(float(min(range_high + range_height * 0.5, entry_price * 1.03)))
+        else:
+            recent_support = df_1h['low'].iloc[-10:].min()
+            tp_targets.append(float(recent_support))
+            
+            range_height = range_high - range_low
+            tp_targets.append(float(max(range_low - range_height * 0.5, entry_price * 0.97)))
+    except:
+        # Fallback TP
+        if side == "BUY":
+            tp_targets.append(entry_price * 1.02)
+            tp_targets.append(entry_price * 1.04)
+        else:
+            tp_targets.append(entry_price * 0.98)
+            tp_targets.append(entry_price * 0.96)
+    
+    debug_data.tp_calculation = {
+        'tp_targets': tp_targets,
+        'tp1_distance_pct': abs(tp_targets[0] - entry_price) / entry_price * 100 if len(tp_targets) > 0 else 0,
+        'method': 'recent_structure' if ('recent_resistance' in locals() or 'recent_support' in locals()) else 'percentage_fallback'
+    }
+    
+    entry_zone = {
+        "type": entry_type,
+        "price": entry_price,
+        "low": entry_low,
+        "high": entry_high,
+        "current_in_zone": entry_low <= current_price <= entry_high
+    }
+    
+    return SetupEligibility(
+        eligible=True,
+        side=side,
+        entry_price=entry_price,
+        entry_type=entry_type,
+        entry_zone=entry_zone,
+        sl_price=sl_price,
+        tp_targets=tp_targets
+    )
+
+async def analyze_quality_with_debug(exchange, symbol: str, eligibility: SetupEligibility, debug_data: SignalDebugData) -> SetupQuality:
+    """Same logic as analyze_quality but captures debug data"""
+    
+    side = eligibility.side
+    
+    # Initialize scores
+    sweep_strength = 0.0
+    structure_shift = False
+    from_liquidity_exists = False
+    confirmation_candle = False
+    htfc_alignment_score = 0.0
+    
+    quality_components = {
+        'sweep_strength': {'value': 0.0, 'details': {}},
+        'structure_shift': {'value': False, 'details': {}},
+        'from_liquidity': {'value': False, 'details': {}},
+        'confirmation_candle': {'value': False, 'details': {}},
+        'htfc_alignment': {'value': 0.0, 'details': {}}
+    }
+    
+    try:
+        # Sweep Strength Analysis
+        ohlcv_15m = await fetch_ohlcv(exchange, symbol, "15m", 20)
+        
+        if ohlcv_15m:
+            df_15m = create_dataframe(ohlcv_15m)
+            if df_15m is not None and len(df_15m) >= 10:
+                if side == "BUY":
+                    recent_low = df_15m['low'].iloc[-5:].min()
+                    prev_low = df_15m['low'].iloc[-10:-5].min()
+                    if recent_low < prev_low:
+                        sweep_strength = 0.7
+                        quality_components['sweep_strength']['details']['sweep_detected'] = True
+                        quality_components['sweep_strength']['details']['recent_low'] = float(recent_low)
+                        quality_components['sweep_strength']['details']['prev_low'] = float(prev_low)
+                        quality_components['sweep_strength']['details']['sweep_depth_pct'] = (prev_low - recent_low) / prev_low * 100 if prev_low > 0 else 0
+                        
+                        try:
+                            sweep_idx = df_15m['low'].idxmin()
+                            if sweep_idx < len(df_15m) - 1:
+                                sweep_candle = df_15m.iloc[sweep_idx]
+                                body_size = abs(sweep_candle['close'] - sweep_candle['open'])
+                                wick_size = sweep_candle['high'] - max(sweep_candle['open'], sweep_candle['close'])
+                                if body_size > wick_size:
+                                    sweep_strength = 1.0
+                                    quality_components['sweep_strength']['details']['strong_candle'] = True
+                                    quality_components['sweep_strength']['details']['body_vs_wick'] = body_size / wick_size if wick_size > 0 else 0
+                        except:
+                            pass
+                else:
+                    recent_high = df_15m['high'].iloc[-5:].max()
+                    prev_high = df_15m['high'].iloc[-10:-5].max()
+                    if recent_high > prev_high:
+                        sweep_strength = 0.7
+                        quality_components['sweep_strength']['details']['sweep_detected'] = True
+                        quality_components['sweep_strength']['details']['recent_high'] = float(recent_high)
+                        quality_components['sweep_strength']['details']['prev_high'] = float(prev_high)
+                        quality_components['sweep_strength']['details']['sweep_depth_pct'] = (recent_high - prev_high) / prev_high * 100 if prev_high > 0 else 0
+                        
+                        try:
+                            sweep_idx = df_15m['high'].idxmax()
+                            if sweep_idx < len(df_15m) - 1:
+                                sweep_candle = df_15m.iloc[sweep_idx]
+                                body_size = abs(sweep_candle['close'] - sweep_candle['open'])
+                                wick_size = min(sweep_candle['open'], sweep_candle['close']) - sweep_candle['low']
+                                if body_size > wick_size:
+                                    sweep_strength = 1.0
+                                    quality_components['sweep_strength']['details']['strong_candle'] = True
+                                    quality_components['sweep_strength']['details']['body_vs_wick'] = body_size / wick_size if wick_size > 0 else 0
+                        except:
+                            pass
+        
+        quality_components['sweep_strength']['value'] = sweep_strength
+        
+        # Structure Shift (OPTIONAL)
+        ohlcv_1h = await fetch_ohlcv(exchange, symbol, "1h", 30)
+        if ohlcv_1h:
+            df_1h = create_dataframe(ohlcv_1h)
+            if df_1h is not None and len(df_1h) >= 11:
+                if side == "BUY":
+                    recent_high = df_1h['high'].iloc[-10:-1].max()
+                    current_close = df_1h['close'].iloc[-1]
+                    if current_close > recent_high:
+                        structure_shift = True
+                        quality_components['structure_shift']['details']['breakout'] = True
+                        quality_components['structure_shift']['details']['breakout_level'] = float(recent_high)
+                        quality_components['structure_shift']['details']['breakout_pct'] = (current_close - recent_high) / recent_high * 100 if recent_high > 0 else 0
+                else:
+                    recent_low = df_1h['low'].iloc[-10:-1].min()
+                    current_close = df_1h['close'].iloc[-1]
+                    if current_close < recent_low:
+                        structure_shift = True
+                        quality_components['structure_shift']['details']['breakdown'] = True
+                        quality_components['structure_shift']['details']['breakdown_level'] = float(recent_low)
+                        quality_components['structure_shift']['details']['breakdown_pct'] = (recent_low - current_close) / recent_low * 100 if recent_low > 0 else 0
+        
+        quality_components['structure_shift']['value'] = structure_shift
+        
+        # FROM Liquidity (OPTIONAL)
+        if sweep_strength > 0.5:
+            from_liquidity_exists = True
+            quality_components['from_liquidity']['details']['sweep_based'] = True
+        
+        quality_components['from_liquidity']['value'] = from_liquidity_exists
+        
+        # Confirmation Candle (OPTIONAL)
+        ohlcv_5m = await fetch_ohlcv(exchange, symbol, "5m", 5)
+        debug_data.ohlcv_5m = ohlcv_5m
+        
+        if ohlcv_5m:
+            df_5m = create_dataframe(ohlcv_5m)
+            if df_5m is not None and len(df_5m) > 0:
+                if side == "BUY":
+                    if df_5m['close'].iloc[-1] > df_5m['open'].iloc[-1]:
+                        confirmation_candle = True
+                        quality_components['confirmation_candle']['details']['bullish_close'] = True
+                        quality_components['confirmation_candle']['details']['candle_size_pct'] = (df_5m['close'].iloc[-1] - df_5m['open'].iloc[-1]) / df_5m['open'].iloc[-1] * 100 if df_5m['open'].iloc[-1] > 0 else 0
+                else:
+                    if df_5m['close'].iloc[-1] < df_5m['open'].iloc[-1]:
+                        confirmation_candle = True
+                        quality_components['confirmation_candle']['details']['bearish_close'] = True
+                        quality_components['confirmation_candle']['details']['candle_size_pct'] = (df_5m['open'].iloc[-1] - df_5m['close'].iloc[-1]) / df_5m['open'].iloc[-1] * 100 if df_5m['open'].iloc[-1] > 0 else 0
+        
+        quality_components['confirmation_candle']['value'] = confirmation_candle
+        
+        # HTF + Premium/Discount Alignment
+        htfc_alignment_score = 0.5
+        
+        if eligibility.entry_type in ["DISCOUNT_ZONE", "BULLISH_ENGULFING"] and side == "BUY":
+            htfc_alignment_score = 0.8
+            quality_components['htfc_alignment']['details']['perfect_alignment'] = True
+            quality_components['htfc_alignment']['details']['entry_type'] = eligibility.entry_type
+            quality_components['htfc_alignment']['details']['side'] = side
+        elif eligibility.entry_type in ["PREMIUM_ZONE", "BEARISH_ENGULFING"] and side == "SELL":
+            htfc_alignment_score = 0.8
+            quality_components['htfc_alignment']['details']['perfect_alignment'] = True
+            quality_components['htfc_alignment']['details']['entry_type'] = eligibility.entry_type
+            quality_components['htfc_alignment']['details']['side'] = side
+        else:
+            quality_components['htfc_alignment']['details']['partial_alignment'] = True
+        
+        quality_components['htfc_alignment']['value'] = htfc_alignment_score
+            
+    except Exception as e:
+        quality_components['error'] = str(e)
+    
+    debug_data.quality_components = quality_components
+    
+    # Calculate total score (0-5)
+    total_score = (
+        sweep_strength +
+        (1.0 if structure_shift else 0.0) +
+        (0.5 if from_liquidity_exists else 0.0) +
+        (0.5 if confirmation_candle else 0.0) +
+        htfc_alignment_score
+    )
+    
+    return SetupQuality(
+        sweep_strength=sweep_strength,
+        structure_shift=structure_shift,
+        from_liquidity_exists=from_liquidity_exists,
+        confirmation_candle=confirmation_candle,
+        htfc_alignment_score=htfc_alignment_score,
+        total_score=total_score
+    )
+
+# ---------------- FAST SCANNING WITH DEBUG ----------------
+async def scan_symbol_fast_with_debug(exchange, symbol: str) -> Tuple[Optional[Dict], Optional[SignalDebugData]]:
+    """ULTRA-FAST scanning with debug data capture"""
+    
+    debug_data = SignalDebugData(
+        symbol=symbol,
+        timestamp=datetime.datetime.utcnow(),
+        decision_log=[],
+        disqualify_log=[],
+        processing_times={}
+    )
+    
+    try:
+        # Capture ticker data
+        ticker_start = time.time()
+        ticker = await exchange.fetch_ticker(symbol)
+        debug_data.ticker_data = ticker
+        debug_data.processing_times['ticker_fetch'] = time.time() - ticker_start
+        
+        current_price = ticker.get("last", 0)
+        if current_price == 0:
+            debug_data.disqualify_log.append("No price available in ticker")
+            return None, debug_data
+        
+        # LAYER 1: Eligibility check with data capture
+        eligibility_start = time.time()
+        eligibility = await check_eligibility_fast_with_debug(exchange, symbol, debug_data)
+        debug_data.processing_times['eligibility_check'] = time.time() - eligibility_start
         
         if not eligibility.eligible:
-            return None
+            debug_data.disqualify_log.append(f"Not eligible: {eligibility.disqualify_reason}")
+            return None, debug_data
         
-        # LAYER 2: Quality analysis
-        quality = await analyze_quality(exchange, symbol, eligibility)
+        debug_data.eligibility_raw = {
+            'eligible': eligibility.eligible,
+            'side': eligibility.side,
+            'entry_price': eligibility.entry_price,
+            'entry_type': eligibility.entry_type,
+            'sl_price': eligibility.sl_price,
+            'tp_targets': eligibility.tp_targets,
+            'disqualify_reason': eligibility.disqualify_reason
+        }
         
-        # Get current price
-        ticker = await exchange.fetch_ticker(symbol)
-        current_price = ticker.get("last", 0)
+        debug_data.decision_log.append(f"Eligibility passed: {eligibility.side} signal detected")
+        
+        # LAYER 2: Quality analysis with data capture
+        quality_start = time.time()
+        quality = await analyze_quality_with_debug(exchange, symbol, eligibility, debug_data)
+        debug_data.processing_times['quality_analysis'] = time.time() - quality_start
+        
+        debug_data.quality_raw = {
+            'total_score': quality.total_score,
+            'tier': quality.quality_tier,
+            'sweep_strength': quality.sweep_strength,
+            'structure_shift': quality.structure_shift,
+            'from_liquidity': quality.from_liquidity_exists,
+            'confirmation_candle': quality.confirmation_candle,
+            'htfc_alignment': quality.htfc_alignment_score
+        }
+        
+        debug_data.decision_log.append(f"Quality analysis: {quality.quality_tier} tier with score {quality.total_score:.2f}")
         
         # Calculate RR
         risk = abs(eligibility.entry_price - eligibility.sl_price)
         reward = abs(eligibility.tp_targets[0] - eligibility.entry_price)
         rr_ratio = reward / risk if risk > 0 else 0
         
+        # Final setup
         setup = {
             "symbol": symbol,
             "timestamp": datetime.datetime.utcnow().isoformat(),
@@ -753,10 +1309,14 @@ async def scan_symbol_fast(exchange, symbol: str) -> Optional[Dict]:
             }
         }
         
-        return setup
+        debug_data.final_setup = setup
+        debug_data.decision_log.append(f"Final setup created with RR: {rr_ratio:.2f}:1")
+        
+        return setup, debug_data
+        
     except Exception as e:
-        log.error(f"Error scanning {symbol}: {e}")
-        return None
+        debug_data.decision_log.append(f"Error during scanning: {str(e)}")
+        return None, debug_data
 
 # ---------------- ALERTS ----------------
 async def send_fast_alert(setup: Dict):
@@ -790,7 +1350,6 @@ async def send_fast_alert(setup: Dict):
                 update_info = f"\n🔄 <b>Updated signal</b>"
         
         tp_targets = setup.get('tp_targets', [])
-        # Format TP values separately to avoid f-string formatting errors
         tp1_display = f"{tp_targets[0]:.8f}" if len(tp_targets) > 0 else 'N/A'
         tp2_display = f"{tp_targets[1]:.8f}" if len(tp_targets) > 1 else 'N/A'
         
@@ -822,6 +1381,102 @@ RR: {setup.get('rr_ratio', 0):.2f}:1
     except Exception as e:
         log.error(f"Error sending alert: {e}")
 
+async def send_fast_alert_with_debug(setup: Dict, debug_data: SignalDebugData):
+    """Send concise alert with full breakdown link"""
+    
+    try:
+        symbol = setup.get('symbol', 'UNKNOWN')
+        quality = setup.get('quality', {})
+        
+        # Check if this is an update
+        is_update = symbol in signal_tracker.active_signals
+        update_emoji = "🔄" if is_update else "🆕"
+        
+        tier_emoji = {
+            "A+": "🔥",
+            "A": "✅", 
+            "B": "⚠️",
+            "C": "📊"
+        }.get(quality.get("tier", "C"), "📊")
+        
+        # Add update info if applicable
+        update_info = ""
+        if is_update:
+            old_signal = signal_tracker.active_signals.get(symbol, {})
+            old_setup = old_signal.get('setup', {})
+            old_quality = old_setup.get('quality', {}).get('total_score', 0)
+            new_quality = quality.get('total_score', 0)
+            if new_quality > old_quality:
+                update_info = f"\n📈 <b>Quality UP:</b> {old_quality:.2f} → {new_quality:.2f}"
+            elif old_quality > 0:
+                update_info = f"\n🔄 <b>Updated signal</b>"
+        
+        tp_targets = setup.get('tp_targets', [])
+        tp1_display = f"{tp_targets[0]:.8f}" if len(tp_targets) > 0 else 'N/A'
+        tp2_display = f"{tp_targets[1]:.8f}" if len(tp_targets) > 1 else 'N/A'
+        
+        # Get processing times
+        processing_times = debug_data.processing_times or {}
+        total_time = sum(processing_times.values()) * 1000 if processing_times else 0
+        
+        # Create debug data summary
+        debug_summary = f"""
+🧠 <b>DEBUG SUMMARY</b>
+• Eligibility check: {processing_times.get('eligibility_check', 0)*1000:.0f}ms
+• Quality analysis: {processing_times.get('quality_analysis', 0)*1000:.0f}ms
+• Total processing: {total_time:.0f}ms
+• Decision steps: {len(debug_data.decision_log or [])}
+• Disqualify checks: {len(debug_data.disqualify_log or [])}
+"""
+        
+        # Store debug data to file for later analysis
+        debug_filename = f"debug_{symbol}_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+        debug_filepath = f"/app/data/debug/{debug_filename}"
+        
+        # Create debug directory if it doesn't exist
+        os.makedirs("/app/data/debug", exist_ok=True)
+        
+        # Save debug data
+        with open(debug_filepath, 'w') as f:
+            f.write(debug_data.to_json())
+        
+        debug_link = f"\n📊 <b>Full Analysis:</b> Saved to {debug_filename}"
+        
+        msg = f"""
+{update_emoji}{tier_emoji} <b>ROMEOTPT - {quality.get('tier', 'C')} Tier</b>
+
+<b>{symbol}</b> | {setup.get('side', 'N/A')}
+<b>Entry:</b> {setup.get('entry_price', 0):.8f}
+<b>Current:</b> {setup.get('current_price', 0):.8f}
+<b>Type:</b> {setup.get('entry_type', 'N/A')}{update_info}
+
+🎯 <b>Targets:</b>
+TP1: {tp1_display}
+TP2: {tp2_display}
+
+🛡️ <b>Risk:</b>
+SL: {setup.get('sl_price', 0):.8f}
+RR: {setup.get('rr_ratio', 0):.2f}:1
+
+📈 <b>Quality Score:</b> {quality.get('total_score', 0):.2f}/5.0
+• Sweep: {'✅' if quality.get('sweep_strength', 0) > 0.7 else '⚠️' if quality.get('sweep_strength', 0) > 0.3 else '❌'}
+• Structure: {'✅' if quality.get('structure_shift', False) else '⚠️'}
+• Confirmation: {'✅' if quality.get('confirmation_candle', False) else '⚠️'}
+
+{debug_summary}
+{debug_link}
+
+<i>Detected: {datetime.datetime.utcnow().strftime('%H:%M:%S UTC')}</i>
+"""
+        
+        await send_telegram(msg)
+        
+        # Also store debug data reference in database
+        await store_debug_data_reference(symbol, debug_filename, setup)
+        
+    except Exception as e:
+        log.error(f"Error sending alert with debug: {e}")
+
 async def send_outcome_alert(symbol: str, outcome: Dict):
     """Send alert when signal hits TP or SL"""
     
@@ -846,7 +1501,6 @@ async def send_outcome_alert(symbol: str, outcome: Dict):
             time_str = f"{bars_held//60}h {bars_held%60}min"
         
         tp_targets = setup.get('tp_targets', [0])
-        # Format TP separately
         tp_display = f"{tp_targets[0]:.8f}" if len(tp_targets) > 0 else 'N/A'
         
         msg = f"""
@@ -895,7 +1549,57 @@ async def send_deduped_alert(setup: Dict):
         log.error(f"Error in deduped alert for {setup.get('symbol', 'UNKNOWN')}: {e}")
         return False
 
+async def send_deduped_alert_with_debug(setup: Dict, debug_data: SignalDebugData) -> bool:
+    """Send alert with debug data only if it's a new or meaningfully updated signal"""
+    try:
+        symbol = setup.get('symbol', '')
+        if not symbol:
+            return False
+        
+        should_alert, reason = signal_tracker.is_new_or_updated_signal(symbol, setup)
+        
+        if should_alert:
+            await send_fast_alert_with_debug(setup, debug_data)
+            signal_tracker.update_signal(symbol, setup, alerted=True)
+            log.info(f"📨 Alert sent for {symbol} with debug data: {reason}")
+            return True
+        else:
+            signal_tracker.update_signal(symbol, setup, alerted=False)
+            # Still save debug data even if no alert
+            debug_filename = f"debug_noalert_{symbol}_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+            debug_filepath = f"/app/data/debug/{debug_filename}"
+            os.makedirs("/app/data/debug", exist_ok=True)
+            with open(debug_filepath, 'w') as f:
+                f.write(debug_data.to_json())
+            log.debug(f"⏸️  Skipped alert for {symbol}, saved debug data: {reason}")
+            return False
+    except Exception as e:
+        log.error(f"Error in deduped alert with debug for {setup.get('symbol', 'UNKNOWN')}: {e}")
+        return False
+
 # ---------------- DATABASE ----------------
+async def store_debug_data_reference(symbol: str, debug_filename: str, setup: Dict):
+    """Store reference to debug data file in database"""
+    async with db_lock:
+        try:
+            await db_conn.execute("""
+                INSERT INTO debug_data_references (
+                    symbol, debug_filename, signal_timestamp, 
+                    entry_price, side, quality_tier, quality_score
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                symbol,
+                debug_filename,
+                setup.get('timestamp', ''),
+                setup.get('entry_price', 0),
+                setup.get('side', ''),
+                setup.get('quality', {}).get('tier', 'C'),
+                setup.get('quality', {}).get('total_score', 0)
+            ))
+            await db_conn.commit()
+        except Exception as e:
+            log.error(f"Error storing debug reference: {e}")
+
 async def init_database():
     """Initialize database with outcome tracking tables"""
     try:
@@ -950,15 +1654,31 @@ async def init_database():
             )
         """)
         
+        # Add debug data references table
+        await db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS debug_data_references (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
+                debug_filename TEXT,
+                signal_timestamp TEXT,
+                entry_price REAL,
+                side TEXT,
+                quality_tier TEXT,
+                quality_score REAL,
+                stored_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
         # Create indexes separately (SQLite syntax fix)
         await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_time ON signals (symbol, timestamp)")
         await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_status_time ON signals (status, timestamp)")
         await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_outcome ON signals (outcome)")
         await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_outcomes_symbol_status ON signal_outcomes (symbol, status)")
         await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_outcomes_outcome_type ON signal_outcomes (outcome_type)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_debug_symbol_time ON debug_data_references (symbol, signal_timestamp)")
         
         await db_conn.commit()
-        log.info("Database initialized with indexes")
+        log.info("Database initialized with indexes and debug tracking")
     except Exception as e:
         log.error(f"Error initializing database: {e}")
         raise
@@ -1120,6 +1840,30 @@ async def process_deduped_results(results) -> int:
     
     return alerts_sent
 
+async def process_deduped_results_with_debug(results) -> int:
+    """Process results with deduplication and debug data"""
+    alerts_sent = 0
+    
+    for result in results:
+        if isinstance(result, Exception):
+            log.error(f"Task error: {result}")
+            continue
+            
+        if result and isinstance(result, tuple) and len(result) == 2:
+            setup, debug_data = result
+            if setup and debug_data:
+                try:
+                    quality_score = setup.get("quality", {}).get("total_score", 0)
+                    if quality_score >= MIN_QUALITY_SCORE:
+                        alerted = await send_deduped_alert_with_debug(setup, debug_data)
+                        if alerted:
+                            alerts_sent += 1
+                        await store_signal(setup)
+                except Exception as e:
+                    log.error(f"Error processing result: {e}")
+    
+    return alerts_sent
+
 async def outcome_aware_scanner(exchange):
     """Main scanner with outcome tracking"""
     
@@ -1135,7 +1879,7 @@ async def outcome_aware_scanner(exchange):
 • Outcome check: {OUTCOME_CHECK_INTERVAL}s
 • Min quality: {MIN_QUALITY_SCORE}
 
-<i>Layer 1: Eligibility only | Layer 2: Quality ranking</i>
+<i>Layer 1: Eligibility only | Layer 2: Quality ranking | Full Debug Data Collection</i>
 """
     await send_telegram(startup_msg)
     
@@ -1154,10 +1898,9 @@ async def outcome_aware_scanner(exchange):
             
             for symbol, data in tickers.items():
                 if symbol.endswith("/USDT"):
-                    # ============ ADDED STABLECOIN FILTER ============
+                    # Skip stablecoin pairs
                     if symbol in ["USDC/USDT", "USDG/USDT"]:
-                        continue  # Skip stablecoin pairs
-                    # ==================================================
+                        continue
                     
                     volume = data.get("quoteVolume", 0)
                     if isinstance(volume, (int, float)):
@@ -1178,22 +1921,22 @@ async def outcome_aware_scanner(exchange):
                     win_rate = outcome_stats.get('win_rate', 0)
                     log.info(f"📈 Stats: WR={win_rate:.1f}% | TP1={outcome_stats.get('tp1_hits', 0)} | SL={outcome_stats.get('sl_hits', 0)}")
             
-            # Scan symbols
+            # Scan symbols with debug data
             alerts_this_scan = 0
             tasks = []
             
             for symbol in symbols_to_scan:
-                task = asyncio.create_task(scan_symbol_fast(exchange, symbol))
+                task = asyncio.create_task(scan_symbol_fast_with_debug(exchange, symbol))
                 tasks.append(task)
                 
                 if len(tasks) >= MAX_CONCURRENT:
                     results = await asyncio.gather(*tasks, return_exceptions=True)
-                    alerts_this_scan += await process_deduped_results(results)
+                    alerts_this_scan += await process_deduped_results_with_debug(results)
                     tasks = []
             
             if tasks:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
-                alerts_this_scan += await process_deduped_results(results)
+                alerts_this_scan += await process_deduped_results_with_debug(results)
             
             await asyncio.sleep(SCAN_INTERVAL)
             
@@ -1232,6 +1975,39 @@ async def get_active_signals():
             "age_minutes": (datetime.datetime.utcnow() - data.get('first_seen', datetime.datetime.utcnow())).total_seconds() / 60
         })
     return {"active_signals": active, "count": len(active)}
+
+@app.get("/debug/{symbol}")
+async def get_debug_data(symbol: str, limit: int = 10):
+    """Get debug data references for a symbol"""
+    async with db_lock:
+        try:
+            cursor = await db_conn.execute("""
+                SELECT debug_filename, signal_timestamp, entry_price, side, 
+                       quality_tier, quality_score, stored_at
+                FROM debug_data_references
+                WHERE symbol = ?
+                ORDER BY signal_timestamp DESC
+                LIMIT ?
+            """, (symbol, limit))
+            
+            rows = await cursor.fetchall()
+            debug_refs = []
+            
+            for row in rows:
+                debug_refs.append({
+                    'debug_filename': row[0],
+                    'signal_timestamp': row[1],
+                    'entry_price': row[2],
+                    'side': row[3],
+                    'quality_tier': row[4],
+                    'quality_score': row[5],
+                    'stored_at': row[6]
+                })
+            
+            return {"symbol": symbol, "debug_references": debug_refs, "count": len(debug_refs)}
+        except Exception as e:
+            log.error(f"Error fetching debug data: {e}")
+            return {"error": str(e)}
 
 @app.get("/outcomes/stats")
 async def get_outcome_stats(hours: int = 24):
@@ -1339,10 +2115,14 @@ async def main():
             "timeout": 5000,
         })
         
-        log.info("🚀 ROMEOTPT v3.2 - COMPLETE")
+        log.info("🚀 ROMEOTPT v3.2 - COMPLETE WITH DEBUG DATA")
         log.info(f"Scan: {SCAN_INTERVAL}s | Top {TOP_N} symbols")
         log.info(f"Cooldown: {SIGNAL_COOLDOWN_MINUTES}min | Validity: {SIGNAL_VALIDITY_HOURS}h")
         log.info(f"Outcome check: {OUTCOME_CHECK_INTERVAL}s")
+        log.info(f"Debug data collection: ENABLED (saved to /app/data/debug/)")
+        
+        # Create debug directory
+        os.makedirs("/app/data/debug", exist_ok=True)
         
         # Start cleanup task
         asyncio.create_task(periodic_cleanup())
