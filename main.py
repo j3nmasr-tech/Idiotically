@@ -80,7 +80,7 @@ def setup_logging():
     
     formatter = logging.Formatter(
         "%(asctime)s | %(levelname)-8s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S"
+        datefmt="%Y-%m-d %H:%M:%S"
     )
     console_handler.setFormatter(formatter)
     
@@ -537,20 +537,31 @@ class RomeOPTEngine:
             return 0.0
     
     def _determine_market_state(self, df: pd.DataFrame, atr_val: float) -> str:
-        """Determine market state"""
+        """
+        REFINED RomeOPT market state detection
+        Checks: Strong displacement + actual price movement
+        """
         if len(df) < 3 or atr_val <= 0:
             return "BALANCED"
         
         last = df.iloc[-1]
+        prev = df.iloc[-2]
+        
         try:
             body_ratio = abs(float(last["close"]) - float(last["open"])) / (float(last["high"]) - float(last["low"]) + 1e-8)
             candle_size = float(last["high"]) - float(last["low"])
+            price_movement = abs(float(last["close"]) - float(prev["close"]))
         except (ValueError, TypeError):
             return "BALANCED"
         
-        if body_ratio > 0.7 and candle_size > atr_val * 1.2:
-            return "IMBALANCED"
-        return "BALANCED"
+        # RomeOPT logic: Strong displacement with actual follow-through
+        strong_displacement = (
+            body_ratio > 0.7 and                    # Strong body (>70%)
+            candle_size > atr_val * 1.2 and         # Large candle (>1.2 ATR)
+            price_movement > atr_val * 0.5          # Actual price movement (>0.5 ATR)
+        )
+        
+        return "IMBALANCED" if strong_displacement else "BALANCED"
     
     async def get_htf_liquidity(self, symbol: str, htf: str, side: str) -> Optional[Dict]:
         """Get HTF liquidity for 1m/3m/5m or confluence for 15m/30m"""
@@ -863,16 +874,23 @@ class RomeOPTEngine:
         
         side = "BUY" if ob.type == "BULLISH_OB" else "SELL"
         
-        # Check OB approach
+        # Check OB approach (FIXED - using old code logic)
         last_close = float(df['close'].iloc[-1])
         if side == "BUY":
-            if last_close < ob.high - (ob.high - ob.low) * 0.1:  # Not approaching
-                log.debug(f"Not approaching OB for BUY: price={last_close}, ob_high={ob.high}")
+            # Calculate distance percentage (10% threshold like old code)
+            distance_to_ob = (last_close - ob.high) / (ob.high - ob.low + 1e-8)
+            # Must be at or slightly above OB high, or within 10% distance
+            if not (last_close <= ob.high or distance_to_ob < 0.1):
+                log.debug(f"Not approaching OB for BUY: price={last_close}, ob_high={ob.high}, distance={distance_to_ob:.2%}")
                 return None
+            log.debug(f"Approaching OB for BUY: price={last_close}, ob_high={ob.high}, distance={distance_to_ob:.2%}")
         else:
-            if last_close > ob.low + (ob.high - ob.low) * 0.1:
-                log.debug(f"Not approaching OB for SELL: price={last_close}, ob_low={ob.low}")
+            distance_to_ob = (ob.low - last_close) / (ob.high - ob.low + 1e-8)
+            # Must be at or slightly below OB low, or within 10% distance
+            if not (last_close >= ob.low or distance_to_ob < 0.1):
+                log.debug(f"Not approaching OB for SELL: price={last_close}, ob_low={ob.low}, distance={distance_to_ob:.2%}")
                 return None
+            log.debug(f"Approaching OB for SELL: price={last_close}, ob_low={ob.low}, distance={distance_to_ob:.2%}")
         
         # Momentum and displacement
         last = df.iloc[-1]
