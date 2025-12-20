@@ -58,7 +58,7 @@ class Config:
     OB_LOOKBACK = 30
     LIQUIDITY_LOOKBACK = 50
     ATR_TOLERANCE_MULTIPLIER = 0.15
-    MIN_RISK_REWARD_RATIO = 0.5
+    MIN_RISK_REWARD_RATIO = 0.1
     
     # Exchange
     EXCHANGE_ID = "okx"
