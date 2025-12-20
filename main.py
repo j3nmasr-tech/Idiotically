@@ -41,7 +41,7 @@ class Config:
     
     # Scanning
     SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "10"))
-    TOP_N = int(os.getenv("TOP_N", "20"))
+    TOP_N = int(os.getenv("TOP_N", "30"))
     TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
     
     # Signal thresholds
