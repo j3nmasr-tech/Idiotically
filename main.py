@@ -1430,17 +1430,22 @@ async def send_fast_alert_with_debug(setup: Dict, debug_data: SignalDebugData):
 """
         
         # Store debug data to file for later analysis
-        debug_filename = f"debug_{symbol}_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+        # Replace forward slashes with underscores in symbol for filename
+        safe_symbol = symbol.replace("/", "_")
+        debug_filename = f"debug_{safe_symbol}_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
         debug_filepath = f"/app/data/debug/{debug_filename}"
         
         # Create debug directory if it doesn't exist
         os.makedirs("/app/data/debug", exist_ok=True)
         
         # Save debug data
-        with open(debug_filepath, 'w') as f:
-            f.write(debug_data.to_json())
-        
-        debug_link = f"\n📊 <b>Full Analysis:</b> Saved to {debug_filename}"
+        try:
+            with open(debug_filepath, 'w') as f:
+                f.write(debug_data.to_json())
+            debug_link = f"\n📊 <b>Full Analysis:</b> Saved to {debug_filename}"
+        except Exception as e:
+            log.error(f"Error saving debug data to file: {e}")
+            debug_link = f"\n📊 <b>Full Analysis:</b> Failed to save debug data"
         
         msg = f"""
 {update_emoji}{tier_emoji} <b>ROMEOTPT - {quality.get('tier', 'C')} Tier</b>
@@ -1566,12 +1571,16 @@ async def send_deduped_alert_with_debug(setup: Dict, debug_data: SignalDebugData
         else:
             signal_tracker.update_signal(symbol, setup, alerted=False)
             # Still save debug data even if no alert
-            debug_filename = f"debug_noalert_{symbol}_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
+            safe_symbol = symbol.replace("/", "_")
+            debug_filename = f"debug_noalert_{safe_symbol}_{datetime.datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.json"
             debug_filepath = f"/app/data/debug/{debug_filename}"
             os.makedirs("/app/data/debug", exist_ok=True)
-            with open(debug_filepath, 'w') as f:
-                f.write(debug_data.to_json())
-            log.debug(f"⏸️  Skipped alert for {symbol}, saved debug data: {reason}")
+            try:
+                with open(debug_filepath, 'w') as f:
+                    f.write(debug_data.to_json())
+                log.debug(f"⏸️  Skipped alert for {symbol}, saved debug data: {reason}")
+            except Exception as e:
+                log.error(f"Error saving no-alert debug data for {symbol}: {e}")
             return False
     except Exception as e:
         log.error(f"Error in deduped alert with debug for {setup.get('symbol', 'UNKNOWN')}: {e}")
