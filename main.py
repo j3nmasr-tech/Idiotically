@@ -2,11 +2,15 @@
 # -*- coding: utf-8 -*-
 
 """
-PRODUCTION ROMEOPT SCANNER - COMPLETE VERSION
+PRODUCTION ROMEOPT SCANNER - COMPLETE VERSION WITH HTF BIAS FILTER
 - All 3 MUST-HAVE steps implemented
 - Timeframe-specific liquidity rules:
   • 1m, 3m, 5m → ALWAYS use HTF liquidity
   • 15m, 30m → Use same TF liquidity (HTF as fallback)
+- HTF BIAS FILTERING SYSTEM:
+  • Rule 1: HTF Range Position (no mid-range trades)
+  • Rule 2: HTF Liquidity Status (sweep alignment)
+  • Rule 3: HTF Displacement (momentum continuation)
 - Fixed logging and all errors
 """
 
@@ -64,6 +68,21 @@ class Config:
     # Exchange
     EXCHANGE_ID = "okx"
     ENABLE_RATE_LIMIT = True
+    
+    # HTF BIAS CONFIGURATION
+    HTF_BIAS_ENABLED = True
+    RANGE_EXTREME_THRESHOLD = 0.25  # Top/bottom 25% = "near" range edge
+    MIN_HTF_BIAS_SCORE = 0.6  # Minimum score to accept trade (0.0-1.0)
+    MID_RANGE_REJECT = True   # Auto-reject mid-range entries
+    
+    # HTF Mapping (RomeOPT-style relative HTF)
+    HTF_MAP = {
+        '1m': ['5m', '15m'],      # Micro structure + local range
+        '3m': ['15m'],            # Clean internal liquidity
+        '5m': ['15m', '30m'],     # Avoid noise, still reactive
+        '15m': ['30m', '1h'],     # Real range highs/lows
+        '30m': ['1h', '4h']       # External liquidity
+    }
 
 # ==================== SETUP LOGGING FIRST ====================
 def setup_logging():
@@ -144,6 +163,16 @@ class LiquiditySweep:
     quality_score: float
 
 @dataclass
+class HtfBiasResult:
+    """HTF Bias analysis result"""
+    take_trade: bool
+    score: float  # 0.0-1.0
+    bias: str  # 'BULLISH', 'BEARISH', 'NEUTRAL'
+    reasons: List[str]
+    details: Dict[str, Any]
+    rule_scores: Dict[str, float]  # Individual rule scores
+
+@dataclass
 class RomeOPTSignal:
     """Complete RomeOPT Signal"""
     symbol: str
@@ -160,6 +189,8 @@ class RomeOPTSignal:
     tp_type: str
     tp_locked: bool = True
     risk_reward_ratio: float = 0.0
+    htf_bias_score: float = 0.0
+    htf_bias_result: Optional[HtfBiasResult] = None
     
     def __post_init__(self):
         self.calculate_metrics()
@@ -175,6 +206,384 @@ class RomeOPTSignal:
         
         if risk > 0:
             self.risk_reward_ratio = reward / risk
+
+# ==================== HTF BIAS SYSTEM ====================
+class HtfBiasSystem:
+    """HTF Bias Filtering System based on 3 Rules"""
+    
+    def __init__(self, config: Config, exchange):
+        self.config = config
+        self.exchange = exchange
+        self.htf_cache = {}  # Cache HTF data to reduce API calls
+        self.cache_duration = 60  # Cache for 60 seconds
+        
+    async def get_htf_data(self, symbol: str, timeframe: str, limit: int = 50):
+        """Get HTF data with caching"""
+        cache_key = f"{symbol}:{timeframe}"
+        now = time.time()
+        
+        if cache_key in self.htf_cache:
+            data, timestamp = self.htf_cache[cache_key]
+            if now - timestamp < self.cache_duration:
+                return data
+        
+        try:
+            ohlcv = await self.exchange.fetch_ohlcv(
+                symbol, 
+                timeframe=timeframe, 
+                limit=limit
+            )
+            if not ohlcv or len(ohlcv) < 10:
+                return None
+            
+            df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
+            for col in ["open", "high", "low", "close"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+            
+            self.htf_cache[cache_key] = (df, now)
+            return df
+            
+        except Exception as e:
+            log.debug(f"HTF data fetch failed for {symbol} {timeframe}: {e}")
+            return None
+    
+    def calculate_atr(self, df: pd.DataFrame, period: int = 14) -> float:
+        """Calculate ATR for HTF"""
+        try:
+            high = pd.to_numeric(df["high"], errors='coerce')
+            low = pd.to_numeric(df["low"], errors='coerce')
+            close = pd.to_numeric(df["close"], errors='coerce')
+            
+            tr1 = high - low
+            tr2 = (high - close.shift(1)).abs()
+            tr3 = (low - close.shift(1)).abs()
+            
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            atr = tr.rolling(period, min_periods=1).mean()
+            
+            return float(atr.iloc[-1])
+        except Exception as e:
+            log.debug(f"HTF ATR calculation error: {e}")
+            return 0.0
+    
+    async def assess_htf_bias(self, symbol: str, entry_tf: str, entry_price: float, 
+                             side: str) -> HtfBiasResult:
+        """
+        Assess HTF bias based on 3 rules
+        Returns: HtfBiasResult with final decision
+        """
+        if not self.config.HTF_BIAS_ENABLED:
+            return HtfBiasResult(
+                take_trade=True,
+                score=1.0,
+                bias=side.upper(),
+                reasons=["HTF_BIAS_DISABLED"],
+                details={},
+                rule_scores={"rule1": 1.0, "rule2": 1.0, "rule3": 1.0}
+            )
+        
+        htf_tfs = self.config.HTF_MAP.get(entry_tf, [])
+        if not htf_tfs:
+            log.warning(f"No HTF mapping for {entry_tf}")
+            return HtfBiasResult(
+                take_trade=True,
+                score=1.0,
+                bias=side.upper(),
+                reasons=["NO_HTF_MAPPING"],
+                details={},
+                rule_scores={"rule1": 1.0, "rule2": 1.0, "rule3": 1.0}
+            )
+        
+        rule1_scores = []
+        rule2_scores = []
+        rule3_scores = []
+        all_reasons = []
+        details = {}
+        
+        # Analyze each HTF
+        for htf_tf in htf_tfs:
+            df = await self.get_htf_data(symbol, htf_tf, 50)
+            if df is None or len(df) < 20:
+                continue
+            
+            # RULE 1: HTF Range Position
+            rule1_result = self._rule1_range_position(df, entry_price, side, htf_tf)
+            rule1_scores.append(rule1_result["score"])
+            
+            # RULE 2: HTF Liquidity Status
+            rule2_result = self._rule2_liquidity_status(df, side, htf_tf)
+            rule2_scores.append(rule2_result["score"])
+            
+            # RULE 3: HTF Displacement
+            rule3_result = self._rule3_displacement(df, side, htf_tf)
+            rule3_scores.append(rule3_result["score"])
+            
+            # Store details
+            details[htf_tf] = {
+                "rule1": rule1_result,
+                "rule2": rule2_result,
+                "rule3": rule3_result
+            }
+            
+            all_reasons.extend(rule1_result.get("reasons", []))
+            all_reasons.extend(rule2_result.get("reasons", []))
+            all_reasons.extend(rule3_result.get("reasons", []))
+        
+        # Calculate final scores
+        rule1_final = np.mean(rule1_scores) if rule1_scores else 0
+        rule2_final = np.mean(rule2_scores) if rule2_scores else 0
+        rule3_final = np.mean(rule3_scores) if rule3_scores else 0
+        
+        # Weighted final score
+        final_score = (
+            rule1_final * 0.50 +  # Rule 1 weight: 50% (most important)
+            rule2_final * 0.30 +  # Rule 2 weight: 30%
+            rule3_final * 0.20    # Rule 3 weight: 20%
+        )
+        
+        # Determine bias
+        if side.upper() == "BUY":
+            bias = "BULLISH"
+        else:
+            bias = "BEARISH"
+        
+        # Check for mid-range rejection
+        if self.config.MID_RANGE_REJECT and rule1_final == 0:
+            all_reasons.append("MID_RANGE_REJECTED")
+            return HtfBiasResult(
+                take_trade=False,
+                score=final_score,
+                bias="NEUTRAL",
+                reasons=all_reasons,
+                details=details,
+                rule_scores={
+                    "rule1": rule1_final,
+                    "rule2": rule2_final,
+                    "rule3": rule3_final
+                }
+            )
+        
+        # Final decision
+        take_trade = final_score >= self.config.MIN_HTF_BIAS_SCORE
+        
+        if take_trade:
+            all_reasons.append(f"HTF_BIAS_CONFIRMED (Score: {final_score:.2f})")
+        else:
+            all_reasons.append(f"HTF_BIAS_REJECTED (Score: {final_score:.2f} < {self.config.MIN_HTF_BIAS_SCORE})")
+        
+        return HtfBiasResult(
+            take_trade=take_trade,
+            score=final_score,
+            bias=bias,
+            reasons=all_reasons,
+            details=details,
+            rule_scores={
+                "rule1": rule1_final,
+                "rule2": rule2_final,
+                "rule3": rule3_final
+            }
+        )
+    
+    def _rule1_range_position(self, df: pd.DataFrame, entry_price: float, 
+                             side: str, htf_tf: str) -> Dict[str, Any]:
+        """
+        RULE 1: HTF Range Position
+        price near HTF range LOW → bullish bias
+        price near HTF range HIGH → bearish bias
+        mid-range → NO BIAS (reject or downgrade)
+        """
+        # Get HTF range (last 20 candles)
+        lookback = min(20, len(df))
+        htf_high = float(df['high'].iloc[-lookback:].max())
+        htf_low = float(df['low'].iloc[-lookback:].min())
+        range_size = htf_high - htf_low
+        
+        if range_size <= 0:
+            return {
+                "score": 0.0,
+                "reasons": [f"{htf_tf}: ZERO_RANGE"],
+                "htf_high": htf_high,
+                "htf_low": htf_low,
+                "position": 0.5
+            }
+        
+        # Calculate position in range (0-1)
+        position = (entry_price - htf_low) / range_size
+        
+        # Determine score based on position and side
+        if side.upper() == "BUY":
+            # For BUY: Want to be near LOW
+            if position <= self.config.RANGE_EXTREME_THRESHOLD:
+                score = 1.0 - (position / self.config.RANGE_EXTREME_THRESHOLD)
+                reason = f"{htf_tf}: NEAR_LOW_BUY"
+            elif position >= (1 - self.config.RANGE_EXTREME_THRESHOLD):
+                score = 0.0  # Wrong extreme
+                reason = f"{htf_tf}: WRONG_EXTREME_BUY"
+            else:
+                score = 0.0  # Mid-range
+                reason = f"{htf_tf}: MID_RANGE_BUY"
+        else:  # SELL
+            # For SELL: Want to be near HIGH
+            if position >= (1 - self.config.RANGE_EXTREME_THRESHOLD):
+                score = 1.0 - ((1 - position) / self.config.RANGE_EXTREME_THRESHOLD)
+                reason = f"{htf_tf}: NEAR_HIGH_SELL"
+            elif position <= self.config.RANGE_EXTREME_THRESHOLD:
+                score = 0.0  # Wrong extreme
+                reason = f"{htf_tf}: WRONG_EXTREME_SELL"
+            else:
+                score = 0.0  # Mid-range
+                reason = f"{htf_tf}: MID_RANGE_SELL"
+        
+        return {
+            "score": score,
+            "reasons": [reason],
+            "htf_high": htf_high,
+            "htf_low": htf_low,
+            "position": position,
+            "range_size": range_size
+        }
+    
+    def _rule2_liquidity_status(self, df: pd.DataFrame, side: str, 
+                               htf_tf: str) -> Dict[str, Any]:
+        """
+        RULE 2: HTF Liquidity Status
+        HTF high swept → bearish bias
+        HTF low swept → bullish bias
+        no sweep → neutral (allowed but weaker)
+        """
+        # Look for recent sweeps (last 10 candles)
+        lookback = min(10, len(df) - 1)
+        if lookback < 2:
+            return {
+                "score": 0.5,  # Neutral
+                "reasons": [f"{htf_tf}: INSUFFICIENT_DATA"],
+                "sweep_found": False
+            }
+        
+        # Get recent extremes
+        recent_highs = df['high'].iloc[-lookback-5:-1].values
+        recent_lows = df['low'].iloc[-lookback-5:-1].values
+        
+        # Check last few candles for sweeps
+        sweep_found = False
+        sweep_score = 0.0
+        
+        for i in range(1, lookback + 1):
+            current_high = float(df['high'].iloc[-i])
+            current_low = float(df['low'].iloc[-i])
+            
+            # Check high sweep
+            if side.upper() == "SELL":
+                if any(current_high > high * 1.0001 for high in recent_highs):  # 0.01% above
+                    sweep_found = True
+                    age = i / lookback
+                    sweep_score = max(sweep_score, 1.0 - age * 0.5)  # Recent sweeps get higher score
+                    break
+            
+            # Check low sweep
+            if side.upper() == "BUY":
+                if any(current_low < low * 0.9999 for low in recent_lows):  # 0.01% below
+                    sweep_found = True
+                    age = i / lookback
+                    sweep_score = max(sweep_score, 1.0 - age * 0.5)
+                    break
+        
+        if sweep_found:
+            return {
+                "score": sweep_score,
+                "reasons": [f"{htf_tf}: SWEEP_CONFIRMED"],
+                "sweep_found": True,
+                "sweep_score": sweep_score
+            }
+        else:
+            return {
+                "score": 0.5,  # Neutral score
+                "reasons": [f"{htf_tf}: NO_SWEEP"],
+                "sweep_found": False
+            }
+    
+    def _rule3_displacement(self, df: pd.DataFrame, side: str, 
+                           htf_tf: str) -> Dict[str, Any]:
+        """
+        RULE 3: HTF Displacement/Imbalance
+        Strong HTF displacement → bias continues
+        Balanced candles → bias weakens
+        """
+        # Analyze last 5 candles
+        lookback = min(5, len(df))
+        if lookback < 3:
+            return {
+                "score": 0.5,
+                "reasons": [f"{htf_tf}: INSUFFICIENT_DATA"],
+                "displacement": "NEUTRAL"
+            }
+        
+        displacement_scores = []
+        
+        for i in range(1, lookback + 1):
+            candle = df.iloc[-i]
+            try:
+                open_price = float(candle["open"])
+                close_price = float(candle["close"])
+                high_price = float(candle["high"])
+                low_price = float(candle["low"])
+            except (ValueError, TypeError):
+                continue
+            
+            candle_range = high_price - low_price
+            if candle_range <= 0:
+                continue
+            
+            # Calculate body ratio and position
+            body_size = abs(close_price - open_price)
+            body_ratio = body_size / candle_range if candle_range > 0 else 0
+            
+            # For bullish bias: want strong bullish candles
+            if side.upper() == "BUY":
+                if close_price > open_price:  # Bullish candle
+                    if body_ratio > 0.7:
+                        displacement_scores.append(1.0)  # Strong bullish
+                    elif body_ratio > 0.3:
+                        displacement_scores.append(0.7)  # Moderate bullish
+                    else:
+                        displacement_scores.append(0.3)  # Weak bullish
+                else:  # Bearish candle (contrary)
+                    displacement_scores.append(0.1)
+            
+            # For bearish bias: want strong bearish candles
+            else:  # SELL
+                if close_price < open_price:  # Bearish candle
+                    if body_ratio > 0.7:
+                        displacement_scores.append(1.0)  # Strong bearish
+                    elif body_ratio > 0.3:
+                        displacement_scores.append(0.7)  # Moderate bearish
+                    else:
+                        displacement_scores.append(0.3)  # Weak bearish
+                else:  # Bullish candle (contrary)
+                    displacement_scores.append(0.1)
+        
+        if displacement_scores:
+            avg_score = np.mean(displacement_scores)
+            
+            if avg_score >= 0.7:
+                displacement_type = "STRONG"
+            elif avg_score >= 0.4:
+                displacement_type = "MODERATE"
+            else:
+                displacement_type = "WEAK"
+            
+            return {
+                "score": avg_score,
+                "reasons": [f"{htf_tf}: {displacement_type}_DISPLACEMENT"],
+                "displacement": displacement_type,
+                "avg_score": avg_score
+            }
+        else:
+            return {
+                "score": 0.5,
+                "reasons": [f"{htf_tf}: NEUTRAL_DISPLACEMENT"],
+                "displacement": "NEUTRAL"
+            }
 
 # ==================== DATABASE ====================
 class RomeOPTDatabase:
@@ -208,6 +617,7 @@ class RomeOPTDatabase:
                 market_state TEXT,
                 tp_type TEXT,
                 risk_reward REAL,
+                htf_bias_score REAL DEFAULT 0,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -222,18 +632,19 @@ class RomeOPTDatabase:
                 await self.conn.execute("""
                     INSERT INTO signals (
                         symbol, side, entry, sl, tp, timeframe, timestamp,
-                        status, reason, score, market_state, tp_type, risk_reward
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        status, reason, score, market_state, tp_type, risk_reward, htf_bias_score
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     signal.symbol, signal.side, signal.entry, signal.sl,
                     signal.tp, signal.timeframe,
                     datetime.datetime.utcnow().isoformat(),
                     'OPEN', ' | '.join(signal.reasons), signal.score,
-                    signal.market_state, signal.tp_type, signal.risk_reward_ratio
+                    signal.market_state, signal.tp_type, signal.risk_reward_ratio,
+                    signal.htf_bias_score
                 ))
                 
                 await self.conn.commit()
-                log.info(f"Signal saved: {signal.symbol} {signal.side}")
+                log.info(f"Signal saved: {signal.symbol} {signal.side} (HTF Bias: {signal.htf_bias_score:.2f})")
                 return True
             except Exception as e:
                 log.error(f"Failed to save signal: {e}")
@@ -315,13 +726,14 @@ class TelegramBot:
 
 # ==================== ROMEOPT ENGINE ====================
 class RomeOPTEngine:
-    """Core RomeOPT trading engine"""
+    """Core RomeOPT trading engine with HTF Bias filtering"""
     
     def __init__(self, config: Config):
         self.config = config
         self.exchange = None
         self.db = RomeOPTDatabase(config.DB_PATH)
         self.tg_bot = TelegramBot(config.TELEGRAM_TOKEN, config.TELEGRAM_CHAT_ID)
+        self.htf_bias_system = None
         
         # Tracking
         self.recent_sl_hits = defaultdict(lambda: deque())
@@ -345,13 +757,17 @@ class RomeOPTEngine:
             await self.exchange.load_markets()
             log.info(f"Connected to {self.config.EXCHANGE_ID}")
             
+            # Initialize HTF Bias System
+            self.htf_bias_system = HtfBiasSystem(self.config, self.exchange)
+            
         except Exception as e:
             log.error(f"Failed to initialize exchange: {e}")
             raise
         
         await self.tg_bot.send_message("🚀 ROMEOPT ENGINE STARTED\n"
                                       "✅ All 3 MUST-HAVE steps active\n"
-                                      "✅ Timeframe-specific liquidity rules enabled")
+                                      "✅ Timeframe-specific liquidity rules enabled\n"
+                                      f"✅ HTF BIAS FILTERING: {'ENABLED' if self.config.HTF_BIAS_ENABLED else 'DISABLED'}")
         log.info("RomeOPT Engine initialized successfully")
     
     # ==================== TIME-SPECIFIC RULES ====================
@@ -842,8 +1258,9 @@ class RomeOPTEngine:
     
     def calculate_romeopt_score(self, sweep: LiquiditySweep, ob: OrderBlock, 
                               momentum: float, displacement: float,
-                              rr_ratio: float, use_htf: bool) -> int:
-        """Calculate 6-step RomeOPT score (0-6)"""
+                              rr_ratio: float, use_htf: bool, 
+                              htf_bias_score: float = 0.0) -> int:
+        """Calculate 6-step RomeOPT score (0-6) with HTF bias integration"""
         score = 0
         
         # Step 1: Liquidity Sweep (max 2 points)
@@ -868,16 +1285,22 @@ class RomeOPTEngine:
         if use_htf:
             score += 1  # HTF alignment confirmed
         
-        # Step 6: Risk/Reward (max 1 point)
+        # Step 6: Risk/Reward & HTF Bias Bonus (max 1 point)
         if rr_ratio >= 1.0:
-            score += 1
+            score += 0.5
         elif rr_ratio >= 0.5:
-            score += 0.5  # Half point
+            score += 0.25  # Quarter point
+        
+        # HTF Bias bonus (up to 0.5 points)
+        if htf_bias_score > 0.8:
+            score += 0.5
+        elif htf_bias_score > 0.6:
+            score += 0.25
         
         return min(6, int(score))
     
     async def generate_romeopt_signal(self, symbol: str, timeframe: str) -> Optional[RomeOPTSignal]:
-        """Generate a complete RomeOPT signal"""
+        """Generate a complete RomeOPT signal with HTF Bias filtering"""
         log.debug(f"Generating signal for {symbol} {timeframe}")
         
         # Fetch data
@@ -940,6 +1363,20 @@ class RomeOPTEngine:
         atr_val = self._calculate_atr(df, self.config.ATR_PERIOD)
         entry = last_close
         
+        # ========== HTF BIAS FILTERING ==========
+        htf_bias_result = None
+        if self.config.HTF_BIAS_ENABLED and self.htf_bias_system:
+            htf_bias_result = await self.htf_bias_system.assess_htf_bias(
+                symbol, timeframe, entry, side
+            )
+            
+            if not htf_bias_result.take_trade:
+                log.info(f"HTF Bias rejected: {symbol} {timeframe} {side} (Score: {htf_bias_result.score:.2f})")
+                log.info(f"HTF Bias reasons: {', '.join(htf_bias_result.reasons)}")
+                return None
+            
+            log.info(f"HTF Bias approved: {symbol} {timeframe} {side} (Score: {htf_bias_result.score:.2f})")
+        
         use_htf = self.should_use_htf_liquidity(timeframe)
         tp_sl_result = await self.calculate_romeopt_tp_sl(
             entry, side, df, ob, atr_val, symbol, timeframe
@@ -961,8 +1398,9 @@ class RomeOPTEngine:
         
         rr_ratio = reward / risk if risk > 0 else 0
         
-        # Calculate 6-step score
-        score = self.calculate_romeopt_score(sweep, ob, momentum, displacement, rr_ratio, use_htf)
+        # Calculate 6-step score with HTF bias integration
+        htf_bias_score = htf_bias_result.score if htf_bias_result else 0.0
+        score = self.calculate_romeopt_score(sweep, ob, momentum, displacement, rr_ratio, use_htf, htf_bias_score)
         
         # Determine market state
         market_state = self._determine_market_state(df, atr_val)
@@ -975,6 +1413,12 @@ class RomeOPTEngine:
             f"Mom:{momentum:.2f}|Disp:{displacement:.2f}",
             f"TP:{tp_type}",
         ]
+        
+        # Add HTF bias reasons if available
+        if htf_bias_result:
+            htf_reasons = [r for r in htf_bias_result.reasons if "CONFIRMED" in r or "REJECTED" in r]
+            if htf_reasons:
+                reasons.append(f"HTFBias:{htf_bias_result.score:.2f}")
         
         signal = RomeOPTSignal(
             symbol=symbol,
@@ -989,22 +1433,25 @@ class RomeOPTEngine:
             order_block=ob,
             market_state=market_state,
             tp_type=tp_type,
-            tp_locked=True
+            tp_locked=True,
+            htf_bias_score=htf_bias_score,
+            htf_bias_result=htf_bias_result
         )
         
-        # Send notification
-        await self.send_signal_notification(signal, htf_liquidity, use_htf)
+        # Send notification with HTF bias info
+        await self.send_signal_notification(signal, htf_liquidity, use_htf, htf_bias_result)
         
         # Save to DB
         await self.db.save_signal(signal)
         
         self.signals_generated += 1
-        log.info(f"Signal generated: {symbol} {timeframe} {side} | Score: {score}")
+        log.info(f"Signal generated: {symbol} {timeframe} {side} | Score: {score} | HTF Bias: {htf_bias_score:.2f}")
         
         return signal
     
-    async def send_signal_notification(self, signal: RomeOPTSignal, htf_liquidity: Dict = None, use_htf: bool = False):
-        """Send Telegram notification with all sweep and OB data in minimal format"""
+    async def send_signal_notification(self, signal: RomeOPTSignal, htf_liquidity: Dict = None, 
+                                      use_htf: bool = False, htf_bias_result: HtfBiasResult = None):
+        """Send Telegram notification with HTF bias info"""
         
         # Determine liquidity source
         if use_htf and htf_liquidity:
@@ -1021,7 +1468,7 @@ class RomeOPTEngine:
         entry_proximity = (entry_distance / ob_range) if ob_range > 0 else 1.0
         momentum = abs(signal.entry - signal.order_block.body_low) / (ob_range + 1e-8)
         
-        # Build message with ALL sweep and OB data
+        # Build message
         message = [
             f"ROMEOPT {signal.symbol} {signal.side} {signal.timeframe} SCORE:{signal.score}/6",
             f"SWEEP:{signal.liquidity_sweep.type} DIR:{signal.liquidity_sweep.direction}",
@@ -1034,8 +1481,13 @@ class RomeOPTEngine:
             f"OB_TESTED:{signal.order_block.tested} CONF:{signal.order_block.confluence_score}",
             f"ENTRY:{signal.entry:.6f} OB_PROX:{entry_proximity:.1%} MOM:{momentum:.2f}",
             f"LIQ_SRC:{liquidity_source} TP_TYPE:{target_type} STATE:{signal.market_state}",
-            f"SL:{signal.sl:.6f} TP:{signal.tp:.6f} RR:{signal.risk_reward_ratio:.2f}:1 TP_LOCKED"
         ]
+        
+        # Add HTF bias info if available
+        if htf_bias_result:
+            message.append(f"HTF_BIAS:{htf_bias_result.score:.2f} RULE1:{htf_bias_result.rule_scores.get('rule1', 0):.2f} RULE2:{htf_bias_result.rule_scores.get('rule2', 0):.2f} RULE3:{htf_bias_result.rule_scores.get('rule3', 0):.2f}")
+        
+        message.append(f"SL:{signal.sl:.6f} TP:{signal.tp:.6f} RR:{signal.risk_reward_ratio:.2f}:1 TP_LOCKED")
         
         # Send as one compact message
         await self.tg_bot.send_message("\n".join(message))
@@ -1113,7 +1565,7 @@ class RomeOPTEngine:
     # ==================== SCANNING ====================
     async def scan_markets(self):
         """Main scanning loop"""
-        await self.tg_bot.send_message(f"SCANNING STARTED Top {self.config.TOP_N} pairs TFs:{','.join(self.config.TIMEFRAMES)}")
+        await self.tg_bot.send_message(f"SCANNING STARTED Top {self.config.TOP_N} pairs TFs:{','.join(self.config.TIMEFRAMES)} HTF_BIAS:{'ON' if self.config.HTF_BIAS_ENABLED else 'OFF'}")
         log.info(f"Starting market scan for top {self.config.TOP_N} pairs")
         
         while True:
@@ -1253,6 +1705,7 @@ async def get_stats():
     return {
         "signals_generated": romeopt_engine.signals_generated,
         "scan_interval": Config.SCAN_INTERVAL,
+        "htf_bias_enabled": Config.HTF_BIAS_ENABLED,
         "status": "running"
     }
 
