@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ROMEOTPT v4.0 - PURE LIQUIDITY & MARKET STATE ENGINE
-Implementation of true ROMEOTPT philosophy
+COMPLETE & CORRECTED IMPLEMENTATION
 """
 
 import os
@@ -18,7 +18,7 @@ import pandas as pd
 import numpy as np
 from fastapi import FastAPI
 import uvicorn
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Set
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -28,17 +28,17 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v4_0.db")
 
 # Scanner settings
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))  # 1 minute for proper liquidity analysis
-TOP_N = int(os.getenv("TOP_N", 30))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
+TOP_N = int(os.getenv("TOP_N", 60))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 8))
 
 # ROMEOTPT-specific settings
-MIN_SWEEP_STRENGTH = float(os.getenv("MIN_SWEEP_STRENGTH", 0.8))
-MIN_DISPLACEMENT_RATIO = float(os.getenv("MIN_DISPLACEMENT_RATIO", 1.5))
-MAX_ENTRY_DISTANCE_PCT = float(os.getenv("MAX_ENTRY_DISTANCE_PCT", 1.0))
+MIN_SWEEP_STRENGTH = float(os.getenv("MIN_SWEEP_STRENGTH", 0.7))
+MIN_DISPLACEMENT_RATIO = float(os.getenv("MIN_DISPLACEMENT_RATIO", 0.6))
+MAX_ENTRY_DISTANCE_PCT = float(os.getenv("MAX_ENTRY_DISTANCE_PCT", 0.5))
 
 # Deduplication settings
-SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 30))  # Longer cooldown
+SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 30))
 SIGNAL_VALIDITY_HOURS = int(os.getenv("SIGNAL_VALIDITY_HOURS", 4))
 
 # ---------------- ENUMS ----------------
@@ -49,9 +49,9 @@ class MarketState(Enum):
     UNCLEAR = "UNCLEAR"
 
 class SetupType(Enum):
-    SWEEP_REVERSAL = "SWEEP_REVERSAL"  # For Accumulation
-    PULLBACK_CONTINUATION = "PULLBACK_CONTINUATION"  # For Expansion
-    FAILED_BREAKOUT = "FAILED_BREAKOUT"  # For Distribution
+    SWEEP_REVERSAL = "SWEEP_REVERSAL"
+    PULLBACK_CONTINUATION = "PULLBACK_CONTINUATION"
+    FAILED_BREAKOUT = "FAILED_BREAKOUT"
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(
@@ -90,15 +90,16 @@ class HTFNarrative:
 class LiquidityEvent:
     """STEP 2: LIQUIDITY ENGINE"""
     level: float = 0.0
-    event_type: str = ""  # "EQUAL_HIGH", "EQUAL_LOW", "RANGE_SWEEP", "SWING_LIQUIDITY"
+    event_type: str = ""
     timeframe: str = ""
     is_taken: bool = False
     close_back_inside: bool = False
     displacement_away: bool = False
-    strength: float = 0.0  # 0-1.0
+    strength: float = 0.0
+    candle_index: int = -1
     
     def is_valid(self) -> bool:
-        return self.is_taken and (self.close_back_inside or self.displacement_away)
+        return self.is_taken and (self.close_back_inside or self.displacement_away) and self.strength >= MIN_SWEEP_STRENGTH
 
 @dataclass
 class MarketStateAnalysis:
@@ -118,14 +119,15 @@ class MarketStateAnalysis:
 class DisplacementAnalysis:
     """STEP 5: DISPLACEMENT CONFIRMATION"""
     has_displacement: bool = False
-    candle_body_ratio: float = 0.0  # body_size / total_range
+    candle_body_ratio: float = 0.0
     closes_through_structure: bool = False
     leaves_inefficiency: bool = False
-    displacement_direction: str = ""  # "BULLISH", "BEARISH"
+    displacement_direction: str = ""
+    candle_data: Dict = field(default_factory=dict)
     
     def is_valid(self) -> bool:
         return (self.has_displacement and 
-                self.candle_body_ratio >= 0.6 and  # Strong real body
+                self.candle_body_ratio >= MIN_DISPLACEMENT_RATIO and
                 self.closes_through_structure and
                 self.leaves_inefficiency)
 
@@ -133,9 +135,10 @@ class DisplacementAnalysis:
 class StructureShift:
     """STEP 5: MARKET STRUCTURE SHIFT"""
     has_shift: bool = False
-    shift_type: str = ""  # "BULLISH_BREAK", "BEARISH_BREAK"
+    shift_type: str = ""
     broken_level: float = 0.0
     confirmation_price: float = 0.0
+    timeframe: str = ""
     
     def is_valid(self) -> bool:
         return self.has_shift
@@ -156,9 +159,9 @@ class ROMEOTPTSignal:
     timestamp: str = ""
     current_price: float = 0.0
     signal_score: float = 0.0
+    displacement_candle: Dict = field(default_factory=dict)
     
     def to_output_format(self) -> str:
-        """Output in the mandatory format"""
         if not self.is_valid():
             return "NO TRADE — CONDITIONS NOT MET"
         
@@ -174,7 +177,6 @@ TAKE PROFIT LIQUIDITY: {self.take_profit_liquidity:.8f}
 REASON (CAUSE → EFFECT): {self.reason}"""
     
     def is_valid(self) -> bool:
-        """Check if signal meets all ROMEOTPT rules"""
         return all([
             self.asset,
             self.direction in ["LONG", "SHORT"],
@@ -182,7 +184,8 @@ REASON (CAUSE → EFFECT): {self.reason}"""
             self.setup_type is not None,
             self.take_profit_liquidity > 0,
             self.entry_zone[0] > 0,
-            self.signal_score >= 0.7
+            self.signal_score >= 0.7,
+            self.entry_tf != ""
         ])
 
 # ---------------- CORE ROMEOTPT ENGINE ----------------
@@ -197,26 +200,23 @@ class ROMEOTPTEngine:
         narrative = HTFNarrative()
         
         try:
-            # Get 4H data for range analysis
             ohlcv_4h = await self._fetch_ohlcv_with_timeout(exchange, symbol, "4h", 100)
             if not ohlcv_4h or len(ohlcv_4h) < 50:
                 return narrative
             
             df_4h = pd.DataFrame(ohlcv_4h, columns=["timestamp", "open", "high", "low", "close", "volume"])
             
-            # Determine market type: RANGE or TREND
             recent_high = df_4h['high'].iloc[-20:].max()
             recent_low = df_4h['low'].iloc[-20:].min()
             range_height = (recent_high - recent_low) / recent_low * 100
             
             current_price = df_4h['close'].iloc[-1]
             
-            if range_height < 8.0:  # Less than 8% range = RANGE market
+            if range_height < 8.0:
                 narrative.market_type = "RANGE"
                 narrative.range_high = recent_high
                 narrative.range_low = recent_low
                 
-                # Calculate zones
                 range_mid = (recent_high + recent_low) / 2
                 range_quarter = (recent_high - recent_low) / 4
                 
@@ -224,29 +224,25 @@ class ROMEOTPTEngine:
                 narrative.discount_zone = (recent_low, recent_low + range_quarter)
                 narrative.mid_range = (range_mid - range_quarter, range_mid + range_quarter)
                 
-                # Check if price is at extreme
-                if current_price >= narrative.premium_zone[0] or current_price <= narrative.discount_zone[1]:
-                    narrative.is_at_extreme = True
-                else:
-                    narrative.is_at_extreme = False
+                narrative.is_at_extreme = (
+                    current_price >= narrative.premium_zone[0] or 
+                    current_price <= narrative.discount_zone[1]
+                )
             else:
                 narrative.market_type = "TREND"
-                # For trends, use recent swings
-                swing_highs = self._find_swing_highs(df_4h)
-                swing_lows = self._find_swing_lows(df_4h)
+                swing_highs = self._find_swing_highs(df_4h, 5)
+                swing_lows = self._find_swing_lows(df_4h, 5)
                 
                 if swing_highs:
                     narrative.range_high = max(swing_highs[-3:]) if len(swing_highs) >= 3 else swing_highs[-1]
                 if swing_lows:
                     narrative.range_low = min(swing_lows[-3:]) if len(swing_lows) >= 3 else swing_lows[-1]
                 
-                # In trends, premium/discount relative to recent swings
                 narrative.premium_zone = (narrative.range_high * 0.98, narrative.range_high)
                 narrative.discount_zone = (narrative.range_low, narrative.range_low * 1.02)
                 narrative.mid_range = (narrative.range_low * 1.02, narrative.range_high * 0.98)
-                narrative.is_at_extreme = False  # Different logic for trends
+                narrative.is_at_extreme = False
             
-            # Find external liquidity levels (swing highs/lows)
             narrative.external_liquidity_levels = self._find_external_liquidity(df_4h)
             
         except Exception as e:
@@ -259,86 +255,185 @@ class ROMEOTPTEngine:
         events = []
         
         try:
-            # Check multiple timeframes
-            timeframes = ["1h", "30m", "15m"]
+            timeframes = ["4h", "1h", "30m", "15m"]
             
             for tf in timeframes:
-                ohlcv = await self._fetch_ohlcv_with_timeout(exchange, symbol, tf, 50)
-                if not ohlcv or len(ohlcv) < 20:
+                ohlcv = await self._fetch_ohlcv_with_timeout(exchange, symbol, tf, 100)
+                if not ohlcv or len(ohlcv) < 30:
                     continue
                 
                 df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-                current_candle = df.iloc[-1]
-                prev_candle = df.iloc[-2] if len(df) >= 2 else None
                 
-                # 1. Check equal highs/lows (last 5 candles)
-                for i in range(-6, -1):
-                    if abs(i) > len(df):
+                # Check last 10 candles for liquidity events
+                for i in range(-10, 0):
+                    if abs(i) >= len(df):
                         continue
                     
                     candle = df.iloc[i]
-                    # Equal highs
-                    high_neighbors = df['high'].iloc[max(i-2, 0):min(i+3, len(df))]
-                    if candle['high'] == high_neighbors.max() and high_neighbors.value_counts().iloc[0] >= 2:
+                    prev_candle = df.iloc[i-1] if i > -len(df) else None
+                    next_candle = df.iloc[i+1] if i < -1 else None
+                    
+                    # Check for swing point liquidity
+                    is_swing_high = False
+                    is_swing_low = False
+                    
+                    if i < -2 and i > -len(df) + 2:
+                        is_swing_high = (
+                            candle['high'] > df['high'].iloc[i-2] and
+                            candle['high'] > df['high'].iloc[i-1] and
+                            candle['high'] > df['high'].iloc[i+1] and
+                            candle['high'] > df['high'].iloc[i+2]
+                        )
+                        
+                        is_swing_low = (
+                            candle['low'] < df['low'].iloc[i-2] and
+                            candle['low'] < df['low'].iloc[i-1] and
+                            candle['low'] < df['low'].iloc[i+1] and
+                            candle['low'] < df['low'].iloc[i+2]
+                        )
+                    
+                    # Check equal highs (within 0.1%)
+                    if not is_swing_high:
+                        high_window = df['high'].iloc[max(i-3, 0):min(i+4, len(df))]
+                        similar_highs = high_window[
+                            abs(high_window - candle['high']) / candle['high'] < 0.001
+                        ]
+                        is_equal_high = len(similar_highs) >= 2
+                    else:
+                        is_equal_high = False
+                    
+                    # Check equal lows (within 0.1%)
+                    if not is_swing_low:
+                        low_window = df['low'].iloc[max(i-3, 0):min(i+4, len(df))]
+                        similar_lows = low_window[
+                            abs(low_window - candle['low']) / candle['low'] < 0.001
+                        ]
+                        is_equal_low = len(similar_lows) >= 2
+                    else:
+                        is_equal_low = False
+                    
+                    # Current candle for validation
+                    current_candle = df.iloc[-1]
+                    
+                    # Process swing highs
+                    if is_swing_high:
+                        event = LiquidityEvent(
+                            level=candle['high'],
+                            event_type="SWING_HIGH",
+                            timeframe=tf,
+                            is_taken=current_candle['high'] > candle['high'],
+                            close_back_inside=(
+                                current_candle['close'] < candle['high'] and 
+                                next_candle is not None and 
+                                next_candle['close'] < candle['high']
+                            ) if next_candle else False,
+                            displacement_away=(
+                                current_candle['close'] < prev_candle['low'] if prev_candle else False
+                            ),
+                            candle_index=i
+                        )
+                        if event.is_taken:
+                            event.strength = self._calculate_sweep_strength(df, i, "HIGH")
+                            if event.strength >= MIN_SWEEP_STRENGTH:
+                                events.append(event)
+                    
+                    # Process swing lows
+                    if is_swing_low:
+                        event = LiquidityEvent(
+                            level=candle['low'],
+                            event_type="SWING_LOW",
+                            timeframe=tf,
+                            is_taken=current_candle['low'] < candle['low'],
+                            close_back_inside=(
+                                current_candle['close'] > candle['low'] and
+                                next_candle is not None and
+                                next_candle['close'] > candle['low']
+                            ) if next_candle else False,
+                            displacement_away=(
+                                current_candle['close'] > prev_candle['high'] if prev_candle else False
+                            ),
+                            candle_index=i
+                        )
+                        if event.is_taken:
+                            event.strength = self._calculate_sweep_strength(df, i, "LOW")
+                            if event.strength >= MIN_SWEEP_STRENGTH:
+                                events.append(event)
+                    
+                    # Process equal highs
+                    if is_equal_high and not is_swing_high:
                         event = LiquidityEvent(
                             level=candle['high'],
                             event_type="EQUAL_HIGH",
                             timeframe=tf,
                             is_taken=current_candle['high'] > candle['high'],
-                            close_back_inside=current_candle['close'] < candle['high'] if prev_candle else False,
-                            displacement_away=current_candle['close'] < prev_candle['low'] if prev_candle else False
+                            close_back_inside=current_candle['close'] < candle['high'],
+                            displacement_away=(
+                                current_candle['close'] < prev_candle['low'] if prev_candle else False
+                            ),
+                            candle_index=i
                         )
-                        if event.is_valid():
-                            event.strength = self._calculate_sweep_strength(df, i, "HIGH")
+                        if event.is_taken:
+                            event.strength = 0.7  # Base strength for equal highs
                             events.append(event)
                     
-                    # Equal lows
-                    low_neighbors = df['low'].iloc[max(i-2, 0):min(i+3, len(df))]
-                    if candle['low'] == low_neighbors.min() and low_neighbors.value_counts().iloc[0] >= 2:
+                    # Process equal lows
+                    if is_equal_low and not is_swing_low:
                         event = LiquidityEvent(
                             level=candle['low'],
                             event_type="EQUAL_LOW",
                             timeframe=tf,
                             is_taken=current_candle['low'] < candle['low'],
-                            close_back_inside=current_candle['close'] > candle['low'] if prev_candle else False,
-                            displacement_away=current_candle['close'] > prev_candle['high'] if prev_candle else False
+                            close_back_inside=current_candle['close'] > candle['low'],
+                            displacement_away=(
+                                current_candle['close'] > prev_candle['high'] if prev_candle else False
+                            ),
+                            candle_index=i
                         )
-                        if event.is_valid():
-                            event.strength = self._calculate_sweep_strength(df, i, "LOW")
+                        if event.is_taken:
+                            event.strength = 0.7  # Base strength for equal lows
                             events.append(event)
                 
-                # 2. Check range high/low sweep (relative to HTF narrative)
+                # Check range sweeps
+                current_candle = df.iloc[-1]
+                prev_candle = df.iloc[-2] if len(df) >= 2 else None
+                
                 if narrative.range_high > 0 and current_candle['high'] > narrative.range_high:
                     event = LiquidityEvent(
                         level=narrative.range_high,
-                        event_type="RANGE_SWEEP",
+                        event_type="RANGE_HIGH_SWEEP",
                         timeframe=tf,
                         is_taken=True,
                         close_back_inside=current_candle['close'] < narrative.range_high,
-                        displacement_away=current_candle['close'] < prev_candle['low'] if prev_candle else False
+                        displacement_away=(
+                            current_candle['close'] < prev_candle['low'] if prev_candle else False
+                        ),
+                        strength=0.8
                     )
-                    if event.is_valid():
-                        events.append(event)
+                    events.append(event)
                 
                 if narrative.range_low > 0 and current_candle['low'] < narrative.range_low:
                     event = LiquidityEvent(
                         level=narrative.range_low,
-                        event_type="RANGE_SWEEP",
+                        event_type="RANGE_LOW_SWEEP",
                         timeframe=tf,
                         is_taken=True,
                         close_back_inside=current_candle['close'] > narrative.range_low,
-                        displacement_away=current_candle['close'] > prev_candle['high'] if prev_candle else False
+                        displacement_away=(
+                            current_candle['close'] > prev_candle['high'] if prev_candle else False
+                        ),
+                        strength=0.8
                     )
-                    if event.is_valid():
-                        events.append(event)
-            
-            # Filter for strongest events only
-            if events:
-                strongest_event = max(events, key=lambda x: x.strength)
-                events = [strongest_event]  # Only take the strongest liquidity event
+                    events.append(event)
         
         except Exception as e:
             self.log.debug(f"Liquidity detection error for {symbol}: {e}")
+        
+        # Filter for strongest and most recent events
+        if events:
+            # Sort by strength then recency
+            events.sort(key=lambda x: (x.strength, x.candle_index), reverse=True)
+            # Take top 2 strongest events
+            events = events[:2]
         
         return events
     
@@ -347,7 +442,6 @@ class ROMEOTPTEngine:
         analysis = MarketStateAnalysis()
         
         try:
-            # Get 1H data for state analysis
             ohlcv_1h = await self._fetch_ohlcv_with_timeout(exchange, symbol, "1h", 100)
             if not ohlcv_1h or len(ohlcv_1h) < 30:
                 analysis.state = MarketState.UNCLEAR
@@ -355,37 +449,53 @@ class ROMEOTPTEngine:
             
             df_1h = pd.DataFrame(ohlcv_1h, columns=["timestamp", "open", "high", "low", "close", "volume"])
             
-            # Calculate basic metrics
-            recent_high = df_1h['high'].iloc[-10:].max()
-            recent_low = df_1h['low'].iloc[-10:].min()
-            current_price = df_1h['close'].iloc[-1]
+            # Get recent price action
+            recent_df = df_1h.iloc[-20:]
+            recent_high = recent_df['high'].max()
+            recent_low = recent_df['low'].min()
+            current_price = recent_df['close'].iloc[-1]
+            range_height_pct = (recent_high - recent_low) / recent_low * 100
             
-            # Check for ACCUMULATION (repeated sweeps, no sustained displacement)
+            # === ACCUMULATION DETECTION ===
+            # Look for multiple sweeps with rejections
             sweep_count = 0
+            rejection_count = 0
+            
             for i in range(-15, -1):
-                if abs(i) > len(df_1h) - 1:
+                if abs(i) >= len(df_1h) - 1:
                     continue
                 
                 candle = df_1h.iloc[i]
                 next_candle = df_1h.iloc[i+1]
                 
-                # Check for sweep and rejection
-                if (candle['high'] > df_1h['high'].iloc[max(i-5, 0):i].max() and 
-                    next_candle['close'] < candle['high']):
-                    sweep_count += 1
-                elif (candle['low'] < df_1h['low'].iloc[max(i-5, 0):i].min() and 
-                      next_candle['close'] > candle['low']):
-                    sweep_count += 1
+                # Check for high sweep and rejection
+                if candle['high'] > df_1h['high'].iloc[max(i-5, 0):i].max():
+                    if next_candle['close'] < candle['close']:
+                        sweep_count += 1
+                        if next_candle['close'] < next_candle['open']:
+                            rejection_count += 1
+                
+                # Check for low sweep and rejection
+                elif candle['low'] < df_1h['low'].iloc[max(i-5, 0):i].min():
+                    if next_candle['close'] > candle['close']:
+                        sweep_count += 1
+                        if next_candle['close'] > next_candle['open']:
+                            rejection_count += 1
             
-            if sweep_count >= 2 and (recent_high - recent_low) / recent_low < 0.05:
+            accumulation_score = (sweep_count / 15) * 0.5 + (rejection_count / max(sweep_count, 1)) * 0.5
+            
+            if accumulation_score > 0.4 and range_height_pct < 6:
                 analysis.state = MarketState.ACCUMULATION
-                analysis.confidence = min(0.8, sweep_count / 4)
-                analysis.reasons.append(f"Multiple sweeps detected ({sweep_count})")
-                analysis.reasons.append("Price contained in tight range")
+                analysis.confidence = min(0.9, accumulation_score)
+                analysis.reasons.append(f"{sweep_count} sweeps with {rejection_count} rejections")
+                analysis.reasons.append(f"Tight range: {range_height_pct:.1f}%")
                 return analysis
             
-            # Check for EXPANSION (strong displacement, clean directional closes)
-            directional_bars = 0
+            # === EXPANSION DETECTION ===
+            # Check for strong directional movement
+            directional_strength = 0
+            strong_bars = 0
+            
             for i in range(-8, 0):
                 if abs(i) >= len(df_1h):
                     continue
@@ -395,38 +505,43 @@ class ROMEOTPTEngine:
                 total_range = candle['high'] - candle['low']
                 
                 if body_size / total_range > 0.7:  # Strong real body
+                    strong_bars += 1
                     if candle['close'] > candle['open']:
-                        directional_bars += 1
+                        directional_strength += 1
                     else:
-                        directional_bars -= 1
+                        directional_strength -= 1
             
-            if abs(directional_bars) >= 5:
+            expansion_score = (strong_bars / 8) * 0.5 + (abs(directional_strength) / 8) * 0.5
+            
+            if expansion_score > 0.5 and abs(directional_strength) >= 4:
                 analysis.state = MarketState.EXPANSION
-                analysis.confidence = min(0.9, abs(directional_bars) / 8)
-                direction = "BULLISH" if directional_bars > 0 else "BEARISH"
+                analysis.confidence = min(0.9, expansion_score)
+                direction = "BULLISH" if directional_strength > 0 else "BEARISH"
                 analysis.reasons.append(f"Strong {direction} expansion")
-                analysis.reasons.append(f"{abs(directional_bars)} strong directional bars")
+                analysis.reasons.append(f"{strong_bars} strong bars, net direction: {directional_strength}")
                 return analysis
             
-            # Check for DISTRIBUTION (prior trend exists, momentum weakening)
-            # Get 4H trend context
-            ohlcv_4h = await self._fetch_ohlcv_with_timeout(exchange, symbol, "4h", 30)
-            if ohlcv_4h:
-                df_4h = pd.DataFrame(ohlcv_4h, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            # === DISTRIBUTION DETECTION ===
+            # Need prior trend + weakening momentum
+            if len(df_1h) >= 50:
+                # Check 4H trend via multiple 1H candles
+                old_close = df_1h['close'].iloc[-50]
+                recent_close = df_1h['close'].iloc[-10]
+                trend_pct = (recent_close - old_close) / old_close * 100
                 
-                # Simple trend detection
-                early_close = df_4h['close'].iloc[-10]
-                late_close = df_4h['close'].iloc[-1]
-                trend_direction = "UP" if late_close > early_close * 1.03 else "DOWN" if late_close < early_close * 0.97 else "SIDEWAYS"
-                
-                if trend_direction != "SIDEWAYS":
-                    # Check for failed continuation
-                    recent_momentum = self._calculate_momentum(df_1h)
-                    if abs(recent_momentum) < 0.5:  # Momentum weakening
+                if abs(trend_pct) > 5:  # Significant prior trend
+                    # Check recent momentum
+                    recent_momentum = self._calculate_momentum(df_1h.iloc[-10:])
+                    early_momentum = self._calculate_momentum(df_1h.iloc[-20:-10])
+                    
+                    momentum_ratio = abs(recent_momentum) / max(abs(early_momentum), 0.001)
+                    
+                    if momentum_ratio < 0.5:  # Momentum weakened by >50%
                         analysis.state = MarketState.DISTRIBUTION
                         analysis.confidence = 0.7
-                        analysis.reasons.append(f"Prior {trend_direction} trend exists")
-                        analysis.reasons.append("Momentum weakening")
+                        trend_dir = "UP" if trend_pct > 0 else "DOWN"
+                        analysis.reasons.append(f"Prior {trend_dir} trend ({trend_pct:.1f}%)")
+                        analysis.reasons.append(f"Momentum weakened: {momentum_ratio:.2f}")
                         return analysis
             
             analysis.state = MarketState.UNCLEAR
@@ -438,114 +553,189 @@ class ROMEOTPTEngine:
         
         return analysis
     
-    async def analyze_displacement(self, exchange, symbol: str, direction: str) -> DisplacementAnalysis:
+    async def analyze_displacement(self, exchange, symbol: str, direction: str, liquidity_tf: str) -> DisplacementAnalysis:
         """STEP 5.2: DISPLACEMENT ANALYSIS"""
         analysis = DisplacementAnalysis()
         
         try:
-            # Use 15m for displacement analysis
-            ohlcv_15m = await self._fetch_ohlcv_with_timeout(exchange, symbol, "15m", 10)
-            if not ohlcv_15m or len(ohlcv_15m) < 3:
+            # Determine appropriate TF for displacement based on liquidity TF
+            tf_map = {
+                "4h": "1h",
+                "1h": "30m",
+                "30m": "15m",
+                "15m": "5m",
+                "5m": "3m"
+            }
+            
+            displacement_tf = tf_map.get(liquidity_tf, "15m")
+            
+            ohlcv = await self._fetch_ohlcv_with_timeout(exchange, symbol, displacement_tf, 20)
+            if not ohlcv or len(ohlcv) < 5:
                 return analysis
             
-            df_15m = pd.DataFrame(ohlcv_15m, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
             
-            # Get the displacement candle (should be recent)
-            for i in range(-3, 0):
-                if abs(i) >= len(df_15m):
+            # Look for displacement candle in last 3-5 candles
+            for i in range(-5, 0):
+                if abs(i) >= len(df):
                     continue
                 
-                candle = df_15m.iloc[i]
+                candle = df.iloc[i]
+                prev_candle = df.iloc[i-1] if i > -len(df) else None
+                next_candle = df.iloc[i+1] if i < -1 else None
+                
                 body_size = abs(candle['close'] - candle['open'])
                 total_range = candle['high'] - candle['low']
                 
-                if body_size / total_range >= 0.6:  # Strong real body
-                    analysis.has_displacement = True
-                    analysis.candle_body_ratio = body_size / total_range
-                    analysis.displacement_direction = "BULLISH" if candle['close'] > candle['open'] else "BEARISH"
+                if total_range == 0:
+                    continue
+                
+                body_ratio = body_size / total_range
+                
+                if body_ratio >= MIN_DISPLACEMENT_RATIO:
+                    # Check if it's directional
+                    is_bullish = candle['close'] > candle['open']
+                    is_bearish = candle['close'] < candle['open']
                     
-                    # Check if closes through minor structure
-                    if i < -1:
-                        prev_candle = df_15m.iloc[i-1]
-                        if analysis.displacement_direction == "BULLISH":
-                            analysis.closes_through_structure = candle['close'] > prev_candle['high']
-                            # Leaves inefficiency (gap)
-                            analysis.leaves_inefficiency = candle['low'] > prev_candle['high']
-                        else:
-                            analysis.closes_through_structure = candle['close'] < prev_candle['low']
-                            analysis.leaves_inefficiency = candle['high'] < prev_candle['low']
-                    
-                    break
+                    if (direction == "LONG" and is_bullish) or (direction == "SHORT" and is_bearish):
+                        analysis.has_displacement = True
+                        analysis.candle_body_ratio = body_ratio
+                        analysis.displacement_direction = "BULLISH" if is_bullish else "BEARISH"
+                        analysis.candle_data = {
+                            'open': float(candle['open']),
+                            'high': float(candle['high']),
+                            'low': float(candle['low']),
+                            'close': float(candle['close']),
+                            'timestamp': candle['timestamp']
+                        }
+                        
+                        # Check if closes through structure
+                        if prev_candle is not None:
+                            if direction == "LONG":
+                                analysis.closes_through_structure = candle['close'] > prev_candle['high']
+                                analysis.leaves_inefficiency = candle['low'] > prev_candle['high']
+                            else:
+                                analysis.closes_through_structure = candle['close'] < prev_candle['low']
+                                analysis.leaves_inefficiency = candle['high'] < prev_candle['low']
+                        
+                        # Found valid displacement candle
+                        break
         
         except Exception as e:
             self.log.debug(f"Displacement analysis error for {symbol}: {e}")
         
         return analysis
     
-    async def analyze_structure_shift(self, exchange, symbol: str, direction: str) -> StructureShift:
+    async def analyze_structure_shift(self, exchange, symbol: str, direction: str, entry_tf: str) -> StructureShift:
         """STEP 5.3: MARKET STRUCTURE SHIFT"""
         shift = StructureShift()
         
         try:
-            # Use 5m for structure shift detection
-            ohlcv_5m = await self._fetch_ohlcv_with_timeout(exchange, symbol, "5m", 20)
-            if not ohlcv_5m or len(ohlcv_5m) < 10:
+            ohlcv = await self._fetch_ohlcv_with_timeout(exchange, symbol, entry_tf, 50)
+            if not ohlcv or len(ohlcv) < 20:
                 return shift
             
-            df_5m = pd.DataFrame(ohlcv_5m, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
             
-            # Find swing highs and lows
+            # Find recent swing points
             swing_highs = []
             swing_lows = []
             
-            for i in range(1, len(df_5m) - 1):
-                if (df_5m['high'].iloc[i] > df_5m['high'].iloc[i-1] and 
-                    df_5m['high'].iloc[i] > df_5m['high'].iloc[i+1]):
-                    swing_highs.append((i, df_5m['high'].iloc[i]))
+            for i in range(2, len(df) - 2):
+                if (df['high'].iloc[i] > df['high'].iloc[i-1] and 
+                    df['high'].iloc[i] > df['high'].iloc[i-2] and
+                    df['high'].iloc[i] > df['high'].iloc[i+1] and
+                    df['high'].iloc[i] > df['high'].iloc[i+2]):
+                    swing_highs.append((i, df['high'].iloc[i]))
                 
-                if (df_5m['low'].iloc[i] < df_5m['low'].iloc[i-1] and 
-                    df_5m['low'].iloc[i] < df_5m['low'].iloc[i+1]):
-                    swing_lows.append((i, df_5m['low'].iloc[i]))
+                if (df['low'].iloc[i] < df['low'].iloc[i-1] and 
+                    df['low'].iloc[i] < df['low'].iloc[i-2] and
+                    df['low'].iloc[i] < df['low'].iloc[i+1] and
+                    df['low'].iloc[i] < df['low'].iloc[i+2]):
+                    swing_lows.append((i, df['low'].iloc[i]))
             
-            # Check for structure break
-            current_price = df_5m['close'].iloc[-1]
+            current_price = df['close'].iloc[-1]
             
             if direction == "LONG":
-                # Need to break a lower high
+                # Need to break a lower high (downtrend structure)
                 if len(swing_highs) >= 2:
-                    recent_swing_high = swing_highs[-1][1]
-                    prev_swing_high = swing_highs[-2][1] if len(swing_highs) >= 2 else 0
+                    recent_high = swing_highs[-1][1]
+                    prev_high = swing_highs[-2][1] if len(swing_highs) >= 2 else 0
                     
-                    if prev_swing_high > recent_swing_high:  # Lower high exists
-                        shift.has_shift = current_price > recent_swing_high
+                    if prev_high > recent_high:  # Lower high pattern
+                        shift.has_shift = current_price > recent_high
                         shift.shift_type = "BULLISH_BREAK"
-                        shift.broken_level = recent_swing_high
+                        shift.broken_level = recent_high
                         shift.confirmation_price = current_price
+                        shift.timeframe = entry_tf
             
             else:  # SHORT
-                # Need to break a higher low
+                # Need to break a higher low (uptrend structure)
                 if len(swing_lows) >= 2:
-                    recent_swing_low = swing_lows[-1][1]
-                    prev_swing_low = swing_lows[-2][1] if len(swing_lows) >= 2 else float('inf')
+                    recent_low = swing_lows[-1][1]
+                    prev_low = swing_lows[-2][1] if len(swing_lows) >= 2 else float('inf')
                     
-                    if prev_swing_low < recent_swing_low:  # Higher low exists
-                        shift.has_shift = current_price < recent_swing_low
+                    if prev_low < recent_low:  # Higher low pattern
+                        shift.has_shift = current_price < recent_low
                         shift.shift_type = "BEARISH_BREAK"
-                        shift.broken_level = recent_swing_low
+                        shift.broken_level = recent_low
                         shift.confirmation_price = current_price
+                        shift.timeframe = entry_tf
         
         except Exception as e:
             self.log.debug(f"Structure shift error for {symbol}: {e}")
         
         return shift
     
+    async def determine_entry_tf(self, liquidity_tf: str) -> str:
+        """Determine entry TF based on liquidity TF"""
+        tf_mapping = {
+            "4h": "15m",
+            "1h": "15m",
+            "30m": "5m",
+            "15m": "5m",
+            "5m": "1m"
+        }
+        return tf_mapping.get(liquidity_tf, "15m")
+    
+    async def determine_entry_zone(self, direction: str, displacement_candle: Dict, current_price: float) -> Tuple[float, float]:
+        """Determine entry zone based on displacement candle"""
+        if not displacement_candle:
+            # Fallback to tight zone around current price
+            if direction == "LONG":
+                return (
+                    current_price * (1 - MAX_ENTRY_DISTANCE_PCT/200),
+                    current_price * (1 + MAX_ENTRY_DISTANCE_PCT/200)
+                )
+            else:
+                return (
+                    current_price * (1 - MAX_ENTRY_DISTANCE_PCT/200),
+                    current_price * (1 + MAX_ENTRY_DISTANCE_PCT/200)
+                )
+        
+        candle_close = displacement_candle.get('close', current_price)
+        
+        if direction == "LONG":
+            # Entry just above displacement candle close
+            return (
+                candle_close * 0.999,  # 0.1% below
+                candle_close * 1.002   # 0.2% above
+            )
+        else:
+            # Entry just below displacement candle close
+            return (
+                candle_close * 0.998,  # 0.2% below
+                candle_close * 1.001   # 0.1% above
+            )
+    
     async def find_take_profit_liquidity(self, exchange, symbol: str, direction: str, 
                                        narrative: HTFNarrative, entry_tf: str) -> float:
         """STEP 6: TAKE PROFIT ENGINE - Find untouched external liquidity"""
         
-        # Rule: TP liquidity must be on higher TF than entry
+        # TP must be on higher TF than entry
         higher_tf_map = {
-            "5m": ["15m", "30m", "1h"],
+            "1m": ["5m", "15m", "30m", "1h"],
+            "5m": ["15m", "30m", "1h", "4h"],
             "15m": ["30m", "1h", "4h"],
             "30m": ["1h", "4h"],
             "1h": ["4h"]
@@ -563,50 +753,115 @@ class ROMEOTPTEngine:
                 current_price = df['close'].iloc[-1]
                 
                 if direction == "LONG":
-                    # Find untouched swing highs (liquidity above)
-                    swing_highs = self._find_swing_highs(df)
-                    valid_highs = []
+                    # Find untouched swing highs
+                    swing_highs = self._find_swing_highs(df, 5)
                     
-                    for high in swing_highs[-5:]:  # Recent swings
+                    for high in reversed(swing_highs[-10:]):  # Check most recent first
                         if high > current_price * 1.005:  # Must be above current price
-                            # Check if it's been taken recently
+                            # Check if it's been taken recently (last 5 candles)
                             recent_max = df['high'].iloc[-5:].max()
                             if high > recent_max:  # Untouched
-                                valid_highs.append(high)
-                    
-                    if valid_highs:
-                        # Take the closest valid liquidity
-                        return min(valid_highs)
+                                return high
                 
                 else:  # SHORT
-                    # Find untouched swing lows (liquidity below)
-                    swing_lows = self._find_swing_lows(df)
-                    valid_lows = []
+                    # Find untouched swing lows
+                    swing_lows = self._find_swing_lows(df, 5)
                     
-                    for low in swing_lows[-5:]:
+                    for low in reversed(swing_lows[-10:]):
                         if low < current_price * 0.995:  # Must be below current price
                             recent_min = df['low'].iloc[-5:].min()
                             if low < recent_min:  # Untouched
-                                valid_lows.append(low)
-                    
-                    if valid_lows:
-                        # Take the closest valid liquidity
-                        return max(valid_lows)
+                                return low
         
         except Exception as e:
             self.log.debug(f"TP liquidity error for {symbol}: {e}")
         
-        # Fallback: Use HTF narrative levels
+        # Fallback to HTF narrative levels
+        current_price = await self._get_current_price(exchange, symbol)
+        
         if direction == "LONG" and narrative.external_liquidity_levels:
             for level in sorted(narrative.external_liquidity_levels):
                 if level > current_price * 1.01:
                     return level
+        
         elif direction == "SHORT" and narrative.external_liquidity_levels:
             for level in sorted(narrative.external_liquidity_levels, reverse=True):
                 if level < current_price * 0.99:
                     return level
         
         return 0.0
+    
+    async def check_entry_tf_invalidation(self, exchange, symbol: str, entry_tf: str, 
+                                        direction: str, entry_zone: Tuple[float, float]) -> bool:
+        """Check if entry TF has invalidated the setup"""
+        try:
+            ohlcv = await self._fetch_ohlcv_with_timeout(exchange, symbol, entry_tf, 3)
+            if not ohlcv or len(ohlcv) < 2:
+                return True  # Invalid if no data
+            
+            df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            
+            latest_candle = df.iloc[-1]
+            entry_low, entry_high = entry_zone
+            
+            if direction == "LONG":
+                # Invalid if price closes below entry zone
+                if latest_candle['close'] < entry_low:
+                    return True
+                # Invalid if strong rejection candle forms
+                if latest_candle['close'] < latest_candle['open'] and abs(latest_candle['close'] - latest_candle['open']) / latest_candle['open'] > 0.003:
+                    return True
+            
+            else:  # SHORT
+                # Invalid if price closes above entry zone
+                if latest_candle['close'] > entry_high:
+                    return True
+                # Invalid if strong rejection candle forms
+                if latest_candle['close'] > latest_candle['open'] and abs(latest_candle['close'] - latest_candle['open']) / latest_candle['open'] > 0.003:
+                    return True
+            
+            return False
+        
+        except Exception as e:
+            self.log.debug(f"Entry TF invalidation check error: {e}")
+            return True  # Invalid on error
+    
+    async def determine_expansion_direction(self, exchange, symbol: str) -> str:
+        """Determine expansion direction from structure analysis"""
+        try:
+            ohlcv_1h = await self._fetch_ohlcv_with_timeout(exchange, symbol, "1h", 30)
+            if not ohlcv_1h:
+                return "LONG"
+            
+            df_1h = pd.DataFrame(ohlcv_1h, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            
+            # Check for recent structure break
+            swing_highs = self._find_swing_highs(df_1h, 3)
+            swing_lows = self._find_swing_lows(df_1h, 3)
+            
+            current_price = df_1h['close'].iloc[-1]
+            
+            if swing_highs and current_price > swing_highs[-1]:
+                return "LONG"
+            
+            if swing_lows and current_price < swing_lows[-1]:
+                return "SHORT"
+            
+            # Check momentum
+            momentum_5 = self._calculate_momentum(df_1h.iloc[-5:])
+            momentum_10 = self._calculate_momentum(df_1h.iloc[-10:])
+            
+            if momentum_5 > 0 and momentum_10 > 0:
+                return "LONG"
+            elif momentum_5 < 0 and momentum_10 < 0:
+                return "SHORT"
+            
+            # Default based on recent close
+            return "LONG" if df_1h['close'].iloc[-1] > df_1h['close'].iloc[-5] else "SHORT"
+            
+        except Exception as e:
+            self.log.debug(f"Expansion direction error: {e}")
+            return "LONG"
     
     async def generate_signal(self, exchange, symbol: str) -> Optional[ROMEOTPTSignal]:
         """Complete ROMEOTPT signal generation"""
@@ -622,23 +877,24 @@ class ROMEOTPTEngine:
             # Rule: If price is mid-range → STOP
             if narrative.market_type == "RANGE":
                 current_price = await self._get_current_price(exchange, symbol)
-                if (narrative.mid_range[0] <= current_price <= narrative.mid_range[1]):
+                if current_price > 0 and (narrative.mid_range[0] <= current_price <= narrative.mid_range[1]):
                     self.log.debug(f"{symbol}: Price in mid-range, no trade")
                     return None
             
             # === STEP 2: LIQUIDITY DETECTION ===
             liquidity_events = await self.detect_liquidity_events(exchange, symbol, narrative)
+            
+            # Rule: If no external liquidity taken → STOP
+            if not liquidity_events:
+                self.log.debug(f"{symbol}: No valid liquidity events")
+                return None
+            
             signal.liquidity_taken = [{
                 "level": e.level,
                 "type": e.event_type,
                 "timeframe": e.timeframe,
                 "strength": e.strength
             } for e in liquidity_events]
-            
-            # Rule: If no external liquidity taken → STOP
-            if not liquidity_events:
-                self.log.debug(f"{symbol}: No valid liquidity events")
-                return None
             
             # Take strongest liquidity event
             strongest_event = max(liquidity_events, key=lambda x: x.strength)
@@ -655,14 +911,20 @@ class ROMEOTPTEngine:
             # === STEP 4: SETUP SELECTION ===
             if market_state.state == MarketState.ACCUMULATION:
                 setup_type = SetupType.SWEEP_REVERSAL
-                direction = "LONG" if strongest_event.event_type in ["EQUAL_LOW", "RANGE_SWEEP"] else "SHORT"
+                # Direction based on liquidity event type
+                if strongest_event.event_type in ["SWING_LOW", "EQUAL_LOW", "RANGE_LOW_SWEEP"]:
+                    direction = "LONG"
+                else:
+                    direction = "SHORT"
+                    
             elif market_state.state == MarketState.EXPANSION:
                 setup_type = SetupType.PULLBACK_CONTINUATION
-                # Need additional logic for expansion direction
-                direction = await self._determine_expansion_direction(exchange, symbol)
+                direction = await self.determine_expansion_direction(exchange, symbol)
+                
             elif market_state.state == MarketState.DISTRIBUTION:
                 setup_type = SetupType.FAILED_BREAKOUT
                 direction = "SHORT"  # Typically short in distribution
+                
             else:
                 return None
             
@@ -673,13 +935,22 @@ class ROMEOTPTEngine:
             # 5.1 Liquidity Taken (already confirmed)
             
             # 5.2 Displacement
-            displacement = await self.analyze_displacement(exchange, symbol, direction)
+            displacement = await self.analyze_displacement(
+                exchange, symbol, direction, strongest_event.timeframe
+            )
+            
             if not displacement.is_valid():
                 self.log.debug(f"{symbol}: No valid displacement")
                 return None
             
+            signal.displacement_candle = displacement.candle_data
+            
             # 5.3 Market Structure Shift
-            structure_shift = await self.analyze_structure_shift(exchange, symbol, direction)
+            entry_tf = await self.determine_entry_tf(strongest_event.timeframe)
+            structure_shift = await self.analyze_structure_shift(
+                exchange, symbol, direction, entry_tf
+            )
+            
             if not structure_shift.is_valid():
                 self.log.debug(f"{symbol}: No structure shift")
                 return None
@@ -689,28 +960,26 @@ class ROMEOTPTEngine:
             signal.current_price = current_price
             
             if direction == "LONG":
-                # Longs ONLY in discount
                 if not (narrative.discount_zone[0] <= current_price <= narrative.discount_zone[1]):
                     self.log.debug(f"{symbol}: Long not in discount zone")
                     return None
-                entry_zone = (
-                    current_price * (1 - MAX_ENTRY_DISTANCE_PCT/100),
-                    current_price * (1 + MAX_ENTRY_DISTANCE_PCT/100)
-                )
-                entry_tf = "15m"  # Execution TF
-            else:  # SHORT
-                # Shorts ONLY in premium
+            else:
                 if not (narrative.premium_zone[0] <= current_price <= narrative.premium_zone[1]):
                     self.log.debug(f"{symbol}: Short not in premium zone")
                     return None
-                entry_zone = (
-                    current_price * (1 - MAX_ENTRY_DISTANCE_PCT/100),
-                    current_price * (1 + MAX_ENTRY_DISTANCE_PCT/100)
-                )
-                entry_tf = "15m"  # Execution TF
+            
+            # Determine entry zone based on displacement candle
+            entry_zone = await self.determine_entry_zone(
+                direction, displacement.candle_data, current_price
+            )
             
             signal.entry_zone = entry_zone
             signal.entry_tf = entry_tf
+            
+            # Check entry TF invalidation
+            if await self.check_entry_tf_invalidation(exchange, symbol, entry_tf, direction, entry_zone):
+                self.log.debug(f"{symbol}: Entry TF invalidated")
+                return None
             
             # === STEP 6: TAKE PROFIT ===
             tp_liquidity = await self.find_take_profit_liquidity(
@@ -734,7 +1003,8 @@ class ROMEOTPTEngine:
                 strongest_event.strength,
                 market_state.confidence,
                 displacement.candle_body_ratio,
-                1.0 if structure_shift.has_shift else 0.0
+                1.0 if structure_shift.has_shift else 0.0,
+                min(1.0, abs(tp_liquidity - current_price) / current_price * 10)  # TP distance factor
             )
             
             if signal.signal_score < 0.7:
@@ -750,7 +1020,6 @@ class ROMEOTPTEngine:
     # ============ HELPER METHODS ============
     
     async def _fetch_ohlcv_with_timeout(self, exchange, symbol: str, timeframe: str, limit: int):
-        """Fetch OHLCV with timeout"""
         try:
             return await asyncio.wait_for(
                 exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit),
@@ -761,36 +1030,13 @@ class ROMEOTPTEngine:
             return None
     
     async def _get_current_price(self, exchange, symbol: str) -> float:
-        """Get current price"""
         try:
             ticker = await exchange.fetch_ticker(symbol)
             return ticker.get('last', 0)
         except:
             return 0
     
-    async def _determine_expansion_direction(self, exchange, symbol: str) -> str:
-        """Determine expansion direction from 1H data"""
-        try:
-            ohlcv_1h = await self._fetch_ohlcv_with_timeout(exchange, symbol, "1h", 10)
-            if not ohlcv_1h:
-                return "LONG"  # Default
-            
-            df_1h = pd.DataFrame(ohlcv_1h, columns=["timestamp", "open", "high", "low", "close", "volume"])
-            
-            bullish_bars = 0
-            for i in range(-5, 0):
-                if abs(i) >= len(df_1h):
-                    continue
-                candle = df_1h.iloc[i]
-                if candle['close'] > candle['open']:
-                    bullish_bars += 1
-            
-            return "LONG" if bullish_bars >= 3 else "SHORT"
-        except:
-            return "LONG"
-    
     def _find_swing_highs(self, df: pd.DataFrame, lookback: int = 3) -> List[float]:
-        """Find swing highs in dataframe"""
         highs = []
         for i in range(lookback, len(df) - lookback):
             if df['high'].iloc[i] == df['high'].iloc[i-lookback:i+lookback+1].max():
@@ -798,7 +1044,6 @@ class ROMEOTPTEngine:
         return highs
     
     def _find_swing_lows(self, df: pd.DataFrame, lookback: int = 3) -> List[float]:
-        """Find swing lows in dataframe"""
         lows = []
         for i in range(lookback, len(df) - lookback):
             if df['low'].iloc[i] == df['low'].iloc[i-lookback:i+lookback+1].min():
@@ -806,23 +1051,18 @@ class ROMEOTPTEngine:
         return lows
     
     def _find_external_liquidity(self, df: pd.DataFrame) -> List[float]:
-        """Find external liquidity levels (significant swing points)"""
         levels = []
-        
-        # Find significant swing highs
         swing_highs = self._find_swing_highs(df, 5)
+        swing_lows = self._find_swing_lows(df, 5)
+        
         for high in swing_highs[-10:]:
             levels.append(high)
-        
-        # Find significant swing lows
-        swing_lows = self._find_swing_lows(df, 5)
         for low in swing_lows[-10:]:
             levels.append(low)
         
         return sorted(set(levels))
     
     def _calculate_sweep_strength(self, df: pd.DataFrame, sweep_idx: int, sweep_type: str) -> float:
-        """Calculate strength of a liquidity sweep (0-1)"""
         if sweep_idx >= len(df) - 1:
             return 0.5
         
@@ -831,68 +1071,66 @@ class ROMEOTPTEngine:
         
         strength = 0.5
         
-        # 1. Wick size relative to body
         if sweep_type == "HIGH":
             wick_size = sweep_candle['high'] - max(sweep_candle['open'], sweep_candle['close'])
             body_size = abs(sweep_candle['close'] - sweep_candle['open'])
             if body_size > 0:
                 wick_ratio = wick_size / body_size
                 if wick_ratio > 1.5:
-                    strength += 0.2  # Long wick = strong liquidity
-        else:  # LOW
+                    strength += 0.2
+                elif wick_ratio > 2.0:
+                    strength += 0.3
+            
+            if next_candle['close'] < sweep_candle['close']:
+                strength += 0.3
+        
+        else:
             wick_size = min(sweep_candle['open'], sweep_candle['close']) - sweep_candle['low']
             body_size = abs(sweep_candle['close'] - sweep_candle['open'])
             if body_size > 0:
                 wick_ratio = wick_size / body_size
                 if wick_ratio > 1.5:
                     strength += 0.2
-        
-        # 2. Next candle reaction
-        if sweep_type == "HIGH":
-            if next_candle['close'] < sweep_candle['close']:
-                strength += 0.3
-        else:
+                elif wick_ratio > 2.0:
+                    strength += 0.3
+            
             if next_candle['close'] > sweep_candle['close']:
                 strength += 0.3
         
         return min(strength, 1.0)
     
-    def _calculate_momentum(self, df: pd.DataFrame, period: int = 5) -> float:
-        """Calculate price momentum"""
-        if len(df) < period + 1:
+    def _calculate_momentum(self, df: pd.DataFrame) -> float:
+        if len(df) < 2:
             return 0.0
-        
-        early_close = df['close'].iloc[-period-1]
+        early_close = df['close'].iloc[0]
         late_close = df['close'].iloc[-1]
-        
         return (late_close - early_close) / early_close
     
     def _calculate_signal_score(self, sweep_strength: float, state_confidence: float,
-                              displacement_ratio: float, structure_score: float) -> float:
-        """Calculate overall signal score (0-1)"""
-        weights = [0.3, 0.25, 0.25, 0.2]  # Liquidity, State, Displacement, Structure
-        scores = [sweep_strength, state_confidence, displacement_ratio, structure_score]
-        
+                              displacement_ratio: float, structure_score: float, tp_factor: float) -> float:
+        weights = [0.25, 0.25, 0.2, 0.2, 0.1]
+        scores = [sweep_strength, state_confidence, displacement_ratio, structure_score, tp_factor]
         return sum(w * s for w, s in zip(weights, scores))
 
-# ---------------- SIGNAL TRACKER (UPDATED) ----------------
+# ---------------- SIGNAL TRACKER ----------------
 class ROMEOTPTSignalTracker:
-    """Signal tracker for ROMEOTPT signals"""
     
     def __init__(self):
-        self.active_signals = {}  # symbol -> ROMEOTPTSignal
+        self.active_signals = {}
         self.signal_history = []
     
     def should_alert(self, signal: ROMEOTPTSignal) -> Tuple[bool, str]:
-        """Check if we should alert for this signal"""
         symbol = signal.asset
         
         if symbol not in self.active_signals:
             return True, "New signal"
         
-        old_signal = self.active_signals[symbol]
+        old_data = self.active_signals[symbol]
+        old_signal = old_data.get('signal')
         
-        # Check if old signal expired
+        if not old_signal:
+            return True, "Old signal corrupted"
+        
         old_time = datetime.datetime.fromisoformat(old_signal.timestamp)
         new_time = datetime.datetime.fromisoformat(signal.timestamp)
         age_hours = (new_time - old_time).total_seconds() / 3600
@@ -901,27 +1139,22 @@ class ROMEOTPTSignalTracker:
             self.remove_signal(symbol)
             return True, "Old signal expired"
         
-        # Check if same setup
         if old_signal.setup_type != signal.setup_type:
             return True, "Setup type changed"
         
-        # Check if same direction
         if old_signal.direction != signal.direction:
             return True, "Direction changed"
         
-        # Check if TP level changed significantly
         tp_diff = abs(old_signal.take_profit_liquidity - signal.take_profit_liquidity)
         tp_diff_pct = tp_diff / old_signal.take_profit_liquidity * 100 if old_signal.take_profit_liquidity > 0 else 0
         
-        if tp_diff_pct > 2.0:  # TP moved > 2%
+        if tp_diff_pct > 2.0:
             return True, f"TP moved {tp_diff_pct:.1f}%"
         
-        # Check if score improved
         if signal.signal_score - old_signal.signal_score > 0.1:
             return True, f"Score improved {old_signal.signal_score:.2f}→{signal.signal_score:.2f}"
         
-        # Check cooldown
-        last_alerted = self.active_signals[symbol].get('last_alerted')
+        last_alerted = old_data.get('last_alerted')
         if last_alerted:
             time_since_alert = (new_time - last_alerted).total_seconds() / 60
             if time_since_alert < SIGNAL_COOLDOWN_MINUTES:
@@ -930,10 +1163,9 @@ class ROMEOTPTSignalTracker:
         return False, "Similar signal active"
     
     def update_signal(self, signal: ROMEOTPTSignal, alerted: bool = False):
-        """Update or add signal"""
         symbol = signal.asset
         
-        signal_dict = {
+        signal_data = {
             'signal': signal,
             'first_seen': datetime.datetime.fromisoformat(signal.timestamp),
             'alert_count': 0,
@@ -941,27 +1173,38 @@ class ROMEOTPTSignalTracker:
         }
         
         if alerted:
-            signal_dict['last_alerted'] = datetime.datetime.utcnow()
-            signal_dict['alert_count'] = 1
+            signal_data['last_alerted'] = datetime.datetime.utcnow()
+            signal_data['alert_count'] = 1
         
-        self.active_signals[symbol] = signal_dict
+        self.active_signals[symbol] = signal_data
     
     def remove_signal(self, symbol: str):
-        """Remove signal from active tracking"""
         if symbol in self.active_signals:
             signal_data = self.active_signals.pop(symbol)
             signal_data['status'] = 'expired'
             signal_data['expired_at'] = datetime.datetime.utcnow()
             self.signal_history.append(signal_data)
+    
+    def cleanup_old_signals(self):
+        now = datetime.datetime.utcnow()
+        expired = []
+        
+        for symbol, data in self.active_signals.items():
+            age_hours = (now - data['first_seen']).total_seconds() / 3600
+            if age_hours > SIGNAL_VALIDITY_HOURS:
+                expired.append(symbol)
+        
+        for symbol in expired:
+            self.remove_signal(symbol)
+        
+        if expired:
+            log.info(f"Cleaned up {len(expired)} expired signals")
 
-# ---------------- TELEGRAM OUTPUT ----------------
+# ---------------- TELEGRAM ----------------
 async def send_romeopt_alert(signal: ROMEOTPTSignal):
-    """Send ROMEOTPT signal in the mandatory format"""
     try:
-        # Get signal details
         output = signal.to_output_format()
         
-        # Format for Telegram
         emoji = "🟢" if signal.direction == "LONG" else "🔴"
         state_emoji = {
             MarketState.ACCUMULATION: "🟡",
@@ -969,7 +1212,6 @@ async def send_romeopt_alert(signal: ROMEOTPTSignal):
             MarketState.DISTRIBUTION: "🔴"
         }.get(signal.market_state, "⚪")
         
-        # Calculate approximate RR
         current_price = signal.current_price
         entry_mid = (signal.entry_zone[0] + signal.entry_zone[1]) / 2
         tp = signal.take_profit_liquidity
@@ -1009,15 +1251,12 @@ async def send_romeopt_alert(signal: ROMEOTPTSignal):
         msg += f"\n<i>Detected: {datetime.datetime.utcnow().strftime('%H:%M:%S UTC')}</i>"
         
         await send_telegram(msg)
-        
-        # Also send the raw output for verification
         await send_telegram(f"<code>{output}</code>")
         
     except Exception as e:
         log.error(f"Error sending ROMEOTPT alert: {e}")
 
 async def send_telegram(msg: str, parse_mode="HTML"):
-    """Send message to Telegram"""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram credentials not set")
         return
@@ -1035,13 +1274,9 @@ async def send_telegram(msg: str, parse_mode="HTML"):
 
 # ---------------- MAIN SCANNER ----------------
 async def romeopt_scanner_main():
-    """Main ROMEOTPT scanner"""
-    
-    # Initialize
     engine = ROMEOTPTEngine()
     tracker = ROMEOTPTSignalTracker()
     
-    # Create exchange
     exchange = ccxt.okx({
         "enableRateLimit": True,
         "options": {"defaultType": "spot"},
@@ -1049,7 +1284,6 @@ async def romeopt_scanner_main():
         "timeout": 5000,
     })
     
-    # Startup message
     startup_msg = f"""
 🚀 <b>ROMEOTPT v4.0 STARTED</b>
 <i>Pure Liquidity & Market State Engine</i>
@@ -1075,7 +1309,6 @@ async def romeopt_scanner_main():
         scan_cycle += 1
         
         try:
-            # Get top symbols by volume
             tickers = await exchange.fetch_tickers()
             usdt_pairs = []
             
@@ -1088,9 +1321,8 @@ async def romeopt_scanner_main():
             usdt_pairs.sort(key=lambda x: x[1], reverse=True)
             symbols_to_scan = [s[0] for s in usdt_pairs[:TOP_N]]
             
-            log.info(f"🔄 Scan #{scan_cycle}: {len(symbols_to_scan)} symbols")
+            log.info(f"🔄 Scan #{scan_cycle}: {len(symbols_to_scan)} symbols | Active: {len(tracker.active_signals)}")
             
-            # Scan symbols
             signals_found = 0
             tasks = []
             
@@ -1107,7 +1339,6 @@ async def romeopt_scanner_main():
                             continue
                         
                         if result and result.is_valid():
-                            # Check if we should alert
                             should_alert, reason = tracker.should_alert(result)
                             
                             if should_alert:
@@ -1136,23 +1367,8 @@ async def romeopt_scanner_main():
                             tracker.update_signal(result, alerted=True)
                             signals_found += 1
             
-            log.info(f"📊 Scan #{scan_cycle} complete: {signals_found} signals found, {len(tracker.active_signals)} active")
-            
-            # Periodic cleanup
             if scan_cycle % 10 == 0:
-                current_time = datetime.datetime.utcnow()
-                expired = []
-                
-                for symbol, data in tracker.active_signals.items():
-                    age_hours = (current_time - data['first_seen']).total_seconds() / 3600
-                    if age_hours > SIGNAL_VALIDITY_HOURS:
-                        expired.append(symbol)
-                
-                for symbol in expired:
-                    tracker.remove_signal(symbol)
-                
-                if expired:
-                    log.info(f"🧹 Cleaned up {len(expired)} expired signals")
+                tracker.cleanup_old_signals()
             
             await asyncio.sleep(SCAN_INTERVAL)
             
@@ -1173,9 +1389,7 @@ async def health():
 
 @app.get("/signals/active")
 async def get_active_signals():
-    """Get active ROMEOTPT signals"""
-    # This would need the tracker instance
-    return {"message": "Active signals endpoint - implement with tracker"}
+    return {"message": "Active signals available in memory"}
 
 # ---------------- MAIN ----------------
 async def main():
