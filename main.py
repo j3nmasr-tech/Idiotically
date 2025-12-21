@@ -33,7 +33,7 @@ TOP_N = int(os.getenv("TOP_N", 30))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 10))
 
 # Signal thresholds
-MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 2.5))  # Minimum to be valid RomeOTPT
+MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 0.5))  # Minimum to be valid RomeOTPT
 
 # Deduplication settings
 SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 15))
