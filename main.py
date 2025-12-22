@@ -1,950 +1,1508 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-TRUE ROMEOPT SCANNER (Final Refined Version) - WITH ENHANCED SWEEP & OB DATA
-- RomeOPT 6-step entry logic
-- TRUE RomeOPT TP: ONE liquidity target, no TP ladders
-- Simple but accurate market state detection
-- ATR-based tolerance for liquidity detection
-- External liquidity = range extremes (not local swings)
-- TP LOCK: No recalculation after entry
-- Telegram alerts + SQLite logging
-- Forced Filter: Momentum ≥ 0.87 OR (Momentum ≥ 0.85 AND Displacement ≥ 0.80)
-- ENHANCED: Comprehensive liquidity sweep and order block data
+ROMEOTPT SCANNER v3.2 - COMPLETE & CORRECTED VERSION
+Two-layer architecture + Deduplication + Outcome Tracking
 """
 
-import os, time, asyncio, logging, datetime
+import os
+import time
+import asyncio
+import logging
+import datetime
+import json
 import aiosqlite
 import httpx
 import ccxt.async_support as ccxt
 import pandas as pd
-from fastapi import FastAPI, Request, HTTPException
+import numpy as np
+from fastapi import FastAPI
 import uvicorn
-from collections import defaultdict, deque
+from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass
 
 # ---------------- CONFIG ----------------
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
-DB_PATH = "/app/data/signals.db"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v3_2.db")
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
-TOP_N = int(os.getenv("TOP_N", 60))
-TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
-MIN_SCORE = 1
-CRITICAL_FACTORS_MIN = 0
+# Scanner settings
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 30))
+TOP_N = int(os.getenv("TOP_N", 10))
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 10))
 
-# ---------------- FORCED FILTER PARAMETERS ----------------
-MOMENTUM_STRONG_THRESHOLD = 0.00
-MOMENTUM_GOOD_THRESHOLD = 0.00
-DISPLACEMENT_MIN_THRESHOLD = 0.00
+# Signal thresholds
+MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 0.0))
+
+# Deduplication settings
+SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 15))
+SIGNAL_VALIDITY_HOURS = int(os.getenv("SIGNAL_VALIDITY_HOURS", 2))
+PRICE_MOVEMENT_THRESHOLD = float(os.getenv("PRICE_MOVEMENT_THRESHOLD", 0.5))
+
+# Outcome tracking
+OUTCOME_CHECK_INTERVAL = int(os.getenv("OUTCOME_CHECK_INTERVAL", 60))
+MINIMUM_TRADE_HOLD_SECONDS = int(os.getenv("MINIMUM_TRADE_HOLD_SECONDS", 30))
 
 # ---------------- LOGGING ----------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-log = logging.getLogger("romeopt_bot")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+log = logging.getLogger("romeopt_v3_2")
+
+# ---------------- DATA STRUCTURES ----------------
+@dataclass
+class SetupEligibility:
+    """LAYER 1: Fast eligibility check"""
+    eligible: bool = False
+    side: str = ""
+    entry_price: float = 0.0
+    entry_type: str = ""
+    entry_zone: Dict = None
+    sl_price: float = 0.0
+    tp_targets: List[float] = None
+    disqualify_reason: str = ""
+    
+@dataclass
+class SetupQuality:
+    """LAYER 2: Quality metrics with 8-step tracking"""
+    sweep_strength: float = 0.0
+    structure_shift: bool = False
+    from_liquidity_exists: bool = False
+    confirmation_candle: bool = False
+    htfc_alignment_score: float = 0.0
+    total_score: float = 0.0
+    
+    # 8-step tracking
+    eight_steps_status: Dict = None
+    
+    @property
+    def quality_tier(self) -> str:
+        if self.total_score >= 4.0:
+            return "A+"
+        elif self.total_score >= 3.0:
+            return "A"
+        elif self.total_score >= 2.0:
+            return "B"
+        else:
+            return "C"
+
+# ---------------- SIGNAL TRACKER ----------------
+class SignalTracker:
+    """In-memory signal tracking with deduplication and outcome monitoring"""
+    
+    def __init__(self):
+        self.active_signals = {}
+        self.signal_history = []
+        self.outcome_stats = {
+            'total_signals': 0,
+            'tp1_hits': 0,
+            'tp2_hits': 0,
+            'sl_hits': 0,
+            'expired': 0,
+            'active': 0,
+            'win_rate': 0.0
+        }
+    
+    def is_new_or_updated_signal(self, symbol: str, new_setup: Dict) -> Tuple[bool, str]:
+        """Check if this is a NEW signal or UPDATED existing signal"""
+        now = datetime.datetime.utcnow()
+        
+        if symbol not in self.active_signals:
+            return True, "New signal"
+        
+        old_signal = self.active_signals[symbol]
+        old_setup = old_signal.get('setup', {})
+        
+        if not old_setup:
+            return True, "Old signal corrupted"
+        
+        # Has the signal expired?
+        if (now - old_signal['first_seen']).total_seconds() > (SIGNAL_VALIDITY_HOURS * 3600):
+            self.remove_signal(symbol)
+            return True, f"Old signal expired ({SIGNAL_VALIDITY_HOURS}h)"
+        
+        # Check if it's the same side
+        if old_setup.get('side', '') != new_setup.get('side', ''):
+            return True, "Side changed"
+        
+        # Check if price moved significantly
+        old_entry = old_setup.get('entry_price', 0)
+        new_entry = new_setup.get('entry_price', 0)
+        if old_entry == 0:
+            return True, "Old entry price invalid"
+            
+        price_change_pct = abs(new_entry - old_entry) / old_entry * 100
+        if price_change_pct > PRICE_MOVEMENT_THRESHOLD:
+            return True, f"Price moved {price_change_pct:.2f}%"
+        
+        # Check if still in cooldown period
+        if not old_signal.get('last_alerted'):
+            return True, "No previous alert time"
+            
+        time_since_last_alert = (now - old_signal['last_alerted']).total_seconds() / 60
+        if time_since_last_alert < SIGNAL_COOLDOWN_MINUTES:
+            return False, f"In cooldown ({int(SIGNAL_COOLDOWN_MINUTES - time_since_last_alert)}min left)"
+        
+        # Check if quality improved significantly
+        old_quality = old_setup.get('quality', {}).get('total_score', 0)
+        new_quality = new_setup.get('quality', {}).get('total_score', 0)
+        if new_quality - old_quality >= 0.5:
+            return True, f"Quality improved {old_quality:.2f}→{new_quality:.2f}"
+        
+        # Check if entry type changed meaningfully
+        old_entry_type = old_setup.get('entry_type', '')
+        new_entry_type = new_setup.get('entry_type', '')
+        if (old_entry_type in ["DISCOUNT_ZONE", "BULLISH_ENGULFING"] and 
+            new_entry_type in ["PREMIUM_ZONE", "BEARISH_ENGULFING"]):
+            return True, "Entry type changed significantly"
+        
+        # Check if RR improved significantly
+        old_rr = old_setup.get('rr_ratio', 0)
+        new_rr = new_setup.get('rr_ratio', 0)
+        if new_rr > old_rr * 1.2:
+            return True, f"RR improved {old_rr:.2f}→{new_rr:.2f}"
+        
+        return False, "Same signal, minimal changes"
+    
+    def update_signal(self, symbol: str, setup: Dict, alerted: bool = False):
+        """Update or add signal to tracker"""
+        now = datetime.datetime.utcnow()
+        
+        if symbol not in self.active_signals:
+            self.active_signals[symbol] = {
+                'setup': setup,
+                'first_seen': now,
+                'last_alerted': now if alerted else None,
+                'last_checked': now,
+                'alert_count': 1 if alerted else 0,
+                'status': 'active',
+                'outcome': 'active',
+                'highest_price': setup.get('current_price', 0),
+                'lowest_price': setup.get('current_price', 0),
+                'price_at_alert': setup.get('current_price', 0) if alerted else None,
+                'outcome_details': None
+            }
+            self.outcome_stats['total_signals'] += 1
+            self.outcome_stats['active'] += 1
+        else:
+            # Update price extremes
+            current_price = setup.get('current_price', 0)
+            self.active_signals[symbol]['highest_price'] = max(
+                self.active_signals[symbol]['highest_price'],
+                current_price
+            )
+            self.active_signals[symbol]['lowest_price'] = min(
+                self.active_signals[symbol]['lowest_price'],
+                current_price
+            )
+            
+            self.active_signals[symbol]['setup'] = setup
+            if alerted:
+                self.active_signals[symbol]['last_alerted'] = now
+                self.active_signals[symbol]['alert_count'] += 1
+                if not self.active_signals[symbol]['price_at_alert']:
+                    self.active_signals[symbol]['price_at_alert'] = current_price
+    
+    def check_signal_outcome(self, symbol: str, current_price: float) -> Optional[Dict]:
+        """Check if signal has hit TP or SL"""
+        if symbol not in self.active_signals:
+            return None
+        
+        signal = self.active_signals[symbol]
+        setup = signal.get('setup', {})
+        
+        if not setup:
+            return None
+        
+        # Don't check too soon
+        now = datetime.datetime.utcnow()
+        time_since_alert = (now - signal['first_seen']).total_seconds()
+        if time_since_alert < MINIMUM_TRADE_HOLD_SECONDS:
+            return None
+        
+        side = setup.get('side', '')
+        entry = setup.get('entry_price', 0)
+        tp_targets = setup.get('tp_targets', [])
+        tp1 = tp_targets[0] if len(tp_targets) > 0 else 0
+        tp2 = tp_targets[1] if len(tp_targets) > 1 else None
+        sl = setup.get('sl_price', 0)
+        
+        if entry == 0 or tp1 == 0 or sl == 0:
+            return None
+        
+        outcome = None
+        
+        # Check TP1 hit
+        if side == "BUY" and current_price >= tp1:
+            pnl_pct = (current_price - entry) / entry * 100
+            outcome = {
+                'type': 'TP1_HIT',
+                'price': current_price,
+                'pnl_pct': pnl_pct,
+                'bars_held': int(time_since_alert / 60),
+                'max_favorable': (signal['highest_price'] - entry) / entry * 100,
+                'max_adverse': (entry - signal['lowest_price']) / entry * 100
+            }
+        elif side == "SELL" and current_price <= tp1:
+            pnl_pct = (entry - current_price) / entry * 100
+            outcome = {
+                'type': 'TP1_HIT',
+                'price': current_price,
+                'pnl_pct': pnl_pct,
+                'bars_held': int(time_since_alert / 60),
+                'max_favorable': (entry - signal['lowest_price']) / entry * 100,
+                'max_adverse': (signal['highest_price'] - entry) / entry * 100
+            }
+        
+        # Check TP2 hit
+        elif tp2 and ((side == "BUY" and current_price >= tp2) or (side == "SELL" and current_price <= tp2)):
+            if side == "BUY":
+                pnl_pct = (current_price - entry) / entry * 100
+                max_fav = (signal['highest_price'] - entry) / entry * 100
+            else:
+                pnl_pct = (entry - current_price) / entry * 100
+                max_fav = (entry - signal['lowest_price']) / entry * 100
+            
+            outcome = {
+                'type': 'TP2_HIT',
+                'price': current_price,
+                'pnl_pct': pnl_pct,
+                'bars_held': int(time_since_alert / 60),
+                'max_favorable': max_fav,
+                'max_adverse': abs(entry - (signal['lowest_price'] if side == "BUY" else signal['highest_price'])) / entry * 100
+            }
+        
+        # Check SL hit
+        elif (side == "BUY" and current_price <= sl) or (side == "SELL" and current_price >= sl):
+            if side == "BUY":
+                pnl_pct = (current_price - entry) / entry * 100
+                max_fav = (signal['highest_price'] - entry) / entry * 100
+            else:
+                pnl_pct = (entry - current_price) / entry * 100
+                max_fav = (entry - signal['lowest_price']) / entry * 100
+            
+            outcome = {
+                'type': 'SL_HIT',
+                'price': current_price,
+                'pnl_pct': pnl_pct,
+                'bars_held': int(time_since_alert / 60),
+                'max_favorable': max_fav,
+                'max_adverse': abs(entry - sl) / entry * 100
+            }
+        
+        if outcome:
+            signal['outcome'] = outcome['type'].lower()
+            signal['outcome_details'] = outcome
+            signal['closed_at'] = now
+            signal['closed_price'] = current_price
+            signal['status'] = 'closed'
+            
+            # Update stats
+            self.outcome_stats['active'] -= 1
+            if outcome['type'] == 'TP1_HIT':
+                self.outcome_stats['tp1_hits'] += 1
+            elif outcome['type'] == 'TP2_HIT':
+                self.outcome_stats['tp2_hits'] += 1
+            elif outcome['type'] == 'SL_HIT':
+                self.outcome_stats['sl_hits'] += 1
+            
+            wins = self.outcome_stats['tp1_hits'] + self.outcome_stats['tp2_hits']
+            losses = self.outcome_stats['sl_hits']
+            total_closed = wins + losses
+            if total_closed > 0:
+                self.outcome_stats['win_rate'] = wins / total_closed * 100
+            
+            return outcome
+        
+        return None
+    
+    def remove_signal(self, symbol: str, reason: str = "expired"):
+        """Remove signal and mark as expired"""
+        if symbol in self.active_signals:
+            signal = self.active_signals.pop(symbol)
+            signal['status'] = 'expired'
+            signal['expired_at'] = datetime.datetime.utcnow()
+            signal['expired_reason'] = reason
+            
+            self.outcome_stats['active'] -= 1
+            self.outcome_stats['expired'] += 1
+    
+    def cleanup_old_signals(self):
+        """Remove expired signals"""
+        now = datetime.datetime.utcnow()
+        expired_symbols = []
+        
+        for symbol, data in self.active_signals.items():
+            age_minutes = (now - data['first_seen']).total_seconds() / 60
+            if age_minutes > (SIGNAL_VALIDITY_HOURS * 60):
+                expired_symbols.append(symbol)
+        
+        for symbol in expired_symbols:
+            self.remove_signal(symbol, f"Expired after {SIGNAL_VALIDITY_HOURS}h")
+        
+        if expired_symbols:
+            log.debug(f"Cleaned up {len(expired_symbols)} expired signals")
+    
+    def get_stats(self) -> Dict:
+        """Get tracking statistics"""
+        active_count = len(self.active_signals)
+        
+        buy_signals = 0
+        sell_signals = 0
+        
+        for signal in self.active_signals.values():
+            setup = signal.get('setup', {})
+            if setup.get('side') == 'BUY':
+                buy_signals += 1
+            elif setup.get('side') == 'SELL':
+                sell_signals += 1
+        
+        return {
+            'active_signals': active_count,
+            'total_history': len(self.signal_history),
+            'signals_by_side': {
+                'BUY': buy_signals,
+                'SELL': sell_signals
+            }
+        }
+
+# Initialize tracker globally
+signal_tracker = SignalTracker()
 db_lock = asyncio.Lock()
 db_conn = None
 
 # ---------------- TELEGRAM ----------------
-def escape_html(msg: str) -> str:
-    if not msg: return "-"
-    return str(msg).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-async def tg(msg: str):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
-    safe_msg = escape_html(msg)
+async def send_telegram(msg: str, parse_mode="HTML"):
+    """Send message to Telegram"""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram credentials not set")
+        return
+    
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         try:
-            await client.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": safe_msg, "parse_mode":"HTML"})
+            await client.post(url, json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": msg,
+                "parse_mode": parse_mode
+            })
         except Exception as e:
             log.warning(f"Telegram send failed: {e}")
 
-# ---------------- COMPLETE DATABASE MIGRATION ----------------
-async def migrate_db():
-    """Complete database migration from old schema to new schema"""
-    global db_conn
+# ---------------- UTILS ----------------
+async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit: int = 100):
+    """Fetch OHLCV with timeout"""
+    try:
+        return await asyncio.wait_for(
+            exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit),
+            timeout=3.0
+        )
+    except Exception as e:
+        log.debug(f"Failed to fetch {symbol} {timeframe}: {e}")
+        return None
+
+def create_dataframe(ohlcv):
+    """Create DataFrame from OHLCV"""
+    if not ohlcv:
+        return None
+    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+# ---------------- LAYER 1: FAST ELIGIBILITY CHECK ----------------
+async def check_eligibility_fast(exchange, symbol: str) -> SetupEligibility:
+    """LAYER 1: FAST FILTER - ELIGIBILITY ONLY"""
+    
+    # Get current price
+    try:
+        ticker = await exchange.fetch_ticker(symbol)
+        current_price = ticker.get("last", 0)
+        if current_price == 0:
+            return SetupEligibility(eligible=False, disqualify_reason="No price")
+    except Exception as e:
+        log.debug(f"Failed to get ticker for {symbol}: {e}")
+        return SetupEligibility(eligible=False, disqualify_reason="Ticker error")
+    
+    # Quick HTF direction (1H)
+    ohlcv_1h = await fetch_ohlcv(exchange, symbol, "1h", 50)
+    if not ohlcv_1h or len(ohlcv_1h) < 20:
+        return SetupEligibility(eligible=False, disqualify_reason="Insufficient data")
+    
+    df_1h = create_dataframe(ohlcv_1h)
+    if df_1h is None:
+        return SetupEligibility(eligible=False, disqualify_reason="Dataframe error")
+    
+    # Fast trend detection
+    try:
+        df_1h['ema_20'] = df_1h['close'].ewm(span=20).mean()
+        df_1h['ema_50'] = df_1h['close'].ewm(span=50).mean()
+        
+        latest_ema20 = df_1h['ema_20'].iloc[-1]
+        latest_ema50 = df_1h['ema_50'].iloc[-1]
+        latest_close = df_1h['close'].iloc[-1]
+        
+        # Determine bias
+        if latest_ema20 > latest_ema50 and latest_close > latest_ema20:
+            bias = "BULLISH"
+            side = "BUY"
+        elif latest_ema20 < latest_ema50 and latest_close < latest_ema20:
+            bias = "BEARISH"
+            side = "SELL"
+        else:
+            recent_high = df_1h['high'].iloc[-10:].max()
+            recent_low = df_1h['low'].iloc[-10:].min()
+            
+            if current_price > (recent_high + recent_low) / 2:
+                bias = "BULLISH"
+                side = "BUY"
+            else:
+                bias = "BEARISH"
+                side = "SELL"
+    except Exception as e:
+        log.debug(f"Trend detection error for {symbol}: {e}")
+        return SetupEligibility(eligible=False, disqualify_reason="Trend detection error")
+    
+    # Get quick range
+    try:
+        range_high = float(df_1h['high'].iloc[-20:].max())
+        range_low = float(df_1h['low'].iloc[-20:].min())
+    except:
+        range_high = float(df_1h['high'].max())
+        range_low = float(df_1h['low'].min())
+    
+    # Find entry zone (15m)
+    ohlcv_15m = await fetch_ohlcv(exchange, symbol, "15m", 30)
+    if not ohlcv_15m:
+        return SetupEligibility(eligible=False, disqualify_reason="No 15m data")
+    
+    df_15m = create_dataframe(ohlcv_15m)
+    if df_15m is None:
+        return SetupEligibility(eligible=False, disqualify_reason="15m dataframe error")
+    
+    # Find recent OB/FVG (fast detection)
+    entry_found = False
+    entry_price = 0
+    entry_type = ""
+    entry_low = 0
+    entry_high = 0
     
     try:
-        # Check if table exists at all
-        async with db_conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='signals'") as cursor:
-            table_exists = await cursor.fetchone()
-        
-        if not table_exists:
-            log.info("Table 'signals' doesn't exist yet, will create new schema")
-            return
-        
-        # Get current columns
-        async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
-            columns = await cursor.fetchall()
-            column_names = [col[1] for col in columns]
-        
-        log.info(f"Current columns: {column_names}")
-        
-        # List of required columns for new schema
-        required_columns = {
-            'id': 'INTEGER PRIMARY KEY AUTOINCREMENT',
-            'symbol': 'TEXT',
-            'side': 'TEXT',
-            'entry': 'REAL',
-            'sl': 'REAL',
-            'tp': 'REAL',
-            'timestamp': 'TEXT',
-            'status': 'TEXT',
-            'reason': 'TEXT',
-            'score': 'INTEGER',
-            'tp_hit': 'INTEGER DEFAULT 0',
-            'latest_ob': 'TEXT',
-            'tp_type': 'TEXT',
-            'tp_locked': 'INTEGER DEFAULT 1'
-        }
-        
-        # Add missing columns
-        for col_name, col_type in required_columns.items():
-            if col_name not in column_names:
-                try:
-                    await db_conn.execute(f"ALTER TABLE signals ADD COLUMN {col_name} {col_type}")
-                    log.info(f"✅ Added missing column: {col_name}")
-                except Exception as e:
-                    log.warning(f"Could not add column {col_name}: {e}")
-        
-        # If old TP columns exist, migrate data from tp1 to tp
-        if 'tp1' in column_names and 'tp' in column_names:
-            # Check if tp column is empty but tp1 has data
-            async with db_conn.execute("SELECT COUNT(*) FROM signals WHERE tp IS NULL AND tp1 IS NOT NULL") as cursor:
-                count = await cursor.fetchone()
-                if count and count[0] > 0:
-                    log.info(f"🚀 Migrating {count[0]} records from tp1 to tp...")
-                    await db_conn.execute("UPDATE signals SET tp = tp1 WHERE tp IS NULL AND tp1 IS NOT NULL")
+        if side == "BUY":
+            recent_low_15m = df_15m['low'].iloc[-5:].min()
+            
+            if current_price <= recent_low_15m * 1.005:
+                entry_price = current_price
+                entry_type = "DISCOUNT_ZONE"
+                entry_low = recent_low_15m * 0.995
+                entry_high = recent_low_15m * 1.01
+                entry_found = True
+            
+            if not entry_found and len(df_15m) >= 3:
+                last_candle = df_15m.iloc[-1]
+                prev_candle = df_15m.iloc[-2]
+                
+                if (prev_candle['close'] < prev_candle['open'] and 
+                    last_candle['close'] > last_candle['open'] and
+                    last_candle['close'] > prev_candle['close']):
+                    entry_price = last_candle['close']
+                    entry_type = "BULLISH_ENGULFING"
+                    entry_low = last_candle['low']
+                    entry_high = last_candle['high'] * 1.005
+                    entry_found = True
                     
-                    # Also migrate tp1_hit to tp_hit if needed
-                    if 'tp1_hit' in column_names:
-                        await db_conn.execute("UPDATE signals SET tp_hit = tp1_hit WHERE tp_hit = 0 AND tp1_hit = 1")
-                    
-                    log.info("✅ Data migration complete")
-        
-        await db_conn.commit()
-        
+        else:  # SELL
+            recent_high_15m = df_15m['high'].iloc[-5:].max()
+            
+            if current_price >= recent_high_15m * 0.995:
+                entry_price = current_price
+                entry_type = "PREMIUM_ZONE"
+                entry_low = recent_high_15m * 0.99
+                entry_high = recent_high_15m * 1.005
+                entry_found = True
+            
+            if not entry_found and len(df_15m) >= 3:
+                last_candle = df_15m.iloc[-1]
+                prev_candle = df_15m.iloc[-2]
+                
+                if (prev_candle['close'] > prev_candle['open'] and 
+                    last_candle['close'] < last_candle['open'] and
+                    last_candle['close'] < prev_candle['close']):
+                    entry_price = last_candle['close']
+                    entry_type = "BEARISH_ENGULFING"
+                    entry_low = last_candle['low'] * 0.995
+                    entry_high = last_candle['high']
+                    entry_found = True
     except Exception as e:
-        log.error(f"Migration error: {e}")
-
-# ---------------- INIT DATABASE ----------------
-async def init_db():
-    global db_conn
-    db_conn = await aiosqlite.connect(DB_PATH)
-    await db_conn.execute("PRAGMA journal_mode=WAL;")
-    await db_conn.execute("PRAGMA synchronous=NORMAL;")
+        log.debug(f"Entry zone detection error for {symbol}: {e}")
+        return SetupEligibility(eligible=False, disqualify_reason="Entry zone error")
     
-    # Create table if it doesn't exist (NEW SCHEMA)
-    await db_conn.execute("""
-        CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT,
-            side TEXT,
-            entry REAL,
-            sl REAL,
-            tp REAL,
-            timestamp TEXT,
-            status TEXT,
-            reason TEXT,
-            score INTEGER,
-            tp_hit INTEGER DEFAULT 0,
-            latest_ob TEXT,
-            tp_type TEXT,
-            tp_locked INTEGER DEFAULT 1
-        );
-    """)
-    await db_conn.commit()
+    if not entry_found:
+        return SetupEligibility(eligible=False, disqualify_reason="No entry zone")
     
-    # Run complete migration
-    await migrate_db()
-
-# ---------------- OHLCV ----------------
-async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
+    # SL logic
     try:
-        return await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    except Exception as e:
-        log.debug("fetch_ohlcv failed for %s %s: %s", symbol, timeframe, e)
-        return None
-
-# ---------------- INDICATORS ----------------
-def atr(df: pd.DataFrame, period=14):
-    high, low, close = df["high"], df["low"], df["close"]
-    tr = pd.DataFrame({
-        "h-l": high - low,
-        "h-pc": (high - close.shift(1)).abs(),
-        "l-pc": (low - close.shift(1)).abs()
-    }).max(axis=1)
-    return tr.rolling(period, min_periods=1).mean()
-
-# ---------------- FORCED FILTER FUNCTION ----------------
-def force_filter_trade(momentum_value: float, displacement_value: float) -> bool:
-    if momentum_value >= MOMENTUM_STRONG_THRESHOLD:
-        return True
-    if momentum_value >= MOMENTUM_GOOD_THRESHOLD and displacement_value >= DISPLACEMENT_MIN_THRESHOLD:
-        return True
-    return False
-
-# ---------------- REFINED ROMEOPT MARKET STATE ----------------
-def romeopt_market_state(df, atr_val):
-    """
-    REFINED RomeOPT market state detection
-    Checks: Strong displacement + actual price movement
-    """
-    if len(df) < 3:
-        return "BALANCED"
-    
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    
-    body_ratio = abs(last["close"] - last["open"]) / (last["high"] - last["low"] + 1e-8)
-    candle_size = last["high"] - last["low"]
-    price_movement = abs(last["close"] - prev["close"])
-    
-    # RomeOPT logic: Strong displacement with actual follow-through
-    strong_displacement = (
-        body_ratio > 0.7 and                    # Strong body
-        candle_size > atr_val * 1.2 and         # Large candle
-        price_movement > atr_val * 0.5          # Actual price movement
-    )
-    
-    return "IMBALANCED" if strong_displacement else "BALANCED"
-
-# ---------------- REFINED ROMEOPT INTERNAL LIQUIDITY ----------------
-def romeopt_internal_liquidity(df, side, atr_val, lookback=15):
-    """
-    REFINED RomeOPT internal liquidity detection
-    Uses ATR-based tolerance for visual clusters
-    """
-    if side == "SELL":
-        # For SELL: Look for obvious equal lows
-        lows = df['low'].iloc[-lookback:].dropna()
-        if len(lows) < 5:
-            return None
-        
-        # ATR-based tolerance (15% of ATR = visual clustering tolerance)
-        tolerance = atr_val * 0.15
-        
-        # Find potential cluster centers
-        potential_targets = []
-        for i in range(len(lows)):
-            current_low = lows.iloc[i]
-            # Count how many lows are within tolerance
-            nearby_count = (abs(lows - current_low) <= tolerance).sum()
-            if nearby_count >= 2:  # At least 2 lows form a visual cluster
-                potential_targets.append((current_low, nearby_count))
-        
-        if potential_targets:
-            # Choose the lowest price among clusters (most obvious stop pool)
-            best_target = min(potential_targets, key=lambda x: x[0])[0]
-            return best_target
-        
-    else:  # BUY
-        # For BUY: Look for obvious equal highs
-        highs = df['high'].iloc[-lookback:].dropna()
-        if len(highs) < 5:
-            return None
-        
-        tolerance = atr_val * 0.15
-        potential_targets = []
-        
-        for i in range(len(highs)):
-            current_high = highs.iloc[i]
-            nearby_count = (abs(highs - current_high) <= tolerance).sum()
-            if nearby_count >= 2:
-                potential_targets.append((current_high, nearby_count))
-        
-        if potential_targets:
-            # Choose the highest price among clusters
-            best_target = max(potential_targets, key=lambda x: x[0])[0]
-            return best_target
-    
-    return None  # No obvious visual liquidity cluster
-
-# ---------------- REFINED ROMEOPT EXTERNAL LIQUIDITY ----------------
-def romeopt_external_liquidity(df, side, lookback=50):
-    """
-    REFINED RomeOPT external liquidity detection
-    Simple: Range extremes (RomeOPT prefers guaranteed stops)
-    """
-    if side == "SELL":
-        # For SELL in trend: Range low (guaranteed stops below)
-        return df['low'].iloc[-lookback:].min()
-    else:  # BUY
-        # For BUY in trend: Range high (guaranteed stops above)
-        return df['high'].iloc[-lookback:].max()
-
-# ---------------- ROMEOPT TP DECISION (REFINED VERSION) ----------------
-def romeopt_tp_sl(entry, side, atr_val, ob_zone, df):
-    """
-    REFINED RomeOPT TP logic with all fixes
-    """
-    # Step 1: Determine market state
-    market_state = romeopt_market_state(df, atr_val)
-    
-    # Step 2: Find liquidity based on market state
-    tp = None
-    tp_type = ""
-    
-    if market_state == "BALANCED":
-        # RANGE: Look for internal liquidity clusters
-        tp = romeopt_internal_liquidity(df, side, atr_val)
-        if tp:
-            tp_type = f"RANGE: Visual {'Lows' if side == 'SELL' else 'Highs'} Cluster"
-    else:  # IMBALANCED
-        # TREND: Look for external range extremes
-        tp = romeopt_external_liquidity(df, side)
-        if tp:
-            tp_type = f"TREND: Range {'Low' if side == 'SELL' else 'High'}"
-    
-    # REJECT if no obvious liquidity found
-    if tp is None:
-        log.debug(f"❌ No obvious liquidity found for {side} | Market: {market_state}")
-        return None
-    
-    # Step 3: Safety check - reject if recently swept
-    recent_candles = min(10, len(df))
-    if side == "SELL":
-        recent_touch = any(
-            abs(df['low'].iloc[-i] - tp) <= atr_val * 0.1  # Within 10% ATR
-            for i in range(1, recent_candles)
-        )
-    else:  # BUY
-        recent_touch = any(
-            abs(df['high'].iloc[-i] - tp) <= atr_val * 0.1
-            for i in range(1, recent_candles)
-        )
-    
-    if recent_touch:
-        log.debug(f"❌ Liquidity recently swept for {side} at {tp}")
-        return None
-    
-    # Step 4: Calculate SL (keep OB-based SL)
-    if side == "BUY":
-        sl = ob_zone["low"] - (atr_val * 0.3)
-        recent_low = df['low'].iloc[-10:].min()
-        sl = min(sl, recent_low - (atr_val * 0.3))
-        
-        # Ensure minimum risk
-        min_risk = atr_val * 0.5
-        risk = entry - sl
-        if risk < min_risk:
-            risk = min_risk
-            sl = entry - risk
-        
-        # Ensure TP is valid (above entry, at least 0.5R)
-        if tp <= entry:
-            log.debug(f"❌ TP {tp} not above entry {entry} for BUY")
-            return None
-            
-        reward = tp - entry
-        if reward < risk * 0.5:
-            log.debug(f"❌ TP reward {reward/risk:.2f}R < 0.5R minimum")
-            return None
-        
-    else:  # SELL
-        sl = ob_zone["high"] + (atr_val * 0.3)
-        recent_high = df['high'].iloc[-10:].max()
-        sl = max(sl, recent_high + (atr_val * 0.3))
-        
-        min_risk = atr_val * 0.5
-        risk = sl - entry
-        if risk < min_risk:
-            risk = min_risk
-            sl = entry + risk
-        
-        # Ensure TP is valid (below entry, at least 0.5R)
-        if tp >= entry:
-            log.debug(f"❌ TP {tp} not below entry {entry} for SELL")
-            return None
-            
-        reward = entry - tp
-        if reward < risk * 0.5:
-            log.debug(f"❌ TP reward {reward/risk:.2f}R < 0.5R minimum")
-            return None
-    
-    log.info(f"✅ {side} {entry:.6f} | Market: {market_state}")
-    log.info(f"   SL: {sl:.6f} | TP: {tp:.6f} | Type: {tp_type}")
-    log.info(f"   Risk: {risk:.6f} | R:R: {abs(tp-entry)/risk:.2f}:1")
-    
-    return sl, tp, tp_type
-
-# ---------------- ENHANCED ORDER BLOCK DETECTION ----------------
-def find_latest_ob(df: pd.DataFrame, lookback=50):
-    """
-    Enhanced Order Block detection with detailed classification
-    Returns comprehensive OB data
-    """
-    blocks = []
-    
-    # Look for order blocks in the specified lookback
-    for i in range(max(2, len(df) - lookback), len(df) - 1):
-        candle = df.iloc[i]
-        prev_candle = df.iloc[i-1]
-        
-        # Bullish Order Block: Bearish candle followed by bullish candle
-        if (prev_candle["close"] < prev_candle["open"] and  # Previous bearish
-            candle["close"] > candle["open"] and            # Current bullish
-            candle["close"] > prev_candle["close"]):        # Closes above previous close
-            
-            block = {
-                "type": "BULLISH_OB",
-                "index": i,
-                "timestamp": candle.name if hasattr(candle, 'name') else i,
-                "low": min(candle["low"], prev_candle["low"]),
-                "high": max(candle["close"], prev_candle["close"]),
-                "body_low": min(candle["open"], candle["close"]),
-                "body_high": max(candle["open"], candle["close"]),
-                "volume": candle["vol"] if "vol" in candle else 0,
-                "candle_size": candle["high"] - candle["low"],
-                "body_size": abs(candle["close"] - candle["open"]),
-                "wick_ratio": (candle["high"] - max(candle["open"], candle["close"])) / 
-                              (candle["high"] - candle["low"]) if (candle["high"] - candle["low"]) > 0 else 0
-            }
-            blocks.append(block)
-        
-        # Bearish Order Block: Bullish candle followed by bearish candle
-        elif (prev_candle["close"] > prev_candle["open"] and  # Previous bullish
-              candle["close"] < candle["open"] and            # Current bearish
-              candle["close"] < prev_candle["close"]):        # Closes below previous close
-            
-            block = {
-                "type": "BEARISH_OB",
-                "index": i,
-                "timestamp": candle.name if hasattr(candle, 'name') else i,
-                "low": min(candle["close"], prev_candle["close"]),
-                "high": max(candle["high"], prev_candle["high"]),
-                "body_low": min(candle["open"], candle["close"]),
-                "body_high": max(candle["open"], candle["close"]),
-                "volume": candle["vol"] if "vol" in candle else 0,
-                "candle_size": candle["high"] - candle["low"],
-                "body_size": abs(candle["close"] - candle["open"]),
-                "wick_ratio": (min(candle["open"], candle["close"]) - candle["low"]) / 
-                              (candle["high"] - candle["low"]) if (candle["high"] - candle["low"]) > 0 else 0
-            }
-            blocks.append(block)
-    
-    # Return the most recent order block if any exist
-    if blocks:
-        latest_block = max(blocks, key=lambda x: x["index"])
-        
-        # Add classification based on strength
-        body_ratio = latest_block["body_size"] / latest_block["candle_size"] if latest_block["candle_size"] > 0 else 0
-        if body_ratio >= 0.7:
-            latest_block["strength"] = "STRONG"
-        elif body_ratio >= 0.5:
-            latest_block["strength"] = "MODERATE"
+        if side == "BUY":
+            sl_price = min(recent_low_15m * 0.995, entry_price * 0.99)
         else:
-            latest_block["strength"] = "WEAK"
-        
-        # Check if OB has been tested
-        if latest_block["type"] == "BULLISH_OB":
-            subsequent_candles = df.iloc[latest_block["index"]+1:min(latest_block["index"]+10, len(df))]
-            latest_block["tested"] = any(candle["low"] <= latest_block["high"] for _, candle in subsequent_candles.iterrows())
-        else:  # BEARISH_OB
-            subsequent_candles = df.iloc[latest_block["index"]+1:min(latest_block["index"]+10, len(df))]
-            latest_block["tested"] = any(candle["high"] >= latest_block["low"] for _, candle in subsequent_candles.iterrows())
-        
-        return latest_block
-    
-    return None
-
-# ---------------- REST OF SIGNAL GENERATION ----------------
-async def elite_tf_alignment(exchange, symbol: str, side: str):
-    tfs = ["15m","1h","4h"]
-    for tf in tfs:
-        ohlcv = await fetch_ohlcv(exchange, symbol, tf, 50)
-        if not ohlcv or len(ohlcv) < 10: return False
-        df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-        if len(df) < 5: return False
-        trend = df["close"].iloc[-1] - df["close"].iloc[-5]
-        trend_side = "BUY" if trend>0 else "SELL"
-        if trend_side != side:
-            return False
-    return True
-
-async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
-    if df is None or len(df) < 20: return None
-    last = df.iloc[-1]
-    prev5 = df.iloc[-6:-1]
-    score = 0
-    reasons = []
-    
-    calc_values = {}
-
-    # Step 1: ENHANCED Liquidity Sweep Detection
-    lookback_period = 20
-    high_lookback = df['high'].iloc[-lookback_period:-1]
-    low_lookback = df['low'].iloc[-lookback_period:-1]
-    
-    # Check for sweeping previous highs/lows with more precision
-    sweep_high = last["high"] > high_lookback.max()
-    sweep_low = last["low"] < low_lookback.min()
-    
-    # Check if sweep was respected (price closed back inside range)
-    respected_high_sweep = False
-    respected_low_sweep = False
-    sweep_strength = 0.0
-    
-    if sweep_high:
-        # Calculate how much it swept the high
-        sweep_amount = last["high"] - high_lookback.max()
-        candle_range = last["high"] - last["low"]
-        if candle_range > 0:
-            sweep_strength = sweep_amount / candle_range
-        # Check if closed below the swept level (respected)
-        if last["close"] < high_lookback.max():
-            respected_high_sweep = True
-    
-    if sweep_low:
-        # Calculate how much it swept the low
-        sweep_amount = low_lookback.min() - last["low"]
-        candle_range = last["high"] - last["low"]
-        if candle_range > 0:
-            sweep_strength = sweep_amount / candle_range
-        # Check if closed above the swept level (respected)
-        if last["close"] > low_lookback.min():
-            respected_low_sweep = True
-    
-    has_sweep = (sweep_high and respected_high_sweep) or (sweep_low and respected_low_sweep)
-    
-    liquidity_sweep = 2 if has_sweep else 0
-    score += liquidity_sweep
-    
-    # Enhanced sweep type classification
-    if sweep_high and respected_high_sweep:
-        sweep_type = "HIGH_SWEEP_RESPECTED"
-        sweep_direction = "BEARISH"
-    elif sweep_low and respected_low_sweep:
-        sweep_type = "LOW_SWEEP_RESPECTED"
-        sweep_direction = "BULLISH"
-    elif sweep_high:
-        sweep_type = "HIGH_SWEEP_UNRESPECTED"
-        sweep_direction = "NEUTRAL"
-    elif sweep_low:
-        sweep_type = "LOW_SWEEP_UNRESPECTED"
-        sweep_direction = "NEUTRAL"
-    else:
-        sweep_type = "NONE"
-        sweep_direction = "NONE"
-    
-    reasons.append(f"Liquidity Sweep +{liquidity_sweep} ({sweep_type})")
-    calc_values["sweep_type"] = sweep_type
-    calc_values["sweep_direction"] = sweep_direction
-    calc_values["sweep_score"] = liquidity_sweep
-    calc_values["sweep_strength"] = round(sweep_strength, 2) if has_sweep else 0
-    calc_values["sweep_respected"] = respected_high_sweep or respected_low_sweep
-    calc_values["swept_level"] = float(high_lookback.max()) if sweep_high else (float(low_lookback.min()) if sweep_low else 0.0)
-
-    # Step 2: Displacement
-    displacement = abs(last["close"] - last["open"]) / (last["high"] - last["low"] + 1e-8)
-    calc_values["displacement_value"] = round(displacement, 2)
-    has_disp = displacement > 0.6
-    if has_disp:
-        score += 2; reasons.append(f"Displacement +2 ({displacement:.2f})")
-    else:
-        reasons.append(f"Displacement +0 ({displacement:.2f})")
-
-    # Step 3 & 4: ENHANCED Order Block & Zone
-    ob_zone = find_latest_ob(df, lookback=30)
-    
-    if ob_zone:
-        ob_type = "bullish" if ob_zone["type"] == "BULLISH_OB" else "bearish"
-        zone_approach = 0
-        
-        # Enhanced zone approach check
-        if ob_type == "bullish":
-            # For bullish OB, check if price is approaching from above
-            distance_to_ob = (last["close"] - ob_zone["high"]) / (ob_zone["high"] - ob_zone["low"] + 1e-8)
-            if last["close"] <= ob_zone["high"] or distance_to_ob < 0.1:
-                score += 1
-                zone_approach = 1
-                approach_status = f"APPROACHING (dist: {distance_to_ob:.2%})"
-            else:
-                approach_status = f"FAR ({distance_to_ob:.2%} away)"
-        else:  # bearish
-            # For bearish OB, check if price is approaching from below
-            distance_to_ob = (ob_zone["low"] - last["close"]) / (ob_zone["high"] - ob_zone["low"] + 1e-8)
-            if last["close"] >= ob_zone["low"] or distance_to_ob < 0.1:
-                score += 1
-                zone_approach = 1
-                approach_status = f"APPROACHING (dist: {distance_to_ob:.2%})"
-            else:
-                approach_status = f"FAR ({distance_to_ob:.2%} away)"
-        
-        reasons.append(f"Zone Approach +{zone_approach} ({approach_status})")
-        
-        # Store comprehensive OB data
-        calc_values["zone_approach"] = zone_approach
-        calc_values["ob_type"] = ob_type
-        calc_values["ob_strength"] = ob_zone.get("strength", "UNKNOWN")
-        calc_values["ob_tested"] = ob_zone.get("tested", False)
-        calc_values["ob_low"] = round(ob_zone["low"], 6)
-        calc_values["ob_high"] = round(ob_zone["high"], 6)
-        calc_values["ob_body_low"] = round(ob_zone.get("body_low", ob_zone["low"]), 6)
-        calc_values["ob_body_high"] = round(ob_zone.get("body_high", ob_zone["high"]), 6)
-        calc_values["ob_candle_size"] = round(ob_zone.get("candle_size", 0), 6)
-        calc_values["ob_body_ratio"] = round(ob_zone.get("body_size", 0) / ob_zone.get("candle_size", 1) if ob_zone.get("candle_size", 0) > 0 else 0, 2)
-        calc_values["ob_volume"] = ob_zone.get("volume", 0)
-        calc_values["distance_to_ob"] = round(distance_to_ob, 4)
-    else:
-        reasons.append("Zone Approach +0 (No OB detected)")
-        ob_type = None
-        calc_values["zone_approach"] = 0
-        calc_values["ob_type"] = "NONE"
-
-    # Step 5: HTF Alignment
-    tf_map={"1m":"15m","3m":"30m","5m":"1h","15m":"4h","30m":"1h"}
-    htf=tf_map.get(tf,"15m")
-    ohlcv_htf = await fetch_ohlcv(exchange, symbol, htf, 50)
-    htf_alignment = 0
-    htf_trend_value = 0
-    if ohlcv_htf and len(ohlcv_htf) >= 5:
-        df_htf = pd.DataFrame(ohlcv_htf, columns=["ts","open","high","low","close","vol"])
-        if len(df_htf) >= 5:
-            trend = df_htf["close"].iloc[-1] - df_htf["close"].iloc[-5]
-            htf_trend_value = round(trend, 6)
-            htf_dir = "bullish" if trend>0 else "bearish"
-            if ob_type and htf_dir==ob_type:
-                score+=1; htf_alignment=1; reasons.append(f"HTF Alignment +1 ({htf_dir} {trend:+.6f})")
-            else:
-                reasons.append(f"HTF Alignment +0 ({htf_dir} {trend:+.6f})")
-            calc_values["htf_trend"] = htf_trend_value
-            calc_values["htf_direction"] = htf_dir
+            sl_price = max(recent_high_15m * 1.005, entry_price * 1.01)
+    except:
+        # Fallback SL
+        if side == "BUY":
+            sl_price = entry_price * 0.99
         else:
-            reasons.append("HTF Alignment ? (insufficient data)")
-            calc_values["htf_trend"] = 0
-            calc_values["htf_direction"] = "UNKNOWN"
-    else:
-        reasons.append("HTF Alignment ? (no data)")
-        calc_values["htf_trend"] = 0
-        calc_values["htf_direction"] = "UNKNOWN"
-
-    # Step 6: MOMENTUM
-    momentum_ratio = abs(last["close"]-last["open"])/(last["high"]-last["low"]+1e-8)
-    calc_values["momentum_value"] = round(momentum_ratio, 2)
+            sl_price = entry_price * 1.01
     
-    if ob_type=="bullish" and momentum_ratio>=0.8 and last["close"]>last["open"]:
-        score+=1; reasons.append(f"Momentum +1 ({momentum_ratio:.2f})")
-        calc_values["momentum_score"] = 1
-    elif ob_type=="bearish" and momentum_ratio>=0.8 and last["close"]<last["open"]:
-        score+=1; reasons.append(f"Momentum +1 ({momentum_ratio:.2f})")
-        calc_values["momentum_score"] = 1
-    else:
-        reasons.append(f"Momentum +0 ({momentum_ratio:.2f})")
-        calc_values["momentum_score"] = 0
-
-    if not ob_type: return None
-    side_str = "BUY" if ob_type=="bullish" else "SELL"
-    entry = float(last["close"])
-
-    # ---------------- CRITICAL FILTERS ----------------
-    critical_score = htf_alignment + liquidity_sweep
-    if critical_score < CRITICAL_FACTORS_MIN: return None
-    if score < MIN_SCORE: return None
-    if not has_disp: return None
-    if htf_alignment != 1: return None
-
-    # ---------------- FORCED FILTER ----------------
-    displacement_val = calc_values["displacement_value"]
-    momentum_val = calc_values["momentum_value"]
+    # TP targets
+    tp_targets = []
     
-    if not force_filter_trade(momentum_val, displacement_val):
-        reasons.append(f"❌ FORCED FILTER REJECTED: Mom={momentum_val:.2f}, Disp={displacement_val:.2f}")
-        return None
+    try:
+        if side == "BUY":
+            recent_resistance = df_1h['high'].iloc[-10:].max()
+            tp_targets.append(float(recent_resistance))
+            
+            range_height = range_high - range_low
+            tp_targets.append(float(min(range_high + range_height * 0.5, entry_price * 1.03)))
+        else:
+            recent_support = df_1h['low'].iloc[-10:].min()
+            tp_targets.append(float(recent_support))
+            
+            range_height = range_high - range_low
+            tp_targets.append(float(max(range_low - range_height * 0.5, entry_price * 0.97)))
+    except:
+        # Fallback TP
+        if side == "BUY":
+            tp_targets.append(entry_price * 1.02)
+            tp_targets.append(entry_price * 1.04)
+        else:
+            tp_targets.append(entry_price * 0.98)
+            tp_targets.append(entry_price * 0.96)
     
-    filter_reason = "Mom≥0.87" if momentum_val >= MOMENTUM_STRONG_THRESHOLD else "Mom≥0.85 & Disp≥0.80"
-    reasons.append(f"✅ FORCED FILTER PASSED: {filter_reason}")
-
-    # ---------------- ELITE MTF CONFIRMATION ----------------
-    if not await elite_tf_alignment(exchange, symbol, side_str):
-        return None
-    reasons.append("Elite MTF Alignment ✅")
-
-    # ---------------- ROMEOPT TP CALCULATION ----------------
-    atr_val = float(atr(df, 14).iloc[-1])
-    result = romeopt_tp_sl(entry, side_str, atr_val, ob_zone, df)
-    
-    # REJECT if no valid TP found
-    if result is None:
-        reasons.append("❌ NO VALID LIQUIDITY FOUND")
-        return None
-    
-    sl, tp, tp_type = result
-    
-    sig = {
-        "symbol": symbol,
-        "side": side_str,
-        "entry": entry,
-        "sl": sl,
-        "tp": tp,
-        "score": score,
-        "reason": "RomeOPT 6-Step",
-        "reason_list": reasons,
-        "htf_alignment": htf_alignment,
-        "liquidity_sweep": liquidity_sweep,
-        "momentum_ratio": momentum_ratio,
-        "calc_values": calc_values,
-        "tp_type": tp_type
+    entry_zone = {
+        "type": entry_type,
+        "price": entry_price,
+        "low": entry_low,
+        "high": entry_high,
+        "current_in_zone": entry_low <= current_price <= entry_high
     }
     
-    log.info(f"✅ Signal {sig['symbol']} passed forced filter: Mom={momentum_val:.2f}, Disp={displacement_val:.2f}")
-    return sig
+    return SetupEligibility(
+        eligible=True,
+        side=side,
+        entry_price=entry_price,
+        entry_type=entry_type,
+        entry_zone=entry_zone,
+        sl_price=sl_price,
+        tp_targets=tp_targets
+    )
 
-# ---------------- REFINED UPDATE TP/SL LIVE ----------------
-def update_tp_sl_live(sig: dict, df: pd.DataFrame):
-    """
-    REFINED: Only update if TP hasn't been hit AND structure invalidated
-    RomeOPT commits to liquidity objective - no chasing price
-    """
-    # TP LOCK: If TP already hit, do nothing
-    if sig.get("tp_hit", 0) == 1:
-        return sig
+# ---------------- LAYER 2: QUALITY ANALYSIS ----------------
+async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility) -> SetupQuality:
+    """LAYER 2: QUALITY ANALYSIS WITH 8-STEP TRACKING"""
     
-    # Only update if structure is completely invalid
-    latest_ob = find_latest_ob(df)
-    if not latest_ob:
-        # No OB anymore - structure invalid, close trade
+    side = eligibility.side
+    entry_type = eligibility.entry_type
+    entry_price = eligibility.entry_price
+    current_price = entry_price  # Will be updated
+    
+    # Initialize scores
+    sweep_strength = 0.0
+    structure_shift = False
+    from_liquidity_exists = False
+    confirmation_candle = False
+    htfc_alignment_score = 0.0
+    
+    # Initialize 8-step tracking
+    eight_steps = {
+        'step_1_htf_bias': False,
+        'step_2_zone_type': False,
+        'step_3_liquidity_sweep': False,
+        'step_4_structure_shift': False,
+        'step_5_from_liquidity': False,
+        'step_6_confirmation_candle': False,
+        'step_7_entry_zone': False,
+        'step_8_rr_ratio': False,
+        
+        # Details for display
+        'step_details': {
+            '1': 'HTF bias aligned with direction',
+            '2': 'Premium/Discount zone entry',
+            '3': 'Liquidity sweep detected',
+            '4': 'Market structure shift',
+            '5': 'FROM liquidity present',
+            '6': 'Confirmation candle formed',
+            '7': 'Price in valid entry zone',
+            '8': 'Risk/Reward ≥ 1.5:1'
+        }
+    }
+    
+    try:
+        # Get current price for accurate checks
+        ticker = await exchange.fetch_ticker(symbol)
+        current_price = ticker.get("last", entry_price)
+        
+        # === STEP 1: HTF Bias Alignment ===
+        ohlcv_1h = await fetch_ohlcv(exchange, symbol, "1h", 30)
+        if ohlcv_1h:
+            df_1h = create_dataframe(ohlcv_1h)
+            if df_1h is not None and len(df_1h) >= 20:
+                df_1h['ema_20'] = df_1h['close'].ewm(span=20).mean()
+                df_1h['ema_50'] = df_1h['close'].ewm(span=50).mean()
+                
+                if side == "BUY":
+                    htfc_alignment_score = 1.0 if df_1h['ema_20'].iloc[-1] > df_1h['ema_50'].iloc[-1] else 0.5
+                    eight_steps['step_1_htf_bias'] = htfc_alignment_score >= 0.7
+                else:
+                    htfc_alignment_score = 1.0 if df_1h['ema_20'].iloc[-1] < df_1h['ema_50'].iloc[-1] else 0.5
+                    eight_steps['step_1_htf_bias'] = htfc_alignment_score >= 0.7
+        
+        # === STEP 2: Premium/Discount Zone ===
+        if side == "BUY" and entry_type in ["DISCOUNT_ZONE", "BULLISH_ENGULFING"]:
+            eight_steps['step_2_zone_type'] = True
+        elif side == "SELL" and entry_type in ["PREMIUM_ZONE", "BEARISH_ENGULFING"]:
+            eight_steps['step_2_zone_type'] = True
+        
+        # === STEP 3: Liquidity Sweep ===
+        ohlcv_15m = await fetch_ohlcv(exchange, symbol, "15m", 20)
+        if ohlcv_15m:
+            df_15m = create_dataframe(ohlcv_15m)
+            if df_15m is not None and len(df_15m) >= 10:
+                if side == "BUY":
+                    recent_low = df_15m['low'].iloc[-5:].min()
+                    prev_low = df_15m['low'].iloc[-10:-5].min()
+                    if recent_low < prev_low:
+                        sweep_strength = 0.7
+                        eight_steps['step_3_liquidity_sweep'] = True
+                        try:
+                            sweep_idx = df_15m['low'].idxmin()
+                            if sweep_idx < len(df_15m) - 1:
+                                sweep_candle = df_15m.iloc[sweep_idx]
+                                body_size = abs(sweep_candle['close'] - sweep_candle['open'])
+                                wick_size = sweep_candle['high'] - max(sweep_candle['open'], sweep_candle['close'])
+                                if body_size > wick_size:
+                                    sweep_strength = 1.0
+                        except:
+                            pass
+                else:
+                    recent_high = df_15m['high'].iloc[-5:].max()
+                    prev_high = df_15m['high'].iloc[-10:-5].max()
+                    if recent_high > prev_high:
+                        sweep_strength = 0.7
+                        eight_steps['step_3_liquidity_sweep'] = True
+                        try:
+                            sweep_idx = df_15m['high'].idxmax()
+                            if sweep_idx < len(df_15m) - 1:
+                                sweep_candle = df_15m.iloc[sweep_idx]
+                                body_size = abs(sweep_candle['close'] - sweep_candle['open'])
+                                wick_size = min(sweep_candle['open'], sweep_candle['close']) - sweep_candle['low']
+                                if body_size > wick_size:
+                                    sweep_strength = 1.0
+                        except:
+                            pass
+        
+        # === STEP 4: Structure Shift ===
+        if ohlcv_1h:
+            df_1h = create_dataframe(ohlcv_1h)
+            if df_1h is not None and len(df_1h) >= 11:
+                if side == "BUY":
+                    recent_high = df_1h['high'].iloc[-10:-1].max()
+                    current_close = df_1h['close'].iloc[-1]
+                    if current_close > recent_high:
+                        structure_shift = True
+                        eight_steps['step_4_structure_shift'] = True
+                else:
+                    recent_low = df_1h['low'].iloc[-10:-1].min()
+                    current_close = df_1h['close'].iloc[-1]
+                    if current_close < recent_low:
+                        structure_shift = True
+                        eight_steps['step_4_structure_shift'] = True
+        
+        # === STEP 5: FROM Liquidity ===
+        if sweep_strength > 0.5:
+            from_liquidity_exists = True
+            eight_steps['step_5_from_liquidity'] = True
+        
+        # === STEP 6: Confirmation Candle ===
+        ohlcv_5m = await fetch_ohlcv(exchange, symbol, "5m", 5)
+        if ohlcv_5m:
+            df_5m = create_dataframe(ohlcv_5m)
+            if df_5m is not None and len(df_5m) > 0:
+                if side == "BUY":
+                    if df_5m['close'].iloc[-1] > df_5m['open'].iloc[-1]:
+                        confirmation_candle = True
+                        eight_steps['step_6_confirmation_candle'] = True
+                else:
+                    if df_5m['close'].iloc[-1] < df_5m['open'].iloc[-1]:
+                        confirmation_candle = True
+                        eight_steps['step_6_confirmation_candle'] = True
+        
+        # === STEP 7: Entry Zone ===
+        if entry_price > 0:
+            entry_zone_threshold = 0.02  # 2%
+            price_diff_pct = abs(current_price - entry_price) / entry_price * 100
+            eight_steps['step_7_entry_zone'] = price_diff_pct <= entry_zone_threshold
+        
+        # === STEP 8: Risk/Reward Ratio ===
+        risk = abs(eligibility.entry_price - eligibility.sl_price)
+        reward = abs(eligibility.tp_targets[0] - eligibility.entry_price)
+        rr_ratio = reward / risk if risk > 0 else 0
+        eight_steps['step_8_rr_ratio'] = rr_ratio >= 1.5
+        
+        # Store RR ratio for later use
+        eight_steps['rr_ratio'] = rr_ratio
+        
+    except Exception as e:
+        log.debug(f"Quality analysis error for {symbol}: {e}")
+    
+    # Calculate total score (0-5)
+    total_score = (
+        sweep_strength +
+        (1.0 if structure_shift else 0.0) +
+        (0.5 if from_liquidity_exists else 0.0) +
+        (0.5 if confirmation_candle else 0.0) +
+        htfc_alignment_score
+    )
+    
+    return SetupQuality(
+        sweep_strength=sweep_strength,
+        structure_shift=structure_shift,
+        from_liquidity_exists=from_liquidity_exists,
+        confirmation_candle=confirmation_candle,
+        htfc_alignment_score=htfc_alignment_score,
+        total_score=total_score,
+        eight_steps_status=eight_steps
+    )
+
+# ---------------- FAST SCANNING ----------------
+async def scan_symbol_fast(exchange, symbol: str) -> Optional[Dict]:
+    """ULTRA-FAST scanning: Layer 1 only, Layer 2 optional"""
+    
+    try:
+        # LAYER 1: Eligibility check
+        eligibility = await check_eligibility_fast(exchange, symbol)
+        
+        if not eligibility.eligible:
+            return None
+        
+        # LAYER 2: Quality analysis
+        quality = await analyze_quality(exchange, symbol, eligibility)
+        
+        # Get current price
+        ticker = await exchange.fetch_ticker(symbol)
+        current_price = ticker.get("last", 0)
+        
+        # Calculate RR
+        risk = abs(eligibility.entry_price - eligibility.sl_price)
+        reward = abs(eligibility.tp_targets[0] - eligibility.entry_price)
+        rr_ratio = reward / risk if risk > 0 else 0
+        
+        setup = {
+            "symbol": symbol,
+            "timestamp": datetime.datetime.utcnow().isoformat(),
+            "side": eligibility.side,
+            "current_price": current_price,
+            "entry_price": eligibility.entry_price,
+            "entry_type": eligibility.entry_type,
+            "sl_price": eligibility.sl_price,
+            "tp_targets": eligibility.tp_targets,
+            "risk": risk,
+            "reward": reward,
+            "rr_ratio": rr_ratio,
+            
+            "quality": {
+                "tier": quality.quality_tier,
+                "total_score": quality.total_score,
+                "sweep_strength": quality.sweep_strength,
+                "structure_shift": quality.structure_shift,
+                "from_liquidity": quality.from_liquidity_exists,
+                "confirmation_candle": quality.confirmation_candle,
+                "htfc_alignment": quality.htfc_alignment_score,
+                "eight_steps": quality.eight_steps_status
+            }
+        }
+        
+        return setup
+    except Exception as e:
+        log.error(f"Error scanning {symbol}: {e}")
         return None
-    
-    # Check if price has taken out the OB (structure break)
-    if sig["side"] == "BUY":
-        if df['low'].iloc[-1] < latest_ob["low"]:
-            return None  # OB broken, close
-    else:  # SELL
-        if df['high'].iloc[-1] > latest_ob["high"]:
-            return None  # OB broken, close
-    
-    # Structure still valid - keep original TP (RomeOPT doesn't chase)
-    return sig
 
-# ---------------- SL CLUSTER ----------------
-recent_sl = defaultdict(lambda: deque())
-def record_sl_hit(symbol: str, lookback_minutes=30):
-    now = time.time(); dq = recent_sl[symbol]; dq.append(now)
-    cutoff = now - lookback_minutes*60
-    while dq and dq[0]<cutoff: dq.popleft()
-def deprioritized(symbol: str, threshold=3, lookback=30):
-    dq = recent_sl[symbol]; now=time.time(); cutoff=now-lookback*60
-    while dq and dq[0]<cutoff: dq.popleft()
-    return len(dq)>=threshold
+# ---------------- ALERTS ----------------
+async def send_fast_alert(setup: Dict):
+    """Send concise, fast alerts with 8-step numerical display"""
+    
+    try:
+        symbol = setup.get('symbol', 'UNKNOWN')
+        quality = setup.get('quality', {})
+        eight_steps = quality.get('eight_steps', {})
+        step_details = eight_steps.get('step_details', {})
+        
+        # Check if this is an update
+        is_update = symbol in signal_tracker.active_signals
+        update_emoji = "🔄" if is_update else "🆕"
+        
+        tier_emoji = {
+            "A+": "🔥",
+            "A": "✅", 
+            "B": "⚠️",
+            "C": "📊"
+        }.get(quality.get("tier", "C"), "📊")
+        
+        # Add update info if applicable
+        update_info = ""
+        if is_update:
+            old_signal = signal_tracker.active_signals.get(symbol, {})
+            old_setup = old_signal.get('setup', {})
+            old_quality = old_setup.get('quality', {}).get('total_score', 0)
+            new_quality = quality.get('total_score', 0)
+            if new_quality > old_quality:
+                update_info = f"\n📈 <b>Quality UP:</b> {old_quality:.2f} → {new_quality:.2f}"
+            elif old_quality > 0:
+                update_info = f"\n🔄 <b>Updated signal</b>"
+        
+        tp_targets = setup.get('tp_targets', [])
+        # Format TP values separately to avoid f-string formatting errors
+        tp1_display = f"{tp_targets[0]:.8f}" if len(tp_targets) > 0 else 'N/A'
+        tp2_display = f"{tp_targets[1]:.8f}" if len(tp_targets) > 1 else 'N/A'
+        
+        # ============ 8-STEP NUMERICAL DISPLAY ============
+        # Build the 8-step checklist with pass/fail status
+        checklist_lines = []
+        
+        # Step 1: HTF Bias Alignment
+        step1_status = "✅ PASS" if eight_steps.get('step_1_htf_bias', False) else "❌ FAIL"
+        checklist_lines.append(f"1. {step1_status} - HTF bias aligned with direction")
+        
+        # Step 2: Premium/Discount Zone
+        step2_status = "✅ PASS" if eight_steps.get('step_2_zone_type', False) else "❌ FAIL"
+        checklist_lines.append(f"2. {step2_status} - Premium/Discount zone entry")
+        
+        # Step 3: Liquidity Sweep
+        step3_status = "✅ PASS" if eight_steps.get('step_3_liquidity_sweep', False) else "❌ FAIL"
+        sweep_score = quality.get('sweep_strength', 0)
+        checklist_lines.append(f"3. {step3_status} - Liquidity sweep detected (Score: {sweep_score:.2f})")
+        
+        # Step 4: Structure Shift
+        step4_status = "✅ PASS" if eight_steps.get('step_4_structure_shift', False) else "❌ FAIL"
+        checklist_lines.append(f"4. {step4_status} - Market structure shift")
+        
+        # Step 5: FROM Liquidity
+        step5_status = "✅ PASS" if eight_steps.get('step_5_from_liquidity', False) else "❌ FAIL"
+        checklist_lines.append(f"5. {step5_status} - FROM liquidity present")
+        
+        # Step 6: Confirmation Candle
+        step6_status = "✅ PASS" if eight_steps.get('step_6_confirmation_candle', False) else "❌ FAIL"
+        checklist_lines.append(f"6. {step6_status} - Confirmation candle formed")
+        
+        # Step 7: Entry Zone
+        step7_status = "✅ PASS" if eight_steps.get('step_7_entry_zone', False) else "❌ FAIL"
+        entry_price = setup.get('entry_price', 0)
+        current_price = setup.get('current_price', 0)
+        if entry_price > 0:
+            zone_diff = abs(current_price - entry_price) / entry_price * 100
+            checklist_lines.append(f"7. {step7_status} - Price in valid entry zone ({zone_diff:.2f}% from entry)")
+        
+        # Step 8: Risk/Reward Ratio
+        rr_ratio = setup.get('rr_ratio', 0)
+        step8_passed = rr_ratio >= 1.5
+        step8_status = "✅ PASS" if step8_passed else "⚠️ MARGINAL" if rr_ratio >= 1.0 else "❌ FAIL"
+        checklist_lines.append(f"8. {step8_status} - Risk/Reward ≥ 1.5:1 (Current: {rr_ratio:.2f}:1)")
+        
+        # Count passes
+        pass_count = sum([
+            eight_steps.get('step_1_htf_bias', False),
+            eight_steps.get('step_2_zone_type', False),
+            eight_steps.get('step_3_liquidity_sweep', False),
+            eight_steps.get('step_4_structure_shift', False),
+            eight_steps.get('step_5_from_liquidity', False),
+            eight_steps.get('step_6_confirmation_candle', False),
+            eight_steps.get('step_7_entry_zone', False),
+            step8_passed
+        ])
+        
+        # Build checklist string
+        checklist = "📋 <b>8-STEP CHECKLIST:</b>\n"
+        for line in checklist_lines:
+            checklist += f"   {line}\n"
+        checklist += f"\n   📊 <b>SCORE:</b> {pass_count}/8 steps passed"
+        # ==========================================
+        
+        msg = f"""
+{update_emoji}{tier_emoji} <b>ROMEOTPT v3.2 - {quality.get('tier', 'C')} Tier</b>
 
-# ---------------- LOG SIGNAL ----------------
-async def log_signal(sig):
-    async with db_lock:
+<b>🎯 {setup.get('symbol', 'UNKNOWN')}</b> | {setup.get('side', 'N/A')}
+<b>Entry:</b> {setup.get('entry_price', 0):.8f}
+<b>Current:</b> {setup.get('current_price', 0):.8f}
+<b>Type:</b> {setup.get('entry_type', 'N/A')}{update_info}
+
+{checklist}
+
+🎯 <b>Targets:</b>
+TP1: {tp1_display}
+TP2: {tp2_display}
+
+🛡️ <b>Risk:</b>
+SL: {setup.get('sl_price', 0):.8f}
+RR: {setup.get('rr_ratio', 0):.2f}:1
+
+📈 <b>Quality Score:</b> {quality.get('total_score', 0):.2f}/5.0
+• Sweep Strength: {quality.get('sweep_strength', 0):.2f}
+• HTF Alignment: {quality.get('htfc_alignment', 0):.2f}
+• Structure Shift: {'✅' if quality.get('structure_shift', False) else '❌'}
+• Confirmation: {'✅' if quality.get('confirmation_candle', False) else '❌'}
+
+<i>Detected: {datetime.datetime.utcnow().strftime('%H:%M:%S UTC')}</i>
+"""
+        
+        await send_telegram(msg)
+    except Exception as e:
+        log.error(f"Error sending alert: {e}")
+
+async def send_outcome_alert(symbol: str, outcome: Dict):
+    """Send alert when signal hits TP or SL"""
+    
+    try:
+        signal = signal_tracker.active_signals.get(symbol, {})
+        setup = signal.get('setup', {})
+        
+        if outcome['type'] == 'TP1_HIT':
+            emoji = "✅"
+            result_text = "TAKE PROFIT 1 HIT"
+        elif outcome['type'] == 'TP2_HIT':
+            emoji = "🎯"
+            result_text = "TAKE PROFIT 2 HIT"
+        else:
+            emoji = "❌"
+            result_text = "STOP LOSS HIT"
+        
+        bars_held = outcome.get('bars_held', 0)
+        if bars_held < 60:
+            time_str = f"{bars_held}min"
+        else:
+            time_str = f"{bars_held//60}h {bars_held%60}min"
+        
+        tp_targets = setup.get('tp_targets', [0])
+        # Format TP separately
+        tp_display = f"{tp_targets[0]:.8f}" if len(tp_targets) > 0 else 'N/A'
+        
+        msg = f"""
+{emoji} <b>{result_text}</b>
+
+<b>{symbol}</b> | {setup.get('side', 'N/A')}
+<b>Entry:</b> {setup.get('entry_price', 0):.8f}
+<b>Exit:</b> {outcome['price']:.8f}
+<b>PnL:</b> {outcome['pnl_pct']:+.2f}%
+
+⏱️ <b>Held:</b> {time_str}
+📊 <b>Quality was:</b> {setup.get('quality', {}).get('tier', 'N/A')}
+🎯 <b>Target was:</b> {tp_display}
+🛡️ <b>SL was:</b> {setup.get('sl_price', 0):.8f}
+
+<i>Max favorable move: {outcome.get('max_favorable', 0):.2f}%</i>
+<i>Max adverse move: {outcome.get('max_adverse', 0):.2f}%</i>
+
+<i>Outcome recorded: {datetime.datetime.utcnow().strftime('%H:%M:%S UTC')}</i>
+"""
+        
+        await send_telegram(msg)
+    except Exception as e:
+        log.error(f"Error sending outcome alert: {e}")
+
+async def send_deduped_alert(setup: Dict):
+    """Send alert only if it's a new or meaningfully updated signal"""
+    try:
+        symbol = setup.get('symbol', '')
+        if not symbol:
+            return False
+        
+        should_alert, reason = signal_tracker.is_new_or_updated_signal(symbol, setup)
+        
+        if should_alert:
+            await send_fast_alert(setup)
+            signal_tracker.update_signal(symbol, setup, alerted=True)
+            log.info(f"📨 Alert sent for {symbol}: {reason}")
+            return True
+        else:
+            signal_tracker.update_signal(symbol, setup, alerted=False)
+            if np.random.random() < 0.01:
+                log.debug(f"⏸️  Skipped alert for {symbol}: {reason}")
+            return False
+    except Exception as e:
+        log.error(f"Error in deduped alert for {setup.get('symbol', 'UNKNOWN')}: {e}")
+        return False
+
+# ---------------- DATABASE ----------------
+async def init_database():
+    """Initialize database with outcome tracking tables"""
+    try:
+        # Create tables
         await db_conn.execute("""
-            INSERT INTO signals (symbol,side,entry,sl,tp,timestamp,status,reason,score,latest_ob,tp_type,tp_locked)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (sig["symbol"],sig["side"],sig["entry"],sig.get("sl"),sig.get("tp"),
-              datetime.datetime.utcnow().isoformat(),"OPEN",sig["reason"],sig["score"],
-              str(sig.get("latest_ob","")), sig.get("tp_type", ""), 1))
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
+                timestamp TEXT,
+                side TEXT,
+                entry_price REAL,
+                sl_price REAL,
+                tp1 REAL,
+                tp2 REAL,
+                rr_ratio REAL,
+                quality_tier TEXT,
+                quality_score REAL,
+                current_price REAL,
+                status TEXT DEFAULT 'active',
+                alert_sent BOOLEAN DEFAULT 1,
+                closed_at TEXT,
+                closed_price REAL,
+                outcome TEXT,
+                pnl_pct REAL,
+                bars_held INTEGER,
+                max_favorable_pct REAL,
+                max_adverse_pct REAL
+            )
+        """)
+        
+        await db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS signal_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id INTEGER,
+                symbol TEXT,
+                side TEXT,
+                entry_price REAL,
+                sl_price REAL,
+                tp1_price REAL,
+                tp2_price REAL,
+                quality_score REAL,
+                created_at TEXT,
+                status TEXT DEFAULT 'active',
+                closed_at TEXT,
+                closed_price REAL,
+                outcome_type TEXT,
+                pnl_pct REAL,
+                hold_time_minutes INTEGER,
+                max_favorable_pct REAL,
+                max_adverse_pct REAL,
+                FOREIGN KEY (signal_id) REFERENCES signals (id)
+            )
+        """)
+        
+        # Create indexes separately (SQLite syntax fix)
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_time ON signals (symbol, timestamp)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_status_time ON signals (status, timestamp)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_outcome ON signals (outcome)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_outcomes_symbol_status ON signal_outcomes (symbol, status)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_outcomes_outcome_type ON signal_outcomes (outcome_type)")
+        
         await db_conn.commit()
+        log.info("Database initialized with indexes")
+    except Exception as e:
+        log.error(f"Error initializing database: {e}")
+        raise
 
-# ---------------- ROBUST MONITOR SIGNALS ----------------
-async def monitor_signals():
+async def store_signal(setup: Dict):
+    """Store signal in database"""
+    async with db_lock:
+        try:
+            tp_targets = setup.get("tp_targets", [])
+            
+            # Store in signals table
+            cursor = await db_conn.execute("""
+                INSERT INTO signals (
+                    symbol, timestamp, side, entry_price, sl_price, 
+                    tp1, tp2, rr_ratio, quality_tier, quality_score,
+                    current_price, status, alert_sent
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1)
+            """, (
+                setup.get("symbol", ""),
+                setup.get("timestamp", ""),
+                setup.get("side", ""),
+                setup.get("entry_price", 0),
+                setup.get("sl_price", 0),
+                tp_targets[0] if len(tp_targets) > 0 else None,
+                tp_targets[1] if len(tp_targets) > 1 else None,
+                setup.get("rr_ratio", 0),
+                setup.get("quality", {}).get("tier", "C"),
+                setup.get("quality", {}).get("total_score", 0),
+                setup.get("current_price", 0)
+            ))
+            
+            # Get the inserted ID
+            signal_id = cursor.lastrowid
+            
+            # Also store in outcomes table for tracking
+            await db_conn.execute("""
+                INSERT INTO signal_outcomes (
+                    signal_id, symbol, side, entry_price, sl_price, tp1_price,
+                    tp2_price, quality_score, created_at, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+            """, (
+                signal_id,
+                setup.get("symbol", ""),
+                setup.get("side", ""),
+                setup.get("entry_price", 0),
+                setup.get("sl_price", 0),
+                tp_targets[0] if len(tp_targets) > 0 else None,
+                tp_targets[1] if len(tp_targets) > 1 else None,
+                setup.get("quality", {}).get("total_score", 0),
+                setup.get("timestamp", "")
+            ))
+            
+            await db_conn.commit()
+            log.debug(f"Stored signal for {setup.get('symbol', 'UNKNOWN')} with ID {signal_id}")
+            
+        except Exception as e:
+            log.error(f"Error storing signal {setup.get('symbol', 'UNKNOWN')}: {e}")
+
+async def store_outcome(symbol: str, outcome: Dict):
+    """Store signal outcome in database"""
+    async with db_lock:
+        try:
+            now = datetime.datetime.utcnow().isoformat()
+            
+            # Update signals table
+            await db_conn.execute("""
+                UPDATE signals 
+                SET status = 'closed', closed_at = ?, closed_price = ?, outcome = ?,
+                    pnl_pct = ?, bars_held = ?, max_favorable_pct = ?, max_adverse_pct = ?
+                WHERE symbol = ? AND status = 'active'
+                ORDER BY timestamp DESC LIMIT 1
+            """, (
+                now,
+                outcome.get('price', 0),
+                outcome.get('type', ''),
+                outcome.get('pnl_pct', 0),
+                outcome.get('bars_held', 0),
+                outcome.get('max_favorable', 0),
+                outcome.get('max_adverse', 0),
+                symbol
+            ))
+            
+            # Update signal_outcomes table
+            await db_conn.execute("""
+                UPDATE signal_outcomes 
+                SET status = 'closed', closed_at = ?, closed_price = ?, outcome_type = ?,
+                    pnl_pct = ?, hold_time_minutes = ?, max_favorable_pct = ?, max_adverse_pct = ?
+                WHERE symbol = ? AND status = 'active'
+                ORDER BY created_at DESC LIMIT 1
+            """, (
+                now,
+                outcome.get('price', 0),
+                outcome.get('type', ''),
+                outcome.get('pnl_pct', 0),
+                outcome.get('bars_held', 0),
+                outcome.get('max_favorable', 0),
+                outcome.get('max_adverse', 0),
+                symbol
+            ))
+            
+            await db_conn.commit()
+            log.info(f"Stored outcome for {symbol}: {outcome.get('type', 'UNKNOWN')}")
+            
+        except Exception as e:
+            log.error(f"Error storing outcome for {symbol}: {e}")
+
+# ---------------- OUTCOME CHECKER ----------------
+async def outcome_checker_task(exchange):
+    """Background task to check signal outcomes"""
+    log.info("🔄 Outcome checker started")
+    
     while True:
         try:
-            async with db_lock:
-                # Get current columns to build dynamic query
-                async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
-                    columns = await cursor.fetchall()
-                    column_names = [col[1] for col in columns]
+            active_symbols = list(signal_tracker.active_signals.keys())
+            
+            if active_symbols:
+                tickers = await exchange.fetch_tickers()
+                outcomes_found = 0
                 
-                # Build query with fallback for missing columns
-                select_fields = []
-                if 'id' in column_names:
-                    select_fields.append('id')
-                if 'symbol' in column_names:
-                    select_fields.append('symbol')
-                if 'side' in column_names:
-                    select_fields.append('side')
-                if 'entry' in column_names:
-                    select_fields.append('entry')
-                if 'sl' in column_names:
-                    select_fields.append('sl')
-                if 'tp' in column_names:
-                    select_fields.append('tp')
-                else:
-                    select_fields.append('NULL as tp')  # Fallback
+                for symbol in active_symbols:
+                    if symbol in tickers:
+                        current_price = tickers[symbol].get('last', 0)
+                        if current_price > 0:
+                            outcome = signal_tracker.check_signal_outcome(symbol, current_price)
+                            if outcome:
+                                await send_outcome_alert(symbol, outcome)
+                                await store_outcome(symbol, outcome)
+                                outcomes_found += 1
                 
-                if 'tp_hit' in column_names:
-                    select_fields.append('tp_hit')
-                else:
-                    select_fields.append('0 as tp_hit')  # Default value
-                
-                if 'status' in column_names:
-                    select_fields.append('status')
-                
-                query = f"SELECT {','.join(select_fields)} FROM signals WHERE status='OPEN'"
-                
-                async with db_conn.execute(query) as cursor:
-                    async for row in cursor:
-                        # Map row to variables based on query structure
-                        row_dict = dict(zip(select_fields, row))
-                        
-                        sig_id = row_dict.get('id')
-                        symbol = row_dict.get('symbol')
-                        side = row_dict.get('side')
-                        entry = row_dict.get('entry')
-                        sl = row_dict.get('sl')
-                        tp = row_dict.get('tp')
-                        tp_hit = row_dict.get('tp_hit', 0)
-                        status = row_dict.get('status')
-                        
-                        if not all([sig_id, symbol, side, entry]):
-                            continue
-                        
-                        # Check if TP already hit
-                        if tp_hit == 1:
-                            continue
-                        
-                        ticker = await exchange.fetch_ticker(symbol)
-                        last_price = ticker.get("last")
-                        if last_price is None: 
-                            continue
+                if outcomes_found:
+                    log.info(f"📊 Found {outcomes_found} signal outcomes")
+            
+            await asyncio.sleep(OUTCOME_CHECK_INTERVAL)
+            
+        except Exception as e:
+            log.error(f"Outcome checker error: {e}")
+            await asyncio.sleep(OUTCOME_CHECK_INTERVAL * 2)
 
-                        # RomeOPT: TP LOCK - Don't recalculate unless structure broken
-                        hits = []
-                        new_tp_hit = tp_hit
-                        new_status = status
-                        
-                        if side == "BUY":
-                            if not tp_hit and tp is not None and last_price >= tp:
-                                hits.append("TP"); new_tp_hit = 1
-                            if sl is not None and last_price <= sl:
-                                hits.append("SL"); new_status = "CLOSED"
-                        else:
-                            if not tp_hit and tp is not None and last_price <= tp:
-                                hits.append("TP"); new_tp_hit = 1
-                            if sl is not None and last_price >= sl:
-                                hits.append("SL"); new_status = "CLOSED"
+# ---------------- SCANNER MAIN ----------------
+async def process_deduped_results(results) -> int:
+    """Process results with deduplication"""
+    alerts_sent = 0
+    
+    for result in results:
+        if isinstance(result, Exception):
+            log.error(f"Task error: {result}")
+            continue
+            
+        if result:
+            try:
+                quality_score = result.get("quality", {}).get("total_score", 0)
+                if quality_score >= MIN_QUALITY_SCORE:
+                    alerted = await send_deduped_alert(result)
+                    if alerted:
+                        alerts_sent += 1
+                    await store_signal(result)
+            except Exception as e:
+                log.error(f"Error processing result: {e}")
+    
+    return alerts_sent
 
-                        if hits:
-                            await tg(f"🎯 {symbol} {side} HIT\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP:{tp}")
+async def outcome_aware_scanner(exchange):
+    """Main scanner with outcome tracking"""
+    
+    # Send startup message
+    startup_msg = f"""
+🚀 <b>ROMEOTPT v3.2 STARTED</b>
 
-                        if "SL" in hits:
-                            record_sl_hit(symbol)
-                        
-                        # Only update if something changed
-                        if new_tp_hit != tp_hit or new_status != status:
-                            await db_conn.execute("UPDATE signals SET tp_hit=?,status=? WHERE id=?",
-                                                 (new_tp_hit, new_status, sig_id))
-                await db_conn.commit()
-        except Exception as e: 
-            log.exception("monitor error: %s", e)
-        await asyncio.sleep(SCAN_INTERVAL)
+<b>Settings:</b>
+• Scan: {SCAN_INTERVAL}s
+• Top: {TOP_N} symbols
+• Cooldown: {SIGNAL_COOLDOWN_MINUTES}min
+• Validity: {SIGNAL_VALIDITY_HOURS}h
+• Outcome check: {OUTCOME_CHECK_INTERVAL}s
+• Min quality: {MIN_QUALITY_SCORE}
 
-# ---------------- SCAN LOOP ----------------
-last_signal_time = {}
-async def scan_loop(exchange):
+<i>Now with 8-step numerical checklist display</i>
+"""
+    await send_telegram(startup_msg)
+    
+    # Start outcome checker
+    asyncio.create_task(outcome_checker_task(exchange))
+    
+    scan_cycle = 0
+    
     while True:
-        t0=time.time()
+        scan_cycle += 1
+        
         try:
+            # Get symbols
             tickers = await exchange.fetch_tickers()
-            top = sorted([(s,v.get("quoteVolume",0)) for s,v in tickers.items() if s.endswith("USDT")], key=lambda x:x[1], reverse=True)[:TOP_N]
-            signals_found = 0
-            for symbol,_ in top:
-                if deprioritized(symbol): continue
-                for tf in TIMEFRAMES:
-                    key=f"{symbol}:{tf}"
-                    if key in last_signal_time and time.time()-last_signal_time[key]<60: continue
-                    ohlcv = await fetch_ohlcv(exchange,symbol,tf,200)
-                    if not ohlcv: continue
-                    df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
-                    for c in ["open","high","low","close","vol"]: df[c]=pd.to_numeric(df[c],errors="coerce")
-                    sig = await generate_signal_romeopt(exchange,df,symbol,tf)
-                    if sig:
-                        calc = sig.get("calc_values", {})
-                        momentum_val = calc.get("momentum_value", 0)
-                        displacement_val = calc.get("displacement_value", 0)
-                        
-                        filter_passed = force_filter_trade(momentum_val, displacement_val)
-                        
-                        # Calculate R:R
-                        risk = abs(sig["entry"] - sig.get("sl", 0))
-                        reward = abs(sig.get("tp", 0) - sig["entry"])
-                        rr = reward / risk if risk > 0 else 0
-                        
-                        breakdown_lines = [
-                            f"🏆 ROMEOPT SIGNAL: {sig['symbol']} ({tf}) {sig['side']}",
-                            f"Entry: {sig['entry']:.6f}",
-                            f"Score: {sig['score']}/6",
-                            f"",
-                            f"📊 LIQUIDITY SWEEP DATA:",
-                            f"• Type: {calc.get('sweep_type', 'NONE')}",
-                            f"• Direction: {calc.get('sweep_direction', 'NONE')}",
-                            f"• Strength: {calc.get('sweep_strength', 0):.2f}",
-                            f"• Respected: {'✅' if calc.get('sweep_respected', False) else '❌'}",
-                            f"• Swept Level: {calc.get('swept_level', 0):.6f}",
-                            f"",
-                            f"📊 ORDER BLOCK DATA:",
-                            f"• Type: {calc.get('ob_type', 'NONE')}",
-                            f"• Strength: {calc.get('ob_strength', 'UNKNOWN')}",
-                            f"• Tested: {'✅' if calc.get('ob_tested', False) else '❌'}",
-                            f"• Range: {calc.get('ob_low', 0):.6f} - {calc.get('ob_high', 0):.6f}",
-                            f"• Body: {calc.get('ob_body_low', 0):.6f} - {calc.get('ob_body_high', 0):.6f}",
-                            f"• Body Ratio: {calc.get('ob_body_ratio', 0):.2f}",
-                            f"• Distance: {calc.get('distance_to_ob', 0):.2%}",
-                            f"",
-                            f"📊 CORE METRICS:",
-                            f"• Displacement: {calc.get('displacement_value', 0):.2f}",
-                            f"• Momentum: {calc.get('momentum_value', 0):.2f}",
-                            f"• HTF: {calc.get('htf_direction', '?')}",
-                            f"• Forced Filter: {'✅ PASS' if filter_passed else '❌ REJECT'}",
-                            f"• TP Type: {sig.get('tp_type', 'N/A')}",
-                            f"",
-                            f"🎯 LIQUIDITY TARGET (R:R: {rr:.2f}:1):",
-                            f"SL: {sig.get('sl'):.6f}",
-                            f"TP: {sig.get('tp'):.6f}",
-                            f"",
-                            f"💎 ROMEOPT PHILOSOPHY:",
-                            f"One TP = One liquidity objective",
-                            f"TP LOCKED - No chasing price"
-                        ]
-                        
-                        await tg("\n".join(breakdown_lines))
-                        await log_signal(sig)
-                        last_signal_time[key]=time.time()
-                        signals_found+=1
-            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals (TP LOCKED)")
-        except Exception as e: log.exception("scan error: %s", e)
-        elapsed=time.time()-t0
-        await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
+            usdt_pairs = []
+            
+            for symbol, data in tickers.items():
+                if symbol.endswith("/USDT"):
+                    # Skip stablecoin pairs
+                    if symbol in ["USDC/USDT", "USDG/USDT"]:
+                        continue
+                    
+                    volume = data.get("quoteVolume", 0)
+                    if isinstance(volume, (int, float)):
+                        usdt_pairs.append((symbol, float(volume)))
+            
+            usdt_pairs.sort(key=lambda x: x[1], reverse=True)
+            symbols_to_scan = [s[0] for s in usdt_pairs[:TOP_N]]
+            
+            stats = signal_tracker.get_stats()
+            
+            log.info(f"🔄 Scan #{scan_cycle}: {len(symbols_to_scan)} symbols | Active: {stats.get('active_signals', 0)}")
+            
+            # Log stats periodically
+            if scan_cycle % 10 == 0:
+                outcome_stats = signal_tracker.outcome_stats
+                total_closed = outcome_stats.get('tp1_hits', 0) + outcome_stats.get('tp2_hits', 0) + outcome_stats.get('sl_hits', 0)
+                if total_closed > 0:
+                    win_rate = outcome_stats.get('win_rate', 0)
+                    log.info(f"📈 Stats: WR={win_rate:.1f}% | TP1={outcome_stats.get('tp1_hits', 0)} | SL={outcome_stats.get('sl_hits', 0)}")
+            
+            # Scan symbols
+            alerts_this_scan = 0
+            tasks = []
+            
+            for symbol in symbols_to_scan:
+                task = asyncio.create_task(scan_symbol_fast(exchange, symbol))
+                tasks.append(task)
+                
+                if len(tasks) >= MAX_CONCURRENT:
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    alerts_this_scan += await process_deduped_results(results)
+                    tasks = []
+            
+            if tasks:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                alerts_this_scan += await process_deduped_results(results)
+            
+            await asyncio.sleep(SCAN_INTERVAL)
+            
+        except Exception as e:
+            log.error(f"Scanner error: {e}")
+            await asyncio.sleep(SCAN_INTERVAL * 2)
 
 # ---------------- FASTAPI ----------------
 app = FastAPI()
-@app.post("/webhook")
-async def webhook(request: Request):
-    token = request.headers.get("X-Auth","")
-    if token!=WEBHOOK_SECRET: raise HTTPException(403,"Invalid secret")
-    data = await request.json()
-    log.info("Webhook received: %s", data)
-    return {"ok":True}
+
+@app.get("/health")
+async def health():
+    stats = signal_tracker.get_stats()
+    return {
+        "status": "healthy", 
+        "version": "3.2",
+        "active_signals": stats.get('active_signals', 0),
+        "outcome_stats": signal_tracker.outcome_stats
+    }
+
+@app.get("/signals/active")
+async def get_active_signals():
+    """Get currently active signals"""
+    active = []
+    for symbol, data in signal_tracker.active_signals.items():
+        setup = data.get('setup', {})
+        active.append({
+            "symbol": symbol,
+            "side": setup.get('side', ''),
+            "entry_price": setup.get('entry_price', 0),
+            "current_price": setup.get('current_price', 0),
+            "tp1": setup.get('tp_targets', [0])[0] if len(setup.get('tp_targets', [])) > 0 else 0,
+            "sl": setup.get('sl_price', 0),
+            "quality": setup.get('quality', {}).get('total_score', 0),
+            "tier": setup.get('quality', {}).get('tier', 'C'),
+            "age_minutes": (datetime.datetime.utcnow() - data.get('first_seen', datetime.datetime.utcnow())).total_seconds() / 60
+        })
+    return {"active_signals": active, "count": len(active)}
+
+@app.get("/outcomes/stats")
+async def get_outcome_stats(hours: int = 24):
+    """Get outcome statistics"""
+    async with db_lock:
+        try:
+            cursor = await db_conn.execute("""
+                SELECT 
+                    COUNT(*) as total,
+                    SUM(CASE WHEN outcome_type LIKE 'TP%' THEN 1 ELSE 0 END) as wins,
+                    SUM(CASE WHEN outcome_type = 'SL_HIT' THEN 1 ELSE 0 END) as losses,
+                    AVG(pnl_pct) as avg_pnl,
+                    AVG(hold_time_minutes) as avg_hold_time
+                FROM signal_outcomes 
+                WHERE status = 'closed' 
+                AND closed_at > datetime('now', ?)
+            """, (f"-{hours} hours",))
+            row = await cursor.fetchone()
+            
+            cursor = await db_conn.execute("""
+                SELECT 
+                    quality_tier,
+                    COUNT(*) as count,
+                    SUM(CASE WHEN outcome LIKE 'TP%' THEN 1 ELSE 0 END) as wins,
+                    AVG(pnl_pct) as avg_pnl
+                FROM signals 
+                WHERE status = 'closed' 
+                AND timestamp > datetime('now', ?)
+                GROUP BY quality_tier
+            """, (f"-{hours} hours",))
+            rows = await cursor.fetchall()
+            tier_stats = {}
+            for row in rows:
+                if row[0]:  # Only add if tier is not None
+                    tier_stats[row[0]] = {
+                        'count': row[1],
+                        'wins': row[2],
+                        'avg_pnl': row[3]
+                    }
+        except Exception as e:
+            log.error(f"Error fetching outcome stats: {e}")
+            return {"error": str(e)}
+    
+    total = row[0] if row else 0
+    wins = row[1] if row else 0
+    
+    return {
+        'period_hours': hours,
+        'total_signals': total,
+        'wins': wins,
+        'losses': row[2] if row else 0,
+        'win_rate': wins / total * 100 if total > 0 else 0,
+        'avg_pnl_pct': row[3] if row else 0,
+        'avg_hold_minutes': row[4] if row else 0,
+        'by_tier': tier_stats,
+        'memory_stats': signal_tracker.outcome_stats
+    }
+
+@app.get("/outcomes/recent")
+async def get_recent_outcomes(limit: int = 20):
+    """Get recent signal outcomes"""
+    async with db_lock:
+        try:
+            cursor = await db_conn.execute("""
+                SELECT s.symbol, s.side, s.entry_price, s.closed_price, 
+                       s.outcome, s.pnl_pct, s.bars_held, s.quality_tier,
+                       s.timestamp, s.closed_at
+                FROM signals s
+                WHERE s.status = 'closed'
+                ORDER BY s.closed_at DESC
+                LIMIT ?
+            """, (limit,))
+            columns = [description[0] for description in cursor.description]
+            rows = await cursor.fetchall()
+            
+            outcomes = []
+            for row in rows:
+                outcomes.append(dict(zip(columns, row)))
+        except Exception as e:
+            log.error(f"Error fetching recent outcomes: {e}")
+            return {"error": str(e)}
+    
+    return {"outcomes": outcomes, "count": len(outcomes)}
 
 # ---------------- MAIN ----------------
-async def main():
-    await init_db()
-    global exchange
-    exchange = ccxt.okx({"enableRateLimit": True})
-    await tg("🏆 TRUE ROMEOPT SCANNER STARTED (ENHANCED SWEEP & OB DATA)")
-    await tg("🎯 ENHANCED: Comprehensive liquidity sweep analysis")
-    await tg("📊 ENHANCED: Detailed order block classification")
-    await tg("🔒 TP LOCK: No recalculation after entry")
-    await tg("⚡ EXTERNAL LIQUIDITY: Range extremes only")
-    await tg("💎 ROMEOPT CORE: Target where price MUST go")
-    await asyncio.gather(scan_loop(exchange), monitor_signals())
+async def periodic_cleanup():
+    """Periodically clean up old signals"""
+    while True:
+        await asyncio.sleep(300)
+        signal_tracker.cleanup_old_signals()
 
-if __name__=="__main__":
+async def main():
+    global db_conn
+    
+    try:
+        # Initialize database
+        db_conn = await aiosqlite.connect(DB_PATH)
+        await init_database()
+        
+        # Create exchange
+        exchange = ccxt.okx({
+            "enableRateLimit": True,
+            "options": {"defaultType": "spot"},
+            "rateLimit": 10,
+            "timeout": 5000,
+        })
+        
+        log.info("🚀 ROMEOTPT v3.2 - COMPLETE")
+        log.info(f"Scan: {SCAN_INTERVAL}s | Top {TOP_N} symbols")
+        log.info(f"Cooldown: {SIGNAL_COOLDOWN_MINUTES}min | Validity: {SIGNAL_VALIDITY_HOURS}h")
+        log.info(f"Outcome check: {OUTCOME_CHECK_INTERVAL}s")
+        log.info(f"Now with 8-step numerical checklist display")
+        
+        # Start cleanup task
+        asyncio.create_task(periodic_cleanup())
+        
+        await outcome_aware_scanner(exchange)
+        
+    except Exception as e:
+        log.error(f"Fatal error: {e}")
+    finally:
+        if db_conn:
+            await db_conn.close()
+        log.info("Scanner shutdown complete")
+
+if __name__ == "__main__":
     import argparse
-    p=argparse.ArgumentParser()
-    p.add_argument("--http", action="store_true")
-    args=p.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--http", action="store_true", help="Run HTTP server")
+    args = parser.parse_args()
+    
     if args.http:
-        uvicorn.run(app, host="0.0.0.0", port=9000)
+        uvicorn.run(app, host="0.0.0.0", port=8000)
     else:
         try:
             asyncio.run(main())
-        finally:
-            if db_conn:
-                asyncio.run(db_conn.close())
+        except KeyboardInterrupt:
+            log.info("Scanner stopped by user")
