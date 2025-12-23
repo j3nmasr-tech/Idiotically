@@ -216,7 +216,7 @@ class HtfBiasSystem:
         self.exchange = exchange
         self.htf_cache = {}  # Cache HTF data to reduce API calls
         self.cache_duration = 60  # Cache for 60 seconds
-        
+    
     async def get_htf_data(self, symbol: str, timeframe: str, limit: int = 50):
         """Get HTF data with caching"""
         cache_key = f"{symbol}:{timeframe}"
