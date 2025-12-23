@@ -595,10 +595,11 @@ class RomeOPTDatabase:
         self.lock = asyncio.Lock()
     
     async def initialize(self):
-        """Initialize database"""
+        """Initialize database with automatic schema migration"""
         self.conn = await aiosqlite.connect(self.db_path)
         await self.conn.execute("PRAGMA journal_mode=WAL;")
         
+        # First, create the table with all columns
         await self.conn.execute("""
             CREATE TABLE IF NOT EXISTS signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -621,6 +622,22 @@ class RomeOPTDatabase:
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        
+        # Check if htf_bias_score column exists, add it if missing
+        try:
+            # Get table info to check columns
+            cursor = await self.conn.execute("PRAGMA table_info(signals)")
+            columns = await cursor.fetchall()
+            column_names = [col[1] for col in columns]  # column name is at index 1
+            
+            if 'htf_bias_score' not in column_names:
+                log.info("Adding missing column: htf_bias_score")
+                await self.conn.execute("ALTER TABLE signals ADD COLUMN htf_bias_score REAL DEFAULT 0")
+                await self.conn.commit()
+                log.info("Column htf_bias_score added successfully")
+        except Exception as e:
+            log.error(f"Error checking/adding column: {e}")
+            # Continue anyway - the save_signal will try to handle it
         
         await self.conn.commit()
         log.info(f"Database initialized at {self.db_path}")
