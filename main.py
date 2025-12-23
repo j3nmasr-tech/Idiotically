@@ -27,9 +27,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v3_2.db")
 
 # Scanner settings
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 30))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
 TOP_N = int(os.getenv("TOP_N", 30))
-MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 15))
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 10))
 
 # Signal thresholds
 MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 0.0))
