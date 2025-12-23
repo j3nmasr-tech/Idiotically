@@ -45,7 +45,7 @@ class Config:
     
     # Scanning
     SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "10"))
-    TOP_N = int(os.getenv("TOP_N", "60"))
+    TOP_N = int(os.getenv("TOP_N", "10"))
     TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
     
     # Signal thresholds
@@ -70,10 +70,10 @@ class Config:
     ENABLE_RATE_LIMIT = True
     
     # HTF BIAS CONFIGURATION
-    HTF_BIAS_ENABLED = True
+    HTF_BIAS_ENABLED = False
     RANGE_EXTREME_THRESHOLD = 0.25  # Top/bottom 25% = "near" range edge
     MIN_HTF_BIAS_SCORE = 0.6  # Minimum score to accept trade (0.0-1.0)
-    MID_RANGE_REJECT = True   # Auto-reject mid-range entries
+    MID_RANGE_REJECT = False   # Auto-reject mid-range entries
     
     # HTF Mapping (RomeOPT-style relative HTF)
     HTF_MAP = {
