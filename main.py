@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ROMEOTPT SCANNER v3.2 - COMPLETE & CORRECTED VERSION
-Two-layer architecture + Deduplication + Outcome Tracking
+ROMEOTPT SCANNER v3.2 - WITH OKX RATE LIMIT FIX
 """
 
 import os
@@ -26,22 +25,22 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v3_2.db")
 
-# Scanner settings
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 90))
-TOP_N = int(os.getenv("TOP_N", 30))
-MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 10))
+# SCANNER SETTINGS (ADJUSTED FOR OKX)
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "45"))  # 45 seconds between scans
+TOP_N = int(os.getenv("TOP_N", "25"))                 # Top 25 symbols by volume
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", "6"))  # 6 concurrent max
 
 # Signal thresholds
-MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 0.0))
+MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", "0.0"))
 
 # Deduplication settings
-SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 5))
-SIGNAL_VALIDITY_HOURS = int(os.getenv("SIGNAL_VALIDITY_HOURS", 12))
-PRICE_MOVEMENT_THRESHOLD = float(os.getenv("PRICE_MOVEMENT_THRESHOLD", 10.5))
+SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", "5"))
+SIGNAL_VALIDITY_HOURS = int(os.getenv("SIGNAL_VALIDITY_HOURS", "12"))
+PRICE_MOVEMENT_THRESHOLD = float(os.getenv("PRICE_MOVEMENT_THRESHOLD", "10.5"))
 
 # Outcome tracking
-OUTCOME_CHECK_INTERVAL = int(os.getenv("OUTCOME_CHECK_INTERVAL", 60))
-MINIMUM_TRADE_HOLD_SECONDS = int(os.getenv("MINIMUM_TRADE_HOLD_SECONDS", 30))
+OUTCOME_CHECK_INTERVAL = int(os.getenv("OUTCOME_CHECK_INTERVAL", "120"))
+MINIMUM_TRADE_HOLD_SECONDS = int(os.getenv("MINIMUM_TRADE_HOLD_SECONDS", "60"))
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(
@@ -50,6 +49,44 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 log = logging.getLogger("romeopt_v3_2")
+
+# ---------------- RATE LIMITER ----------------
+class OKXRateLimiter:
+    """Smart rate limiter for OKX API (20 requests/second limit)"""
+    
+    def __init__(self, max_per_second=8, burst_size=4):
+        self.max_per_second = max_per_second  # Conservative: 8 req/sec
+        self.burst_size = burst_size
+        self.requests = []
+        self.lock = asyncio.Lock()
+        self.total_requests = 0
+        self.rate_limit_hits = 0
+        
+    async def acquire(self, weight=1):
+        """Acquire permission to make a request"""
+        async with self.lock:
+            now = time.time()
+            
+            # Remove requests older than 1 second
+            self.requests = [t for t in self.requests if now - t < 1.0]
+            
+            # Check if we can proceed
+            if len(self.requests) >= self.max_per_second:
+                # Calculate wait time
+                oldest = self.requests[0]
+                wait_time = 1.0 - (now - oldest)
+                if wait_time > 0:
+                    await asyncio.sleep(wait_time)
+                    now = time.time()
+                    # Re-clean after waiting
+                    self.requests = [t for t in self.requests if now - t < 1.0]
+            
+            # Add this request
+            self.requests.append(now)
+            self.total_requests += 1
+
+# Initialize global rate limiter
+rate_limiter = OKXRateLimiter(max_per_second=8, burst_size=4)
 
 # ---------------- DATA STRUCTURES ----------------
 @dataclass
@@ -392,16 +429,72 @@ async def send_telegram(msg: str, parse_mode="HTML"):
             log.warning(f"Telegram send failed: {e}")
 
 # ---------------- UTILS ----------------
+async def fetch_with_retry(exchange, func, *args, max_retries=3, **kwargs):
+    """Generic fetch with rate limiting and retry logic"""
+    for attempt in range(max_retries):
+        try:
+            # Apply rate limiting
+            await rate_limiter.acquire()
+            
+            # Make the request
+            result = await func(*args, **kwargs)
+            return result
+            
+        except ccxt.RateLimitExceeded as e:
+            if attempt < max_retries - 1:
+                wait_time = (2 ** attempt) * 2  # Exponential backoff: 2, 4, 8 seconds
+                log.warning(f"Rate limit, retry {attempt+1} in {wait_time}s")
+                await asyncio.sleep(wait_time)
+                continue
+            else:
+                log.error(f"Rate limit exceeded after {max_retries} retries")
+                raise
+        except Exception as e:
+            error_str = str(e)
+            if "50011" in error_str or "Too Many Requests" in error_str or "429" in error_str:
+                if attempt < max_retries - 1:
+                    wait_time = (2 ** attempt) * 3  # Longer backoff for OKX errors
+                    log.warning(f"OKX API error, retry {attempt+1} in {wait_time}s")
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    log.error(f"Persistent OKX error")
+                    raise
+            log.debug(f"Fetch failed (attempt {attempt+1}): {e}")
+            if attempt == max_retries - 1:
+                raise
+            await asyncio.sleep(1)
+    return None
+
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit: int = 100):
-    """Fetch OHLCV with timeout"""
+    """Fetch OHLCV with rate limiting and retry"""
     try:
-        return await asyncio.wait_for(
-            exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit),
-            timeout=3.0
+        return await fetch_with_retry(
+            exchange, 
+            exchange.fetch_ohlcv, 
+            symbol, 
+            timeframe=timeframe, 
+            limit=limit
         )
     except Exception as e:
         log.debug(f"Failed to fetch {symbol} {timeframe}: {e}")
         return None
+
+async def fetch_ticker(exchange, symbol: str):
+    """Fetch ticker with rate limiting"""
+    try:
+        return await fetch_with_retry(exchange, exchange.fetch_ticker, symbol)
+    except Exception as e:
+        log.debug(f"Failed to fetch ticker for {symbol}: {e}")
+        return None
+
+async def fetch_tickers_batch(exchange):
+    """Fetch all tickers with rate limiting"""
+    try:
+        return await fetch_with_retry(exchange, exchange.fetch_tickers)
+    except Exception as e:
+        log.error(f"Failed to fetch tickers batch: {e}")
+        return {}
 
 def create_dataframe(ohlcv):
     """Create DataFrame from OHLCV"""
@@ -416,9 +509,12 @@ def create_dataframe(ohlcv):
 async def check_eligibility_fast(exchange, symbol: str) -> SetupEligibility:
     """LAYER 1: FAST FILTER - ELIGIBILITY ONLY"""
     
-    # Get current price
+    # Get current price with rate limiting
     try:
-        ticker = await exchange.fetch_ticker(symbol)
+        ticker = await fetch_ticker(exchange, symbol)
+        if not ticker:
+            return SetupEligibility(eligible=False, disqualify_reason="No ticker data")
+            
         current_price = ticker.get("last", 0)
         if current_price == 0:
             return SetupEligibility(eligible=False, disqualify_reason="No price")
@@ -640,8 +736,9 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility) 
     
     try:
         # Get current price for accurate checks
-        ticker = await exchange.fetch_ticker(symbol)
-        current_price = ticker.get("last", entry_price)
+        ticker = await fetch_ticker(exchange, symbol)
+        if ticker:
+            current_price = ticker.get("last", entry_price)
         
         # === STEP 1: HTF Bias Alignment ===
         ohlcv_1h = await fetch_ohlcv(exchange, symbol, "1h", 30)
@@ -720,9 +817,15 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility) 
                         eight_steps['step_4_structure_shift'] = True
         
         # === STEP 5: FROM Liquidity ===
+        # Simple FROM liquidity check: if sweep happened AND price moved away
         if sweep_strength > 0.5:
-            from_liquidity_exists = True
-            eight_steps['step_5_from_liquidity'] = True
+            # Check if price has moved away from swept level
+            if side == "BUY" and current_price > entry_price * 1.01:  # Moved up 1%
+                from_liquidity_exists = True
+                eight_steps['step_5_from_liquidity'] = True
+            elif side == "SELL" and current_price < entry_price * 0.99:  # Moved down 1%
+                from_liquidity_exists = True
+                eight_steps['step_5_from_liquidity'] = True
         
         # === STEP 6: Confirmation Candle ===
         ohlcv_5m = await fetch_ohlcv(exchange, symbol, "5m", 5)
@@ -820,8 +923,8 @@ async def scan_symbol_fast(exchange, symbol: str) -> Optional[Dict]:
         quality = await analyze_quality(exchange, symbol, eligibility)
         
         # Get current price
-        ticker = await exchange.fetch_ticker(symbol)
-        current_price = ticker.get("last", 0)
+        ticker = await fetch_ticker(exchange, symbol)
+        current_price = ticker.get("last", 0) if ticker else eligibility.entry_price
         
         # Calculate RR
         risk = abs(eligibility.entry_price - eligibility.sl_price)
@@ -892,12 +995,10 @@ async def send_fast_alert(setup: Dict):
                 update_info = f"\n🔄 <b>Updated signal</b>"
         
         tp_targets = setup.get('tp_targets', [])
-        # Format TP values separately to avoid f-string formatting errors
         tp1_display = f"{tp_targets[0]:.8f}" if len(tp_targets) > 0 else 'N/A'
         tp2_display = f"{tp_targets[1]:.8f}" if len(tp_targets) > 1 else 'N/A'
         
         # ============ 8-STEP NUMERICAL DISPLAY ============
-        # Build the 8-step checklist with pass/fail status
         checklist_lines = []
         
         # Step 1: HTF Bias Alignment
@@ -956,7 +1057,6 @@ async def send_fast_alert(setup: Dict):
         for line in checklist_lines:
             checklist += f"   {line}\n"
         checklist += f"\n   📊 <b>SCORE:</b> {pass_count}/8 steps passed"
-        # ==========================================
         
         msg = f"""
 {update_emoji}{tier_emoji} <b>ROMEOTPT v3.2 - {quality.get('tier', 'C')} Tier</b>
@@ -1013,7 +1113,6 @@ async def send_outcome_alert(symbol: str, outcome: Dict):
             time_str = f"{bars_held//60}h {bars_held%60}min"
         
         tp_targets = setup.get('tp_targets', [0])
-        # Format TP separately
         tp_display = f"{tp_targets[0]:.8f}" if len(tp_targets) > 0 else 'N/A'
         
         msg = f"""
@@ -1247,7 +1346,26 @@ async def outcome_checker_task(exchange):
             active_symbols = list(signal_tracker.active_signals.keys())
             
             if active_symbols:
-                tickers = await exchange.fetch_tickers()
+                # Fetch tickers in batches to avoid rate limits
+                tickers = {}
+                batch_size = 5
+                
+                for i in range(0, len(active_symbols), batch_size):
+                    batch = active_symbols[i:i+batch_size]
+                    
+                    # Add delay between batches
+                    if i > 0:
+                        await asyncio.sleep(0.5)
+                    
+                    # Fetch each ticker individually (OKX doesn't have multi-symbol ticker endpoint)
+                    for symbol in batch:
+                        try:
+                            ticker = await fetch_ticker(exchange, symbol)
+                            if ticker:
+                                tickers[symbol] = ticker
+                        except Exception as e:
+                            log.debug(f"Failed to fetch ticker for {symbol} in outcome check: {e}")
+                
                 outcomes_found = 0
                 
                 for symbol in active_symbols:
@@ -1276,7 +1394,11 @@ async def process_deduped_results(results) -> int:
     
     for result in results:
         if isinstance(result, Exception):
-            log.error(f"Task error: {result}")
+            if "rate limit" in str(result).lower() or "50011" in str(result) or "429" in str(result):
+                rate_limiter.rate_limit_hits += 1
+                log.warning(f"Rate limit error in scan: {result}")
+            else:
+                log.error(f"Task error: {result}")
             continue
             
         if result:
@@ -1293,7 +1415,7 @@ async def process_deduped_results(results) -> int:
     return alerts_sent
 
 async def outcome_aware_scanner(exchange):
-    """Main scanner with outcome tracking"""
+    """Main scanner with outcome tracking and rate limiting"""
     
     # Send startup message
     startup_msg = f"""
@@ -1302,16 +1424,14 @@ async def outcome_aware_scanner(exchange):
 <b>Settings:</b>
 • Scan: {SCAN_INTERVAL}s
 • Top: {TOP_N} symbols
+• Concurrent: {MAX_CONCURRENT}
 • Cooldown: {SIGNAL_COOLDOWN_MINUTES}min
 • Validity: {SIGNAL_VALIDITY_HOURS}h
-• Outcome check: {OUTCOME_CHECK_INTERVAL}s
-• Min quality: {MIN_QUALITY_SCORE}
 
-<b>⚠️ NEW FILTER ACTIVE:</b>
-• HTF Bias MUST be aligned ✅
-• Confirmation candle MUST be formed ✅
-
-<i>Only signals with both conditions will be alerted</i>
+<b>⚠️ RATE LIMIT PROTECTION:</b>
+• Max 8 requests/second
+• Exponential backoff
+• Smart batching
 """
     await send_telegram(startup_msg)
     
@@ -1319,31 +1439,67 @@ async def outcome_aware_scanner(exchange):
     asyncio.create_task(outcome_checker_task(exchange))
     
     scan_cycle = 0
+    consecutive_errors = 0
     
     while True:
         scan_cycle += 1
         
         try:
-            # Get symbols
-            tickers = await exchange.fetch_tickers()
+            # Dynamic backoff based on error rate
+            if consecutive_errors > 0:
+                extra_wait = min(consecutive_errors * 5, 30)
+                log.warning(f"Previous errors: {consecutive_errors}, waiting {extra_wait}s extra")
+                await asyncio.sleep(extra_wait)
+            
+            # Get symbols with rate limiting
+            try:
+                tickers = await fetch_tickers_batch(exchange)
+                if not tickers:
+                    log.warning("No tickers returned, retrying in 10s")
+                    await asyncio.sleep(10)
+                    consecutive_errors += 1
+                    continue
+            except Exception as e:
+                error_str = str(e)
+                if "rate limit" in error_str.lower() or "50011" in error_str or "429" in error_str:
+                    consecutive_errors += 2
+                    wait_time = min(consecutive_errors * 10, 60)
+                    log.error(f"Rate limit on tickers: {e}, waiting {wait_time}s")
+                    await asyncio.sleep(wait_time)
+                    continue
+                else:
+                    log.error(f"Error fetching tickers: {e}")
+                    await asyncio.sleep(SCAN_INTERVAL)
+                    consecutive_errors += 1
+                    continue
+            
+            # Reset error counter on success
+            if consecutive_errors > 0:
+                consecutive_errors = max(0, consecutive_errors - 1)
+            
             usdt_pairs = []
             
             for symbol, data in tickers.items():
                 if symbol.endswith("/USDT"):
                     # Skip stablecoin pairs
-                    if symbol in ["USDC/USDT", "USDG/USDT"]:
+                    if symbol in ["USDC/USDT", "USDG/USDT", "DAI/USDT", "BUSD/USDT", "TUSD/USDT"]:
                         continue
                     
                     volume = data.get("quoteVolume", 0)
                     if isinstance(volume, (int, float)):
                         usdt_pairs.append((symbol, float(volume)))
             
+            if not usdt_pairs:
+                log.warning("No USDT pairs found")
+                await asyncio.sleep(SCAN_INTERVAL)
+                continue
+            
             usdt_pairs.sort(key=lambda x: x[1], reverse=True)
             symbols_to_scan = [s[0] for s in usdt_pairs[:TOP_N]]
             
             stats = signal_tracker.get_stats()
             
-            log.info(f"🔄 Scan #{scan_cycle}: {len(symbols_to_scan)} symbols | Active: {stats.get('active_signals', 0)}")
+            log.info(f"🔄 Scan #{scan_cycle}: {len(symbols_to_scan)} symbols | Active: {stats.get('active_signals', 0)} | Rate limit hits: {rate_limiter.rate_limit_hits}")
             
             # Log stats periodically
             if scan_cycle % 10 == 0:
@@ -1353,28 +1509,50 @@ async def outcome_aware_scanner(exchange):
                     win_rate = outcome_stats.get('win_rate', 0)
                     log.info(f"📈 Stats: WR={win_rate:.1f}% | TP1={outcome_stats.get('tp1_hits', 0)} | SL={outcome_stats.get('sl_hits', 0)}")
             
-            # Scan symbols
+            # SMART BATCH SCANNING WITH RATE LIMITING
             alerts_this_scan = 0
-            tasks = []
             
-            for symbol in symbols_to_scan:
-                task = asyncio.create_task(scan_symbol_fast(exchange, symbol))
-                tasks.append(task)
+            # Process in small batches with delays
+            batch_size = min(MAX_CONCURRENT, 4)  # Max 4 concurrent
+            for i in range(0, len(symbols_to_scan), batch_size):
+                batch = symbols_to_scan[i:i+batch_size]
+                tasks = []
                 
-                if len(tasks) >= MAX_CONCURRENT:
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    alerts_this_scan += await process_deduped_results(results)
-                    tasks = []
-            
-            if tasks:
+                for symbol in batch:
+                    task = asyncio.create_task(scan_symbol_fast(exchange, symbol))
+                    tasks.append(task)
+                
+                # Wait for this batch
                 results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Process results
                 alerts_this_scan += await process_deduped_results(results)
+                
+                # Add delay between batches unless this is the last batch
+                if i + batch_size < len(symbols_to_scan):
+                    await asyncio.sleep(1.0)  # 1 second delay between batches
+            
+            # Adaptive scanning based on rate limit hits
+            if rate_limiter.rate_limit_hits > 5:
+                # Reduce scanning intensity
+                extra_wait = min(rate_limiter.rate_limit_hits * 2, 30)
+                log.warning(f"High rate limit hits ({rate_limiter.rate_limit_hits}), waiting {extra_wait}s extra")
+                await asyncio.sleep(extra_wait)
+                rate_limiter.rate_limit_hits = max(0, rate_limiter.rate_limit_hits - 3)
             
             await asyncio.sleep(SCAN_INTERVAL)
             
         except Exception as e:
-            log.error(f"Scanner error: {e}")
-            await asyncio.sleep(SCAN_INTERVAL * 2)
+            error_str = str(e)
+            if "rate limit" in error_str.lower() or "50011" in error_str or "429" in error_str:
+                consecutive_errors += 2
+                wait_time = min(consecutive_errors * 15, 90)
+                log.error(f"Rate limit error in scanner: {e}, waiting {wait_time}s")
+                await asyncio.sleep(wait_time)
+            else:
+                log.error(f"Scanner error: {e}")
+                consecutive_errors += 1
+                await asyncio.sleep(SCAN_INTERVAL * 2)
 
 # ---------------- FASTAPI ----------------
 app = FastAPI()
@@ -1386,7 +1564,10 @@ async def health():
         "status": "healthy", 
         "version": "3.2",
         "active_signals": stats.get('active_signals', 0),
-        "outcome_stats": signal_tracker.outcome_stats
+        "outcome_stats": signal_tracker.outcome_stats,
+        "rate_limit_hits": rate_limiter.rate_limit_hits,
+        "total_requests": rate_limiter.total_requests,
+        "concurrent_limit": MAX_CONCURRENT
     }
 
 @app.get("/signals/active")
@@ -1491,6 +1672,22 @@ async def get_recent_outcomes(limit: int = 20):
     
     return {"outcomes": outcomes, "count": len(outcomes)}
 
+@app.get("/rate-status")
+async def rate_status():
+    """Check rate limit status"""
+    return {
+        "rate_limit_hits": rate_limiter.rate_limit_hits,
+        "total_requests": rate_limiter.total_requests,
+        "requests_per_second": rate_limiter.max_per_second,
+        "current_queue": len(rate_limiter.requests) if hasattr(rate_limiter, 'requests') else 0,
+        "recommended_action": "Increase SCAN_INTERVAL" if rate_limiter.rate_limit_hits > 5 else "Normal",
+        "settings": {
+            "SCAN_INTERVAL": SCAN_INTERVAL,
+            "MAX_CONCURRENT": MAX_CONCURRENT,
+            "TOP_N": TOP_N
+        }
+    }
+
 # ---------------- MAIN ----------------
 async def periodic_cleanup():
     """Periodically clean up old signals"""
@@ -1506,19 +1703,21 @@ async def main():
         db_conn = await aiosqlite.connect(DB_PATH)
         await init_database()
         
-        # Create exchange
+        # Create exchange with OKX-specific settings
         exchange = ccxt.okx({
-            "enableRateLimit": True,
+            "enableRateLimit": True,  # CRITICAL: Enable CCXT's built-in rate limiting
             "options": {"defaultType": "spot"},
-            "rateLimit": 10,
-            "timeout": 5000,
+            "rateLimit": 50,  # OKX uses 50ms per request (20 req/sec)
+            "timeout": 15000,  # Longer timeout
+            "headers": {
+                "User-Agent": "ROMEOTPT/3.2"
+            }
         })
         
-        log.info("🚀 ROMEOTPT v3.2 - COMPLETE")
-        log.info(f"Scan: {SCAN_INTERVAL}s | Top {TOP_N} symbols")
+        log.info("🚀 ROMEOTPT v3.2 - WITH OKX RATE LIMIT FIX")
+        log.info(f"Scan: {SCAN_INTERVAL}s | Top {TOP_N} symbols | Concurrent: {MAX_CONCURRENT}")
         log.info(f"Cooldown: {SIGNAL_COOLDOWN_MINUTES}min | Validity: {SIGNAL_VALIDITY_HOURS}h")
-        log.info(f"Outcome check: {OUTCOME_CHECK_INTERVAL}s")
-        log.info(f"Filter: HTF Aligned + Confirmation Candle")
+        log.info(f"Rate limit: {rate_limiter.max_per_second} req/sec")
         
         # Start cleanup task
         asyncio.create_task(periodic_cleanup())
