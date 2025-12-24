@@ -2,22 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-LIVE ROMEOPT 6-STEP SCANNER - ENHANCED VERSION WITH CODE 1 TP LOGIC
-- Uses Code 1's single liquidity target TP logic
-- Keeps Code 2's enhanced features
-- RomeOPT 6-step logic
-- TP/SL tracking with ATR or OB
-- Telegram alerts
-- Async SQLite logging
-- Filters: Score >=5, Displacement +2, Sweep+2 OR Zone+1
-- Improved Order Block detection
-- HTF + Sweep scoring threshold
-- Elite multi-timeframe confirmation
-- 🎯 MOMENTUM FILTER: 0.8 threshold
-- 📊 ENHANCED BREAKDOWN: Shows all numerical values
-- 🔒 FORCED FILTER: Momentum ≥ 0.70 OR (Momentum ≥ 0.65 AND Displacement ≥ 0.60)
-- 🆕 OB DISTANCE FILTER: Reject trades where OB distance > 0.70%
-- 🆕 CODE 1 TP LOGIC: Single liquidity target, no TP ladders
+LIVE ROMEOPT 6-STEP SCANNER - LIQUIDITY PRIMARY, SWING FALLBACK
+- PRIMARY TP: Liquidity target (Code 1 logic)
+- FALLBACK TP: Swing high/low if no liquidity found
+- Enhanced features from Code 2
+- WORKING TP/SL Telegram alerts
 """
 
 import os, time, asyncio, logging, datetime
@@ -80,7 +69,6 @@ async def init_db():
     await db_conn.execute("PRAGMA journal_mode=WAL;")
     await db_conn.execute("PRAGMA synchronous=NORMAL;")
     
-    # Create table with single TP column (like Code 1)
     await db_conn.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,7 +90,8 @@ async def init_db():
             momentum_value REAL,
             displacement_value REAL,
             ob_distance_pct REAL,
-            ob_distance_filter TEXT
+            ob_distance_filter TEXT,
+            tp_source TEXT
         );
     """)
     await db_conn.commit()
@@ -159,12 +148,10 @@ def check_ob_distance_filter(entry_price: float, ob_midpoint: float, ob_low: flo
         "quality": quality
     }
 
-# ================ CODE 1 TP LOGIC INTEGRATION ================
+# ================ LIQUIDITY PRIMARY, SWING FALLBACK TP LOGIC ================
 
 def romeopt_market_state(df, atr_val):
-    """
-    FROM CODE 1: REFINED RomeOPT market state detection
-    """
+    """FROM CODE 1: Market state detection"""
     if len(df) < 3:
         return "BALANCED"
     
@@ -184,9 +171,7 @@ def romeopt_market_state(df, atr_val):
     return "IMBALANCED" if strong_displacement else "BALANCED"
 
 def romeopt_internal_liquidity(df, side, atr_val, lookback=15):
-    """
-    FROM CODE 1: REFINED RomeOPT internal liquidity detection
-    """
+    """FROM CODE 1: Internal liquidity detection"""
     if side == "SELL":
         lows = df['low'].iloc[-lookback:].dropna()
         if len(lows) < 5:
@@ -225,55 +210,116 @@ def romeopt_internal_liquidity(df, side, atr_val, lookback=15):
     return None
 
 def romeopt_external_liquidity(df, side, lookback=50):
-    """
-    FROM CODE 1: REFINED RomeOPT external liquidity detection
-    """
+    """FROM CODE 1: External liquidity detection"""
     if side == "SELL":
         return df['low'].iloc[-lookback:].min()
     else:  # BUY
         return df['high'].iloc[-lookback:].max()
 
-def romeopt_tp_sl_single(entry, side, atr_val, ob_zone, df):
+def find_swing_high_low(df, side, lookback=20):
     """
-    FROM CODE 1: SINGLE TP LOGIC
-    Returns: sl, tp, tp_type
+    FALLBACK TP: Find swing high/low
+    For BUY: Find recent swing high
+    For SELL: Find recent swing low
+    """
+    if len(df) < lookback:
+        return None
+    
+    if side == "BUY":
+        # Find swing highs (peak detection)
+        highs = df['high'].iloc[-lookback:].values
+        swing_highs = []
+        
+        for i in range(1, len(highs)-1):
+            if highs[i] > highs[i-1] and highs[i] > highs[i+1]:
+                swing_highs.append(highs[i])
+        
+        if swing_highs:
+            # Get the most recent swing high
+            return max(swing_highs)
+        else:
+            # Fallback to highest high in lookback
+            return df['high'].iloc[-lookback:].max()
+    
+    else:  # SELL
+        # Find swing lows (trough detection)
+        lows = df['low'].iloc[-lookback:].values
+        swing_lows = []
+        
+        for i in range(1, len(lows)-1):
+            if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
+                swing_lows.append(lows[i])
+        
+        if swing_lows:
+            # Get the most recent swing low
+            return min(swing_lows)
+        else:
+            # Fallback to lowest low in lookback
+            return df['low'].iloc[-lookback:].min()
+
+def romeopt_tp_sl_with_fallback(entry, side, atr_val, ob_zone, df):
+    """
+    PRIMARY: Liquidity target (Code 1 logic)
+    FALLBACK: Swing high/low if no liquidity found
     """
     market_state = romeopt_market_state(df, atr_val)
+    tp_source = "UNKNOWN"
     
+    # ================ PRIMARY: TRY LIQUIDITY TARGET ================
     tp = None
     tp_type = ""
     
     if market_state == "BALANCED":
         tp = romeopt_internal_liquidity(df, side, atr_val)
         if tp:
-            tp_type = f"RANGE: Visual {'Lows' if side == 'SELL' else 'Highs'} Cluster"
+            tp_type = f"LIQUIDITY_RANGE: Visual {'Lows' if side == 'SELL' else 'Highs'} Cluster"
+            tp_source = "LIQUIDITY"
     else:  # IMBALANCED
         tp = romeopt_external_liquidity(df, side)
         if tp:
-            tp_type = f"TREND: Range {'Low' if side == 'SELL' else 'High'}"
+            tp_type = f"LIQUIDITY_TREND: Range {'Low' if side == 'SELL' else 'High'}"
+            tp_source = "LIQUIDITY"
     
+    # ================ FALLBACK: SWING HIGH/LOW ================
     if tp is None:
-        log.debug(f"❌ No obvious liquidity found for {side} | Market: {market_state}")
-        return None
+        # No liquidity found, use swing high/low
+        swing_tp = find_swing_high_low(df, side)
+        if swing_tp:
+            tp = swing_tp
+            tp_type = f"SWING_{'HIGH' if side == 'BUY' else 'LOW'}: Recent {'Swing High' if side == 'BUY' else 'Swing Low'}"
+            tp_source = "SWING"
+            log.info(f"⚠️ No liquidity found, using fallback swing {'high' if side == 'BUY' else 'low'}: {tp:.6f}")
+        else:
+            log.debug(f"❌ No liquidity OR swing found for {side}")
+            return None
     
-    # Safety check - reject if recently swept
-    recent_candles = min(10, len(df))
-    if side == "SELL":
-        recent_touch = any(
-            abs(df['low'].iloc[-i] - tp) <= atr_val * 0.1
-            for i in range(1, recent_candles)
-        )
-    else:  # BUY
-        recent_touch = any(
-            abs(df['high'].iloc[-i] - tp) <= atr_val * 0.1
-            for i in range(1, recent_candles)
-        )
+    # Safety check - reject if recently swept (only for liquidity targets)
+    if tp_source == "LIQUIDITY":
+        recent_candles = min(10, len(df))
+        if side == "SELL":
+            recent_touch = any(
+                abs(df['low'].iloc[-i] - tp) <= atr_val * 0.1
+                for i in range(1, recent_candles)
+            )
+        else:  # BUY
+            recent_touch = any(
+                abs(df['high'].iloc[-i] - tp) <= atr_val * 0.1
+                for i in range(1, recent_candles)
+            )
+        
+        if recent_touch:
+            log.debug(f"❌ Liquidity recently swept for {side} at {tp}")
+            # Try swing fallback
+            swing_tp = find_swing_high_low(df, side)
+            if swing_tp:
+                tp = swing_tp
+                tp_type = f"SWING_{'HIGH' if side == 'BUY' else 'LOW'}_FALLBACK"
+                tp_source = "SWING_FALLBACK"
+                log.info(f"⚠️ Liquidity swept, using swing fallback: {tp:.6f}")
+            else:
+                return None
     
-    if recent_touch:
-        log.debug(f"❌ Liquidity recently swept for {side} at {tp}")
-        return None
-    
-    # Calculate SL (keep OB-based SL)
+    # ================ CALCULATE SL ================
     if side == "BUY":
         sl = ob_zone["low"] - (atr_val * 0.3)
         recent_low = df['low'].iloc[-10:].min()
@@ -316,13 +362,13 @@ def romeopt_tp_sl_single(entry, side, atr_val, ob_zone, df):
             log.debug(f"❌ TP reward {reward/risk:.2f}R < 0.5R minimum")
             return None
     
-    log.info(f"✅ {side} {entry:.6f} | Market: {market_state}")
+    log.info(f"✅ {side} {entry:.6f} | TP Source: {tp_source}")
     log.info(f"   SL: {sl:.6f} | TP: {tp:.6f} | Type: {tp_type}")
     log.info(f"   Risk: {risk:.6f} | R:R: {abs(tp-entry)/risk:.2f}:1")
     
-    return sl, tp, tp_type
+    return sl, tp, tp_type, tp_source
 
-# ================ END CODE 1 TP LOGIC ================
+# ================ END TP LOGIC ================
 
 # ---------------- ELITE TF ALIGNMENT ----------------
 async def elite_tf_alignment(exchange, symbol: str, side: str):
@@ -338,7 +384,7 @@ async def elite_tf_alignment(exchange, symbol: str, side: str):
             return False
     return True
 
-# ---------------- SIGNAL GENERATION (Code 2's logic with Code 1's TP) ----------------
+# ---------------- SIGNAL GENERATION ----------------
 async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
     if df is None or len(df) < 20: return None
     last = df.iloc[-1]
@@ -445,7 +491,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         calc_values["momentum_score"] = 0
 
     if not ob_type: return None
-    side = "BUY" if ob_type=="bullish" else "SELL"
+    side_str = "BUY" if ob_type=="bullish" else "SELL"
     entry = float(last["close"])
 
     # ---------------- CRITICAL FILTERS ----------------
@@ -491,24 +537,24 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         calc_values["ob_distance_filter_status"] = "NO_OB"
 
     # ---------------- ELITE MTF CONFIRMATION ----------------
-    if not await elite_tf_alignment(exchange, symbol, side):
+    if not await elite_tf_alignment(exchange, symbol, side_str):
         return None
     reasons.append("Elite MTF Alignment ✅")
 
-    # ---------------- CODE 1 TP CALCULATION ----------------
+    # ---------------- LIQUIDITY PRIMARY, SWING FALLBACK TP CALCULATION ----------------
     atr_val = float(atr(df, 14).iloc[-1])
-    result = romeopt_tp_sl_single(entry, side, atr_val, ob_zone, df)
+    result = romeopt_tp_sl_with_fallback(entry, side_str, atr_val, ob_zone, df)
     
     # REJECT if no valid TP found
     if result is None:
-        reasons.append("❌ NO VALID LIQUIDITY TARGET FOUND")
+        reasons.append("❌ NO VALID TP FOUND (liquidity or swing)")
         return None
     
-    sl, tp, tp_type = result
+    sl, tp, tp_type, tp_source = result
     
     sig = {
         "symbol": symbol,
-        "side": side,
+        "side": side_str,
         "entry": entry,
         "sl": sl,
         "tp": tp,
@@ -519,7 +565,8 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         "liquidity_sweep": liquidity_sweep,
         "momentum_ratio": momentum_ratio,
         "calc_values": calc_values,
-        "tp_type": tp_type
+        "tp_type": tp_type,
+        "tp_source": tp_source
     }
     
     # ---------------- FINAL FORCED VALIDATION ----------------
@@ -527,7 +574,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         log.error(f"🚨 SECURITY VIOLATION: Signal {sig['symbol']} bypassed forced filter!")
         return None
     
-    log.info(f"✅ Signal {sig['symbol']} passed all filters: Mom={momentum_val:.2f}, Disp={displacement_val:.2f}, OB Dist={calc_values.get('ob_distance_pct', 0):.2f}%")
+    log.info(f"✅ Signal {sig['symbol']} passed all filters: Mom={momentum_val:.2f}, Disp={displacement_val:.2f}, TP Source: {tp_source}")
     return sig
 
 # ---------------- SL CLUSTER ----------------
@@ -548,8 +595,8 @@ async def log_signal(sig):
         ob_distance_filter = calc.get("ob_distance_filter", {})
         
         await db_conn.execute("""
-            INSERT INTO signals (symbol,side,entry,sl,tp,timestamp,status,reason,score,tp_hit,latest_ob,tp_type,tp_locked,ob_type,sweep_type,momentum_value,displacement_value,ob_distance_pct,ob_distance_filter)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO signals (symbol,side,entry,sl,tp,timestamp,status,reason,score,tp_hit,latest_ob,tp_type,tp_locked,ob_type,sweep_type,momentum_value,displacement_value,ob_distance_pct,ob_distance_filter,tp_source)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             sig["symbol"],
             sig["side"],
@@ -560,20 +607,21 @@ async def log_signal(sig):
             "OPEN",
             sig["reason"],
             sig["score"],
-            0,  # tp_hit starts at 0
+            0,
             str(sig.get("latest_ob","")),
             sig.get("tp_type", ""),
-            1,  # tp_locked = 1 (like Code 1)
+            1,
             calc.get("ob_type", ""),
             calc.get("sweep_type", ""),
             calc.get("momentum_value", 0),
             calc.get("displacement_value", 0),
             calc.get("ob_distance_pct", 0),
-            ob_distance_filter.get("status", "UNKNOWN")
+            ob_distance_filter.get("status", "UNKNOWN"),
+            sig.get("tp_source", "UNKNOWN")
         ))
         await db_conn.commit()
 
-# ---------------- MONITOR SIGNALS ----------------
+# ---------------- MONITOR SIGNALS WITH WORKING ALERTS ----------------
 async def monitor_signals():
     while True:
         try:
@@ -598,12 +646,54 @@ async def monitor_signals():
                             if sl is not None and last_price>=sl: 
                                 hits.append("SL"); status="CLOSED"; sl_hit=True
 
+                        # FIXED: Send Telegram alert when TP/SL is hit
                         if hits:
-                            await tg(f"🎯 {symbol} {side} update\nEntry:{entry}\nLast:{last_price}\nHits:{','.join(hits)}\nSL:{sl}\nTP:{tp}")
+                            # Get additional signal info
+                            async with db_conn.execute("SELECT tp_type,tp_source FROM signals WHERE id=?", (sig_id,)) as cursor2:
+                                extra_info = await cursor2.fetchone()
+                                tp_type = extra_info[0] if extra_info else ""
+                                tp_source = extra_info[1] if extra_info else ""
+                            
+                            # Format alert message
+                            current_time = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+                            
+                            if "SL" in hits:
+                                loss = abs(last_price - entry)
+                                loss_pct = abs((last_price - entry) / entry * 100)
+                                alert_msg = f"""
+🚨 **STOP LOSS HIT** 🚨
+
+{symbol} {side}
+Entry: {entry:.6f}
+SL: {sl:.6f}
+Last Price: {last_price:.6f}
+Loss: {loss:.6f} ({loss_pct:.2f}%)
+TP Type: {tp_type}
+TP Source: {tp_source}
+Time: {current_time}
+                                """
+                            elif "TP" in hits:
+                                profit = last_price - entry if side == "BUY" else entry - last_price
+                                profit_pct = (profit / entry * 100)
+                                alert_msg = f"""
+🎉 **TAKE PROFIT HIT** 🎉
+
+{symbol} {side}
+Entry: {entry:.6f}
+TP: {tp:.6f}
+Last Price: {last_price:.6f}
+Profit: {profit:.6f} ({profit_pct:.2f}%)
+TP Type: {tp_type}
+TP Source: {tp_source}
+Time: {current_time}
+                                """
+                            
+                            await tg(alert_msg)
+                            log.info(f"📢 Alert sent for {symbol}: {hits}")
 
                         if sl_hit: record_sl_hit(symbol)
                         
-                        # Only update if something changed
+                        # Update database if something changed
                         if new_tp_hit != tp_hit or status != "OPEN":
                             await db_conn.execute("UPDATE signals SET tp_hit=?,status=? WHERE id=?",
                                                  (new_tp_hit, status, sig_id))
@@ -642,6 +732,7 @@ async def scan_loop(exchange):
                         displacement_val = calc.get("displacement_value", 0)
                         ob_distance_pct = calc.get("ob_distance_pct", 100)
                         ob_filter_status = calc.get("ob_distance_filter_status", "UNKNOWN")
+                        tp_source = sig.get("tp_source", "UNKNOWN")
                         
                         filter_passed = force_filter_trade(momentum_val, displacement_val)
                         
@@ -672,7 +763,8 @@ async def scan_loop(exchange):
                             f"• Momentum ≥ {MOMENTUM_STRONG_THRESHOLD if momentum_val >= MOMENTUM_STRONG_THRESHOLD else MOMENTUM_GOOD_THRESHOLD}",
                             f"• Displacement ≥ {DISPLACEMENT_MIN_THRESHOLD}",
                             f"",
-                            f"🎯 LIQUIDITY TARGET (Code 1 TP Logic):",
+                            f"🎯 TP STRATEGY:",
+                            f"• Source: {tp_source}",
                             f"• Type: {sig.get('tp_type', 'N/A')}",
                             f"• SL: {sig.get('sl'):.6f}",
                             f"• TP: {sig.get('tp'):.6f}",
@@ -680,16 +772,20 @@ async def scan_loop(exchange):
                             f"• Risk: {risk:.6f}",
                             f"",
                             f"💎 ROMEOPT PHILOSOPHY:",
-                            f"One TP = One liquidity objective",
-                            f"TP LOCKED - No chasing price"
+                            f"Primary: Liquidity target",
+                            f"Fallback: Swing {'high' if sig['side'] == 'BUY' else 'low'}"
                         ]
+                        
+                        # Highlight if using fallback
+                        if "SWING" in tp_source:
+                            breakdown_lines.insert(1, f"⚠️ USING FALLBACK TP STRATEGY")
                         
                         await tg("\n".join(breakdown_lines))
                         await log_signal(sig)
                         last_signal_time[key]=time.time()
                         signals_found+=1
             
-            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals (Code 1 TP Logic)")
+            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals (Liquidity Primary, Swing Fallback)")
         
         except Exception as e: 
             log.exception("scan error: %s", e)
@@ -719,12 +815,14 @@ async def main():
     
     # Start announcement
     await tg("🏆 ROMEOPT 6-STEP SCANNER STARTED")
-    await tg("🔄 INTEGRATED: Code 1 TP Logic + Code 2 Enhanced Features")
-    await tg("🎯 TP LOGIC: Single liquidity target (Code 1)")
+    await tg("🎯 TP STRATEGY: Liquidity Primary, Swing Fallback")
+    await tg("  1. PRIMARY: Find liquidity target (Code 1 logic)")
+    await tg("  2. FALLBACK: Swing high/low if no liquidity found")
     await tg("📊 ENHANCED: OB Distance Filter + Detailed Breakdown")
     await tg("🔒 FORCED FILTER: Momentum ≥ 0.70 OR (≥0.65 & Disp≥0.60)")
     await tg("📏 OB DISTANCE: ≤ 0.70% required")
-    await tg("💎 PHILOSOPHY: Target where price MUST go")
+    await tg("📢 ALERTS: TP/SL alerts enabled")
+    await tg("💎 PHILOSOPHY: Always find a target")
     
     # Start main loops
     await asyncio.gather(
