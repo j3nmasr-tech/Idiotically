@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ROMEOTPT SCANNER v3.2 - WITH OKX RATE LIMIT FIX
+ROMEOTPT SCANNER v3.2 - WITH GOLDEN RATIO FILTER (RR ≥ 1.0:1)
 """
 
 import os
@@ -87,6 +87,60 @@ class OKXRateLimiter:
 
 # Initialize global rate limiter
 rate_limiter = OKXRateLimiter(max_per_second=8, burst_size=4)
+
+# ---------------- GOLDEN RATIO TRACKER ----------------
+class GoldenRatioTracker:
+    """Track Golden Ratio filtering performance"""
+    def __init__(self):
+        self.signals_checked = 0
+        self.signals_passed = 0
+        self.signals_rejected = 0
+        self.rejection_reasons = {}
+        
+    def check_signal(self, setup: Dict) -> Tuple[bool, str]:
+        """Check if signal passes Golden Ratio (RR ≥ 1.0:1)"""
+        self.signals_checked += 1
+        
+        if not setup:
+            self.signals_rejected += 1
+            return False, "No setup"
+        
+        rr_ratio = setup.get('rr_ratio', 0)
+        symbol = setup.get('symbol', 'UNKNOWN')
+        
+        # GOLDEN RATIO FILTER: RR MUST BE ≥ 1.0:1
+        if rr_ratio < 1.0:
+            reason = f"RR={rr_ratio:.2f}:1"
+            self.rejection_reasons[reason] = self.rejection_reasons.get(reason, 0) + 1
+            self.signals_rejected += 1
+            log.info(f"⛔ GR REJECT {symbol}: {reason}")
+            return False, reason
+        
+        self.signals_passed += 1
+        log.info(f"✅ GR PASS {symbol}: RR={rr_ratio:.2f}:1")
+        return True, f"RR={rr_ratio:.2f}:1"
+    
+    def get_stats(self) -> Dict:
+        """Get Golden Ratio statistics"""
+        if self.signals_checked == 0:
+            return {"status": "No signals checked"}
+        
+        pass_rate = (self.signals_passed / self.signals_checked) * 100
+        
+        return {
+            "checked": self.signals_checked,
+            "passed": self.signals_passed,
+            "rejected": self.signals_rejected,
+            "pass_rate": f"{pass_rate:.1f}%",
+            "top_rejections": dict(sorted(
+                self.rejection_reasons.items(), 
+                key=lambda x: x[1], 
+                reverse=True
+            )[:5])
+        }
+
+# Initialize Golden Ratio tracker
+golden_ratio_tracker = GoldenRatioTracker()
 
 # ---------------- DATA STRUCTURES ----------------
 @dataclass
@@ -730,7 +784,7 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility) 
             '5': 'FROM liquidity present',
             '6': 'Confirmation candle formed',
             '7': 'Price in valid entry zone',
-            '8': 'Risk/Reward ≥ 1.5:1'
+            '8': 'Risk/Reward ≥ 1.0:1 (Golden Ratio)'
         }
     }
     
@@ -847,11 +901,11 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility) 
             price_diff_pct = abs(current_price - entry_price) / entry_price * 100
             eight_steps['step_7_entry_zone'] = price_diff_pct <= entry_zone_threshold
         
-        # === STEP 8: Risk/Reward Ratio ===
+        # === STEP 8: Risk/Reward Ratio (GOLDEN RATIO) ===
         risk = abs(eligibility.entry_price - eligibility.sl_price)
         reward = abs(eligibility.tp_targets[0] - eligibility.entry_price)
         rr_ratio = reward / risk if risk > 0 else 0
-        eight_steps['step_8_rr_ratio'] = rr_ratio >= 1.5
+        eight_steps['step_8_rr_ratio'] = rr_ratio >= 1.0  # GOLDEN RATIO: 1.0 not 1.5!
         
         # Store RR ratio for later use
         eight_steps['rr_ratio'] = rr_ratio
@@ -859,13 +913,20 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility) 
     except Exception as e:
         log.debug(f"Quality analysis error for {symbol}: {e}")
     
-    # Calculate total score (0-5)
+    # Calculate total score (0-5) with Golden Ratio bonus
+    golden_ratio_bonus = 0.0
+    if eight_steps.get('rr_ratio', 0) >= 1.5:
+        golden_ratio_bonus = 0.5
+    elif eight_steps.get('rr_ratio', 0) >= 2.0:
+        golden_ratio_bonus = 1.0
+    
     total_score = (
         sweep_strength +
         (1.0 if structure_shift else 0.0) +
         (0.5 if from_liquidity_exists else 0.0) +
         (0.5 if confirmation_candle else 0.0) +
-        htfc_alignment_score
+        htfc_alignment_score +
+        golden_ratio_bonus
     )
     
     return SetupQuality(
@@ -878,33 +939,35 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility) 
         eight_steps_status=eight_steps
     )
 
-# ---------------- SIGNAL FILTER ----------------
-def filter_signal_by_criteria(setup: Dict) -> bool:
-    """Filter signals: MUST have HTF aligned AND Confirmation candle"""
+# ---------------- GOLDEN RATIO FILTER ----------------
+def golden_ratio_filter(setup: Dict) -> bool:
+    """ULTRA-STRICT GOLDEN RATIO FILTER - RR ≥ 1.0:1"""
     if not setup:
         return False
     
+    # RULE 1: RR MUST BE ≥ 1.0:1
+    rr_ratio = setup.get('rr_ratio', 0)
+    if rr_ratio < 1.0:
+        symbol = setup.get('symbol', 'UNKNOWN')
+        log.info(f"⛔ GOLDEN RATIO REJECT: {symbol} RR={rr_ratio:.2f}:1")
+        return False
+    
+    # Additional optional filters
     quality = setup.get('quality', {})
-    eight_steps = quality.get('eight_steps', {})
     
-    # MUST HAVE: HTF bias aligned
-    htf_aligned = eight_steps.get('step_1_htf_bias', False)
-    if not htf_aligned:
+    # RULE 2: Must have SOME liquidity sweep
+    sweep_strength = quality.get('sweep_strength', 0)
+    if sweep_strength <= 0.00:
+        symbol = setup.get('symbol', 'UNKNOWN')
+        log.debug(f"🔍 Filtered {symbol}: No liquidity sweep")
         return False
     
-    # MUST HAVE: Confirmation candle formed
-    confirmation_candle = eight_steps.get('step_6_confirmation_candle', False)
-    if not confirmation_candle:
+    # RULE 3: Minimum quality score
+    quality_score = quality.get('total_score', 0)
+    if quality_score < 0.5:
+        symbol = setup.get('symbol', 'UNKNOWN')
+        log.debug(f"🔍 Filtered {symbol}: Quality score too low")
         return False
-    
-    # Log filtered signals
-    symbol = setup.get('symbol', 'UNKNOWN')
-    if not htf_aligned:
-        log.debug(f"🔍 Filtered {symbol}: Missing HTF alignment")
-    elif not confirmation_candle:
-        log.debug(f"🔍 Filtered {symbol}: Missing confirmation candle")
-    else:
-        log.info(f"✅ Signal passed filter: {symbol}")
     
     return True
 
@@ -913,6 +976,12 @@ async def scan_symbol_fast(exchange, symbol: str) -> Optional[Dict]:
     """ULTRA-FAST scanning: Layer 1 only, Layer 2 optional"""
     
     try:
+        # EARLY REJECTION: Toxic assets
+        toxic_assets = ['CXT/USDT', 'XPL/USDT', 'FIL/USDT', 'ANIME/USDT', 'AVNT/USDT', 'HYPE/USDT']
+        if any(toxic in symbol.upper() for toxic in toxic_assets):
+            log.debug(f"⛔ Early toxic asset rejection: {symbol}")
+            return None
+        
         # LAYER 1: Eligibility check
         eligibility = await check_eligibility_fast(exchange, symbol)
         
@@ -961,177 +1030,126 @@ async def scan_symbol_fast(exchange, symbol: str) -> Optional[Dict]:
         log.error(f"Error scanning {symbol}: {e}")
         return None
 
-# ---------------- ALERTS ----------------
+# ---------------- MINIMAL ALERTS ----------------
 async def send_fast_alert(setup: Dict):
-    """Send concise, fast alerts with 8-step numerical display"""
-    
+    """ULTRA-MINIMAL ALERT - NUMBERS ONLY"""
     try:
         symbol = setup.get('symbol', 'UNKNOWN')
-        quality = setup.get('quality', {})
-        eight_steps = quality.get('eight_steps', {})
-        step_details = eight_steps.get('step_details', {})
-        
-        # Check if this is an update
-        is_update = symbol in signal_tracker.active_signals
-        update_emoji = "🔄" if is_update else "🆕"
-        
-        tier_emoji = {
-            "A+": "🔥",
-            "A": "✅", 
-            "B": "⚠️",
-            "C": "📊"
-        }.get(quality.get("tier", "C"), "📊")
-        
-        # Add update info if applicable
-        update_info = ""
-        if is_update:
-            old_signal = signal_tracker.active_signals.get(symbol, {})
-            old_setup = old_signal.get('setup', {})
-            old_quality = old_setup.get('quality', {}).get('total_score', 0)
-            new_quality = quality.get('total_score', 0)
-            if new_quality > old_quality:
-                update_info = f"\n📈 <b>Quality UP:</b> {old_quality:.2f} → {new_quality:.2f}"
-            elif old_quality > 0:
-                update_info = f"\n🔄 <b>Updated signal</b>"
-        
+        side = setup.get('side', '')
+        entry = setup.get('entry_price', 0)
+        current = setup.get('current_price', 0)
+        sl = setup.get('sl_price', 0)
         tp_targets = setup.get('tp_targets', [])
-        tp1_display = f"{tp_targets[0]:.8f}" if len(tp_targets) > 0 else 'N/A'
-        tp2_display = f"{tp_targets[1]:.8f}" if len(tp_targets) > 1 else 'N/A'
+        rr = setup.get('rr_ratio', 0)
         
-        # ============ 8-STEP NUMERICAL DISPLAY ============
-        checklist_lines = []
+        quality = setup.get('quality', {})
+        quality_score = quality.get('total_score', 0)
+        sweep = quality.get('sweep_strength', 0)
+        htfc = quality.get('htfc_alignment', 0)
+        structure = 1.0 if quality.get('structure_shift', False) else 0.0
+        confirm = 1.0 if quality.get('confirmation_candle', False) else 0.0
         
-        # Step 1: HTF Bias Alignment
-        step1_status = "✅ PASS" if eight_steps.get('step_1_htf_bias', False) else "❌ FAIL"
-        checklist_lines.append(f"1. {step1_status} - HTF bias aligned with direction")
+        # Get checklist scores (0 or 1 for each step)
+        eight_steps = quality.get('eight_steps', {})
+        step1 = 1.0 if eight_steps.get('step_1_htf_bias', False) else 0.0
+        step2 = 1.0 if eight_steps.get('step_2_zone_type', False) else 0.0
+        step3 = 1.0 if eight_steps.get('step_3_liquidity_sweep', False) else 0.0
+        step4 = 1.0 if eight_steps.get('step_4_structure_shift', False) else 0.0
+        step5 = 1.0 if eight_steps.get('step_5_from_liquidity', False) else 0.0
+        step6 = 1.0 if eight_steps.get('step_6_confirmation_candle', False) else 0.0
+        step7 = 1.0 if eight_steps.get('step_7_entry_zone', False) else 0.0
+        step8 = 1.0 if rr >= 1.0 else 0.0  # Golden Ratio step
         
-        # Step 2: Premium/Discount Zone
-        step2_status = "✅ PASS" if eight_steps.get('step_2_zone_type', False) else "❌ FAIL"
-        checklist_lines.append(f"2. {step2_status} - Premium/Discount zone entry")
+        # Calculate score sum
+        checklist_score = step1 + step2 + step3 + step4 + step5 + step6 + step7 + step8
         
-        # Step 3: Liquidity Sweep
-        step3_status = "✅ PASS" if eight_steps.get('step_3_liquidity_sweep', False) else "❌ FAIL"
-        sweep_score = quality.get('sweep_strength', 0)
-        checklist_lines.append(f"3. {step3_status} - Liquidity sweep detected (Score: {sweep_score:.2f})")
+        # Check if update
+        is_update = symbol in signal_tracker.active_signals
+        update_marker = "🔄" if is_update else "🆕"
         
-        # Step 4: Structure Shift
-        step4_status = "✅ PASS" if eight_steps.get('step_4_structure_shift', False) else "❌ FAIL"
-        checklist_lines.append(f"4. {step4_status} - Market structure shift")
+        # Golden Ratio indicator
+        golden_marker = "🏆" if rr >= 1.5 else "🎯" if rr >= 1.0 else ""
         
-        # Step 5: FROM Liquidity
-        step5_status = "✅ PASS" if eight_steps.get('step_5_from_liquidity', False) else "❌ FAIL"
-        checklist_lines.append(f"5. {step5_status} - FROM liquidity present")
+        # Format entry type
+        entry_type = setup.get('entry_type', '')
+        if entry_type == "BULLISH_ENGULFING":
+            entry_display = "BULL"
+        elif entry_type == "BEARISH_ENGULFING":
+            entry_display = "BEAR"
+        elif entry_type == "PREMIUM_ZONE":
+            entry_display = "PREMIUM"
+        elif entry_type == "DISCOUNT_ZONE":
+            entry_display = "DISCOUNT"
+        else:
+            entry_display = entry_type[:8]
         
-        # Step 6: Confirmation Candle
-        step6_status = "✅ PASS" if eight_steps.get('step_6_confirmation_candle', False) else "❌ FAIL"
-        checklist_lines.append(f"6. {step6_status} - Confirmation candle formed")
+        # TP formatting
+        tp1 = tp_targets[0] if len(tp_targets) > 0 else 0
+        tp2 = tp_targets[1] if len(tp_targets) > 1 else 0
         
-        # Step 7: Entry Zone
-        step7_status = "✅ PASS" if eight_steps.get('step_7_entry_zone', False) else "❌ FAIL"
-        entry_price = setup.get('entry_price', 0)
-        current_price = setup.get('current_price', 0)
-        if entry_price > 0:
-            zone_diff = abs(current_price - entry_price) / entry_price * 100
-            checklist_lines.append(f"7. {step7_status} - Price in valid entry zone ({zone_diff:.2f}% from entry)")
+        # Calculate distance percentages
+        entry_diff_pct = 0.0
+        tp1_diff_pct = 0.0
+        sl_diff_pct = 0.0
         
-        # Step 8: Risk/Reward Ratio
-        rr_ratio = setup.get('rr_ratio', 0)
-        step8_passed = rr_ratio >= 1.5
-        step8_status = "✅ PASS" if step8_passed else "⚠️ MARGINAL" if rr_ratio >= 1.0 else "❌ FAIL"
-        checklist_lines.append(f"8. {step8_status} - Risk/Reward ≥ 1.5:1 (Current: {rr_ratio:.2f}:1)")
+        if entry > 0:
+            entry_diff_pct = abs(current - entry) / entry * 100
+            tp1_diff_pct = abs(tp1 - entry) / entry * 100
+            sl_diff_pct = abs(sl - entry) / entry * 100
         
-        # Count passes
-        pass_count = sum([
-            eight_steps.get('step_1_htf_bias', False),
-            eight_steps.get('step_2_zone_type', False),
-            eight_steps.get('step_3_liquidity_sweep', False),
-            eight_steps.get('step_4_structure_shift', False),
-            eight_steps.get('step_5_from_liquidity', False),
-            eight_steps.get('step_6_confirmation_candle', False),
-            eight_steps.get('step_7_entry_zone', False),
-            step8_passed
-        ])
-        
-        # Build checklist string
-        checklist = "📋 <b>8-STEP CHECKLIST:</b>\n"
-        for line in checklist_lines:
-            checklist += f"   {line}\n"
-        checklist += f"\n   📊 <b>SCORE:</b> {pass_count}/8 steps passed"
-        
+        # ULTRA-MINIMAL MESSAGE
         msg = f"""
-{update_emoji}{tier_emoji} <b>ROMEOTPT v3.2 - {quality.get('tier', 'C')} Tier</b>
+{update_marker}{golden_marker} {symbol} {side}
 
-<b>🎯 {setup.get('symbol', 'UNKNOWN')}</b> | {setup.get('side', 'N/A')}
-<b>Entry:</b> {setup.get('entry_price', 0):.8f}
-<b>Current:</b> {setup.get('current_price', 0):.8f}
-<b>Type:</b> {setup.get('entry_type', 'N/A')}{update_info}
+📊 Q:{quality_score:.1f}/5.0 CS:{checklist_score:.0f}/8 RR:{rr:.2f}
+🎯 {entry_display} {entry:.8f} ({entry_diff_pct:.2f}%)
+📈 C:{current:.8f} TP1:{tp1:.8f} ({tp1_diff_pct:.2f}%)
+🛡️ SL:{sl:.8f} ({sl_diff_pct:.2f}%)
 
-{checklist}
+🔢 {step1:.0f}{step2:.0f}{step3:.0f}{step4:.0f}{step5:.0f}{step6:.0f}{step7:.0f}{step8:.0f}
+🎛️ SW:{sweep:.2f} HTF:{htfc:.2f} ST:{structure:.0f} CF:{confirm:.0f}
 
-🎯 <b>Targets:</b>
-TP1: {tp1_display}
-TP2: {tp2_display}
-
-🛡️ <b>Risk:</b>
-SL: {setup.get('sl_price', 0):.8f}
-RR: {setup.get('rr_ratio', 0):.2f}:1
-
-📈 <b>Quality Score:</b> {quality.get('total_score', 0):.2f}/5.0
-• Sweep Strength: {quality.get('sweep_strength', 0):.2f}
-• HTF Alignment: {quality.get('htfc_alignment', 0):.2f}
-• Structure Shift: {'✅' if quality.get('structure_shift', False) else '❌'}
-• Confirmation: {'✅' if quality.get('confirmation_candle', False) else '❌'}
-
-<i>Detected: {datetime.datetime.utcnow().strftime('%H:%M:%S UTC')}</i>
+{datetime.datetime.utcnow().strftime('%H:%M:%S')}
 """
         
         await send_telegram(msg)
     except Exception as e:
-        log.error(f"Error sending alert: {e}")
+        log.error(f"Error sending minimal alert: {e}")
 
 async def send_outcome_alert(symbol: str, outcome: Dict):
-    """Send alert when signal hits TP or SL"""
-    
+    """MINIMAL OUTCOME ALERT"""
     try:
         signal = signal_tracker.active_signals.get(symbol, {})
         setup = signal.get('setup', {})
         
         if outcome['type'] == 'TP1_HIT':
-            emoji = "✅"
-            result_text = "TAKE PROFIT 1 HIT"
+            emoji = "✅ TP1"
         elif outcome['type'] == 'TP2_HIT':
-            emoji = "🎯"
-            result_text = "TAKE PROFIT 2 HIT"
+            emoji = "🎯 TP2"
         else:
-            emoji = "❌"
-            result_text = "STOP LOSS HIT"
+            emoji = "❌ SL"
         
-        bars_held = outcome.get('bars_held', 0)
-        if bars_held < 60:
-            time_str = f"{bars_held}min"
+        pnl = outcome.get('pnl_pct', 0)
+        bars = outcome.get('bars_held', 0)
+        
+        # Format time
+        if bars < 60:
+            time_str = f"{bars}m"
         else:
-            time_str = f"{bars_held//60}h {bars_held%60}min"
+            hours = bars // 60
+            mins = bars % 60
+            time_str = f"{hours}h{mins}m"
         
-        tp_targets = setup.get('tp_targets', [0])
-        tp_display = f"{tp_targets[0]:.8f}" if len(tp_targets) > 0 else 'N/A'
-        
+        # MINIMAL MESSAGE
         msg = f"""
-{emoji} <b>{result_text}</b>
+{emoji} {symbol}
 
-<b>{symbol}</b> | {setup.get('side', 'N/A')}
-<b>Entry:</b> {setup.get('entry_price', 0):.8f}
-<b>Exit:</b> {outcome['price']:.8f}
-<b>PnL:</b> {outcome['pnl_pct']:+.2f}%
+📊 PnL:{pnl:+.2f}% ⏱️{time_str}
+🎯 Entry:{setup.get('entry_price', 0):.8f}
+💰 Exit:{outcome.get('price', 0):.8f}
+🛡️ SL:{setup.get('sl_price', 0):.8f}
 
-⏱️ <b>Held:</b> {time_str}
-📊 <b>Quality was:</b> {setup.get('quality', {}).get('tier', 'N/A')}
-🎯 <b>Target was:</b> {tp_display}
-🛡️ <b>SL was:</b> {setup.get('sl_price', 0):.8f}
-
-<i>Max favorable move: {outcome.get('max_favorable', 0):.2f}%</i>
-<i>Max adverse move: {outcome.get('max_adverse', 0):.2f}%</i>
-
-<i>Outcome recorded: {datetime.datetime.utcnow().strftime('%H:%M:%S UTC')}</i>
+{datetime.datetime.utcnow().strftime('%H:%M:%S')}
 """
         
         await send_telegram(msg)
@@ -1139,16 +1157,16 @@ async def send_outcome_alert(symbol: str, outcome: Dict):
         log.error(f"Error sending outcome alert: {e}")
 
 async def send_deduped_alert(setup: Dict):
-    """Send alert only if it's a new or meaningfully updated signal AND passes filter"""
+    """Send alert only if it's a new or meaningfully updated signal"""
     try:
         symbol = setup.get('symbol', '')
         if not symbol:
             return False
         
-        # ====== APPLY FILTER ======
-        if not filter_signal_by_criteria(setup):
+        # ====== APPLY GOLDEN RATIO FILTER ======
+        if not golden_ratio_filter(setup):
             return False
-        # ==========================
+        # ======================================
         
         should_alert, reason = signal_tracker.is_new_or_updated_signal(symbol, setup)
         
@@ -1389,7 +1407,7 @@ async def outcome_checker_task(exchange):
 
 # ---------------- SCANNER MAIN ----------------
 async def process_deduped_results(results) -> int:
-    """Process results with deduplication"""
+    """Process results with Golden Ratio filtering"""
     alerts_sent = 0
     
     for result in results:
@@ -1403,6 +1421,12 @@ async def process_deduped_results(results) -> int:
             
         if result:
             try:
+                # ====== GOLDEN RATIO FILTER ======
+                passes_golden_ratio, gr_reason = golden_ratio_tracker.check_signal(result)
+                if not passes_golden_ratio:
+                    continue  # SKIP THIS SIGNAL - FAILS GOLDEN RATIO
+                # =================================
+                
                 quality_score = result.get("quality", {}).get("total_score", 0)
                 if quality_score >= MIN_QUALITY_SCORE:
                     alerted = await send_deduped_alert(result)
@@ -1419,7 +1443,7 @@ async def outcome_aware_scanner(exchange):
     
     # Send startup message
     startup_msg = f"""
-🚀 <b>ROMEOTPT v3.2 STARTED</b>
+🚀 <b>ROMEOTPT v3.2 WITH GOLDEN RATIO FILTER</b>
 
 <b>Settings:</b>
 • Scan: {SCAN_INTERVAL}s
@@ -1427,6 +1451,11 @@ async def outcome_aware_scanner(exchange):
 • Concurrent: {MAX_CONCURRENT}
 • Cooldown: {SIGNAL_COOLDOWN_MINUTES}min
 • Validity: {SIGNAL_VALIDITY_HOURS}h
+
+<b>🏆 GOLDEN RATIO FILTER:</b>
+• RR ≥ 1.0:1 ONLY
+• No toxic assets
+• Must have liquidity sweep
 
 <b>⚠️ RATE LIMIT PROTECTION:</b>
 • Max 8 requests/second
@@ -1499,7 +1528,10 @@ async def outcome_aware_scanner(exchange):
             
             stats = signal_tracker.get_stats()
             
-            log.info(f"🔄 Scan #{scan_cycle}: {len(symbols_to_scan)} symbols | Active: {stats.get('active_signals', 0)} | Rate limit hits: {rate_limiter.rate_limit_hits}")
+            # Log Golden Ratio stats
+            gr_stats = golden_ratio_tracker.get_stats()
+            
+            log.info(f"🔄 Scan #{scan_cycle}: {len(symbols_to_scan)} symbols | Active: {stats.get('active_signals', 0)} | GR: {gr_stats.get('pass_rate', '0%')} | Rate limit hits: {rate_limiter.rate_limit_hits}")
             
             # Log stats periodically
             if scan_cycle % 10 == 0:
@@ -1560,11 +1592,13 @@ app = FastAPI()
 @app.get("/health")
 async def health():
     stats = signal_tracker.get_stats()
+    gr_stats = golden_ratio_tracker.get_stats()
     return {
         "status": "healthy", 
         "version": "3.2",
         "active_signals": stats.get('active_signals', 0),
         "outcome_stats": signal_tracker.outcome_stats,
+        "golden_ratio_stats": gr_stats,
         "rate_limit_hits": rate_limiter.rate_limit_hits,
         "total_requests": rate_limiter.total_requests,
         "concurrent_limit": MAX_CONCURRENT
@@ -1672,6 +1706,63 @@ async def get_recent_outcomes(limit: int = 20):
     
     return {"outcomes": outcomes, "count": len(outcomes)}
 
+@app.get("/golden-ratio/stats")
+async def get_golden_ratio_stats():
+    """Get Golden Ratio filtering statistics"""
+    stats = golden_ratio_tracker.get_stats()
+    
+    # Calculate performance for Golden Ratio filtered signals
+    async with db_lock:
+        try:
+            cursor = await db_conn.execute("""
+                SELECT 
+                    COUNT(*) as total,
+                    SUM(CASE WHEN outcome LIKE 'TP%' THEN 1 ELSE 0 END) as wins
+                FROM signals 
+                WHERE rr_ratio >= 1.0
+                AND status = 'closed'
+            """)
+            row = await cursor.fetchone()
+            
+            total = row[0] if row else 0
+            wins = row[1] if row else 0
+            win_rate = wins / total * 100 if total > 0 else 0
+            
+            cursor = await db_conn.execute("""
+                SELECT 
+                    COUNT(*) as total,
+                    SUM(CASE WHEN outcome LIKE 'TP%' THEN 1 ELSE 0 END) as wins
+                FROM signals 
+                WHERE rr_ratio < 1.0
+                AND status = 'closed'
+            """)
+            row2 = await cursor.fetchone()
+            
+            total_bad = row2[0] if row2 else 0
+            wins_bad = row2[1] if row2 else 0
+            win_rate_bad = wins_bad / total_bad * 100 if total_bad > 0 else 0
+            
+        except Exception as e:
+            log.error(f"Error fetching Golden Ratio stats: {e}")
+            return {"error": str(e)}
+    
+    return {
+        "filter_stats": stats,
+        "performance": {
+            "rr_ge_1_0": {
+                "total": total,
+                "wins": wins,
+                "win_rate": f"{win_rate:.1f}%"
+            },
+            "rr_lt_1_0": {
+                "total": total_bad,
+                "wins": wins_bad,
+                "win_rate": f"{win_rate_bad:.1f}%"
+            }
+        },
+        "golden_ratio_rule": "RR ≥ 1.0:1"
+    }
+
 @app.get("/rate-status")
 async def rate_status():
     """Check rate limit status"""
@@ -1714,10 +1805,11 @@ async def main():
             }
         })
         
-        log.info("🚀 ROMEOTPT v3.2 - WITH OKX RATE LIMIT FIX")
+        log.info("🚀 ROMEOTPT v3.2 - WITH GOLDEN RATIO FILTER (RR ≥ 1.0:1)")
         log.info(f"Scan: {SCAN_INTERVAL}s | Top {TOP_N} symbols | Concurrent: {MAX_CONCURRENT}")
         log.info(f"Cooldown: {SIGNAL_COOLDOWN_MINUTES}min | Validity: {SIGNAL_VALIDITY_HOURS}h")
         log.info(f"Rate limit: {rate_limiter.max_per_second} req/sec")
+        log.info(f"🏆 GOLDEN RATIO: RR ≥ 1.0:1 ONLY")
         
         # Start cleanup task
         asyncio.create_task(periodic_cleanup())
