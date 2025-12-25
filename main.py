@@ -32,7 +32,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 30))
-TOP_N = int(os.getenv("TOP_N", 60))
+TOP_N = int(os.getenv("TOP_N", 15))
 TIMEFRAMES = ["15m", "30m", "1h", "2h", "3h", "4h"]
 MIN_ZONE_SIZE = 3
 MIN_CONFIDENCE = 0.1  # 10% for data collection
