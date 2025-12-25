@@ -26,9 +26,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 30))  # Increased for higher TFs
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 30))
 TOP_N = int(os.getenv("TOP_N", 60))
-TIMEFRAMES = ["15m", "30m", "1h", "2h", "3h", "4h"]  # UPDATED: Higher timeframes only
+TIMEFRAMES = ["15m", "30m", "1h", "2h", "3h", "4h"]
 MIN_SCORE = 5
 CRITICAL_FACTORS_MIN = 2
 
@@ -63,6 +63,47 @@ async def tg(msg: str):
         except Exception as e:
             log.warning(f"Telegram send failed: {e}")
 
+# ---------------- DATABASE MIGRATION ----------------
+async def migrate_db():
+    """Add missing columns to existing database"""
+    global db_conn
+    
+    try:
+        # Check if table exists
+        async with db_conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='signals'") as cursor:
+            table_exists = await cursor.fetchone()
+        
+        if not table_exists:
+            log.info("Table 'signals' doesn't exist yet")
+            return
+        
+        # Get current columns
+        async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
+            columns = await cursor.fetchall()
+            column_names = [col[1] for col in columns]
+        
+        log.info(f"Current columns: {column_names}")
+        
+        # List of columns that should exist
+        required_columns = {
+            'timeframe': 'TEXT',
+            'tp_source': 'TEXT'
+        }
+        
+        # Add missing columns
+        for col_name, col_type in required_columns.items():
+            if col_name not in column_names:
+                try:
+                    await db_conn.execute(f"ALTER TABLE signals ADD COLUMN {col_name} {col_type}")
+                    log.info(f"✅ Added missing column: {col_name}")
+                except Exception as e:
+                    log.warning(f"Could not add column {col_name}: {e}")
+        
+        await db_conn.commit()
+        
+    except Exception as e:
+        log.error(f"Migration error: {e}")
+
 # ---------------- DATABASE ----------------
 async def init_db():
     global db_conn
@@ -70,6 +111,7 @@ async def init_db():
     await db_conn.execute("PRAGMA journal_mode=WAL;")
     await db_conn.execute("PRAGMA synchronous=NORMAL;")
     
+    # Create table with all columns if it doesn't exist
     await db_conn.execute("""
         CREATE TABLE IF NOT EXISTS signals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,10 +135,13 @@ async def init_db():
             ob_distance_pct REAL,
             ob_distance_filter TEXT,
             tp_source TEXT,
-            timeframe TEXT  -- NEW: Store which timeframe generated the signal
+            timeframe TEXT
         );
     """)
     await db_conn.commit()
+    
+    # Run migration to add missing columns
+    await migrate_db()
 
 # ---------------- OHLCV ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit=200):
@@ -377,11 +422,11 @@ async def elite_tf_alignment(exchange, symbol: str, side: str):
     # For higher timeframes, check even higher TFs for alignment
     tfs = ["4h", "1d"]  # Check 4h and daily for alignment
     for tf in tfs:
-        ohlcv = await fetch_ohlcv(exchange, symbol, tf, 100)  # More candles for higher TFs
+        ohlcv = await fetch_ohlcv(exchange, symbol, tf, 100)
         if not ohlcv or len(ohlcv) < 20: return False
         df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
         if len(df) < 10: return False
-        trend = df["close"].iloc[-1] - df["close"].iloc[-10]  # Longer trend for higher TFs
+        trend = df["close"].iloc[-1] - df["close"].iloc[-10]
         trend_side = "BUY" if trend>0 else "SELL"
         if trend_side != side:
             return False
@@ -389,9 +434,8 @@ async def elite_tf_alignment(exchange, symbol: str, side: str):
 
 # ---------------- SIGNAL GENERATION ----------------
 async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
-    if df is None or len(df) < 50: return None  # More data needed for higher TFs
+    if df is None or len(df) < 50: return None
     last = df.iloc[-1]
-    # For higher TFs, look back more candles for sweep detection
     lookback = 10 if tf in ["15m", "30m"] else 20
     prev_lookback = df.iloc[-(lookback+1):-1]
     score = 0
@@ -399,7 +443,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     
     calc_values = {}
 
-    # Step 1: Liquidity Sweep (adjusted for higher TFs)
+    # Step 1: Liquidity Sweep
     sweep_high = last["high"] > prev_lookback["high"].max()
     sweep_low = last["low"] < prev_lookback["low"].min()
     has_sweep = sweep_high or sweep_low
@@ -419,11 +463,10 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     else:
         reasons.append(f"Displacement +0 ({displacement:.2f})")
 
-    # Step 3 & 4: Order Block & Zone (look further back for higher TFs)
+    # Step 3 & 4: Order Block & Zone
     ob_zone = None
     ob_midpoint = None
     
-    # Look back more candles for OB detection on higher TFs
     lookback_ob = 20 if tf in ["15m", "30m"] else 30
     start_idx = max(0, len(df) - lookback_ob)
     
@@ -460,8 +503,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         calc_values["ob_type"] = "NONE"
         calc_values["ob_midpoint"] = None
 
-    # Step 5: HTF Alignment (adjusted for higher TFs)
-    # For higher TFs, check even higher TFs
+    # Step 5: HTF Alignment
     tf_map = {
         "15m": "1h",
         "30m": "2h", 
@@ -584,7 +626,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         "calc_values": calc_values,
         "tp_type": tp_type,
         "tp_source": tp_source,
-        "timeframe": tf  # Store the timeframe
+        "timeframe": tf
     }
     
     # ---------------- FINAL FORCED VALIDATION ----------------
@@ -645,9 +687,33 @@ async def monitor_signals():
     while True:
         try:
             async with db_lock:
-                async with db_conn.execute("SELECT id,symbol,side,entry,sl,tp,tp_hit,status,timeframe FROM signals WHERE status='OPEN'") as cursor:
+                # Dynamic query based on available columns
+                async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
+                    columns = await cursor.fetchall()
+                    column_names = [col[1] for col in columns]
+                
+                # Build SELECT query based on available columns
+                select_fields = ['id', 'symbol', 'side', 'entry', 'sl', 'tp', 'tp_hit', 'status']
+                if 'timeframe' in column_names:
+                    select_fields.append('timeframe')
+                
+                query = f"SELECT {','.join(select_fields)} FROM signals WHERE status='OPEN'"
+                
+                async with db_conn.execute(query) as cursor:
                     async for row in cursor:
-                        sig_id, symbol, side, entry, sl, tp, tp_hit, status, timeframe = row
+                        # Map row values to variables
+                        row_dict = dict(zip(select_fields, row))
+                        
+                        sig_id = row_dict['id']
+                        symbol = row_dict['symbol']
+                        side = row_dict['side']
+                        entry = row_dict['entry']
+                        sl = row_dict['sl']
+                        tp = row_dict['tp']
+                        tp_hit = row_dict['tp_hit']
+                        status = row_dict['status']
+                        timeframe = row_dict.get('timeframe', 'UNKNOWN')
+                        
                         ticker = await exchange.fetch_ticker(symbol)
                         last_price = ticker.get("last")
                         if last_price is None: continue
@@ -665,13 +731,24 @@ async def monitor_signals():
                             if sl is not None and last_price>=sl: 
                                 hits.append("SL"); status="CLOSED"; sl_hit=True
 
-                        # FIXED: Send Telegram alert when TP/SL is hit
+                        # Send Telegram alert when TP/SL is hit
                         if hits:
                             # Get additional signal info
-                            async with db_conn.execute("SELECT tp_type,tp_source FROM signals WHERE id=?", (sig_id,)) as cursor2:
+                            extra_select = ['tp_type', 'tp_source']
+                            if 'timeframe' in column_names:
+                                extra_select.append('timeframe')
+                            
+                            extra_query = f"SELECT {','.join(extra_select)} FROM signals WHERE id=?"
+                            async with db_conn.execute(extra_query, (sig_id,)) as cursor2:
                                 extra_info = await cursor2.fetchone()
-                                tp_type = extra_info[0] if extra_info else ""
-                                tp_source = extra_info[1] if extra_info else ""
+                                if extra_info:
+                                    tp_type = extra_info[0]
+                                    tp_source = extra_info[1]
+                                    if len(extra_info) > 2:
+                                        timeframe = extra_info[2]
+                                else:
+                                    tp_type = ""
+                                    tp_source = ""
                             
                             # Format alert message
                             current_time = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
@@ -736,9 +813,9 @@ async def scan_loop(exchange):
                 
                 for tf in TIMEFRAMES:
                     key=f"{symbol}:{tf}"
-                    if key in last_signal_time and time.time()-last_signal_time[key]<300: continue  # 5 min cooldown for higher TFs
+                    if key in last_signal_time and time.time()-last_signal_time[key]<300: continue
                     
-                    ohlcv = await fetch_ohlcv(exchange,symbol,tf,300)  # More candles for higher TFs
+                    ohlcv = await fetch_ohlcv(exchange,symbol,tf,300)
                     if not ohlcv: continue
                     
                     df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
@@ -810,7 +887,7 @@ async def scan_loop(exchange):
             log.exception("scan error: %s", e)
         
         elapsed=time.time()-t0
-        await asyncio.sleep(max(10, SCAN_INTERVAL-elapsed))  # Minimum 10 seconds for higher TFs
+        await asyncio.sleep(max(10, SCAN_INTERVAL-elapsed))
 
 # ---------------- FASTAPI ----------------
 app = FastAPI()
