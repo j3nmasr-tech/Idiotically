@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-LIVE ROMEOPT 6-STEP SCANNER - LIQUIDITY PRIMARY, SWING FALLBACK
+LIVE ROMEOPT 6-STEP SCANNER - HIGHER TIMEFRAMES ONLY
+- Timeframes: 15m, 30m, 1h, 2h, 3h, 4h
 - PRIMARY TP: Liquidity target (Code 1 logic)
 - FALLBACK TP: Swing high/low if no liquidity found
 - Enhanced features from Code 2
@@ -25,9 +26,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 30))  # Increased for higher TFs
 TOP_N = int(os.getenv("TOP_N", 60))
-TIMEFRAMES = ["1m", "3m", "5m", "15m", "30m"]
+TIMEFRAMES = ["15m", "30m", "1h", "2h", "3h", "4h"]  # UPDATED: Higher timeframes only
 MIN_SCORE = 5
 CRITICAL_FACTORS_MIN = 2
 
@@ -91,7 +92,8 @@ async def init_db():
             displacement_value REAL,
             ob_distance_pct REAL,
             ob_distance_filter TEXT,
-            tp_source TEXT
+            tp_source TEXT,
+            timeframe TEXT  -- NEW: Store which timeframe generated the signal
         );
     """)
     await db_conn.commit()
@@ -370,15 +372,16 @@ def romeopt_tp_sl_with_fallback(entry, side, atr_val, ob_zone, df):
 
 # ================ END TP LOGIC ================
 
-# ---------------- ELITE TF ALIGNMENT ----------------
+# ---------------- ELITE TF ALIGNMENT FOR HIGHER TIMEFRAMES ----------------
 async def elite_tf_alignment(exchange, symbol: str, side: str):
-    tfs = ["15m","1h","4h"]
+    # For higher timeframes, check even higher TFs for alignment
+    tfs = ["4h", "1d"]  # Check 4h and daily for alignment
     for tf in tfs:
-        ohlcv = await fetch_ohlcv(exchange, symbol, tf, 50)
-        if not ohlcv or len(ohlcv) < 10: return False
+        ohlcv = await fetch_ohlcv(exchange, symbol, tf, 100)  # More candles for higher TFs
+        if not ohlcv or len(ohlcv) < 20: return False
         df = pd.DataFrame(ohlcv, columns=["ts","open","high","low","close","vol"])
-        if len(df) < 5: return False
-        trend = df["close"].iloc[-1] - df["close"].iloc[-5]
+        if len(df) < 10: return False
+        trend = df["close"].iloc[-1] - df["close"].iloc[-10]  # Longer trend for higher TFs
         trend_side = "BUY" if trend>0 else "SELL"
         if trend_side != side:
             return False
@@ -386,17 +389,19 @@ async def elite_tf_alignment(exchange, symbol: str, side: str):
 
 # ---------------- SIGNAL GENERATION ----------------
 async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: str):
-    if df is None or len(df) < 20: return None
+    if df is None or len(df) < 50: return None  # More data needed for higher TFs
     last = df.iloc[-1]
-    prev5 = df.iloc[-6:-1]
+    # For higher TFs, look back more candles for sweep detection
+    lookback = 10 if tf in ["15m", "30m"] else 20
+    prev_lookback = df.iloc[-(lookback+1):-1]
     score = 0
     reasons = []
     
     calc_values = {}
 
-    # Step 1: Liquidity Sweep
-    sweep_high = last["high"] > prev5["high"].max()
-    sweep_low = last["low"] < prev5["low"].min()
+    # Step 1: Liquidity Sweep (adjusted for higher TFs)
+    sweep_high = last["high"] > prev_lookback["high"].max()
+    sweep_low = last["low"] < prev_lookback["low"].min()
     has_sweep = sweep_high or sweep_low
     liquidity_sweep = 2 if has_sweep else 0
     score += liquidity_sweep
@@ -414,11 +419,15 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
     else:
         reasons.append(f"Displacement +0 ({displacement:.2f})")
 
-    # Step 3 & 4: Order Block & Zone
+    # Step 3 & 4: Order Block & Zone (look further back for higher TFs)
     ob_zone = None
     ob_midpoint = None
     
-    for i in range(len(df)-5, len(df)-1):
+    # Look back more candles for OB detection on higher TFs
+    lookback_ob = 20 if tf in ["15m", "30m"] else 30
+    start_idx = max(0, len(df) - lookback_ob)
+    
+    for i in range(start_idx, len(df)-1):
         candle, prev_candle = df.iloc[i], df.iloc[i-1]
         if candle["close"]>candle["open"] and prev_candle["close"]<prev_candle["open"]:
             ob_zone={"type":"bullish","low":min(candle["low"], prev_candle["low"]),"high":candle["close"]}
@@ -451,15 +460,23 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         calc_values["ob_type"] = "NONE"
         calc_values["ob_midpoint"] = None
 
-    # Step 5: HTF Alignment
-    tf_map={"1m":"15m","3m":"30m","5m":"1h","15m":"4h","30m":"1h"}
-    htf=tf_map.get(tf,"15m")
-    ohlcv_htf = await fetch_ohlcv(exchange, symbol, htf, 50)
+    # Step 5: HTF Alignment (adjusted for higher TFs)
+    # For higher TFs, check even higher TFs
+    tf_map = {
+        "15m": "1h",
+        "30m": "2h", 
+        "1h": "4h",
+        "2h": "6h",
+        "3h": "12h",
+        "4h": "1d"
+    }
+    htf = tf_map.get(tf, "4h")
+    ohlcv_htf = await fetch_ohlcv(exchange, symbol, htf, 100)
     htf_alignment = 0
-    if ohlcv_htf and len(ohlcv_htf) >= 5:
+    if ohlcv_htf and len(ohlcv_htf) >= 20:
         df_htf = pd.DataFrame(ohlcv_htf, columns=["ts","open","high","low","close","vol"])
-        if len(df_htf) >= 5:
-            trend = df_htf["close"].iloc[-1] - df_htf["close"].iloc[-5]
+        if len(df_htf) >= 10:
+            trend = df_htf["close"].iloc[-1] - df_htf["close"].iloc[-10]
             htf_dir = "bullish" if trend>0 else "bearish"
             if ob_type and htf_dir==ob_type:
                 score+=1; htf_alignment=1; reasons.append(f"HTF Alignment +1 ({htf_dir} {trend:+.6f})")
@@ -566,7 +583,8 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         "momentum_ratio": momentum_ratio,
         "calc_values": calc_values,
         "tp_type": tp_type,
-        "tp_source": tp_source
+        "tp_source": tp_source,
+        "timeframe": tf  # Store the timeframe
     }
     
     # ---------------- FINAL FORCED VALIDATION ----------------
@@ -574,7 +592,7 @@ async def generate_signal_romeopt(exchange, df: pd.DataFrame, symbol: str, tf: s
         log.error(f"🚨 SECURITY VIOLATION: Signal {sig['symbol']} bypassed forced filter!")
         return None
     
-    log.info(f"✅ Signal {sig['symbol']} passed all filters: Mom={momentum_val:.2f}, Disp={displacement_val:.2f}, TP Source: {tp_source}")
+    log.info(f"✅ Signal {sig['symbol']} {tf} passed all filters: Mom={momentum_val:.2f}, Disp={displacement_val:.2f}, TP Source: {tp_source}")
     return sig
 
 # ---------------- SL CLUSTER ----------------
@@ -595,8 +613,8 @@ async def log_signal(sig):
         ob_distance_filter = calc.get("ob_distance_filter", {})
         
         await db_conn.execute("""
-            INSERT INTO signals (symbol,side,entry,sl,tp,timestamp,status,reason,score,tp_hit,latest_ob,tp_type,tp_locked,ob_type,sweep_type,momentum_value,displacement_value,ob_distance_pct,ob_distance_filter,tp_source)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            INSERT INTO signals (symbol,side,entry,sl,tp,timestamp,status,reason,score,tp_hit,latest_ob,tp_type,tp_locked,ob_type,sweep_type,momentum_value,displacement_value,ob_distance_pct,ob_distance_filter,tp_source,timeframe)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """, (
             sig["symbol"],
             sig["side"],
@@ -617,7 +635,8 @@ async def log_signal(sig):
             calc.get("displacement_value", 0),
             calc.get("ob_distance_pct", 0),
             ob_distance_filter.get("status", "UNKNOWN"),
-            sig.get("tp_source", "UNKNOWN")
+            sig.get("tp_source", "UNKNOWN"),
+            sig.get("timeframe", "UNKNOWN")
         ))
         await db_conn.commit()
 
@@ -626,9 +645,9 @@ async def monitor_signals():
     while True:
         try:
             async with db_lock:
-                async with db_conn.execute("SELECT id,symbol,side,entry,sl,tp,tp_hit,status FROM signals WHERE status='OPEN'") as cursor:
+                async with db_conn.execute("SELECT id,symbol,side,entry,sl,tp,tp_hit,status,timeframe FROM signals WHERE status='OPEN'") as cursor:
                     async for row in cursor:
-                        sig_id, symbol, side, entry, sl, tp, tp_hit, status = row
+                        sig_id, symbol, side, entry, sl, tp, tp_hit, status, timeframe = row
                         ticker = await exchange.fetch_ticker(symbol)
                         last_price = ticker.get("last")
                         if last_price is None: continue
@@ -663,7 +682,7 @@ async def monitor_signals():
                                 alert_msg = f"""
 🚨 **STOP LOSS HIT** 🚨
 
-{symbol} {side}
+{symbol} {side} ({timeframe})
 Entry: {entry:.6f}
 SL: {sl:.6f}
 Last Price: {last_price:.6f}
@@ -678,7 +697,7 @@ Time: {current_time}
                                 alert_msg = f"""
 🎉 **TAKE PROFIT HIT** 🎉
 
-{symbol} {side}
+{symbol} {side} ({timeframe})
 Entry: {entry:.6f}
 TP: {tp:.6f}
 Last Price: {last_price:.6f}
@@ -689,7 +708,7 @@ Time: {current_time}
                                 """
                             
                             await tg(alert_msg)
-                            log.info(f"📢 Alert sent for {symbol}: {hits}")
+                            log.info(f"📢 Alert sent for {symbol} {timeframe}: {hits}")
 
                         if sl_hit: record_sl_hit(symbol)
                         
@@ -717,9 +736,9 @@ async def scan_loop(exchange):
                 
                 for tf in TIMEFRAMES:
                     key=f"{symbol}:{tf}"
-                    if key in last_signal_time and time.time()-last_signal_time[key]<60: continue
+                    if key in last_signal_time and time.time()-last_signal_time[key]<300: continue  # 5 min cooldown for higher TFs
                     
-                    ohlcv = await fetch_ohlcv(exchange,symbol,tf,200)
+                    ohlcv = await fetch_ohlcv(exchange,symbol,tf,300)  # More candles for higher TFs
                     if not ohlcv: continue
                     
                     df=pd.DataFrame(ohlcv,columns=["ts","open","high","low","close","vol"])
@@ -785,13 +804,13 @@ async def scan_loop(exchange):
                         last_signal_time[key]=time.time()
                         signals_found+=1
             
-            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals (Liquidity Primary, Swing Fallback)")
+            log.info(f"📊 Scan complete: {signals_found} RomeOPT signals (Higher TFs)")
         
         except Exception as e: 
             log.exception("scan error: %s", e)
         
         elapsed=time.time()-t0
-        await asyncio.sleep(max(1,SCAN_INTERVAL-elapsed))
+        await asyncio.sleep(max(10, SCAN_INTERVAL-elapsed))  # Minimum 10 seconds for higher TFs
 
 # ---------------- FASTAPI ----------------
 app = FastAPI()
@@ -815,6 +834,7 @@ async def main():
     
     # Start announcement
     await tg("🏆 ROMEOPT 6-STEP SCANNER STARTED")
+    await tg("📈 HIGHER TIMEFRAMES: 15m, 30m, 1h, 2h, 3h, 4h")
     await tg("🎯 TP STRATEGY: Liquidity Primary, Swing Fallback")
     await tg("  1. PRIMARY: Find liquidity target (Code 1 logic)")
     await tg("  2. FALLBACK: Swing high/low if no liquidity found")
@@ -822,7 +842,7 @@ async def main():
     await tg("🔒 FORCED FILTER: Momentum ≥ 0.70 OR (≥0.65 & Disp≥0.60)")
     await tg("📏 OB DISTANCE: ≤ 0.70% required")
     await tg("📢 ALERTS: TP/SL alerts enabled")
-    await tg("💎 PHILOSOPHY: Always find a target")
+    await tg("💎 PHILOSOPHY: Higher timeframe precision")
     
     # Start main loops
     await asyncio.gather(
