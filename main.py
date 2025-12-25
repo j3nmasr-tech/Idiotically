@@ -32,7 +32,7 @@ SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 30))
 TOP_N = int(os.getenv("TOP_N", 60))
 TIMEFRAMES = ["15m", "30m", "1h", "2h", "3h", "4h"]
 MIN_ZONE_SIZE = 3
-MIN_CONFIDENCE = 0.1  # Minimum confidence score
+MIN_CONFIDENCE = 0.1  # 10% for data collection mode
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -1338,7 +1338,7 @@ async def main():
 📈 **Features:**
 • Complete numeric breakdown for every signal
 • ATR-based risk management
-• Confidence scoring
+• Confidence scoring (min: {MIN_CONFIDENCE*100}%)
 • TP/SL alerts
 • Database tracking
 
