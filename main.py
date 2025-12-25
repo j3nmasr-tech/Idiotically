@@ -7,6 +7,7 @@ ULTRA-FOCUSED 5-METHOD SCANNER - FRESH DATABASE VERSION
 - Timeframes: 15m, 30m, 1h, 2h, 3h, 4h
 - MIN_CONFIDENCE = 0.1 for data collection
 - FRESH DATABASE - WILL DELETE OLD DATA
+- ADDED: Duplicate signal prevention system
 """
 
 import os
@@ -15,6 +16,7 @@ import asyncio
 import logging
 import datetime
 import json
+import hashlib
 import aiosqlite
 import httpx
 import ccxt.async_support as ccxt
@@ -38,12 +40,113 @@ MIN_ZONE_SIZE = 3
 MIN_CONFIDENCE = 0.1  # 10% for data collection
 FRESH_DATABASE = True  # Set to True to delete old database
 
+# Duplicate prevention settings
+SIGNAL_COOLDOWN_MINUTES = 30  # Don't repeat same signal for 30 minutes
+MIN_PRICE_MOVEMENT_PCT = 0.5  # Require at least 0.5% price movement
+PRICE_BUCKET_SIZE_PCT = 0.1  # Group prices within 0.1% as duplicates
+
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger("scanner_fresh")
 db_lock = asyncio.Lock()
 db_conn = None
 exchange = None
+
+# ---------------- DUPLICATE PREVENTION ----------------
+processed_signals = set()  # Set of signal hashes
+signal_cooldown = {}  # symbol:method:side -> timestamp
+last_price_movement = {}  # symbol -> last checked price
+
+def get_signal_hash(signal: Dict) -> str:
+    """Create unique hash for signal to prevent duplicates"""
+    # Create base string with key components
+    base_str = f"{signal['symbol']}:{signal['method']}:{signal['side']}:{signal['timeframe']}"
+    
+    # Add price bucket (group similar prices together)
+    price_bucket = int(signal['entry'] / (signal['entry'] * (PRICE_BUCKET_SIZE_PCT / 100)))
+    base_str += f":{price_bucket}"
+    
+    # Add time bucket (group by 5-minute intervals)
+    time_bucket = int(time.time() / (5 * 60))  # 5-minute buckets
+    base_str += f":{time_bucket}"
+    
+    # Create hash
+    return hashlib.md5(base_str.encode()).hexdigest()
+
+def check_signal_cooldown(signal: Dict) -> bool:
+    """Check if signal is in cooldown period"""
+    key = f"{signal['symbol']}:{signal['method']}:{signal['side']}"
+    current_time = time.time()
+    
+    if key in signal_cooldown:
+        if current_time - signal_cooldown[key] < SIGNAL_COOLDOWN_MINUTES * 60:
+            return True  # Still in cooldown
+    
+    # Update cooldown
+    signal_cooldown[key] = current_time
+    
+    # Clean old cooldowns (older than 2 hours)
+    cleanup_time = current_time - (120 * 60)  # 2 hours
+    keys_to_remove = [k for k, t in signal_cooldown.items() if t < cleanup_time]
+    for k in keys_to_remove:
+        signal_cooldown.pop(k, None)
+    
+    return False  # Not in cooldown
+
+def has_sufficient_price_movement(df: pd.DataFrame, symbol: str) -> bool:
+    """Check if price has moved enough to justify a new signal"""
+    if len(df) < 20:
+        return False
+    
+    current_price = df['close'].iloc[-1]
+    
+    # Check price movement in last 20 candles
+    recent_high = df['high'].iloc[-20:].max()
+    recent_low = df['low'].iloc[-20:].min()
+    
+    if recent_low == 0:
+        return False
+    
+    price_range_pct = ((recent_high - recent_low) / recent_low) * 100
+    
+    # Also check volatility (std dev of returns)
+    returns = df['close'].pct_change().dropna()
+    if len(returns) > 10:
+        volatility = returns.std() * 100
+        # Require either decent range or volatility
+        if price_range_pct < MIN_PRICE_MOVEMENT_PCT and volatility < 0.3:
+            return False
+    
+    return price_range_pct >= MIN_PRICE_MOVEMENT_PCT
+
+def merge_similar_signals(signals: List[Dict]) -> List[Dict]:
+    """Merge signals that are too similar"""
+    if not signals:
+        return []
+    
+    merged = []
+    signals.sort(key=lambda x: x['confidence'], reverse=True)
+    
+    for signal in signals:
+        is_similar = False
+        
+        for existing in merged:
+            # Check if similar (same symbol, side, within price bucket)
+            if (signal['symbol'] == existing['symbol'] and 
+                signal['side'] == existing['side'] and
+                abs(signal['entry'] - existing['entry']) / existing['entry'] < (PRICE_BUCKET_SIZE_PCT / 100)):
+                
+                is_similar = True
+                # Keep the one with higher confidence
+                if signal['confidence'] > existing['confidence']:
+                    merged.remove(existing)
+                    merged.append(signal)
+                break
+        
+        if not is_similar:
+            merged.append(signal)
+    
+    return merged
 
 # ---------------- TELEGRAM ----------------
 async def tg(msg: str):
@@ -101,7 +204,8 @@ async def init_db_fresh():
                 rr_ratio REAL,
                 risk_pct REAL,
                 reward_pct REAL,
-                numeric_breakdown TEXT
+                numeric_breakdown TEXT,
+                signal_hash TEXT UNIQUE
             )
         """)
         
@@ -110,6 +214,7 @@ async def init_db_fresh():
         await db_conn.execute("CREATE INDEX idx_status ON signals(status);")
         await db_conn.execute("CREATE INDEX idx_timestamp ON signals(timestamp);")
         await db_conn.execute("CREATE INDEX idx_method ON signals(method);")
+        await db_conn.execute("CREATE INDEX idx_signal_hash ON signals(signal_hash);")
         
         await db_conn.commit()
         log.info("✅ Fresh database created with all columns")
@@ -416,11 +521,15 @@ def calculate_tp_sl(signal: Dict, df: pd.DataFrame, atr_val: float) -> Tuple[Opt
             return signal['entry'] * 1.02, signal['entry'] * 0.96
 
 def analyze_all_methods(df: pd.DataFrame, symbol: str, timeframe: str) -> Optional[Dict]:
-    """Analyze all 5 methods"""
+    """Analyze all 5 methods with duplicate prevention checks"""
     if len(df) < 50:
         return None
     
     try:
+        # Check 1: Require minimum price movement
+        if not has_sufficient_price_movement(df, symbol):
+            return None
+        
         # Get current price
         current_price = df['close'].iloc[-1]
         
@@ -509,7 +618,10 @@ def analyze_all_methods(df: pd.DataFrame, symbol: str, timeframe: str) -> Option
                     'method_details': breaker['details']
                 })
         
-        # Pick best signal
+        # Merge similar signals
+        all_signals = merge_similar_signals(all_signals)
+        
+        # Pick best signal if any
         if all_signals:
             # Sort by confidence
             all_signals.sort(key=lambda x: x['confidence'], reverse=True)
@@ -537,6 +649,9 @@ def analyze_all_methods(df: pd.DataFrame, symbol: str, timeframe: str) -> Option
                 # Add breakdown
                 best_signal['numeric_breakdown'] = generate_numeric_breakdown(best_signal, df)
                 
+                # Add signal hash for duplicate tracking
+                best_signal['signal_hash'] = get_signal_hash(best_signal)
+                
                 return best_signal
         
         return None
@@ -546,14 +661,50 @@ def analyze_all_methods(df: pd.DataFrame, symbol: str, timeframe: str) -> Option
 
 # ---------------- SIGNAL LOGGING ----------------
 async def log_signal(sig: Dict):
-    """Log signal to database"""
+    """Log signal to database with duplicate check"""
     try:
+        signal_hash = sig.get('signal_hash')
+        if not signal_hash:
+            signal_hash = get_signal_hash(sig)
+        
         async with db_lock:
+            # Check for duplicate signal hash
+            async with db_conn.execute("""
+                SELECT COUNT(*) FROM signals WHERE signal_hash=?
+            """, (signal_hash,)) as cursor:
+                count = (await cursor.fetchone())[0]
+            
+            if count > 0:
+                log.info(f"⏭️ Database duplicate found (hash): {sig['symbol']} {sig['method']}")
+                return
+            
+            # Check for recent similar signal (same symbol, method, side, similar price)
+            async with db_conn.execute("""
+                SELECT COUNT(*) FROM signals 
+                WHERE symbol=? AND method=? AND side=?
+                AND timestamp > datetime('now', '-2 hours')
+                AND ABS(entry - ?) / ? < ?
+            """, (
+                sig['symbol'], 
+                sig['method'], 
+                sig['side'],
+                sig['entry'], 
+                sig['entry'],
+                PRICE_BUCKET_SIZE_PCT / 100  # Convert to decimal
+            )) as cursor:
+                count = (await cursor.fetchone())[0]
+            
+            if count > 0:
+                log.info(f"⏭️ Similar signal found in last 2 hours: {sig['symbol']} {sig['method']}")
+                return
+            
+            # Insert new signal
             await db_conn.execute("""
                 INSERT INTO signals (
                     symbol, side, entry, sl, tp, status, method, method_details,
-                    strength, confidence, timeframe, rr_ratio, risk_pct, reward_pct, numeric_breakdown
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    strength, confidence, timeframe, rr_ratio, risk_pct, reward_pct, 
+                    numeric_breakdown, signal_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 sig['symbol'],
                 sig['side'],
@@ -569,7 +720,8 @@ async def log_signal(sig: Dict):
                 sig.get('rr_ratio', 0),
                 sig.get('risk_pct', 0),
                 sig.get('reward_pct', 0),
-                sig.get('numeric_breakdown', '')
+                sig.get('numeric_breakdown', ''),
+                signal_hash
             ))
             await db_conn.commit()
             log.info(f"✅ Signal logged: {sig['symbol']} {sig['method']}")
@@ -604,10 +756,10 @@ Confidence: {confidence:.1f}%
         log.error(f"Alert error: {e}")
 
 # ---------------- SCAN LOOP ----------------
-last_signal_time = {}
+last_scan_time = {}
 
 async def scan_loop(exchange):
-    """Main scanning loop"""
+    """Main scanning loop with duplicate prevention"""
     while True:
         start_time = time.time()
         
@@ -634,11 +786,13 @@ async def scan_loop(exchange):
                     if timeframe == "3h":  # OKX doesn't support 3h
                         continue
                     
-                    # Rate limiting
+                    # Rate limiting per symbol/timeframe
                     key = f"{symbol}:{timeframe}"
-                    if key in last_signal_time:
-                        if time.time() - last_signal_time[key] < 300:
+                    if key in last_scan_time:
+                        if time.time() - last_scan_time[key] < 60:  # 1 minute minimum between scans
                             continue
+                    
+                    last_scan_time[key] = time.time()
                     
                     # Fetch data
                     ohlcv = await fetch_ohlcv(exchange, symbol, timeframe, 150)
@@ -654,14 +808,31 @@ async def scan_loop(exchange):
                     signal = analyze_all_methods(df, symbol, timeframe)
                     
                     if signal:
+                        # Check cooldown
+                        if check_signal_cooldown(signal):
+                            log.info(f"⏭️ Signal in cooldown: {signal['symbol']} {signal['method']}")
+                            continue
+                        
+                        # Check processed signals (in-memory)
+                        signal_hash = signal.get('signal_hash', get_signal_hash(signal))
+                        if signal_hash in processed_signals:
+                            log.info(f"⏭️ Signal already processed: {signal['symbol']} {signal['method']}")
+                            continue
+                        
+                        # Add to processed signals
+                        processed_signals.add(signal_hash)
+                        
+                        # Clean old processed signals (older than 1 hour)
+                        if len(processed_signals) > 1000:
+                            # Simple cleanup - just clear if gets too large
+                            processed_signals.clear()
+                        
                         # Send alert
                         await send_signal_alert(signal)
                         
                         # Log to database
                         await log_signal(signal)
                         
-                        # Update timing
-                        last_signal_time[key] = time.time()
                         signals_found += 1
             
             log.info(f"Scan complete: {signals_found} signals found")
@@ -803,6 +974,11 @@ Methods: Supply/Demand, FVG, Order Blocks, Liquidity Grab, Breaker Blocks
 Timeframes: 15m, 30m, 1h, 2h, 4h (3h skipped for OKX)
 Confidence: {MIN_CONFIDENCE*100}% minimum
 Database: Fresh start - all columns exist
+
+DUPLICATE PREVENTION ENABLED:
+- Cooldown: {SIGNAL_COOLDOWN_MINUTES} minutes per symbol/method/side
+- Min price movement: {MIN_PRICE_MOVEMENT_PCT}%
+- Price grouping: {PRICE_BUCKET_SIZE_PCT}%
         """)
         
         log.info("✅ Scanner ready - starting loops...")
