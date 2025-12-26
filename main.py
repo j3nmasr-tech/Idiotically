@@ -26,7 +26,7 @@ DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
 TOP_N = int(os.getenv("TOP_N", 60))
-MIN_CONFIDENCE = 4  # Need ALL 5 conditions for expansion start
+MIN_CONFIDENCE = 2  # Need ALL 5 conditions for expansion start
 
 # Timeframes - Focused on pressure detection
 TIMEFRAMES = {
