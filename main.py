@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-Visual Synthesis Scanner - الإصدار المؤكد للإرسال
+Visual Synthesis Scanner - الإصدار المؤكد للإرسال بدون تكرار
 """
 
 import os
@@ -90,9 +90,14 @@ async def init_db():
                 close_price REAL,
                 close_timestamp DATETIME,
                 pnl_percent REAL,
-                signal_hash TEXT UNIQUE
+                signal_hash TEXT UNIQUE,
+                price_hash TEXT
             )
         """)
+        
+        # Create index for faster duplicate checks
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_price_hash ON signals(price_hash)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_symbol_timestamp ON signals(symbol, timestamp)")
         
         await db_conn.commit()
         log.info("✅ Database ready")
@@ -322,10 +327,67 @@ def calculate_simple_sltp(current_price: float, side: str, data: Dict[str, pd.Da
         else:
             return current_price * 1.02, current_price * 0.96, "Error fallback"
 
-# ================ SIMPLE SIGNAL GENERATION ================
+# ================ SIGNAL GENERATION WITH DEDUPLICATION ================
+
+async def check_duplicate_signal(symbol: str, side: str, current_price: float, 
+                                tf_score: float, wave_score: float) -> Tuple[bool, str]:
+    """Check if similar signal was recently sent"""
+    try:
+        # Create price condition hash (based on market conditions, not time)
+        price_conditions = f"{symbol}:{side}:{current_price:.4f}:{tf_score:.2f}:{wave_score:.2f}"
+        price_hash = hashlib.md5(price_conditions.encode()).hexdigest()
+        
+        async with db_lock:
+            # Check for same price conditions in last 4 hours
+            async with db_conn.execute("""
+                SELECT COUNT(*) FROM signals 
+                WHERE price_hash = ? AND timestamp > datetime('now', '-4 hours')
+            """, (price_hash,)) as cursor:
+                same_conditions = (await cursor.fetchone())[0]
+            
+            if same_conditions > 0:
+                log.debug(f"{symbol}: Same market conditions detected recently")
+                return True, price_hash
+            
+            # Check for same symbol and side in last 6 hours (max 2 signals)
+            async with db_conn.execute("""
+                SELECT COUNT(*) FROM signals 
+                WHERE symbol = ? AND side = ? 
+                AND timestamp > datetime('now', '-6 hours')
+                AND status = 'OPEN'
+            """, (symbol, side)) as cursor:
+                recent_signals = (await cursor.fetchone())[0]
+            
+            if recent_signals >= 2:
+                log.debug(f"{symbol}: Too many recent {side} signals ({recent_signals})")
+                return True, price_hash
+            
+            # Check if price hasn't moved much from last signal
+            async with db_conn.execute("""
+                SELECT entry FROM signals 
+                WHERE symbol = ? AND side = ? 
+                AND timestamp > datetime('now', '-2 hours')
+                ORDER BY timestamp DESC LIMIT 1
+            """, (symbol, side)) as cursor:
+                result = await cursor.fetchone()
+                
+                if result:
+                    last_entry = result[0]
+                    price_change = abs(current_price - last_entry) / last_entry * 100
+                    
+                    if price_change < 0.5:  # Less than 0.5% price change
+                        log.debug(f"{symbol}: Price hasn't moved enough ({price_change:.2f}%)")
+                        return True, price_hash
+        
+        return False, price_hash
+        
+    except Exception as e:
+        log.error(f"Duplicate check error: {e}")
+        # If error, create a random hash and allow the signal
+        return False, hashlib.md5(f"{symbol}:{time.time_ns()}".encode()).hexdigest()
 
 async def generate_signal_simple(data: Dict[str, pd.DataFrame], symbol: str) -> Optional[Dict]:
-    """Generate signal with simple logic"""
+    """Generate signal with simple logic and duplicate prevention"""
     try:
         log.info(f"Analyzing {symbol}...")
         
@@ -348,17 +410,26 @@ async def generate_signal_simple(data: Dict[str, pd.DataFrame], symbol: str) -> 
         scores = [tf_score, wave_score, strength_score, indicators_score, volume_score]
         total_score = np.mean(scores)
         
-        log.info(f"{symbol}: Total score {total_score:.2f} = {tf_score:.2f}+{wave_score:.2f}+{strength_score:.2f}+{indicators_score:.2f}+{volume_score:.2f}")
+        log.info(f"{symbol}: Total score {total_score:.2f}")
         
         # 4. Check if score is good enough
         if total_score < MIN_SYNTHESIS_SCORE:
             log.debug(f"{symbol}: Score too low ({total_score:.2f} < {MIN_SYNTHESIS_SCORE})")
             return None
         
-        # 5. Get current price and calculate SL/TP
+        # 5. Get current price
         current_price = data['M15']['close'].iloc[-1]
         side = "BUY" if direction == "UP" else "SELL"
         
+        # 6. Check for duplicates BEFORE calculating SL/TP
+        is_duplicate, price_hash = await check_duplicate_signal(
+            symbol, side, current_price, tf_score, wave_score
+        )
+        
+        if is_duplicate:
+            return None
+        
+        # 7. Calculate SL/TP
         sl, tp, sltp_logic = calculate_simple_sltp(current_price, side, data)
         
         # Calculate risk/reward
@@ -370,6 +441,10 @@ async def generate_signal_simple(data: Dict[str, pd.DataFrame], symbol: str) -> 
         if rr_ratio < 1.0:
             log.debug(f"{symbol}: Poor R:R ratio ({rr_ratio:.1f}:1)")
             return None
+        
+        # 8. Create unique signal hash
+        unique_id = f"{symbol}:{side}:{current_price:.8f}:{time.time_ns()}"
+        signal_hash = hashlib.md5(unique_id.encode()).hexdigest()
         
         # Create signal
         signal = {
@@ -387,9 +462,8 @@ async def generate_signal_simple(data: Dict[str, pd.DataFrame], symbol: str) -> 
             'volume_status': volume_reason[:80],
             'synthesis_score': total_score,
             
-            'signal_hash': hashlib.md5(
-                f"{symbol}:{side}:{current_price:.8f}:{time.time()}".encode()
-            ).hexdigest()
+            'signal_hash': signal_hash,
+            'price_hash': price_hash
         }
         
         log.info(f"✅ SIGNAL: {symbol} {side} @ {current_price:.4f} | Score: {total_score:.2f} | R:R: {rr_ratio:.1f}:1")
@@ -444,10 +518,10 @@ async def fetch_ohlcv_data(exchange, symbol: str) -> Optional[Dict[str, pd.DataF
 
 async def scanning_loop(exchange):
     """Main scanning loop"""
-    log.info("🚀 Starting scanner with simple logic")
+    log.info("🚀 Starting scanner with duplicate prevention")
     
     # Test Telegram
-    await tg("🚀 Scanner started successfully!")
+    await tg("🚀 Scanner started with duplicate prevention!")
     
     while True:
         try:
@@ -492,7 +566,7 @@ async def scanning_loop(exchange):
                     if signal:
                         # Save to database
                         async with db_lock:
-                            # Check for duplicates
+                            # Final duplicate check with signal hash
                             async with db_conn.execute(
                                 "SELECT COUNT(*) FROM signals WHERE signal_hash = ?",
                                 (signal['signal_hash'],)
@@ -506,14 +580,14 @@ async def scanning_loop(exchange):
                                         symbol, side, entry, sl, tp, status,
                                         timeframe_alignment, wave_structure, strength_level,
                                         indicators_signal, volume_status, synthesis_score,
-                                        signal_hash
-                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                        signal_hash, price_hash
+                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 """, (
                                     signal['symbol'], signal['side'], signal['entry'], signal['sl'],
                                     signal['tp'], signal['status'], signal['timeframe_alignment'],
                                     signal['wave_structure'], signal['strength_level'],
                                     signal['indicators_signal'], signal['volume_status'],
-                                    signal['synthesis_score'], signal['signal_hash']
+                                    signal['synthesis_score'], signal['signal_hash'], signal['price_hash']
                                 ))
                                 
                                 await db_conn.commit()
@@ -553,7 +627,7 @@ async def scanning_loop(exchange):
                                 signals_found += 1
                                 log.info(f"✅ Signal sent for {symbol}")
                             else:
-                                log.debug(f"Duplicate signal for {symbol}")
+                                log.debug(f"Final duplicate check failed for {symbol}")
                     
                     # Small delay between symbols
                     await asyncio.sleep(0.5)
@@ -675,7 +749,7 @@ async def root():
     return {
         "status": "running",
         "scanner": "Visual Synthesis Scanner",
-        "version": "2.0",
+        "version": "2.0 - No Duplicates",
         "min_score": MIN_SYNTHESIS_SCORE,
         "scan_interval": SCAN_INTERVAL
     }
@@ -749,14 +823,55 @@ async def get_stats():
             
             async with db_conn.execute("SELECT COUNT(*) FROM signals") as cursor:
                 total_count = (await cursor.fetchone())[0]
+            
+            # Get duplicate prevention stats
+            async with db_conn.execute("""
+                SELECT COUNT(DISTINCT price_hash) as unique_signals,
+                       COUNT(*) as total_attempts
+                FROM signals 
+                WHERE timestamp > datetime('now', '-24 hours')
+            """) as cursor:
+                dup_stats = await cursor.fetchone()
+                unique_signals = dup_stats[0]
+                total_attempts = dup_stats[1]
+                duplicates_blocked = total_attempts - unique_signals if total_attempts > unique_signals else 0
         
         return {
             "open_positions": open_count,
             "closed_positions": closed_count,
             "total_signals": total_count,
+            "unique_signals_24h": unique_signals,
+            "duplicates_blocked_24h": duplicates_blocked,
             "scan_interval": SCAN_INTERVAL,
-            "min_score": MIN_SYNTHESIS_SCORE
+            "min_score": MIN_SYNTHESIS_SCORE,
+            "duplicate_prevention": "ACTIVE"
         }
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/recent-signals")
+async def get_recent_signals(limit: int = 10):
+    """Get recent signals"""
+    try:
+        async with db_lock:
+            await db_conn.row_factory = aiosqlite.Row
+            async with db_conn.execute("""
+                SELECT symbol, side, entry, sl, tp, synthesis_score, timestamp, status
+                FROM signals 
+                ORDER BY timestamp DESC 
+                LIMIT ?
+            """, (limit,)) as cursor:
+                rows = await cursor.fetchall()
+                
+                signals = []
+                for row in rows:
+                    signals.append(dict(row))
+                
+                return {
+                    "status": "success",
+                    "signals": signals,
+                    "count": len(signals)
+                }
     except Exception as e:
         return {"error": str(e)}
 
@@ -766,7 +881,7 @@ async def main():
     global exchange
     
     log.info("=" * 60)
-    log.info("🚀 SIMPLE VISUAL SCANNER - GUARANTEED SIGNALS")
+    log.info("🚀 VISUAL SCANNER - NO DUPLICATE SIGNALS")
     log.info("=" * 60)
     
     # Initialize database
@@ -792,19 +907,20 @@ async def main():
     
     # Send startup message
     await tg(f"""
-🚀 **الماسح الضوئي البصري - الإصدار المبسط**
+🚀 **الماسح الضوئي البصري - بدون إشارات مكررة**
 
 ✅ **تم بدء التشغيل بنجاح**
+
+**ميزات مكافحة التكرار:**
+• فحص التكرار بالسعر والظروف
+• حد أقصى إشارتين لكل زوج في 6 ساعات
+• منع الإشارات المتشابهة في 4 ساعات
+• تتبع تغير الأسعار
 
 **الإعدادات:**
 • الحد الأدنى للجودة: {MIN_SYNTHESIS_SCORE}
 • فاصل المسح: {SCAN_INTERVAL} ثانية
 • عدد الأزواج: {TOP_N}
-
-**المميزات:**
-• منطق مبسط للمزيد من الإشارات
-• متابعة تلقائية للصفقات
-• إشعارات فورية
 
 جاهز للعمل! سيبدأ المسح الآن...
 
