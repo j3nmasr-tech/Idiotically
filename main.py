@@ -2,15 +2,14 @@
 # -*- coding: utf-8 -*-
 
 """
-6-STEP CONFLUENCE SCANNER
-Clean minimal alerts with logic-based SL/TP - FIXED VERSION
+6-STEP EXPANSION SCANNER
+Detects START of big moves, not just confluence
 """
 
 import os
 import time
 import asyncio
 import logging
-import datetime
 import hashlib
 import aiosqlite
 import httpx
@@ -27,18 +26,18 @@ DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
 TOP_N = int(os.getenv("TOP_N", 60))
-MIN_CONFIDENCE = 4  # Need at least 4 out of 5 steps (wave analysis excluded)
+MIN_CONFIDENCE = 5  # Need ALL 5 conditions for expansion start
 
-# Timeframes for MTF analysis
+# Timeframes - Focused on pressure detection
 TIMEFRAMES = {
-    "HTF": "4h",    # Primary Trend
-    "MTF": "1h",    # Wave Analysis  
-    "LTF": "15m"    # Entry & Indicators
+    "HTF": "4h",    # Overall pressure
+    "MTF": "1h",    # Wave exhaustion
+    "LTF": "15m"    # Entry & explosion detection
 }
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-log = logging.getLogger("6step_clean")
+log = logging.getLogger("expansion_scanner")
 db_lock = asyncio.Lock()
 db_conn = None
 exchange = None
@@ -64,20 +63,12 @@ async def init_db():
     """Initialize database"""
     global db_conn
     try:
-        # Remove old database
         if os.path.exists(DB_PATH):
-            log.info(f"Removing old database")
             os.remove(DB_PATH)
         
-        # Create directory
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-        
-        # Create fresh database
         db_conn = await aiosqlite.connect(DB_PATH)
-        await db_conn.execute("PRAGMA journal_mode=WAL;")
-        await db_conn.execute("PRAGMA synchronous=NORMAL;")
         
-        # Create table
         await db_conn.execute("""
             CREATE TABLE signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -88,31 +79,16 @@ async def init_db():
                 tp REAL NOT NULL,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 status TEXT DEFAULT 'OPEN',
-                step1_result INTEGER DEFAULT 0,
-                step2_direction TEXT DEFAULT 'NEUTRAL',
-                step3_result INTEGER DEFAULT 0,
-                step4_result INTEGER DEFAULT 0,
-                step5_result INTEGER DEFAULT 0,
-                step6_result INTEGER DEFAULT 0,
-                confidence_score INTEGER DEFAULT 0,
+                timeframe_pressure TEXT,
+                wave_exhaustion TEXT,
+                strength_shift TEXT,
+                volume_confirmation TEXT,
+                expansion_trigger TEXT,
+                expansion_score INTEGER DEFAULT 0,
                 logic_breakdown TEXT,
-                timeframe_combo TEXT,
-                trend_direction TEXT,
-                wave_pattern TEXT,
-                rsi_value REAL,
-                macd_hist REAL,
-                volume_ratio REAL,
-                strength_level TEXT,
-                rr_ratio REAL,
-                risk_pct REAL,
-                reward_pct REAL,
                 signal_hash TEXT UNIQUE
             )
         """)
-        
-        # Indexes
-        await db_conn.execute("CREATE INDEX idx_symbol_status ON signals(symbol, status);")
-        await db_conn.execute("CREATE INDEX idx_timestamp ON signals(timestamp);")
         
         await db_conn.commit()
         log.info("✅ Database created")
@@ -120,18 +96,507 @@ async def init_db():
         
     except Exception as e:
         log.error(f"Database error: {e}")
-        if db_conn:
-            await db_conn.close()
-            db_conn = None
         return False
 
-# ---------------- DATA FETCHING ----------------
+# ================ EXPANSION DETECTION LOGIC ================
+
+def detect_timeframe_pressure(data: Dict[str, pd.DataFrame]) -> Tuple[bool, str, str]:
+    """
+    1️⃣ TIMEFRAME PRESSURE
+    HTF + MTF + LTF aligned with NO opposing force
+    """
+    try:
+        htf_df = data['HTF']
+        mtf_df = data['MTF']
+        ltf_df = data['LTF']
+        
+        # Recent trend direction for each timeframe
+        htf_dir = "UP" if htf_df['close'].iloc[-1] > htf_df['close'].iloc[-20] else "DOWN"
+        mtf_dir = "UP" if mtf_df['close'].iloc[-1] > mtf_df['close'].iloc[-10] else "DOWN"
+        ltf_dir = "UP" if ltf_df['close'].iloc[-1] > ltf_df['close'].iloc[-5] else "DOWN"
+        
+        # Check alignment (all same direction = maximum pressure)
+        directions = [htf_dir, mtf_dir, ltf_dir]
+        
+        if all(d == "UP" for d in directions):
+            pressure = True
+            direction = "UP"
+            reason = f"ALL TIMEFRAMES UP | No opposing force detected"
+        
+        elif all(d == "DOWN" for d in directions):
+            pressure = True
+            direction = "DOWN"
+            reason = f"ALL TIMEFRAMES DOWN | No opposing force detected"
+        
+        else:
+            # Check if one timeframe is opposing (weakens pressure)
+            up_count = directions.count("UP")
+            down_count = directions.count("DOWN")
+            
+            if up_count == 2 and down_count == 1:
+                # Majority UP but one timeframe DOWN
+                opposing_tf = "LTF" if ltf_dir == "DOWN" else ("MTF" if mtf_dir == "DOWN" else "HTF")
+                pressure = False
+                direction = "UP"
+                reason = f"OPPOSITION: {opposing_tf} is DOWN | Pressure weakened"
+            
+            elif down_count == 2 and up_count == 1:
+                opposing_tf = "LTF" if ltf_dir == "UP" else ("MTF" if mtf_dir == "UP" else "HTF")
+                pressure = False
+                direction = "DOWN"
+                reason = f"OPPOSITION: {opposing_tf} is UP | Pressure weakened"
+            
+            else:
+                pressure = False
+                direction = "NEUTRAL"
+                reason = f"NO CLEAR PRESSURE | Mixed: HTF:{htf_dir} MTF:{mtf_dir} LTF:{ltf_dir}"
+        
+        return pressure, direction, reason
+        
+    except Exception as e:
+        return False, "NEUTRAL", f"Error: {str(e)}"
+
+def detect_wave_exhaustion(data: Dict[str, pd.DataFrame], direction: str) -> Tuple[bool, str]:
+    """
+    2️⃣ WAVE EXHAUSTION → WAVE RELEASE
+    Small waves failing, then one breaks the rhythm
+    """
+    try:
+        mtf_df = data['MTF']
+        prices = mtf_df['close'].values[-30:]
+        highs = mtf_df['high'].values[-30:]
+        lows = mtf_df['low'].values[-30:]
+        
+        # Find recent swing points
+        swing_highs = []
+        swing_lows = []
+        
+        for i in range(3, len(prices)-3):
+            if (highs[i] > highs[i-1] and highs[i] > highs[i-2] and highs[i] > highs[i-3] and
+                highs[i] > highs[i+1] and highs[i] > highs[i+2] and highs[i] > highs[i+3]):
+                swing_highs.append((i, highs[i]))
+            
+            if (lows[i] < lows[i-1] and lows[i] < lows[i-2] and lows[i] < lows[i-3] and
+                lows[i] < lows[i+1] and lows[i] < lows[i+2] and lows[i] < lows[i+3]):
+                swing_lows.append((i, lows[i]))
+        
+        if len(swing_highs) >= 3 and len(swing_lows) >= 3:
+            # Get last 3 swings
+            last_highs = [h[1] for h in swing_highs[-3:]]
+            last_lows = [l[1] for l in swing_lows[-3:]]
+            
+            # Check for compression (smaller waves)
+            high_range = max(last_highs) - min(last_highs)
+            low_range = max(last_lows) - min(last_lows)
+            price_range = prices[-1] * 0.02  # 2% of price as threshold
+            
+            compression_detected = high_range < price_range and low_range < price_range
+            
+            if direction == "UP":
+                # For uptrend: Look for higher lows failing to get lower
+                if (last_lows[-1] > last_lows[-2] and  # Still making higher lows
+                    last_lows[-2] > last_lows[-3] and
+                    compression_detected):
+                    return True, f"COMPRESSION → RELEASE UP | Waves compressed {high_range:.2f}/{low_range:.2f}"
+            
+            elif direction == "DOWN":
+                # For downtrend: Look for lower highs failing to get higher
+                if (last_highs[-1] < last_highs[-2] and  # Still making lower highs
+                    last_highs[-2] < last_highs[-3] and
+                    compression_detected):
+                    return True, f"COMPRESSION → RELEASE DOWN | Waves compressed {high_range:.2f}/{low_range:.2f}"
+        
+        # Look for recent breakout of compression
+        recent_prices = prices[-10:]
+        price_std = np.std(recent_prices)
+        if price_std < (prices[-1] * 0.005):  # Very low volatility
+            return True, f"EXTREME COMPRESSION | Std: {price_std:.4f}"
+        
+        return False, "NO WAVE EXHAUSTION | Normal wave activity"
+        
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+
+def detect_strength_shift(data: Dict[str, pd.DataFrame], direction: str) -> Tuple[bool, str]:
+    """
+    3️⃣ STRENGTH SHIFT
+    Bodies getting larger, speed increasing, closes becoming aggressive
+    """
+    try:
+        ltf_df = data['LTF']
+        
+        # Last 5 candles analysis
+        recent = ltf_df.iloc[-5:]
+        
+        # Candle body size increase
+        body_sizes = abs(recent['close'] - recent['open'])
+        avg_body = body_sizes.mean()
+        last_body = body_sizes.iloc[-1]
+        
+        body_increasing = last_body > avg_body * 1.5
+        
+        # Close aggression
+        if direction == "UP":
+            # Bullish aggression: Closing near highs
+            recent_high_pct = (recent['close'] - recent['low']) / (recent['high'] - recent['low'])
+            avg_high_pct = recent_high_pct.mean()
+            last_high_pct = recent_high_pct.iloc[-1]
+            
+            close_aggressive = last_high_pct > 0.7 and last_high_pct > avg_high_pct
+        
+        else:  # DOWN
+            # Bearish aggression: Closing near lows
+            recent_low_pct = (recent['high'] - recent['close']) / (recent['high'] - recent['low'])
+            avg_low_pct = recent_low_pct.mean()
+            last_low_pct = recent_low_pct.iloc[-1]
+            
+            close_aggressive = last_low_pct > 0.7 and last_low_pct > avg_low_pct
+        
+        # Speed increase (momentum)
+        price_changes = recent['close'].pct_change().dropna()
+        if len(price_changes) > 1:
+            momentum_increasing = abs(price_changes.iloc[-1]) > abs(price_changes.iloc[-2]) * 1.3
+        else:
+            momentum_increasing = False
+        
+        # Control shift detection
+        if direction == "UP":
+            # For bullish shift: More green candles, bigger bodies
+            green_candles = (recent['close'] > recent['open']).sum()
+            control_shift = green_candles >= 3 and body_increasing
+        else:
+            red_candles = (recent['close'] < recent['open']).sum()
+            control_shift = red_candles >= 3 and body_increasing
+        
+        if control_shift and (close_aggressive or momentum_increasing):
+            return True, f"CONTROL SHIFT | Bodies: +{(last_body/avg_body-1)*100:.0f}% | Aggressive closes"
+        
+        return False, "NO STRENGTH SHIFT | Normal candle patterns"
+        
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+
+def detect_volume_confirmation(data: Dict[str, pd.DataFrame], direction: str) -> Tuple[bool, str, float]:
+    """
+    4️⃣ VOLUME CONFIRMATION
+    Not stop hunt, not noise - BIG PARTICIPATION
+    """
+    try:
+        mtf_df = data['MTF']
+        ltf_df = data['LTF']
+        
+        # MTF volume trend (big picture)
+        mtf_volumes = mtf_df['volume'].values[-20:]
+        mtf_avg_volume = np.mean(mtf_volumes[:-5])  # Average of first 15
+        mtf_recent_volume = np.mean(mtf_volumes[-5:])  # Last 5
+        
+        mtf_volume_spike = mtf_recent_volume > mtf_avg_volume * 1.3
+        
+        # LTF volume for entry confirmation
+        ltf_volumes = ltf_df['volume'].values[-10:]
+        ltf_avg_volume = np.mean(ltf_volumes[:-3])
+        ltf_last_volume = ltf_volumes[-1]
+        
+        ltf_volume_spike = ltf_last_volume > ltf_avg_volume * 1.5
+        
+        # Volume-by-price analysis
+        recent = ltf_df.iloc[-5:]
+        
+        if direction == "UP":
+            up_candles = recent[recent['close'] > recent['open']]
+            down_candles = recent[recent['close'] < recent['open']]
+            
+            if not up_candles.empty and not down_candles.empty:
+                up_volume = up_candles['volume'].sum()
+                down_volume = down_candles['volume'].sum()
+                volume_ratio = up_volume / down_volume if down_volume > 0 else 10
+                
+                volume_confirms = volume_ratio > 1.5
+            else:
+                volume_confirms = False
+        
+        else:  # DOWN
+            up_candles = recent[recent['close'] > recent['open']]
+            down_candles = recent[recent['close'] < recent['open']]
+            
+            if not up_candles.empty and not down_candles.empty:
+                up_volume = up_candles['volume'].sum()
+                down_volume = down_candles['volume'].sum()
+                volume_ratio = down_volume / up_volume if up_volume > 0 else 10
+                
+                volume_confirms = volume_ratio > 1.5
+            else:
+                volume_confirms = False
+        
+        # Big money participation detection
+        big_participation = (mtf_volume_spike or ltf_volume_spike) and volume_confirms
+        
+        volume_ratio_value = ltf_last_volume / ltf_avg_volume if ltf_avg_volume > 0 else 1
+        
+        if big_participation:
+            reason = f"BIG PARTICIPATION | Volume spike: {volume_ratio_value:.1f}x | Confirms direction"
+            return True, reason, volume_ratio_value
+        else:
+            reason = f"WEAK PARTICIPATION | Volume: {volume_ratio_value:.1f}x | No confirmation"
+            return False, reason, volume_ratio_value
+        
+    except Exception as e:
+        return False, f"Error: {str(e)}", 1.0
+
+def detect_expansion_trigger(data: Dict[str, pd.DataFrame], direction: str) -> Tuple[bool, str]:
+    """
+    5️⃣ EXPANSION TRIGGER
+    The actual moment price starts expanding
+    """
+    try:
+        ltf_df = data['LTF']
+        
+        # Last 3 candles pattern
+        recent = ltf_df.iloc[-3:]
+        
+        if direction == "UP":
+            # Bullish expansion trigger
+            # 1. Higher lows
+            higher_lows = (recent['low'].iloc[-1] > recent['low'].iloc[-2] and 
+                          recent['low'].iloc[-2] > recent['low'].iloc[-3])
+            
+            # 2. Increasing range
+            ranges = recent['high'] - recent['low']
+            range_increasing = ranges.iloc[-1] > ranges.iloc[-2] > ranges.iloc[-3]
+            
+            # 3. Strong close
+            last_close_pct = (recent['close'].iloc[-1] - recent['low'].iloc[-1]) / (recent['high'].iloc[-1] - recent['low'].iloc[-1])
+            strong_close = last_close_pct > 0.7
+            
+            if higher_lows and range_increasing and strong_close:
+                return True, f"EXPANSION TRIGGER UP | Higher lows + Range expanding + Strong close"
+        
+        else:  # DOWN
+            # Bearish expansion trigger
+            # 1. Lower highs
+            lower_highs = (recent['high'].iloc[-1] < recent['high'].iloc[-2] and 
+                          recent['high'].iloc[-2] < recent['high'].iloc[-3])
+            
+            # 2. Increasing range
+            ranges = recent['high'] - recent['low']
+            range_increasing = ranges.iloc[-1] > ranges.iloc[-2] > ranges.iloc[-3]
+            
+            # 3. Weak close
+            last_close_pct = (recent['high'].iloc[-1] - recent['close'].iloc[-1]) / (recent['high'].iloc[-1] - recent['low'].iloc[-1])
+            weak_close = last_close_pct > 0.7
+            
+            if lower_highs and range_increasing and weak_close:
+                return True, f"EXPANSION TRIGGER DOWN | Lower highs + Range expanding + Weak close"
+        
+        # Check for breakout of recent range
+        recent_high = ltf_df['high'].iloc[-10:].max()
+        recent_low = ltf_df['low'].iloc[-10:].min()
+        current_close = ltf_df['close'].iloc[-1]
+        
+        range_size = recent_high - recent_low
+        if range_size > 0:
+            if direction == "UP" and current_close > recent_high + (range_size * 0.1):
+                return True, f"BREAKOUT TRIGGER | Broke above range by {((current_close-recent_high)/recent_low)*100:.1f}%"
+            
+            if direction == "DOWN" and current_close < recent_low - (range_size * 0.1):
+                return True, f"BREAKDOWN TRIGGER | Broke below range by {((recent_low-current_close)/recent_high)*100:.1f}%"
+        
+        return False, "NO EXPANSION TRIGGER | Still inside range"
+        
+    except Exception as e:
+        return False, f"Error: {str(e)}"
+
+def calculate_expansion_targets(current_price: float, side: str, data: Dict[str, pd.DataFrame]) -> Tuple[float, float, str]:
+    """
+    Calculate SL/TP for expansion moves
+    Entry at START of expansion, TP at logical expansion targets
+    """
+    logic_lines = []
+    
+    mtf_df = data['MTF']
+    
+    if side == "BUY":
+        # Find nearest support (logical invalidation)
+        recent_lows = mtf_df['low'].values[-20:]
+        support = np.min(recent_lows[-5:])  # Most recent low cluster
+        sl = support * 0.995  # Just below support
+        
+        # Expansion target: Previous swing high or measured move
+        recent_highs = mtf_df['high'].values[-20:]
+        resistance = np.max(recent_highs[-10:])
+        
+        # Risk-based TP with expansion logic
+        risk = current_price - sl
+        expansion_multiplier = 2.5  # Expansion moves give 2.5:1+ R:R
+        tp = current_price + (risk * expansion_multiplier)
+        
+        # Ensure TP doesn't exceed major resistance
+        if tp > resistance * 1.05:  # Don't go too far beyond resistance
+            tp = resistance * 1.02
+        
+        logic_lines.append(f"SL: Below support {support:.2f} (invalidation)")
+        logic_lines.append(f"TP: Expansion target ~{((tp-current_price)/current_price*100):.1f}% move")
+        logic_lines.append(f"R:R: {expansion_multiplier:.1f}:1 (expansion phase)")
+    
+    else:  # SELL
+        # Find nearest resistance (logical invalidation)
+        recent_highs = mtf_df['high'].values[-20:]
+        resistance = np.max(recent_highs[-5:])
+        sl = resistance * 1.005  # Just above resistance
+        
+        # Expansion target: Previous swing low
+        recent_lows = mtf_df['low'].values[-20:]
+        support = np.min(recent_lows[-10:])
+        
+        risk = sl - current_price
+        expansion_multiplier = 2.5
+        tp = current_price - (risk * expansion_multiplier)
+        
+        if tp < support * 0.95:
+            tp = support * 0.98
+        
+        logic_lines.append(f"SL: Above resistance {resistance:.2f} (invalidation)")
+        logic_lines.append(f"TP: Expansion target ~{((current_price-tp)/current_price*100):.1f}% move")
+        logic_lines.append(f"R:R: {expansion_multiplier:.1f}:1 (expansion phase)")
+    
+    return sl, tp, " | ".join(logic_lines)
+
+# ================ MAIN DETECTION ================
+
+async def detect_expansion_start(data: Dict[str, pd.DataFrame], symbol: str) -> Optional[Dict]:
+    """
+    Detect the START of an expansion phase
+    Returns signal if ALL 5 conditions are met
+    """
+    try:
+        log.info(f"🔍 Checking {symbol} for expansion start...")
+        
+        # 1. TIMEFRAME PRESSURE
+        pressure, direction, pressure_reason = detect_timeframe_pressure(data)
+        
+        if not pressure:
+            log.debug(f"❌ {symbol}: No timeframe pressure - {pressure_reason}")
+            return None
+        
+        log.info(f"✅ {symbol}: Timeframe pressure {direction} - {pressure_reason}")
+        
+        # 2. WAVE EXHAUSTION
+        wave_exhaustion, wave_reason = detect_wave_exhaustion(data, direction)
+        
+        if not wave_exhaustion:
+            log.debug(f"❌ {symbol}: No wave exhaustion - {wave_reason}")
+            return None
+        
+        log.info(f"✅ {symbol}: Wave exhaustion detected - {wave_reason}")
+        
+        # 3. STRENGTH SHIFT
+        strength_shift, strength_reason = detect_strength_shift(data, direction)
+        
+        if not strength_shift:
+            log.debug(f"❌ {symbol}: No strength shift - {strength_reason}")
+            return None
+        
+        log.info(f"✅ {symbol}: Strength shift detected - {strength_reason}")
+        
+        # 4. VOLUME CONFIRMATION
+        volume_confirm, volume_reason, volume_ratio = detect_volume_confirmation(data, direction)
+        
+        if not volume_confirm:
+            log.debug(f"❌ {symbol}: No volume confirmation - {volume_reason}")
+            return None
+        
+        log.info(f"✅ {symbol}: Volume confirms - {volume_reason}")
+        
+        # 5. EXPANSION TRIGGER
+        expansion_trigger, trigger_reason = detect_expansion_trigger(data, direction)
+        
+        if not expansion_trigger:
+            log.debug(f"❌ {symbol}: No expansion trigger - {trigger_reason}")
+            return None
+        
+        log.info(f"🎯 {symbol}: EXPANSION TRIGGERED! - {trigger_reason}")
+        
+        # ALL 5 CONDITIONS MET - EXPANSION STARTING
+        current_price = data['LTF']['close'].iloc[-1]
+        side = "BUY" if direction == "UP" else "SELL"
+        
+        # Calculate expansion targets
+        sl, tp, sl_tp_logic = calculate_expansion_targets(current_price, side, data)
+        
+        # Risk metrics
+        risk = abs(current_price - sl)
+        reward = abs(tp - current_price)
+        rr_ratio = reward / risk if risk > 0 else 0
+        risk_pct = (risk / current_price) * 100
+        reward_pct = (reward / current_price) * 100
+        
+        # Create signal
+        signal = {
+            'symbol': symbol,
+            'side': side,
+            'entry': current_price,
+            'sl': sl,
+            'tp': tp,
+            'status': 'OPEN',
+            
+            'timeframe_pressure': pressure_reason,
+            'wave_exhaustion': wave_reason,
+            'strength_shift': strength_reason,
+            'volume_confirmation': volume_reason,
+            'expansion_trigger': trigger_reason,
+            'expansion_score': 5,  # All 5 conditions met
+            
+            'logic_breakdown': f"""
+🚀 **EXPANSION PHASE STARTING** 🚀
+
+**{symbol} {side}**
+
+1️⃣ TIMEFRAME PRESSURE:
+{pressure_reason}
+
+2️⃣ WAVE EXHAUSTION → RELEASE:
+{wave_reason}
+
+3️⃣ STRENGTH SHIFT (Control Change):
+{strength_reason}
+
+4️⃣ VOLUME CONFIRMATION (Big Participation):
+{volume_reason}
+
+5️⃣ EXPANSION TRIGGER:
+{trigger_reason}
+
+**ENTRY: {current_price:.2f}**
+**SL: {sl:.2f}** (Invalidation)
+**TP: {tp:.2f}** (Expansion target)
+
+Risk: {risk_pct:.1f}% | Reward: {reward_pct:.1f}% | R:R: {rr_ratio:.2f}:1
+
+{sl_tp_logic}
+""".strip(),
+            
+            'signal_hash': hashlib.md5(
+                f"{symbol}:{side}:{current_price:.8f}:{int(time.time())}".encode()
+            ).hexdigest()
+        }
+        
+        log.info(f"🔥 EXPANSION SIGNAL: {symbol} {side} at {current_price:.2f}")
+        log.info(f"   R:R {rr_ratio:.2f}:1 | Risk {risk_pct:.1f}% | Reward {reward_pct:.1f}%")
+        
+        return signal
+        
+    except Exception as e:
+        log.error(f"Detection error {symbol}: {e}")
+        return None
+
+# ================ MAIN SCANNING ================
+
 async def fetch_multi_timeframe_data(exchange, symbol: str) -> Optional[Dict[str, pd.DataFrame]]:
-    """Fetch data for all 3 timeframes"""
+    """Fetch data for expansion detection"""
     data = {}
     for tf_type, tf in TIMEFRAMES.items():
         try:
-            ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=tf, limit=150)
+            ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=tf, limit=100)
             if ohlcv and len(ohlcv) > 50:
                 df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
                 for col in ["open", "high", "low", "close", "volume"]:
@@ -144,515 +609,10 @@ async def fetch_multi_timeframe_data(exchange, symbol: str) -> Optional[Dict[str
             return None
     return data
 
-# ================ 6 STEPS - FIXED VERSION ================
-
-def step1_mtf_analysis(data: Dict[str, pd.DataFrame]) -> Tuple[int, str]:
-    """STEP 1: Multi-Timeframe Analysis - Simplified"""
-    try:
-        htf_df = data['HTF']
-        mtf_df = data['MTF']
-        ltf_df = data['LTF']
-        
-        htf_trend = "UP" if htf_df['close'].iloc[-1] > htf_df['close'].iloc[-50] else "DOWN"
-        mtf_trend = "UP" if mtf_df['close'].iloc[-1] > mtf_df['close'].iloc[-20] else "DOWN"
-        ltf_trend = "UP" if ltf_df['close'].iloc[-1] > ltf_df['close'].iloc[-10] else "DOWN"
-        
-        score = 0
-        if htf_trend == mtf_trend: score += 1
-        if mtf_trend == ltf_trend: score += 1
-        if htf_trend == ltf_trend: score += 1
-        
-        trends = [htf_trend, mtf_trend, ltf_trend]
-        dominant_trend = max(set(trends), key=trends.count)
-        
-        return (1 if score >= 2 else 0), dominant_trend
-        
-    except:
-        return 0, "NEUTRAL"
-
-def step2_wave_analysis(data: Dict[str, pd.DataFrame]) -> Tuple[str, str]:
-    """STEP 2: Wave Analysis - DIRECTION ONLY"""
-    try:
-        mtf_df = data['MTF']
-        prices = mtf_df['close'].values[-30:]
-        
-        swing_highs = []
-        swing_lows = []
-        
-        for i in range(2, len(prices)-2):
-            if (prices[i] > prices[i-1] and prices[i] > prices[i-2] and
-                prices[i] > prices[i+1] and prices[i] > prices[i+2]):
-                swing_highs.append(prices[i])
-            
-            if (prices[i] < prices[i-1] and prices[i] < prices[i-2] and
-                prices[i] < prices[i+1] and prices[i] < prices[i+2]):
-                swing_lows.append(prices[i])
-        
-        if len(swing_highs) >= 2 and len(swing_lows) >= 2:
-            last_high_1 = swing_highs[-1]
-            last_high_2 = swing_highs[-2]
-            last_low_1 = swing_lows[-1]
-            last_low_2 = swing_lows[-2]
-            
-            # Uptrend: Higher highs AND higher lows
-            if last_high_1 > last_high_2 and last_low_1 > last_low_2:
-                return "UP", "IMPULSE_UP"
-            
-            # Downtrend: Lower highs AND lower lows
-            elif last_high_1 < last_high_2 and last_low_1 < last_low_2:
-                return "DOWN", "IMPULSE_DOWN"
-            
-            # Correction/Consolidation
-            elif (last_high_1 < last_high_2 and last_low_1 > last_low_2) or \
-                 (last_high_1 > last_high_2 and last_low_1 < last_low_2):
-                return "NEUTRAL", "CORRECTION"
-        
-        # Default to neutral if unclear
-        return "NEUTRAL", "NO_CLEAR_PATTERN"
-        
-    except:
-        return "NEUTRAL", "ERROR"
-
-def step3_strength_analysis(data: Dict[str, pd.DataFrame]) -> Tuple[int, str]:
-    """STEP 3: Strength Analysis - Simplified"""
-    try:
-        mtf_df = data['MTF']
-        prices = mtf_df['close'].values[-20:]
-        
-        if len(prices) < 6:
-            return 0, "WEAK_NEUTRAL"
-        
-        roc_5 = ((prices[-1] / prices[-6]) - 1) * 100
-        
-        if len(prices) >= 10:
-            x = np.arange(len(prices[-10:]))
-            y = prices[-10:]
-            slope, _ = np.polyfit(x, y, 1)
-            slope_pct = abs(slope / prices[-1]) * 100
-        else:
-            slope_pct = 0
-        
-        avg_candle_size = (mtf_df['high'].iloc[-10:] - mtf_df['low'].iloc[-10:]).mean()
-        avg_candle_pct = (avg_candle_size / prices[-1]) * 100
-        
-        if abs(roc_5) > 2.0 and slope_pct > 0.1 and avg_candle_pct > 0.5:
-            strength = "STRONG"
-            passed = 1
-        elif abs(roc_5) > 1.0 and slope_pct > 0.05 and avg_candle_pct > 0.3:
-            strength = "MODERATE"
-            passed = 1
-        else:
-            strength = "WEAK"
-            passed = 0
-        
-        direction = "UP" if roc_5 > 0 else "DOWN"
-        return passed, f"{strength}_{direction}"
-        
-    except:
-        return 0, "WEAK_NEUTRAL"
-
-def step4_indicators_analysis(data: Dict[str, pd.DataFrame]) -> Tuple[int, str, float, float]:
-    """STEP 4: Indicators - Simplified"""
-    try:
-        ltf_df = data['LTF']
-        prices = ltf_df['close'].values
-        
-        # RSI
-        if len(prices) >= 15:
-            deltas = np.diff(prices[-15:])
-            gains = deltas[deltas >= 0]
-            losses = -deltas[deltas < 0]
-            
-            avg_gain = np.mean(gains) if len(gains) > 0 else 0
-            avg_loss = np.mean(losses) if len(losses) > 0 else 0
-            
-            if avg_loss == 0:
-                rsi = 100 if avg_gain > 0 else 0
-            else:
-                rs = avg_gain / avg_loss
-                rsi = 100 - (100 / (1 + rs))
-        else:
-            rsi = 50
-        
-        # MACD Histogram
-        if len(prices) >= 26:
-            ema_12 = pd.Series(prices[-26:]).ewm(span=12, adjust=False).mean().iloc[-1]
-            ema_26 = pd.Series(prices[-26:]).ewm(span=26, adjust=False).mean().iloc[-1]
-            macd_line = ema_12 - ema_26
-            macd_hist = pd.Series([macd_line]).ewm(span=9, adjust=False).mean().iloc[-1]
-            histogram = macd_line - macd_hist
-        else:
-            histogram = 0
-        
-        # Signal
-        rsi_signal = "BULLISH" if rsi < 35 else "BEARISH" if rsi > 65 else "NEUTRAL"
-        macd_signal = "BULLISH" if histogram > 0 else "BEARISH" if histogram < 0 else "NEUTRAL"
-        
-        if rsi_signal == macd_signal and rsi_signal != "NEUTRAL":
-            signal = rsi_signal
-            passed = 1
-        elif rsi_signal != "NEUTRAL" or macd_signal != "NEUTRAL":
-            signal = rsi_signal if rsi_signal != "NEUTRAL" else macd_signal
-            passed = 1
-        else:
-            signal = "NEUTRAL"
-            passed = 0
-        
-        return passed, signal, rsi, histogram
-        
-    except:
-        return 0, "NEUTRAL", 50, 0
-
-def step5_volume_analysis(data: Dict[str, pd.DataFrame]) -> Tuple[int, str, float]:
-    """STEP 5: Volume - Simplified"""
-    try:
-        ltf_df = data['LTF']
-        
-        recent_vol = ltf_df['volume'].values[-10:]
-        prev_vol = ltf_df['volume'].values[-20:-10]
-        
-        if len(recent_vol) > 0 and len(prev_vol) > 0:
-            avg_recent = np.mean(recent_vol)
-            avg_prev = np.mean(prev_vol)
-            volume_ratio = avg_recent / avg_prev if avg_prev > 0 else 1
-        else:
-            volume_ratio = 1
-        
-        # Volume confirmation
-        price_change = ((ltf_df['close'].iloc[-1] / ltf_df['close'].iloc[-10]) - 1) * 100
-        up_mask = ltf_df['close'] > ltf_df['open']
-        down_mask = ltf_df['close'] < ltf_df['open']
-        
-        up_volume = ltf_df[up_mask]['volume'].mean() if up_mask.any() else 0
-        down_volume = ltf_df[down_mask]['volume'].mean() if down_mask.any() else 0
-        
-        volume_confirmed = False
-        if price_change > 0 and up_volume > down_volume:
-            volume_confirmed = True
-        elif price_change < 0 and down_volume > up_volume:
-            volume_confirmed = True
-        
-        # Strength
-        if volume_ratio > 1.5 and volume_confirmed:
-            strength = "HIGH"
-            passed = 1
-        elif volume_ratio > 1.2 and volume_confirmed:
-            strength = "MODERATE"
-            passed = 1
-        elif volume_ratio > 0.8 and volume_confirmed:
-            strength = "LOW"
-            passed = 1
-        else:
-            strength = "VERY_LOW"
-            passed = 0
-        
-        return passed, strength, volume_ratio
-        
-    except:
-        return 0, "VERY_LOW", 1
-
-def step6_trend_identification(step1_trend: str, step2_direction: str,
-                              step3_strength: str, step4_signal: str,
-                              step5_strength: str) -> Tuple[int, str]:
-    """STEP 6: Trend Identification - Uses wave direction"""
-    try:
-        trend_votes = []
-        
-        # Step 1 vote
-        trend_votes.append(step1_trend)
-        
-        # Step 2 vote - USING WAVE DIRECTION
-        if step2_direction in ["UP", "DOWN"]:
-            trend_votes.append(step2_direction)
-        
-        # Step 3 vote
-        if "UP" in step3_strength:
-            trend_votes.append("UP")
-        elif "DOWN" in step3_strength:
-            trend_votes.append("DOWN")
-        
-        # Step 4 vote
-        if step4_signal == "BULLISH":
-            trend_votes.append("UP")
-        elif step4_signal == "BEARISH":
-            trend_votes.append("DOWN")
-        
-        # Step 5 vote (only if volume is good)
-        if step5_strength in ["HIGH", "MODERATE"]:
-            if "UP" in step3_strength:
-                trend_votes.append("UP")
-            elif "DOWN" in step3_strength:
-                trend_votes.append("DOWN")
-        
-        # Count votes
-        up_count = trend_votes.count("UP")
-        down_count = trend_votes.count("DOWN")
-        
-        if up_count > down_count:
-            return 1, "UP"
-        elif down_count > up_count:
-            return 1, "DOWN"
-        else:
-            return 0, "NEUTRAL"
-        
-    except:
-        return 0, "NEUTRAL"
-
-# ================ REALISTIC LOGIC-BASED SL/TP ================
-
-def calculate_logic_based_sltp(current_price: float, side: str, data: Dict[str, pd.DataFrame],
-                             step2_pattern: str, step3_strength: str, rsi_value: float,
-                             volume_ratio: float, confidence_score: int) -> Tuple[float, float, str]:
-    """
-    Calculate REALISTIC SL and TP based on logic
-    """
-    logic_lines = []
-    
-    htf_df = data['HTF']
-    mtf_df = data['MTF']
-    
-    # 1. SMART STOP-LOSS CALCULATION
-    if side == "BUY":
-        # Look for nearest support levels
-        recent_lows = mtf_df['low'].values[-20:]
-        support_levels = []
-        
-        # Find swing lows as potential support
-        for i in range(2, len(recent_lows)-2):
-            if (recent_lows[i] < recent_lows[i-1] and recent_lows[i] < recent_lows[i-2] and
-                recent_lows[i] < recent_lows[i+1] and recent_lows[i] < recent_lows[i+2]):
-                support_levels.append(recent_lows[i])
-        
-        # Use the most recent significant support
-        if support_levels:
-            # Take the lowest support (most conservative)
-            base_sl = min(support_levels) * 0.99  # 1% buffer
-            logic_lines.append(f"SL: Below recent swing low {min(support_levels):.1f}")
-        else:
-            # Fallback: Use ATR-based stop
-            atr = (mtf_df['high'].iloc[-14:] - mtf_df['low'].iloc[-14:]).mean()
-            base_sl = current_price - (atr * 1.5)
-            logic_lines.append(f"SL: ATR-based {atr:.1f} x1.5")
-    
-    else:  # SELL
-        # Look for nearest resistance levels
-        recent_highs = mtf_df['high'].values[-20:]
-        resistance_levels = []
-        
-        # Find swing highs as potential resistance
-        for i in range(2, len(recent_highs)-2):
-            if (recent_highs[i] > recent_highs[i-1] and recent_highs[i] > recent_highs[i-2] and
-                recent_highs[i] > recent_highs[i+1] and recent_highs[i] > recent_highs[i+2]):
-                resistance_levels.append(recent_highs[i])
-        
-        if resistance_levels:
-            # Take the highest resistance (most conservative)
-            base_sl = max(resistance_levels) * 1.01  # 1% buffer
-            logic_lines.append(f"SL: Above recent swing high {max(resistance_levels):.1f}")
-        else:
-            atr = (mtf_df['high'].iloc[-14:] - mtf_df['low'].iloc[-14:]).mean()
-            base_sl = current_price + (atr * 1.5)
-            logic_lines.append(f"SL: ATR-based {atr:.1f} x1.5")
-    
-    # 2. REALISTIC TAKE-PROFIT CALCULATION
-    
-    # Base R:R ratio - be conservative
-    base_rr_ratio = 1.5  # Max 1.5:1 (realistic for day trading)
-    
-    # Adjust based on confidence (but cap it!)
-    if confidence_score == 5:
-        rr_multiplier = 1.0  # 1.5:1 max for high confidence
-    elif confidence_score >= 4:
-        rr_multiplier = 0.9  # ~1.35:1 for medium confidence
-    else:
-        rr_multiplier = 0.7  # ~1.05:1 for low confidence
-    
-    # Volume adjustment (be conservative)
-    volume_multiplier = 1.0
-    if volume_ratio > 1.5:
-        volume_multiplier = 1.05  # Only 5% increase
-    elif volume_ratio < 0.8:
-        volume_multiplier = 0.95  # Only 5% decrease
-    
-    # RSI adjustment (mean reversion aware)
-    rsi_multiplier = 1.0
-    if side == "BUY":
-        if rsi_value < 30:  # Oversold - might mean weaker trend
-            rsi_multiplier = 0.9
-        elif rsi_value > 70:  # Overbought - might reverse soon
-            rsi_multiplier = 0.8
-    else:
-        if rsi_value > 70:  # Overbought - might mean weaker downtrend
-            rsi_multiplier = 0.9
-        elif rsi_value < 30:  # Oversold - might bounce
-            rsi_multiplier = 0.8
-    
-    # Calculate risk
-    if side == "BUY":
-        risk = current_price - base_sl
-        # Realistic TP: Base R:R with capped multipliers
-        tp_distance = risk * base_rr_ratio * rr_multiplier * volume_multiplier * rsi_multiplier
-        
-        # CAP THE TP DISTANCE TO PREVENT UNREALISTIC TARGETS
-        # Max 5% move from entry for realistic trades
-        max_tp_pct = 0.05  # 5% max
-        max_tp_absolute = current_price * max_tp_pct
-        tp_distance = min(tp_distance, max_tp_absolute)
-        
-        tp = current_price + tp_distance
-        
-    else:  # SELL
-        risk = base_sl - current_price
-        tp_distance = risk * base_rr_ratio * rr_multiplier * volume_multiplier * rsi_multiplier
-        
-        # Same cap for sells
-        max_tp_pct = 0.05
-        max_tp_absolute = current_price * max_tp_pct
-        tp_distance = min(tp_distance, max_tp_absolute)
-        
-        tp = current_price - tp_distance
-    
-    # Calculate final R:R
-    rr_ratio = tp_distance / risk if risk > 0 else 0
-    
-    logic_lines.append(f"TP: R:R {base_rr_ratio:.1f}:1 base | Confidence: {rr_multiplier:.1f}x")
-    logic_lines.append(f"Volume: {volume_multiplier:.1f}x | RSI: {rsi_multiplier:.1f}x")
-    logic_lines.append(f"Final R:R: {rr_ratio:.2f}:1 | Max TP: ±{max_tp_pct*100:.0f}%")
-    
-    return base_sl, tp, " | ".join(logic_lines)
-
-# ================ MAIN ANALYSIS - FIXED ================
-
-def analyze_symbol_with_6steps(data: Dict[str, pd.DataFrame], symbol: str) -> Optional[Dict]:
-    """Main analysis function - FIXED VERSION"""
-    try:
-        log.info(f"Analyzing {symbol}...")
-        
-        # Execute all 6 steps
-        step1_passed, step1_trend = step1_mtf_analysis(data)
-        step2_direction, step2_pattern = step2_wave_analysis(data)  # Direction only
-        step3_passed, step3_strength = step3_strength_analysis(data)
-        step4_passed, step4_signal, rsi_value, macd_hist = step4_indicators_analysis(data)
-        step5_passed, step5_strength, volume_ratio = step5_volume_analysis(data)
-        
-        # Step 6 uses wave direction
-        step6_passed, step6_trend = step6_trend_identification(
-            step1_trend, step2_direction, step3_strength, step4_signal, step5_strength
-        )
-        
-        # Calculate total - WAVE ANALYSIS (step2) NOT COUNTED in confluence score
-        steps_passed = [step1_passed, step3_passed, step4_passed, step5_passed, step6_passed]  # 5 steps now
-        total_passed = sum(steps_passed)
-        
-        log.info(f"Confluence: {total_passed}/5 for {symbol}")
-        
-        # Check confluence AND ensure wave direction agrees with trend
-        if (total_passed >= MIN_CONFIDENCE and 
-            step6_trend in ["UP", "DOWN"] and
-            step2_direction in ["UP", "DOWN"] and
-            step2_direction == step6_trend):  # Wave must confirm trend
-            
-            current_price = data['LTF']['close'].iloc[-1]
-            side = "BUY" if step6_trend == "UP" else "SELL"
-            
-            # Calculate REALISTIC logic-based SL/TP
-            sl, tp, sl_tp_logic = calculate_logic_based_sltp(
-                current_price, side, data, step2_pattern, step3_strength,
-                rsi_value, volume_ratio, total_passed
-            )
-            
-            # Additional reality check: TP shouldn't be > 10% move typically
-            if side == "BUY":
-                tp_pct = (tp - current_price) / current_price * 100
-            else:
-                tp_pct = (current_price - tp) / current_price * 100
-            
-            # Skip if TP is unrealistic (>10% move) or risk is too small
-            if tp_pct > 10:
-                log.warning(f"Skipping {symbol}: TP target too high ({tp_pct:.1f}%)")
-                return None
-            
-            # Risk metrics
-            risk = abs(current_price - sl)
-            reward = abs(tp - current_price)
-            rr_ratio = reward / risk if risk > 0 else 0
-            risk_pct = (risk / current_price) * 100
-            reward_pct = (reward / current_price) * 100
-            
-            # Skip if risk is too small (<0.5%) - likely poor SL placement
-            if risk_pct < 0.5:
-                log.warning(f"Skipping {symbol}: Risk too small ({risk_pct:.1f}%)")
-                return None
-            
-            # Skip if R:R is poor (<1:1)
-            if rr_ratio < 1.0:
-                log.warning(f"Skipping {symbol}: Poor R:R ({rr_ratio:.2f}:1)")
-                return None
-            
-            # Create minimal logic breakdown
-            logic_breakdown = f"""
-Step 1 (MTF): {'✓' if step1_passed else '✗'} - {step1_trend}
-Step 2 (Wave): Direction: {step2_direction} - Pattern: {step2_pattern}
-Step 3 (Strength): {'✓' if step3_passed else '✗'} - {step3_strength}
-Step 4 (Indicators): {'✓' if step4_passed else '✗'} - {step4_signal} (RSI:{rsi_value:.1f})
-Step 5 (Volume): {'✓' if step5_passed else '✗'} - {step5_strength} ({volume_ratio:.1f}x)
-Step 6 (Trend): {'✓' if step6_passed else '✗'} - {step6_trend}
-
-SL/TP Logic: {sl_tp_logic}
-"""
-            
-            # Create signal
-            signal = {
-                'symbol': symbol,
-                'side': side,
-                'entry': current_price,
-                'sl': sl,
-                'tp': tp,
-                'status': 'OPEN',
-                
-                'step1_result': step1_passed,
-                'step2_direction': step2_direction,
-                'step3_result': step3_passed,
-                'step4_result': step4_passed,
-                'step5_result': step5_passed,
-                'step6_result': step6_passed,
-                'confidence_score': total_passed,
-                
-                'logic_breakdown': logic_breakdown.strip(),
-                
-                'timeframe_combo': f"{TIMEFRAMES['HTF']}|{TIMEFRAMES['MTF']}|{TIMEFRAMES['LTF']}",
-                'trend_direction': step6_trend,
-                'wave_pattern': step2_pattern,
-                'rsi_value': rsi_value,
-                'macd_hist': macd_hist,
-                'volume_ratio': volume_ratio,
-                'strength_level': step3_strength,
-                
-                'rr_ratio': rr_ratio,
-                'risk_pct': risk_pct,
-                'reward_pct': reward_pct,
-                
-                'signal_hash': hashlib.md5(
-                    f"{symbol}:{side}:{current_price:.8f}:{total_passed}:{int(time.time())}".encode()
-                ).hexdigest()
-            }
-            
-            log.info(f"✅ Signal: {symbol} {side} at {current_price:.2f} | R:R {rr_ratio:.2f}:1")
-            return signal
-        
-        log.info(f"❌ No signal: {symbol} - Confluence: {total_passed}/5, Wave: {step2_direction}, Trend: {step6_trend}")
-        return None
-        
-    except Exception as e:
-        log.error(f"Analysis error {symbol}: {e}")
-        return None
-
-# ---------------- DATABASE ----------------
 async def save_signal(signal: Dict) -> bool:
-    """Save signal to database"""
+    """Save expansion signal"""
     try:
         async with db_lock:
-            # Check duplicate
             async with db_conn.execute(
                 "SELECT COUNT(*) FROM signals WHERE signal_hash = ?",
                 (signal['signal_hash'],)
@@ -662,25 +622,20 @@ async def save_signal(signal: Dict) -> bool:
             if exists > 0:
                 return False
             
-            # Insert
             await db_conn.execute("""
                 INSERT INTO signals (
                     symbol, side, entry, sl, tp, status,
-                    step1_result, step2_direction, step3_result, step4_result,
-                    step5_result, step6_result, confidence_score, logic_breakdown,
-                    timeframe_combo, trend_direction, wave_pattern, rsi_value,
-                    macd_hist, volume_ratio, strength_level, rr_ratio, risk_pct,
-                    reward_pct, signal_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    timeframe_pressure, wave_exhaustion, strength_shift,
+                    volume_confirmation, expansion_trigger, expansion_score,
+                    logic_breakdown, signal_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 signal['symbol'], signal['side'], signal['entry'], signal['sl'],
-                signal['tp'], signal['status'], signal['step1_result'],
-                signal['step2_direction'], signal['step3_result'], signal['step4_result'],
-                signal['step5_result'], signal['step6_result'], signal['confidence_score'],
-                signal['logic_breakdown'], signal['timeframe_combo'], signal['trend_direction'],
-                signal['wave_pattern'], signal['rsi_value'], signal['macd_hist'],
-                signal['volume_ratio'], signal['strength_level'], signal['rr_ratio'],
-                signal['risk_pct'], signal['reward_pct'], signal['signal_hash']
+                signal['tp'], signal['status'], signal['timeframe_pressure'],
+                signal['wave_exhaustion'], signal['strength_shift'],
+                signal['volume_confirmation'], signal['expansion_trigger'],
+                signal['expansion_score'], signal['logic_breakdown'],
+                signal['signal_hash']
             ))
             
             await db_conn.commit()
@@ -690,95 +645,87 @@ async def save_signal(signal: Dict) -> bool:
         log.error(f"Save error: {e}")
         return False
 
-# ---------------- CLEAN ALERTS ----------------
-async def send_clean_alert(signal: Dict):
-    """Send MINIMAL clean alert to Telegram"""
+async def send_expansion_alert(signal: Dict):
+    """Send expansion alert"""
     try:
-        # Create clean, minimal message
         message = f"""
-🎯 **6-STEP CONFLUENCE SIGNAL** 🎯
+⚡ **EXPANSION PHASE DETECTED** ⚡
 
-**{signal['symbol']}** | **{signal['side']}**
-Confluence: {signal['confidence_score']}/5 ✅
+**{signal['symbol']}** | **ENTER {signal['side']}**
 
-**TRADE SETUP:**
+🎯 **ALL 5 CONDITIONS MET:**
+1️⃣ Timeframe Pressure ✓
+2️⃣ Wave Exhaustion ✓  
+3️⃣ Strength Shift ✓
+4️⃣ Volume Confirmation ✓
+5️⃣ Expansion Trigger ✓
+
+**TRADE:**
 Entry: {signal['entry']:.2f}
-SL: {signal['sl']:.2f} ({signal['risk_pct']:.1f}%)
-TP: {signal['tp']:.2f} ({signal['reward_pct']:.1f}%)
-R:R: {signal['rr_ratio']:.2f}:1
+SL: {signal['sl']:.2f} (invalidation)
+TP: {signal['tp']:.2f} (expansion target)
 
-**KEY METRICS:**
-Trend: {signal['trend_direction']}
-Wave: {signal['wave_pattern']}
-RSI: {signal['rsi_value']:.1f}
-Volume: {signal['volume_ratio']:.1f}x
-Strength: {signal['strength_level']}
+**EXPECT:**
+• Price to expand in next 5min-2hrs
+• Hard move in {signal['side']} direction
+• Big participation move
 
-**LOGIC-BASED SL/TP:**
-{signal['logic_breakdown'].split('SL/TP Logic: ')[-1] if 'SL/TP Logic:' in signal['logic_breakdown'] else 'Based on 6-step analysis'}
-
-#6StepMethod #{signal['side']}
+#ExpansionPhase #{signal['side']}
 """
         
         await tg(message)
-        log.info(f"Alert sent: {signal['symbol']}")
+        log.info(f"Expansion alert sent: {signal['symbol']}")
         
     except Exception as e:
         log.error(f"Alert error: {e}")
 
-# ---------------- SCANNING LOOP ----------------
-async def scan_loop(exchange):
-    """Main scanning loop"""
+async def scan_for_expansions(exchange):
+    """Scan for expansion starts"""
     while True:
         try:
-            log.info("Starting scan...")
+            log.info("🔭 Scanning for expansion phases...")
             
             # Get top pairs
             tickers = await exchange.fetch_tickers()
             usdt_pairs = [(s, t['quoteVolume']) for s, t in tickers.items() 
-                         if s.endswith('/USDT') and t.get('quoteVolume', 0) > 0]
+                         if s.endswith('/USDT') and t.get('quoteVolume', 0) > 1000000]
             usdt_pairs.sort(key=lambda x: x[1], reverse=True)
             top_pairs = usdt_pairs[:TOP_N]
             
-            signals_found = 0
+            expansions_found = 0
             
             for symbol, volume in top_pairs:
                 try:
-                    # Fetch data
                     data = await fetch_multi_timeframe_data(exchange, symbol)
                     if not data:
                         continue
                     
-                    # Analyze
-                    signal = analyze_symbol_with_6steps(data, symbol)
+                    signal = await detect_expansion_start(data, symbol)
                     
                     if signal:
-                        # Save and alert
                         if await save_signal(signal):
-                            await send_clean_alert(signal)
-                            signals_found += 1
+                            await send_expansion_alert(signal)
+                            expansions_found += 1
                     
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)
                     
                 except Exception as e:
-                    log.error(f"Error {symbol}: {e}")
+                    log.debug(f"Scan error {symbol}: {e}")
                     continue
             
-            log.info(f"Scan complete. Found {signals_found} signals.")
+            log.info(f"Scan complete. Found {expansions_found} expansion starts.")
             
             await asyncio.sleep(SCAN_INTERVAL)
             
         except Exception as e:
-            log.error(f"Scan error: {e}")
+            log.error(f"Scan loop error: {e}")
             await asyncio.sleep(30)
 
-# ---------------- MONITORING LOOP - FIXED ----------------
-async def monitor_loop(exchange):
-    """Monitor TP/SL - FIXED VERSION"""
+async def monitor_expansions(exchange):
+    """Monitor expansion trades"""
     while True:
         try:
             async with db_lock:
-                # Fetch all open signals
                 async with db_conn.execute("""
                     SELECT id, symbol, side, entry, sl, tp FROM signals 
                     WHERE status='OPEN'
@@ -795,29 +742,28 @@ async def monitor_loop(exchange):
                         
                         if side == "BUY":
                             if current_price >= tp:
-                                await tg(f"✅ {symbol} TP HIT | Entry: {entry:.2f} → TP: {tp:.2f}")
+                                await tg(f"✅ {symbol} EXPANSION COMPLETE | Target hit")
                                 await db_conn.execute("UPDATE signals SET status='CLOSED' WHERE id=?", (sig_id,))
                             elif current_price <= sl:
-                                await tg(f"❌ {symbol} SL HIT | Entry: {entry:.2f} → SL: {sl:.2f}")
+                                await tg(f"❌ {symbol} EXPANSION FAILED | Invalidated")
                                 await db_conn.execute("UPDATE signals SET status='CLOSED' WHERE id=?", (sig_id,))
-                        else:  # SELL
+                        else:
                             if current_price <= tp:
-                                await tg(f"✅ {symbol} TP HIT | Entry: {entry:.2f} → TP: {tp:.2f}")
+                                await tg(f"✅ {symbol} EXPANSION COMPLETE | Target hit")
                                 await db_conn.execute("UPDATE signals SET status='CLOSED' WHERE id=?", (sig_id,))
                             elif current_price >= sl:
-                                await tg(f"❌ {symbol} SL HIT | Entry: {entry:.2f} → SL: {sl:.2f}")
+                                await tg(f"❌ {symbol} EXPANSION FAILED | Invalidated")
                                 await db_conn.execute("UPDATE signals SET status='CLOSED' WHERE id=?", (sig_id,))
                     
                     except Exception as e:
-                        log.error(f"Monitor error {symbol}: {e}")
-                        continue
+                        log.debug(f"Monitor error {symbol}: {e}")
                 
                 await db_conn.commit()
             
-            await asyncio.sleep(30)
+            await asyncio.sleep(15)  # Check every 15 seconds
             
         except Exception as e:
-            log.error(f"Monitor loop error: {e}")
+            log.error(f"Monitor error: {e}")
             await asyncio.sleep(30)
 
 # ---------------- FASTAPI ----------------
@@ -826,55 +772,34 @@ app = FastAPI()
 @app.get("/")
 async def root():
     return {
-        "status": "running",
-        "scanner": "6-Step Confluence Scanner",
-        "min_confidence": MIN_CONFIDENCE,
-        "timeframes": TIMEFRAMES
+        "status": "scanning_for_expansions",
+        "min_conditions": 5,
+        "target": "detect_start_of_big_moves"
     }
 
-@app.get("/signals")
-async def get_signals(limit: int = 10):
+@app.get("/expansions")
+async def get_expansions():
     try:
         async with db_lock:
             async with db_conn.execute("""
-                SELECT id, symbol, side, entry, sl, tp, confidence_score, 
-                       timestamp, trend_direction, rr_ratio, risk_pct, reward_pct
-                FROM signals WHERE status='OPEN' ORDER BY timestamp DESC LIMIT ?
-            """, (limit,)) as cursor:
+                SELECT symbol, side, entry, sl, tp, expansion_score, timestamp 
+                FROM signals WHERE status='OPEN' ORDER BY timestamp DESC LIMIT 10
+            """) as cursor:
                 rows = await cursor.fetchall()
-                columns = [description[0] for description in cursor.description]
         
-        signals = [dict(zip(columns, row)) for row in rows]
-        return {"count": len(signals), "signals": signals}
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.get("/stats")
-async def get_stats():
-    try:
-        async with db_lock:
-            # Total signals
-            async with db_conn.execute("SELECT COUNT(*) FROM signals") as cursor:
-                total = (await cursor.fetchone())[0]
-            
-            # Open signals
-            async with db_conn.execute("SELECT COUNT(*) FROM signals WHERE status='OPEN'") as cursor:
-                open_count = (await cursor.fetchone())[0]
-            
-            # Closed signals
-            async with db_conn.execute("SELECT COUNT(*) FROM signals WHERE status='CLOSED'") as cursor:
-                closed = (await cursor.fetchone())[0]
-            
-            # Average confidence
-            async with db_conn.execute("SELECT AVG(confidence_score) FROM signals") as cursor:
-                avg_conf = (await cursor.fetchone())[0]
-            
-            return {
-                "total_signals": total,
-                "open_signals": open_count,
-                "closed_signals": closed,
-                "average_confidence": round(avg_conf, 2) if avg_conf else 0
-            }
+        expansions = []
+        for row in rows:
+            expansions.append({
+                "symbol": row[0],
+                "side": row[1],
+                "entry": row[2],
+                "sl": row[3],
+                "tp": row[4],
+                "score": row[5],
+                "time": row[6]
+            })
+        
+        return {"expansions": expansions}
     except Exception as e:
         return {"error": str(e)}
 
@@ -882,49 +807,50 @@ async def get_stats():
 async def main():
     global exchange
     
-    log.info("="*50)
-    log.info("🚀 6-STEP SCANNER STARTING - FIXED VERSION")
-    log.info("="*50)
+    log.info("="*60)
+    log.info("🚀 EXPANSION PHASE SCANNER STARTING")
+    log.info("Looking for START of big moves")
+    log.info("="*60)
     
     try:
-        # Initialize database
         if not await init_db():
             return
         
-        # Initialize exchange
         exchange = ccxt.okx({
             "enableRateLimit": True,
             "options": {"defaultType": "spot"}
         })
         
-        # Test connection
         await exchange.fetch_ticker("BTC/USDT")
         log.info("✅ Exchange connected")
         
         # Startup message
         await tg(f"""
-🚀 6-STEP SCANNER STARTED - FIXED VERSION
+🔥 EXPANSION PHASE SCANNER STARTED
 
-Features:
-• Wave analysis for direction only (not scored)
-• Realistic TP targets (max 5% move)
-• {MIN_CONFIDENCE}/5 confluence required
-• Timeframes: 4h, 1h, 15m
-• Smart SL based on support/resistance
-• Fixed monitor loop
+I scan for the START of big moves when:
 
-Ready to scan!
+1️⃣ All timeframes align (no opposing force)
+2️⃣ Waves exhaust → release
+3️⃣ Strength shifts (control changes)
+4️⃣ Volume confirms (big participation)
+5️⃣ Expansion triggers
+
+When all 5 hit → "ENTER LONG/SHORT"
+Then price expands in next 5min-2hrs
+
+Scanning {TOP_N} pairs...
         """)
         
-        # Start loops
+        # Start scanning
         await asyncio.gather(
-            scan_loop(exchange),
-            monitor_loop(exchange)
+            scan_for_expansions(exchange),
+            monitor_expansions(exchange)
         )
         
     except KeyboardInterrupt:
         log.info("Stopped by user")
-        await tg("🛑 Scanner stopped by user")
+        await tg("🛑 Expansion scanner stopped")
     except Exception as e:
         log.error(f"Fatal: {e}")
         await tg(f"❌ Scanner crashed: {str(e)[:200]}")
