@@ -27,7 +27,7 @@ SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
 TOP_N = int(os.getenv("TOP_N", 60))
 
 # Easier thresholds for more signals
-MIN_SYNTHESIS_SCORE = 0.55  # Lowered from 0.6
+MIN_SYNTHESIS_SCORE = 0.25  # Lowered from 0.6
 
 # Timeframes - using fewer for reliability
 TIMEFRAMES = {
