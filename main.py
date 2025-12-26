@@ -851,10 +851,12 @@ async def get_stats():
 
 @app.get("/recent-signals")
 async def get_recent_signals(limit: int = 10):
-    """Get recent signals"""
+    """Get recent signals - FIXED VERSION"""
     try:
         async with db_lock:
-            await db_conn.row_factory = aiosqlite.Row
+            # Set row factory - FIXED: removed 'await' from assignment
+            db_conn.row_factory = aiosqlite.Row
+            
             async with db_conn.execute("""
                 SELECT symbol, side, entry, sl, tp, synthesis_score, timestamp, status
                 FROM signals 
