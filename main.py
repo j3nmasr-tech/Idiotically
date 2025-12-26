@@ -3,14 +3,8 @@
 
 """
 YOUR 6-STEP CONFLUENCE SCANNER
-1. Multi-Timeframe Analysis (MTF)
-2. Wave Analysis
-3. Strength/Momentum
-4. Technical Indicators
-5. Volume Analysis
-6. Trend Identification
-
-EXACTLY as you specified.
+WITH COMPLETE LOGIC BREAKDOWN
+Database initialization FIXED
 """
 
 import os
@@ -25,31 +19,29 @@ import httpx
 import ccxt.async_support as ccxt
 import pandas as pd
 import numpy as np
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI
 import uvicorn
-from collections import defaultdict, deque
 from typing import Dict, List, Optional, Tuple, Any
 
 # ---------------- CONFIG ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "changeme")
 DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
-TOP_N = int(os.getenv("TOP_N", 80))
+TOP_N = int(os.getenv("TOP_N", 60))
 MIN_CONFIDENCE = 1  # Need at least 4 out of 6 steps confirmed
 
-# Timeframes for MTF analysis - your method requires 3 timeframes minimum
+# Timeframes for MTF analysis
 TIMEFRAMES = {
-    "HTF": "4h",    # Higher Timeframe for Primary Trend
-    "MTF": "1h",    # Medium Timeframe for Wave Analysis
-    "LTF": "15m"    # Lower Timeframe for Entry
+    "HTF": "4h",    # Higher Timeframe: Primary Trend
+    "MTF": "1h",    # Medium Timeframe: Wave Analysis  
+    "LTF": "15m"    # Lower Timeframe: Entry & Indicators
 }
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-log = logging.getLogger("6step_scanner")
+log = logging.getLogger("6step_transparent")
 db_lock = asyncio.Lock()
 db_conn = None
 exchange = None
@@ -70,18 +62,27 @@ async def tg(msg: str):
     except Exception as e:
         log.warning(f"Telegram send failed: {e}")
 
-# ---------------- DATABASE ----------------
+# ---------------- DATABASE FIXED ----------------
 async def init_db():
-    """Initialize database for your 6-step method"""
+    """Initialize database - DROP and RECREATE to ensure schema matches"""
     global db_conn
     try:
+        # Remove old database file if exists
+        if os.path.exists(DB_PATH):
+            log.info(f"Removing old database: {DB_PATH}")
+            os.remove(DB_PATH)
+        
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        
+        # Create fresh database
         db_conn = await aiosqlite.connect(DB_PATH)
         await db_conn.execute("PRAGMA journal_mode=WAL;")
         await db_conn.execute("PRAGMA synchronous=NORMAL;")
         
-        # Create table specifically for your 6-step method
+        # Create table with ALL required columns
         await db_conn.execute("""
-            CREATE TABLE IF NOT EXISTS signals (
+            CREATE TABLE signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol TEXT NOT NULL,
                 side TEXT NOT NULL,
@@ -91,24 +92,28 @@ async def init_db():
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 status TEXT DEFAULT 'OPEN',
                 
-                -- Your 6 Steps Tracking --
-                step1_mtf INTEGER DEFAULT 0,
-                step2_wave INTEGER DEFAULT 0,
-                step3_strength INTEGER DEFAULT 0,
-                step4_indicators INTEGER DEFAULT 0,
-                step5_volume INTEGER DEFAULT 0,
-                step6_trend INTEGER DEFAULT 0,
-                
-                -- Additional Info --
+                -- Step Results --
+                step1_result INTEGER DEFAULT 0,
+                step2_result INTEGER DEFAULT 0,
+                step3_result INTEGER DEFAULT 0,
+                step4_result INTEGER DEFAULT 0,
+                step5_result INTEGER DEFAULT 0,
+                step6_result INTEGER DEFAULT 0,
                 confidence_score INTEGER DEFAULT 0,
-                timeframe_combo TEXT,
-                wave_pattern TEXT,
-                trend_direction TEXT,
-                rsi_value REAL,
-                macd_signal TEXT,
-                volume_ratio REAL,
                 
-                -- Trade Management --
+                -- Complete Logic Breakdown --
+                logic_breakdown TEXT,
+                
+                -- Analysis Details --
+                timeframe_combo TEXT,
+                trend_direction TEXT,
+                wave_pattern TEXT,
+                rsi_value REAL,
+                macd_hist REAL,
+                volume_ratio REAL,
+                strength_level TEXT,
+                
+                -- Risk Management --
                 atr_value REAL,
                 rr_ratio REAL,
                 risk_pct REAL,
@@ -119,23 +124,32 @@ async def init_db():
         """)
         
         # Create indexes
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_symbol ON signals(symbol);")
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON signals(status);")
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_confidence ON signals(confidence_score);")
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_hash ON signals(signal_hash);")
+        await db_conn.execute("CREATE INDEX idx_symbol_status ON signals(symbol, status);")
+        await db_conn.execute("CREATE INDEX idx_timestamp ON signals(timestamp);")
+        await db_conn.execute("CREATE INDEX idx_confidence ON signals(confidence_score);")
+        await db_conn.execute("CREATE INDEX idx_signal_hash ON signals(signal_hash);")
         
         await db_conn.commit()
-        log.info("✅ Database initialized for 6-step method")
+        log.info("✅ Database created FRESH with all columns")
+        
+        # Verify columns exist
+        async with db_conn.execute("PRAGMA table_info(signals)") as cursor:
+            columns = await cursor.fetchall()
+            log.info(f"Database columns: {[col[1] for col in columns]}")
+            
         return True
+        
     except Exception as e:
         log.error(f"Database initialization error: {e}")
+        if db_conn:
+            await db_conn.close()
+            db_conn = None
         return False
 
-# ---------------- OHLCV FETCH ----------------
-async def fetch_multi_timeframe_data(exchange, symbol: str) -> Dict[str, pd.DataFrame]:
-    """Fetch data for all 3 timeframes required by your method"""
+# ---------------- DATA FETCHING ----------------
+async def fetch_multi_timeframe_data(exchange, symbol: str) -> Optional[Dict[str, pd.DataFrame]]:
+    """Fetch data for all 3 timeframes"""
     data = {}
-    
     for tf_type, tf in TIMEFRAMES.items():
         try:
             ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=tf, limit=200)
@@ -144,461 +158,572 @@ async def fetch_multi_timeframe_data(exchange, symbol: str) -> Dict[str, pd.Data
                 for col in ["open", "high", "low", "close", "volume"]:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
                 data[tf_type] = df
-                log.debug(f"✓ Fetched {tf} data for {symbol}")
             else:
-                log.warning(f"Failed to fetch {tf} data for {symbol}")
                 return None
-        except Exception as e:
-            log.warning(f"Error fetching {tf} for {symbol}: {e}")
+        except:
             return None
-    
     return data
 
-# ================ YOUR 6-STEP ANALYSIS ================
+# ================ YOUR 6 STEPS WITH LOGIC TRACKING ================
 
-def step1_mtf_analysis(data: Dict[str, pd.DataFrame]) -> Tuple[int, str, Dict]:
+def step1_mtf_analysis(data: Dict[str, pd.DataFrame]) -> Tuple[int, str, str]:
     """
     STEP 1: Multi-Timeframe Analysis
-    أراقب كل الفريمات - Watch all timeframes
+    Returns: (passed, trend, logic_description)
     """
+    logic_lines = []
     try:
-        htf_df = data['HTF']  # 4h
-        mtf_df = data['MTF']  # 1h
-        ltf_df = data['LTF']  # 15m
+        htf_df = data['HTF']
+        mtf_df = data['MTF']
+        ltf_df = data['LTF']
         
-        # Check trend consistency across timeframes
-        htf_trend = "UP" if htf_df['close'].iloc[-1] > htf_df['close'].iloc[-50] else "DOWN"
-        mtf_trend = "UP" if mtf_df['close'].iloc[-1] > mtf_df['close'].iloc[-20] else "DOWN"
-        ltf_trend = "UP" if ltf_df['close'].iloc[-1] > ltf_df['close'].iloc[-10] else "DOWN"
+        # Calculate trends
+        htf_price_50 = htf_df['close'].iloc[-50] if len(htf_df) >= 50 else htf_df['close'].iloc[0]
+        mtf_price_20 = mtf_df['close'].iloc[-20] if len(mtf_df) >= 20 else mtf_df['close'].iloc[0]
+        ltf_price_10 = ltf_df['close'].iloc[-10] if len(ltf_df) >= 10 else ltf_df['close'].iloc[0]
         
-        # Score based on alignment (3 points max)
+        htf_current = htf_df['close'].iloc[-1]
+        mtf_current = mtf_df['close'].iloc[-1]
+        ltf_current = ltf_df['close'].iloc[-1]
+        
+        htf_trend = "UP" if htf_current > htf_price_50 else "DOWN"
+        mtf_trend = "UP" if mtf_current > mtf_price_20 else "DOWN"
+        ltf_trend = "UP" if ltf_current > ltf_price_10 else "DOWN"
+        
+        logic_lines.append("📊 STEP 1: MULTI-TIMEFRAME ANALYSIS")
+        logic_lines.append(f"HTF (4h): {htf_current:.6f} vs {htf_price_50:.6f} → {htf_trend}")
+        logic_lines.append(f"MTF (1h): {mtf_current:.6f} vs {mtf_price_20:.6f} → {mtf_trend}")
+        logic_lines.append(f"LTF (15m): {ltf_current:.6f} vs {ltf_price_10:.6f} → {ltf_trend}")
+        
+        # Score alignment
         score = 0
-        if htf_trend == mtf_trend: score += 1
-        if mtf_trend == ltf_trend: score += 1
-        if htf_trend == ltf_trend: score += 1
+        if htf_trend == mtf_trend: 
+            score += 1
+            logic_lines.append("✓ HTF & MTF aligned")
+        else:
+            logic_lines.append("✗ HTF & MTF not aligned")
+            
+        if mtf_trend == ltf_trend: 
+            score += 1
+            logic_lines.append("✓ MTF & LTF aligned")
+        else:
+            logic_lines.append("✗ MTF & LTF not aligned")
+            
+        if htf_trend == ltf_trend: 
+            score += 1
+            logic_lines.append("✓ HTF & LTF aligned")
+        else:
+            logic_lines.append("✗ HTF & LTF not aligned")
+        
+        logic_lines.append(f"Alignment Score: {score}/3")
         
         # Determine dominant trend
         trends = [htf_trend, mtf_trend, ltf_trend]
         dominant_trend = max(set(trends), key=trends.count)
+        logic_lines.append(f"Dominant Trend: {dominant_trend} (based on majority)")
         
-        details = {
-            "htf_trend": htf_trend,
-            "mtf_trend": mtf_trend,
-            "ltf_trend": ltf_trend,
-            "dominant_trend": dominant_trend,
-            "alignment": f"{score}/3 timeframes aligned"
-        }
-        
-        # Must have at least 2 timeframes aligned to pass
+        # Pass if at least 2 timeframes aligned
         passed = 1 if score >= 2 else 0
+        logic_lines.append(f"Step Result: {'PASS' if passed else 'FAIL'} ({'≥2 timeframes aligned' if passed else '<2 timeframes aligned'})")
         
-        return passed, dominant_trend, details
+        logic_text = "\n".join(logic_lines)
+        return passed, dominant_trend, logic_text
+        
     except Exception as e:
-        log.error(f"Step 1 error: {e}")
-        return 0, "NEUTRAL", {"error": str(e)}
+        logic_lines.append(f"ERROR: {str(e)}")
+        return 0, "ERROR", "\n".join(logic_lines)
 
-def step2_wave_analysis(data: Dict[str, pd.DataFrame]) -> Tuple[int, str, Dict]:
+def step2_wave_analysis(data: Dict[str, pd.DataFrame]) -> Tuple[int, str, str]:
     """
     STEP 2: Wave Analysis
-    المدى الموجي - Wave range analysis
+    Returns: (passed, pattern, logic_description)
     """
+    logic_lines = []
     try:
-        mtf_df = data['MTF']  # Use 1h for wave analysis
+        mtf_df = data['MTF']
+        prices = mtf_df['close'].values[-30:]
         
-        # Simple wave/price structure detection
-        prices = mtf_df['close'].values[-50:]
+        logic_lines.append("\n🌊 STEP 2: WAVE ANALYSIS")
+        logic_lines.append(f"Analyzing last {len(prices)} candles on 1h")
         
-        # Find swing highs and lows
+        # Find swing points
         swing_highs = []
         swing_lows = []
         
         for i in range(2, len(prices)-2):
-            # Swing high
-            if prices[i] > prices[i-1] and prices[i] > prices[i-2] and \
-               prices[i] > prices[i+1] and prices[i] > prices[i+2]:
+            # Swing high detection
+            if (prices[i] > prices[i-1] and prices[i] > prices[i-2] and
+                prices[i] > prices[i+1] and prices[i] > prices[i+2]):
                 swing_highs.append(prices[i])
             
-            # Swing low
-            if prices[i] < prices[i-1] and prices[i] < prices[i-2] and \
-               prices[i] < prices[i+1] and prices[i] < prices[i+2]:
+            # Swing low detection
+            if (prices[i] < prices[i-1] and prices[i] < prices[i-2] and
+                prices[i] < prices[i+1] and prices[i] < prices[i+2]):
                 swing_lows.append(prices[i])
         
-        # Analyze wave pattern
+        logic_lines.append(f"Found {len(swing_highs)} swing highs, {len(swing_lows)} swing lows")
+        
+        # Pattern recognition
         if len(swing_highs) >= 2 and len(swing_lows) >= 2:
-            # Check for higher highs/lows (uptrend pattern)
-            if swing_highs[-1] > swing_highs[-2] and swing_lows[-1] > swing_lows[-2]:
+            last_high_1 = swing_highs[-1]
+            last_high_2 = swing_highs[-2] if len(swing_highs) >= 2 else last_high_1
+            last_low_1 = swing_lows[-1]
+            last_low_2 = swing_lows[-2] if len(swing_lows) >= 2 else last_low_1
+            
+            logic_lines.append(f"Last 2 highs: {last_high_2:.6f} → {last_high_1:.6f}")
+            logic_lines.append(f"Last 2 lows: {last_low_2:.6f} → {last_low_1:.6f}")
+            
+            # Uptrend pattern: higher highs AND higher lows
+            if last_high_1 > last_high_2 and last_low_1 > last_low_2:
                 pattern = "IMPULSE_UP"
-                score = 1
-            # Check for lower highs/lows (downtrend pattern)
-            elif swing_highs[-1] < swing_highs[-2] and swing_lows[-1] < swing_lows[-2]:
+                passed = 1
+                logic_lines.append("✓ Pattern: IMPULSE UP (Higher Highs & Higher Lows)")
+            
+            # Downtrend pattern: lower highs AND lower lows
+            elif last_high_1 < last_high_2 and last_low_1 < last_low_2:
                 pattern = "IMPULSE_DOWN"
-                score = 1
+                passed = 1
+                logic_lines.append("✓ Pattern: IMPULSE DOWN (Lower Highs & Lower Lows)")
+            
             # Correction pattern
-            elif (swing_highs[-1] < swing_highs[-2] and swing_lows[-1] > swing_lows[-2]) or \
-                 (swing_highs[-1] > swing_highs[-2] and swing_lows[-1] < swing_lows[-2]):
+            elif (last_high_1 < last_high_2 and last_low_1 > last_low_2) or \
+                 (last_high_1 > last_high_2 and last_low_1 < last_low_2):
                 pattern = "CORRECTION"
-                score = 1
+                passed = 1
+                logic_lines.append("✓ Pattern: CORRECTION (Mixed Highs/Lows)")
+            
             else:
                 pattern = "CONSOLIDATION"
-                score = 0
+                passed = 0
+                logic_lines.append("✗ Pattern: CONSOLIDATION (No clear direction)")
+        
         else:
-            pattern = "NO_CLEAR_WAVE"
-            score = 0
+            pattern = "INSUFFICIENT_SWINGS"
+            passed = 0
+            logic_lines.append("✗ Insufficient swing points for analysis")
         
-        details = {
-            "pattern": pattern,
-            "swing_highs_count": len(swing_highs),
-            "swing_lows_count": len(swing_lows),
-            "current_price": float(mtf_df['close'].iloc[-1])
-        }
+        logic_lines.append(f"Step Result: {'PASS' if passed else 'FAIL'} ({pattern})")
+        logic_text = "\n".join(logic_lines)
+        return passed, pattern, logic_text
         
-        return score, pattern, details
     except Exception as e:
-        log.error(f"Step 2 error: {e}")
-        return 0, "UNKNOWN", {"error": str(e)}
+        logic_lines.append(f"ERROR: {str(e)}")
+        return 0, "ERROR", "\n".join(logic_lines)
 
-def step3_strength_analysis(data: Dict[str, pd.DataFrame]) -> Tuple[int, str, Dict]:
+def step3_strength_analysis(data: Dict[str, pd.DataFrame]) -> Tuple[int, str, str]:
     """
     STEP 3: Strength/Momentum Analysis
-    القوة - Strength measurement
+    Returns: (passed, strength_level, logic_description)
     """
+    logic_lines = []
     try:
-        mtf_df = data['MTF']  # Use 1h for strength analysis
-        
-        # Calculate momentum using rate of change and price slope
+        mtf_df = data['MTF']
         prices = mtf_df['close'].values[-20:]
         
-        if len(prices) < 10:
-            return 0, "WEAK", {"error": "Insufficient data"}
+        logic_lines.append("\n💪 STEP 3: STRENGTH ANALYSIS")
+        logic_lines.append(f"Analyzing momentum on last {len(prices)} candles")
         
-        # Rate of Change (5-period)
-        roc_5 = ((prices[-1] / prices[-6]) - 1) * 100
+        # 1. Rate of Change (5-period)
+        if len(prices) >= 6:
+            roc_5 = ((prices[-1] / prices[-6]) - 1) * 100
+            logic_lines.append(f"ROC(5): {roc_5:+.2f}%")
+        else:
+            roc_5 = 0
+            logic_lines.append("ROC(5): Insufficient data")
         
-        # Price slope (linear regression on last 10 periods)
-        x = np.arange(len(prices[-10:]))
-        y = prices[-10:]
-        slope, _ = np.polyfit(x, y, 1)
-        slope_pct = (slope / prices[-1]) * 100
+        # 2. Price slope (linear regression on last 10)
+        if len(prices) >= 10:
+            x = np.arange(len(prices[-10:]))
+            y = prices[-10:]
+            slope, _ = np.polyfit(x, y, 1)
+            slope_pct = (slope / prices[-1]) * 100
+            logic_lines.append(f"Slope(10): {slope_pct:+.4f}% per candle")
+        else:
+            slope_pct = 0
+            logic_lines.append("Slope(10): Insufficient data")
         
-        # Average candle size (strength of moves)
-        avg_candle_size = (mtf_df['high'].iloc[-10:] - mtf_df['low'].iloc[-10:]).mean()
-        avg_candle_pct = (avg_candle_size / prices[-1]) * 100
+        # 3. Average candle size
+        if len(mtf_df) >= 10:
+            avg_candle_size = (mtf_df['high'].iloc[-10:] - mtf_df['low'].iloc[-10:]).mean()
+            avg_candle_pct = (avg_candle_size / prices[-1]) * 100
+            logic_lines.append(f"Avg Candle Size: {avg_candle_pct:.2f}% of price")
+        else:
+            avg_candle_pct = 0
+            logic_lines.append("Avg Candle Size: Insufficient data")
         
-        # Determine strength
+        # Strength determination
         if abs(roc_5) > 2.0 and abs(slope_pct) > 0.1 and avg_candle_pct > 0.5:
             strength = "STRONG"
-            score = 1
+            passed = 1
+            logic_lines.append(f"✓ Strength: STRONG (All thresholds met)")
         elif abs(roc_5) > 1.0 and abs(slope_pct) > 0.05 and avg_candle_pct > 0.3:
             strength = "MODERATE"
-            score = 1
+            passed = 1
+            logic_lines.append(f"✓ Strength: MODERATE (Medium thresholds met)")
         else:
             strength = "WEAK"
-            score = 0
+            passed = 0
+            logic_lines.append(f"✗ Strength: WEAK (Thresholds not met)")
         
+        # Direction
         direction = "UP" if roc_5 > 0 else "DOWN"
+        logic_lines.append(f"Direction: {direction} (Based on ROC sign)")
         
-        details = {
-            "roc_5": float(roc_5),
-            "slope_pct": float(slope_pct),
-            "avg_candle_pct": float(avg_candle_pct),
-            "direction": direction,
-            "strength_level": strength
-        }
+        logic_lines.append(f"Step Result: {'PASS' if passed else 'FAIL'} ({strength} {direction})")
+        logic_text = "\n".join(logic_lines)
+        return passed, f"{strength}_{direction}", logic_text
         
-        return score, strength, details
     except Exception as e:
-        log.error(f"Step 3 error: {e}")
-        return 0, "WEAK", {"error": str(e)}
+        logic_lines.append(f"ERROR: {str(e)}")
+        return 0, "ERROR", "\n".join(logic_lines)
 
-def step4_indicators_analysis(data: Dict[str, pd.DataFrame]) -> Tuple[int, str, Dict]:
+def step4_indicators_analysis(data: Dict[str, pd.DataFrame]) -> Tuple[int, str, str, float, float]:
     """
-    STEP 4: Technical Indicators
-    المؤشرات - RSI, MACD, etc.
+    STEP 4: Technical Indicators (RSI & MACD)
+    Returns: (passed, signal, logic_description, rsi, macd_hist)
     """
+    logic_lines = []
     try:
-        ltf_df = data['LTF']  # Use 15m for indicator analysis
-        
-        # Calculate RSI
-        def calculate_rsi(prices, period=14):
-            deltas = np.diff(prices)
-            seed = deltas[:period+1]
-            up = seed[seed >= 0].sum()/period
-            down = -seed[seed < 0].sum()/period
-            rs = up/down if down != 0 else 0
-            rsi = 100 - 100/(1 + rs)
-            
-            for i in range(period, len(prices)):
-                delta = deltas[i-1]
-                if delta > 0:
-                    upval = delta
-                    downval = 0
-                else:
-                    upval = 0
-                    downval = -delta
-                
-                up = (up*(period-1) + upval)/period
-                down = (down*(period-1) + downval)/period
-                rs = up/down if down != 0 else 0
-                rsi = np.append(rsi, 100 - 100/(1 + rs))
-            
-            return rsi
-        
+        ltf_df = data['LTF']
         prices = ltf_df['close'].values
-        if len(prices) > 14:
-            rsi_values = calculate_rsi(prices)
-            current_rsi = rsi_values[-1] if len(rsi_values) > 0 else 50
+        
+        logic_lines.append("\n📈 STEP 4: TECHNICAL INDICATORS")
+        
+        # RSI Calculation
+        if len(prices) >= 15:
+            deltas = np.diff(prices[-15:])
+            gains = deltas[deltas >= 0]
+            losses = -deltas[deltas < 0]
+            
+            avg_gain = np.mean(gains) if len(gains) > 0 else 0
+            avg_loss = np.mean(losses) if len(losses) > 0 else 0
+            
+            if avg_loss == 0:
+                rs = 100 if avg_gain > 0 else 0
+            else:
+                rs = avg_gain / avg_loss
+            
+            rsi = 100 - (100 / (1 + rs))
+            logic_lines.append(f"RSI: {rsi:.2f} (Avg Gain: {avg_gain:.6f}, Avg Loss: {avg_loss:.6f})")
         else:
-            current_rsi = 50
+            rsi = 50
+            logic_lines.append("RSI: 50.0 (default, insufficient data)")
         
-        # Simple MACD calculation
-        def calculate_macd(prices, fast=12, slow=26, signal=9):
-            exp1 = pd.Series(prices).ewm(span=fast, adjust=False).mean()
-            exp2 = pd.Series(prices).ewm(span=slow, adjust=False).mean()
-            macd = exp1 - exp2
-            signal_line = macd.ewm(span=signal, adjust=False).mean()
-            histogram = macd - signal_line
-            return macd.iloc[-1], signal_line.iloc[-1], histogram.iloc[-1]
+        # RSI Signal
+        if rsi < 30:
+            rsi_signal = "BULLISH"
+        elif rsi > 70:
+            rsi_signal = "BEARISH"
+        else:
+            rsi_signal = "NEUTRAL"
         
-        macd_val, signal_val, hist_val = calculate_macd(prices[-50:])
+        logic_lines.append(f"RSI Signal: {rsi_signal}")
         
-        # Determine signal from indicators
-        rsi_signal = "BULLISH" if current_rsi < 30 else "BEARISH" if current_rsi > 70 else "NEUTRAL"
-        macd_signal = "BULLISH" if macd_val > signal_val and hist_val > 0 else "BEARISH" if macd_val < signal_val and hist_val < 0 else "NEUTRAL"
+        # MACD Calculation
+        if len(prices) >= 26:
+            ema_12 = pd.Series(prices[-26:]).ewm(span=12, adjust=False).mean().iloc[-1]
+            ema_26 = pd.Series(prices[-26:]).ewm(span=26, adjust=False).mean().iloc[-1]
+            macd_line = ema_12 - ema_26
+            macd_hist = pd.Series([macd_line]).ewm(span=9, adjust=False).mean().iloc[-1]
+            histogram = macd_line - macd_hist
+            
+            logic_lines.append(f"MACD Histogram: {histogram:+.6f}")
+            
+            if macd_line > macd_hist and histogram > 0:
+                macd_signal = "BULLISH"
+            elif macd_line < macd_hist and histogram < 0:
+                macd_signal = "BEARISH"
+            else:
+                macd_signal = "NEUTRAL"
+            
+            logic_lines.append(f"MACD Signal: {macd_signal}")
+        else:
+            macd_signal = "NEUTRAL"
+            histogram = 0
+            logic_lines.append("MACD: NEUTRAL (insufficient data)")
         
-        # Score if both indicators agree
+        # Combined Signal
         if rsi_signal == macd_signal and rsi_signal != "NEUTRAL":
-            score = 1
             signal = rsi_signal
-        elif (rsi_signal == "BULLISH" or macd_signal == "BULLISH") and not (rsi_signal == "BEARISH" or macd_signal == "BEARISH"):
-            score = 1
+            passed = 1
+            logic_lines.append(f"✓ Both indicators agree: {signal}")
+        elif (rsi_signal == "BULLISH" or macd_signal == "BULLISH") and \
+             not (rsi_signal == "BEARISH" or macd_signal == "BEARISH"):
             signal = "BULLISH"
-        elif (rsi_signal == "BEARISH" or macd_signal == "BEARISH") and not (rsi_signal == "BULLISH" or macd_signal == "BULLISH"):
-            score = 1
+            passed = 1
+            logic_lines.append(f"✓ At least one BULLISH: {signal}")
+        elif (rsi_signal == "BEARISH" or macd_signal == "BEARISH") and \
+             not (rsi_signal == "BULLISH" or macd_signal == "BULLISH"):
             signal = "BEARISH"
+            passed = 1
+            logic_lines.append(f"✓ At least one BEARISH: {signal}")
         else:
-            score = 0
             signal = "NEUTRAL"
+            passed = 0
+            logic_lines.append(f"✗ No clear signal: {signal}")
         
-        details = {
-            "rsi": float(current_rsi),
-            "rsi_signal": rsi_signal,
-            "macd": float(macd_val),
-            "macd_signal": macd_signal,
-            "histogram": float(hist_val),
-            "final_signal": signal
-        }
+        logic_lines.append(f"Step Result: {'PASS' if passed else 'FAIL'} ({signal})")
+        logic_text = "\n".join(logic_lines)
+        return passed, signal, logic_text, rsi, histogram
         
-        return score, signal, details
     except Exception as e:
-        log.error(f"Step 4 error: {e}")
-        return 0, "NEUTRAL", {"error": str(e)}
+        logic_lines.append(f"ERROR: {str(e)}")
+        return 0, "ERROR", "\n".join(logic_lines), 50, 0
 
-def step5_volume_analysis(data: Dict[str, pd.DataFrame]) -> Tuple[int, str, Dict]:
+def step5_volume_analysis(data: Dict[str, pd.DataFrame]) -> Tuple[int, str, str, float]:
     """
     STEP 5: Volume Analysis
-    Volume - Confirmation of moves
+    Returns: (passed, volume_strength, logic_description, volume_ratio)
     """
+    logic_lines = []
     try:
-        ltf_df = data['LTF']  # Use 15m for volume analysis
+        ltf_df = data['LTF']
         
-        # Calculate volume metrics
-        recent_volume = ltf_df['volume'].values[-10:]
-        prev_volume = ltf_df['volume'].values[-20:-10]
+        logic_lines.append("\n📊 STEP 5: VOLUME ANALYSIS")
         
-        if len(recent_volume) == 0 or len(prev_volume) == 0:
-            return 0, "LOW", {"error": "Insufficient volume data"}
+        # Recent vs previous volume
+        recent_vol = ltf_df['volume'].values[-10:]
+        prev_vol = ltf_df['volume'].values[-20:-10]
         
-        avg_recent_volume = np.mean(recent_volume)
-        avg_prev_volume = np.mean(prev_volume)
-        
-        volume_ratio = avg_recent_volume / avg_prev_volume if avg_prev_volume > 0 else 1
-        
-        # Check volume on up vs down candles
-        up_candle_volume = ltf_df[ltf_df['close'] > ltf_df['open']]['volume'].mean()
-        down_candle_volume = ltf_df[ltf_df['close'] < ltf_df['open']]['volume'].mean()
-        
-        # Volume confirmation score
-        if volume_ratio > 1.5:
-            volume_strength = "VERY_HIGH"
-            score = 1
-        elif volume_ratio > 1.2:
-            volume_strength = "HIGH"
-            score = 1
-        elif volume_ratio > 0.8:
-            volume_strength = "MODERATE"
-            score = 1
+        if len(recent_vol) > 0 and len(prev_vol) > 0:
+            avg_recent = np.mean(recent_vol)
+            avg_prev = np.mean(prev_vol)
+            volume_ratio = avg_recent / avg_prev if avg_prev > 0 else 1
+            
+            logic_lines.append(f"Volume Ratio: {volume_ratio:.2f}x (Recent/Previous)")
         else:
-            volume_strength = "LOW"
-            score = 0
+            volume_ratio = 1
+            logic_lines.append("Volume Ratio: 1.0x (insufficient data)")
         
-        # Check if volume supports the trend
+        # Volume on up vs down candles
+        up_mask = ltf_df['close'] > ltf_df['open']
+        down_mask = ltf_df['close'] < ltf_df['open']
+        
+        up_volume = ltf_df[up_mask]['volume'].mean() if up_mask.any() else 0
+        down_volume = ltf_df[down_mask]['volume'].mean() if down_mask.any() else 0
+        
+        logic_lines.append(f"Up Candle Volume: {up_volume:.2f}")
+        logic_lines.append(f"Down Candle Volume: {down_volume:.2f}")
+        
+        # Price change for confirmation
         price_change = ((ltf_df['close'].iloc[-1] / ltf_df['close'].iloc[-10]) - 1) * 100
-        volume_confirmation = "CONFIRMED" if (price_change > 0 and up_candle_volume > down_candle_volume) or \
-                                             (price_change < 0 and down_candle_volume > up_candle_volume) else "DIVERGING"
+        logic_lines.append(f"Price Change: {price_change:+.2f}%")
         
-        if volume_confirmation == "DIVERGING":
-            score = 0
+        # Volume confirmation
+        volume_confirmed = False
+        if price_change > 0 and up_volume > down_volume:
+            volume_confirmed = True
+            logic_lines.append("✓ Volume confirms UP move")
+        elif price_change < 0 and down_volume > up_volume:
+            volume_confirmed = True
+            logic_lines.append("✓ Volume confirms DOWN move")
+        else:
+            logic_lines.append("✗ Volume divergence")
         
-        details = {
-            "volume_ratio": float(volume_ratio),
-            "volume_strength": volume_strength,
-            "up_volume": float(up_candle_volume) if not np.isnan(up_candle_volume) else 0,
-            "down_volume": float(down_candle_volume) if not np.isnan(down_candle_volume) else 0,
-            "confirmation": volume_confirmation,
-            "price_change_pct": float(price_change)
-        }
+        # Volume strength
+        if volume_ratio > 1.5:
+            strength = "VERY_HIGH"
+            passed = 1 if volume_confirmed else 0
+        elif volume_ratio > 1.2:
+            strength = "HIGH"
+            passed = 1 if volume_confirmed else 0
+        elif volume_ratio > 0.8:
+            strength = "MODERATE"
+            passed = 1 if volume_confirmed else 0
+        else:
+            strength = "LOW"
+            passed = 0
         
-        return score, volume_strength, details
+        logic_lines.append(f"Volume Strength: {strength}")
+        logic_lines.append(f"Step Result: {'PASS' if passed else 'FAIL'} ({strength})")
+        
+        logic_text = "\n".join(logic_lines)
+        return passed, strength, logic_text, volume_ratio
+        
     except Exception as e:
-        log.error(f"Step 5 error: {e}")
-        return 0, "LOW", {"error": str(e)}
+        logic_lines.append(f"ERROR: {str(e)}")
+        return 0, "ERROR", "\n".join(logic_lines), 1
 
-def step6_trend_identification(data: Dict[str, pd.DataFrame], wave_pattern: str, 
-                              strength_signal: str, indicator_signal: str) -> Tuple[int, str, Dict]:
+def step6_trend_identification(data: Dict[str, pd.DataFrame], 
+                              step1_trend: str,
+                              step2_pattern: str,
+                              step3_strength: str,
+                              step4_signal: str,
+                              step5_strength: str) -> Tuple[int, str, str]:
     """
-    STEP 6: Trend Identification
-    أحدد الاتجاه - Determine direction
+    STEP 6: Trend Identification (Final Decision)
+    Returns: (passed, final_trend, logic_description)
     """
+    logic_lines = []
     try:
         htf_df = data['HTF']
         
-        # Multiple trend confirmation methods
-        trend_signals = []
+        logic_lines.append("\n🎯 STEP 6: TREND IDENTIFICATION")
         
-        # 1. Simple moving average trend
-        sma_50 = htf_df['close'].rolling(window=50).mean().iloc[-1]
-        sma_20 = htf_df['close'].rolling(window=20).mean().iloc[-1]
-        current_price = htf_df['close'].iloc[-1]
+        # Collect votes from previous steps
+        trend_votes = []
         
-        if current_price > sma_20 > sma_50:
-            trend_signals.append("UP")
-        elif current_price < sma_20 < sma_50:
-            trend_signals.append("DOWN")
+        # From Step 1
+        trend_votes.append(step1_trend)
+        logic_lines.append(f"Step 1 vote: {step1_trend}")
         
-        # 2. Higher highs/lows for uptrend, lower highs/lows for downtrend
-        highs = htf_df['high'].values[-20:]
-        lows = htf_df['low'].values[-20:]
+        # From Step 2
+        if "UP" in step2_pattern:
+            trend_votes.append("UP")
+            logic_lines.append(f"Step 2 vote: UP ({step2_pattern})")
+        elif "DOWN" in step2_pattern:
+            trend_votes.append("DOWN")
+            logic_lines.append(f"Step 2 vote: DOWN ({step2_pattern})")
+        else:
+            logic_lines.append(f"Step 2 vote: NO_VOTE ({step2_pattern})")
         
-        if len(highs) >= 5 and len(lows) >= 5:
-            if highs[-1] > highs[-5] and lows[-1] > lows[-5]:
-                trend_signals.append("UP")
-            elif highs[-1] < highs[-5] and lows[-1] < lows[-5]:
-                trend_signals.append("DOWN")
+        # From Step 3
+        if "UP" in step3_strength:
+            trend_votes.append("UP")
+            logic_lines.append(f"Step 3 vote: UP ({step3_strength})")
+        elif "DOWN" in step3_strength:
+            trend_votes.append("DOWN")
+            logic_lines.append(f"Step 3 vote: DOWN ({step3_strength})")
+        else:
+            logic_lines.append(f"Step 3 vote: NO_VOTE ({step3_strength})")
         
-        # 3. Wave pattern confirmation
-        if wave_pattern == "IMPULSE_UP":
-            trend_signals.append("UP")
-        elif wave_pattern == "IMPULSE_DOWN":
-            trend_signals.append("DOWN")
+        # From Step 4
+        if step4_signal == "BULLISH":
+            trend_votes.append("UP")
+            logic_lines.append(f"Step 4 vote: UP ({step4_signal})")
+        elif step4_signal == "BEARISH":
+            trend_votes.append("DOWN")
+            logic_lines.append(f"Step 4 vote: DOWN ({step4_signal})")
+        else:
+            logic_lines.append(f"Step 4 vote: NO_VOTE ({step4_signal})")
         
-        # 4. Strength confirmation
-        if strength_signal == "STRONG":
-            # Check if strong move is in trend direction
-            if "UP" in trend_signals and len(trend_signals) > 0:
-                trend_signals.append("UP")
-            elif "DOWN" in trend_signals and len(trend_signals) > 0:
-                trend_signals.append("DOWN")
+        # From Step 5 (only if strong volume)
+        if step5_strength in ["VERY_HIGH", "HIGH"]:
+            price_change = ((htf_df['close'].iloc[-1] / htf_df['close'].iloc[-5]) - 1) * 100
+            if price_change > 0:
+                trend_votes.append("UP")
+                logic_lines.append(f"Step 5 vote: UP (Strong volume on UP move)")
+            elif price_change < 0:
+                trend_votes.append("DOWN")
+                logic_lines.append(f"Step 5 vote: DOWN (Strong volume on DOWN move)")
+        else:
+            logic_lines.append(f"Step 5 vote: NO_VOTE ({step5_strength} volume)")
         
-        # 5. Indicator confirmation
-        if indicator_signal == "BULLISH":
-            trend_signals.append("UP")
-        elif indicator_signal == "BEARISH":
-            trend_signals.append("DOWN")
+        # Count votes
+        up_count = trend_votes.count("UP")
+        down_count = trend_votes.count("DOWN")
         
-        # Determine final trend
-        if trend_signals:
-            up_count = trend_signals.count("UP")
-            down_count = trend_signals.count("DOWN")
-            
-            if up_count > down_count:
-                final_trend = "UP"
-                score = 1
-            elif down_count > up_count:
-                final_trend = "DOWN"
-                score = 1
-            else:
-                final_trend = "NEUTRAL"
-                score = 0
+        logic_lines.append(f"\nVote Count: UP={up_count}, DOWN={down_count}")
+        
+        # Decision
+        if up_count > down_count:
+            final_trend = "UP"
+            passed = 1
+            logic_lines.append(f"✓ Majority votes for UP")
+        elif down_count > up_count:
+            final_trend = "DOWN"
+            passed = 1
+            logic_lines.append(f"✓ Majority votes for DOWN")
         else:
             final_trend = "NEUTRAL"
-            score = 0
+            passed = 0
+            logic_lines.append(f"✗ No clear majority")
         
-        details = {
-            "sma_trend": "UP" if current_price > sma_20 > sma_50 else "DOWN" if current_price < sma_20 < sma_50 else "NEUTRAL",
-            "price_structure": "UP" if (highs[-1] > highs[-5] and lows[-1] > lows[-5]) else "DOWN" if (highs[-1] < highs[-5] and lows[-1] < lows[-5]) else "NEUTRAL",
-            "wave_confirmation": wave_pattern,
-            "signal_count": len(trend_signals),
-            "up_count": up_count if 'up_count' in locals() else 0,
-            "down_count": down_count if 'down_count' in locals() else 0,
-            "final_trend": final_trend
-        }
+        # Moving average confirmation
+        if len(htf_df) >= 50:
+            sma_20 = htf_df['close'].rolling(window=20).mean().iloc[-1]
+            sma_50 = htf_df['close'].rolling(window=50).mean().iloc[-1]
+            current_price = htf_df['close'].iloc[-1]
+            
+            logic_lines.append(f"\nSMA(20): {sma_20:.6f}")
+            logic_lines.append(f"SMA(50): {sma_50:.6f}")
+            logic_lines.append(f"Current Price: {current_price:.6f}")
+            
+            if final_trend == "UP" and current_price > sma_20 > sma_50:
+                logic_lines.append("✓ Price structure confirms UP trend")
+                passed = 1
+            elif final_trend == "DOWN" and current_price < sma_20 < sma_50:
+                logic_lines.append("✓ Price structure confirms DOWN trend")
+                passed = 1
+            else:
+                logic_lines.append("✗ Price structure doesn't confirm trend")
+                passed = 0
         
-        return score, final_trend, details
+        logic_lines.append(f"\nStep Result: {'PASS' if passed else 'FAIL'} ({final_trend})")
+        logic_text = "\n".join(logic_lines)
+        return passed, final_trend, logic_text
+        
     except Exception as e:
-        log.error(f"Step 6 error: {e}")
-        return 0, "NEUTRAL", {"error": str(e)}
+        logic_lines.append(f"ERROR: {str(e)}")
+        return 0, "ERROR", "\n".join(logic_lines)
 
-def execute_6step_analysis(data: Dict[str, pd.DataFrame], symbol: str) -> Optional[Dict]:
+# ================ MAIN ANALYSIS FUNCTION ================
+
+def execute_6step_analysis_with_full_logic(data: Dict[str, pd.DataFrame], symbol: str) -> Optional[Dict]:
     """
-    Execute ALL 6 steps of your method and generate signal if confluence exists
+    Execute all 6 steps and return signal with COMPLETE logic breakdown
     """
     try:
-        log.info(f"Analyzing {symbol} with 6-step method...")
+        log.info(f"Analyzing {symbol}...")
         
-        # Step 1: Multi-Timeframe Analysis
-        step1_passed, step1_trend, step1_details = step1_mtf_analysis(data)
+        # Initialize logic
+        complete_logic = []
         
-        # Step 2: Wave Analysis
-        step2_passed, step2_pattern, step2_details = step2_wave_analysis(data)
+        # Step 1
+        step1_passed, step1_trend, step1_logic = step1_mtf_analysis(data)
+        complete_logic.append(step1_logic)
         
-        # Step 3: Strength Analysis
-        step3_passed, step3_strength, step3_details = step3_strength_analysis(data)
+        # Step 2
+        step2_passed, step2_pattern, step2_logic = step2_wave_analysis(data)
+        complete_logic.append(step2_logic)
         
-        # Step 4: Indicators Analysis
-        step4_passed, step4_signal, step4_details = step4_indicators_analysis(data)
+        # Step 3
+        step3_passed, step3_strength, step3_logic = step3_strength_analysis(data)
+        complete_logic.append(step3_logic)
         
-        # Step 5: Volume Analysis
-        step5_passed, step5_volume, step5_details = step5_volume_analysis(data)
+        # Step 4
+        step4_passed, step4_signal, step4_logic, rsi_value, macd_hist = step4_indicators_analysis(data)
+        complete_logic.append(step4_logic)
         
-        # Step 6: Trend Identification (uses outputs from previous steps)
-        step6_passed, step6_trend, step6_details = step6_trend_identification(
-            data, step2_pattern, step3_strength, step4_signal
+        # Step 5
+        step5_passed, step5_strength, step5_logic, volume_ratio = step5_volume_analysis(data)
+        complete_logic.append(step5_logic)
+        
+        # Step 6
+        step6_passed, step6_trend, step6_logic = step6_trend_identification(
+            data, step1_trend, step2_pattern, step3_strength, step4_signal, step5_strength
         )
+        complete_logic.append(step6_logic)
         
-        # Calculate total confidence (how many steps passed)
-        steps_passed = [
-            step1_passed, step2_passed, step3_passed, 
-            step4_passed, step5_passed, step6_passed
-        ]
-        
+        # Calculate total
+        steps_passed = [step1_passed, step2_passed, step3_passed, step4_passed, step5_passed, step6_passed]
         total_passed = sum(steps_passed)
         
-        log.info(f"6-Step Results for {symbol}:")
-        log.info(f"  Step 1 (MTF): {'✓' if step1_passed else '✗'} - {step1_trend}")
-        log.info(f"  Step 2 (Wave): {'✓' if step2_passed else '✗'} - {step2_pattern}")
-        log.info(f"  Step 3 (Strength): {'✓' if step3_passed else '✗'} - {step3_strength}")
-        log.info(f"  Step 4 (Indicators): {'✓' if step4_passed else '✗'} - {step4_signal}")
-        log.info(f"  Step 5 (Volume): {'✓' if step5_passed else '✗'} - {step5_volume}")
-        log.info(f"  Step 6 (Trend): {'✓' if step6_passed else '✗'} - {step6_trend}")
-        log.info(f"  Total: {total_passed}/6 passed")
+        # Combine logic
+        full_logic_text = "\n".join(complete_logic)
         
-        # Check if we have minimum confluence
-        if total_passed >= MIN_CONFIDENCE:
-            # Determine trade direction based on trend
-            if step6_trend == "UP":
-                side = "BUY"
-                current_price = data['LTF']['close'].iloc[-1]
-                sl = current_price * 0.98  # 2% stop loss
-                tp = current_price * 1.04  # 4% take profit
-            elif step6_trend == "DOWN":
-                side = "SELL"
-                current_price = data['LTF']['close'].iloc[-1]
-                sl = current_price * 1.02  # 2% stop loss
-                tp = current_price * 0.96  # 4% take profit
-            else:
-                return None  # No clear trend
+        # Add summary
+        summary = f"\n{'='*50}\nFINAL SUMMARY FOR {symbol}\n{'='*50}"
+        summary += f"\nStep 1 (MTF): {'✓' if step1_passed else '✗'} - {step1_trend}"
+        summary += f"\nStep 2 (Wave): {'✓' if step2_passed else '✗'} - {step2_pattern}"
+        summary += f"\nStep 3 (Strength): {'✓' if step3_passed else '✗'} - {step3_strength}"
+        summary += f"\nStep 4 (Indicators): {'✓' if step4_passed else '✗'} - {step4_signal}"
+        summary += f"\nStep 5 (Volume): {'✓' if step5_passed else '✗'} - {step5_strength}"
+        summary += f"\nStep 6 (Trend): {'✓' if step6_passed else '✗'} - {step6_trend}"
+        summary += f"\n{'='*50}"
+        summary += f"\nTOTAL CONFLUENCE: {total_passed}/6"
+        summary += f"\nMINIMUM REQUIRED: {MIN_CONFIDENCE}/6"
+        summary += f"\n{'='*50}"
+        
+        full_logic_text += summary
+        
+        log.info(f"Analysis: {total_passed}/6 confluence for {symbol}")
+        
+        # Check confluence
+        if total_passed >= MIN_CONFIDENCE and step6_trend in ["UP", "DOWN"]:
+            current_price = data['LTF']['close'].iloc[-1]
             
-            # Calculate ATR for risk management
+            # Calculate ATR
             def calculate_atr(df, period=14):
                 high = df['high']
                 low = df['low']
@@ -610,14 +735,38 @@ def execute_6step_analysis(data: Dict[str, pd.DataFrame], symbol: str) -> Option
                 
                 tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
                 atr = tr.rolling(window=period).mean()
-                return atr.iloc[-1] if len(atr) > 0 else 0
+                return atr.iloc[-1] if len(atr) > 0 else current_price * 0.02
             
             atr_value = calculate_atr(data['LTF'])
             
-            # Calculate R:R ratio
+            # Set trade parameters
+            if step6_trend == "UP":
+                side = "BUY"
+                sl = current_price - (atr_value * 1.5)
+                tp = current_price + (2 * (current_price - sl))
+            else:
+                side = "SELL"
+                sl = current_price + (atr_value * 1.5)
+                tp = current_price - (2 * (sl - current_price))
+            
+            # Ensure valid
+            if side == "BUY":
+                if sl >= current_price:
+                    sl = current_price * 0.98
+                if tp <= current_price:
+                    tp = current_price * 1.04
+            else:
+                if sl <= current_price:
+                    sl = current_price * 1.02
+                if tp >= current_price:
+                    tp = current_price * 0.96
+            
+            # Calculate metrics
             risk = abs(current_price - sl)
             reward = abs(tp - current_price)
             rr_ratio = reward / risk if risk > 0 else 0
+            risk_pct = (risk / current_price) * 100
+            reward_pct = (reward / current_price) * 100
             
             # Create signal
             signal = {
@@ -628,160 +777,149 @@ def execute_6step_analysis(data: Dict[str, pd.DataFrame], symbol: str) -> Option
                 'tp': tp,
                 'status': 'OPEN',
                 
-                # Your 6 Steps
-                'step1_mtf': step1_passed,
-                'step2_wave': step2_passed,
-                'step3_strength': step3_passed,
-                'step4_indicators': step4_passed,
-                'step5_volume': step5_passed,
-                'step6_trend': step6_passed,
-                
-                # Details
+                'step1_result': step1_passed,
+                'step2_result': step2_passed,
+                'step3_result': step3_passed,
+                'step4_result': step4_passed,
+                'step5_result': step5_passed,
+                'step6_result': step6_passed,
                 'confidence_score': total_passed,
-                'timeframe_combo': f"{TIMEFRAMES['HTF']}|{TIMEFRAMES['MTF']}|{TIMEFRAMES['LTF']}",
-                'wave_pattern': step2_pattern,
-                'trend_direction': step6_trend,
-                'rsi_value': step4_details.get('rsi', 50),
-                'macd_signal': step4_details.get('final_signal', 'NEUTRAL'),
-                'volume_ratio': step5_details.get('volume_ratio', 1),
                 
-                # Trade metrics
+                'logic_breakdown': full_logic_text,
+                
+                'timeframe_combo': f"{TIMEFRAMES['HTF']}|{TIMEFRAMES['MTF']}|{TIMEFRAMES['LTF']}",
+                'trend_direction': step6_trend,
+                'wave_pattern': step2_pattern,
+                'rsi_value': rsi_value,
+                'macd_hist': macd_hist,
+                'volume_ratio': volume_ratio,
+                'strength_level': step3_strength,
+                
                 'atr_value': atr_value,
                 'rr_ratio': rr_ratio,
-                'risk_pct': (risk / current_price) * 100,
-                'reward_pct': (reward / current_price) * 100,
+                'risk_pct': risk_pct,
+                'reward_pct': reward_pct,
                 
-                # Signal hash for duplicate prevention
                 'signal_hash': hashlib.md5(
-                    f"{symbol}:{side}:{current_price:.6f}:{step6_trend}:{total_passed}".encode()
+                    f"{symbol}:{side}:{current_price:.8f}:{total_passed}:{time.time()}".encode()
                 ).hexdigest()
             }
             
-            log.info(f"✓ Strong confluence found for {symbol}: {side} at {current_price:.6f}")
+            log.info(f"✅ Signal found for {symbol}: {side}")
             return signal
-        else:
-            log.info(f"✗ Insufficient confluence for {symbol}: {total_passed}/6")
-            return None
-            
+        
+        log.info(f"❌ No signal for {symbol}: {total_passed}/6")
+        return None
+        
     except Exception as e:
-        log.error(f"6-step analysis error for {symbol}: {e}")
+        log.error(f"Analysis error: {e}")
         return None
 
-# ---------------- SIGNAL MANAGEMENT ----------------
-async def log_signal_to_db(signal: Dict):
-    """Log signal to database"""
+# ---------------- DATABASE & ALERT FUNCTIONS ----------------
+async def save_signal_with_logic(signal: Dict) -> bool:
+    """Save signal to database"""
     try:
         async with db_lock:
-            # Check for duplicate using hash
-            async with db_conn.execute("""
-                SELECT COUNT(*) FROM signals WHERE signal_hash=?
-            """, (signal['signal_hash'],)) as cursor:
-                count = (await cursor.fetchone())[0]
+            # Check duplicate
+            async with db_conn.execute(
+                "SELECT COUNT(*) FROM signals WHERE signal_hash = ?",
+                (signal['signal_hash'],)
+            ) as cursor:
+                exists = (await cursor.fetchone())[0]
             
-            if count > 0:
-                log.info(f"⏭️ Duplicate signal found: {signal['symbol']}")
+            if exists > 0:
+                log.info(f"Duplicate: {signal['symbol']}")
                 return False
             
-            # Insert new signal
+            # Insert
             await db_conn.execute("""
                 INSERT INTO signals (
                     symbol, side, entry, sl, tp, status,
-                    step1_mtf, step2_wave, step3_strength, step4_indicators, 
-                    step5_volume, step6_trend, confidence_score, timeframe_combo,
-                    wave_pattern, trend_direction, rsi_value, macd_signal, volume_ratio,
-                    atr_value, rr_ratio, risk_pct, reward_pct, signal_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    step1_result, step2_result, step3_result, step4_result,
+                    step5_result, step6_result, confidence_score, logic_breakdown,
+                    timeframe_combo, trend_direction, wave_pattern, rsi_value,
+                    macd_hist, volume_ratio, strength_level, atr_value, rr_ratio,
+                    risk_pct, reward_pct, signal_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                signal['symbol'],
-                signal['side'],
-                signal['entry'],
-                signal['sl'],
-                signal['tp'],
-                signal['status'],
-                signal['step1_mtf'],
-                signal['step2_wave'],
-                signal['step3_strength'],
-                signal['step4_indicators'],
-                signal['step5_volume'],
-                signal['step6_trend'],
-                signal['confidence_score'],
-                signal['timeframe_combo'],
-                signal['wave_pattern'],
-                signal['trend_direction'],
-                signal['rsi_value'],
-                signal['macd_signal'],
-                signal['volume_ratio'],
-                signal['atr_value'],
-                signal['rr_ratio'],
-                signal['risk_pct'],
-                signal['reward_pct'],
+                signal['symbol'], signal['side'], signal['entry'], signal['sl'],
+                signal['tp'], signal['status'], signal['step1_result'],
+                signal['step2_result'], signal['step3_result'], signal['step4_result'],
+                signal['step5_result'], signal['step6_result'], signal['confidence_score'],
+                signal['logic_breakdown'], signal['timeframe_combo'], signal['trend_direction'],
+                signal['wave_pattern'], signal['rsi_value'], signal['macd_hist'],
+                signal['volume_ratio'], signal['strength_level'], signal['atr_value'],
+                signal['rr_ratio'], signal['risk_pct'], signal['reward_pct'],
                 signal['signal_hash']
             ))
             
             await db_conn.commit()
-            log.info(f"✅ Signal logged to DB: {signal['symbol']} {signal['side']}")
+            log.info(f"Signal saved: {signal['symbol']}")
             return True
             
     except Exception as e:
-        log.error(f"Database error: {e}")
+        log.error(f"Save error: {e}")
         return False
 
-async def send_signal_alert(signal: Dict):
-    """Send formatted alert to Telegram"""
+async def send_comprehensive_alert(signal: Dict):
+    """Send alert with full logic"""
     try:
+        # Create message
         message = f"""
-🎯 **YOUR 6-STEP METHOD SIGNAL** 🎯
+🎯 **6-STEP METHOD - COMPLETE LOGIC** 🎯
 
-{signal['symbol']} | {signal['side']}
+**{signal['symbol']}** | **{signal['side']}**
+Confluence: {signal['confidence_score']}/6 steps
 
-**Entry:** {signal['entry']:.6f}
-**SL:** {signal['sl']:.6f} ({signal['risk_pct']:.1f}%)
-**TP:** {signal['tp']:.6f} ({signal['reward_pct']:.1f}%)
-**R:R:** {signal['rr_ratio']:.2f}:1
+**TRADE:**
+Entry: {signal['entry']:.6f}
+SL: {signal['sl']:.6f} ({signal['risk_pct']:.1f}%)
+TP: {signal['tp']:.6f} ({signal['reward_pct']:.1f}%)
+R:R: {signal['rr_ratio']:.2f}:1
 
-**Confluence Score:** {signal['confidence_score']}/6
-**Trend:** {signal['trend_direction']}
-**Wave Pattern:** {signal['wave_pattern']}
-**RSI:** {signal['rsi_value']:.1f}
-**Volume Ratio:** {signal['volume_ratio']:.2f}
+**SUMMARY:**
+Trend: {signal['trend_direction']}
+Wave: {signal['wave_pattern']}
+Strength: {signal['strength_level']}
+RSI: {signal['rsi_value']:.1f}
+MACD Hist: {signal['macd_hist']:+.6f}
+Volume Ratio: {signal['volume_ratio']:.2f}x
 
-**Timeframes:** {signal['timeframe_combo']}
-**ATR:** {signal['atr_value']:.6f}
+**STEPS:**
+1️⃣ MTF: {'✓' if signal['step1_result'] else '✗'}
+2️⃣ Wave: {'✓' if signal['step2_result'] else '✗'}
+3️⃣ Strength: {'✓' if signal['step3_result'] else '✗'}
+4️⃣ Indicators: {'✓' if signal['step4_result'] else '✗'}
+5️⃣ Volume: {'✓' if signal['step5_result'] else '✗'}
+6️⃣ Trend: {'✓' if signal['step6_result'] else '✗'}
 
-**Steps Confirmed:**
-1️⃣ MTF: {'✓' if signal['step1_mtf'] else '✗'}
-2️⃣ Wave: {'✓' if signal['step2_wave'] else '✗'}
-3️⃣ Strength: {'✓' if signal['step3_strength'] else '✗'}
-4️⃣ Indicators: {'✓' if signal['step4_indicators'] else '✗'}
-5️⃣ Volume: {'✓' if signal['step5_volume'] else '✗'}
-6️⃣ Trend: {'✓' if signal['step6_trend'] else '✗'}
-
-#6StepMethod #{signal['side']}
+Timeframes: {signal['timeframe_combo']}
 """
+
+        # Add logic breakdown if not too long
+        logic_preview = signal['logic_breakdown'][:1500]
+        if len(signal['logic_breakdown']) > 1500:
+            logic_preview += "\n... [full logic available in database]"
+        
+        message += f"\n{'='*40}\n**LOGIC BREAKDOWN:**\n{logic_preview}"
+        
         await tg(message)
-        log.info(f"📢 Alert sent for {signal['symbol']}")
+        log.info(f"Alert sent: {signal['symbol']}")
+        
     except Exception as e:
         log.error(f"Alert error: {e}")
 
 # ---------------- SCANNING LOOP ----------------
-async def scan_symbols(exchange):
-    """Main scanning loop using your 6-step method"""
+async def scan_symbols_loop(exchange):
+    """Main scanning loop"""
     while True:
         try:
-            log.info("=" * 50)
-            log.info("Starting 6-step method scan...")
+            log.info("Starting scan...")
             
-            # Get top USDT pairs
+            # Get top pairs
             tickers = await exchange.fetch_tickers()
-            usdt_pairs = []
-            
-            for symbol in tickers:
-                if symbol.endswith("/USDT"):
-                    volume = tickers[symbol].get("quoteVolume", 0)
-                    if volume > 0:
-                        usdt_pairs.append((symbol, volume))
-            
-            # Take top N pairs
+            usdt_pairs = [(s, t['quoteVolume']) for s, t in tickers.items() 
+                         if s.endswith('/USDT') and t.get('quoteVolume', 0) > 0]
             usdt_pairs.sort(key=lambda x: x[1], reverse=True)
             top_pairs = usdt_pairs[:TOP_N]
             
@@ -789,45 +927,40 @@ async def scan_symbols(exchange):
             
             for symbol, volume in top_pairs:
                 try:
-                    log.info(f"Analyzing {symbol}...")
+                    log.info(f"Analyzing {symbol}")
                     
-                    # Fetch multi-timeframe data
+                    # Fetch data
                     data = await fetch_multi_timeframe_data(exchange, symbol)
-                    
                     if not data:
-                        log.warning(f"Could not fetch data for {symbol}")
                         continue
                     
-                    # Execute your 6-step analysis
-                    signal = execute_6step_analysis(data, symbol)
+                    # Run analysis
+                    signal = execute_6step_analysis_with_full_logic(data, symbol)
                     
                     if signal:
-                        # Log to database
-                        if await log_signal_to_db(signal):
-                            # Send alert
-                            await send_signal_alert(signal)
+                        # Save and alert
+                        if await save_signal_with_logic(signal):
+                            await send_comprehensive_alert(signal)
                             signals_found += 1
                     
-                    # Small delay between symbols
                     await asyncio.sleep(1)
                     
                 except Exception as e:
-                    log.error(f"Error analyzing {symbol}: {e}")
+                    log.error(f"Error on {symbol}: {e}")
                     continue
             
-            log.info(f"Scan complete. Found {signals_found} signals with confluence.")
+            log.info(f"Scan complete. Found {signals_found} signals.")
             log.info(f"Next scan in {SCAN_INTERVAL} seconds...")
-            log.info("=" * 50)
+            
+            await asyncio.sleep(SCAN_INTERVAL)
             
         except Exception as e:
-            log.error(f"Scan loop error: {e}")
-        
-        # Wait for next scan
-        await asyncio.sleep(SCAN_INTERVAL)
+            log.error(f"Scan error: {e}")
+            await asyncio.sleep(30)
 
-# ---------------- SIGNAL MONITORING ----------------
-async def monitor_open_signals(exchange):
-    """Monitor open signals for TP/SL hits"""
+# ---------------- MONITORING ----------------
+async def monitor_signals(exchange):
+    """Monitor open signals for TP/SL"""
     while True:
         try:
             async with db_lock:
@@ -838,9 +971,7 @@ async def monitor_open_signals(exchange):
                 """) as cursor:
                     signals = await cursor.fetchall()
                 
-                for sig in signals:
-                    sig_id, symbol, side, entry, sl, tp = sig
-                    
+                for sig_id, symbol, side, entry, sl, tp in signals:
                     try:
                         ticker = await exchange.fetch_ticker(symbol)
                         current_price = ticker.get('last')
@@ -854,32 +985,33 @@ async def monitor_open_signals(exchange):
                         if side == "BUY":
                             if current_price >= tp:
                                 tp_hit = True
-                                await tg(f"✅ TP HIT: {symbol}\nEntry: {entry:.6f}\nTP: {tp:.6f}\nCurrent: {current_price:.6f}")
+                                await tg(f"✅ TP HIT: {symbol}")
                             elif current_price <= sl:
                                 sl_hit = True
-                                await tg(f"❌ SL HIT: {symbol}\nEntry: {entry:.6f}\nSL: {sl:.6f}\nCurrent: {current_price:.6f}")
+                                await tg(f"❌ SL HIT: {symbol}")
                         else:  # SELL
                             if current_price <= tp:
                                 tp_hit = True
-                                await tg(f"✅ TP HIT: {symbol}\nEntry: {entry:.6f}\nTP: {tp:.6f}\nCurrent: {current_price:.6f}")
+                                await tg(f"✅ TP HIT: {symbol}")
                             elif current_price >= sl:
                                 sl_hit = True
-                                await tg(f"❌ SL HIT: {symbol}\nEntry: {entry:.6f}\nSL: {sl:.6f}\nCurrent: {current_price:.6f}")
+                                await tg(f"❌ SL HIT: {symbol}")
                         
                         if tp_hit or sl_hit:
-                            await db_conn.execute("""
-                                UPDATE signals SET status='CLOSED' WHERE id=?
-                            """, (sig_id,))
+                            await db_conn.execute(
+                                "UPDATE signals SET status='CLOSED' WHERE id=?",
+                                (sig_id,)
+                            )
                             await db_conn.commit()
                             
                     except Exception as e:
-                        log.error(f"Error monitoring {symbol}: {e}")
+                        log.error(f"Monitor error {symbol}: {e}")
                         continue
             
         except Exception as e:
-            log.error(f"Monitor error: {e}")
+            log.error(f"Monitor loop error: {e}")
         
-        await asyncio.sleep(30)  # Check every 30 seconds
+        await asyncio.sleep(30)
 
 # ---------------- FASTAPI ----------------
 app = FastAPI()
@@ -888,83 +1020,24 @@ app = FastAPI()
 async def root():
     return {
         "status": "running",
-        "method": "Your 6-Step Confluence Method",
-        "steps": [
-            "1. Multi-Timeframe Analysis",
-            "2. Wave Analysis",
-            "3. Strength/Momentum",
-            "4. Technical Indicators",
-            "5. Volume Analysis",
-            "6. Trend Identification"
-        ],
-        "min_confidence": f"{MIN_CONFIDENCE}/6",
-        "timeframes": TIMEFRAMES
+        "scanner": "6-Step Method with Complete Logic",
+        "min_confidence": f"{MIN_CONFIDENCE}/6"
     }
 
-@app.get("/health")
-async def health():
-    return {"status": "healthy", "timestamp": datetime.datetime.now().isoformat()}
-
 @app.get("/signals")
-async def get_signals(limit: int = 20, status: str = "OPEN", min_confidence: int = 4):
+async def get_signals(limit: int = 20, status: str = "OPEN"):
     try:
         async with db_lock:
             async with db_conn.execute("""
-                SELECT * FROM signals 
-                WHERE status=? AND confidence_score>=?
-                ORDER BY timestamp DESC 
-                LIMIT ?
-            """, (status, min_confidence, limit)) as cursor:
+                SELECT id, symbol, side, entry, sl, tp, confidence_score, 
+                       timestamp, trend_direction, rr_ratio 
+                FROM signals WHERE status=? ORDER BY timestamp DESC LIMIT ?
+            """, (status, limit)) as cursor:
                 rows = await cursor.fetchall()
                 columns = [description[0] for description in cursor.description]
         
         signals = [dict(zip(columns, row)) for row in rows]
-        return {
-            "count": len(signals),
-            "min_confidence": min_confidence,
-            "signals": signals
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.get("/analysis/{symbol}")
-async def analyze_symbol(symbol: str):
-    """Manual analysis of a specific symbol"""
-    try:
-        # Add USDT if not present
-        if not symbol.endswith("/USDT"):
-            symbol = f"{symbol}/USDT"
-        
-        # Initialize exchange if not already
-        if not exchange:
-            return {"error": "Exchange not initialized"}
-        
-        # Fetch data
-        data = await fetch_multi_timeframe_data(exchange, symbol)
-        
-        if not data:
-            return {"error": "Could not fetch data"}
-        
-        # Run analysis
-        signal = execute_6step_analysis(data, symbol)
-        
-        if signal:
-            # Remove database-specific fields
-            for key in ['status', 'signal_hash']:
-                signal.pop(key, None)
-            
-            return {
-                "symbol": symbol,
-                "signal": signal,
-                "confluence_score": signal['confidence_score']
-            }
-        else:
-            return {
-                "symbol": symbol,
-                "signal": None,
-                "message": "No sufficient confluence found"
-            }
-            
+        return {"count": len(signals), "signals": signals}
     except Exception as e:
         return {"error": str(e)}
 
@@ -972,26 +1045,15 @@ async def analyze_symbol(symbol: str):
 async def main():
     global exchange
     
-    log.info("=" * 60)
-    log.info("🚀 STARTING YOUR 6-STEP CONFLUENCE SCANNER 🚀")
-    log.info("=" * 60)
-    
-    # Display method details
-    log.info("📊 YOUR METHOD:")
-    log.info("1. أراقب كل الفريمات - Multi-Timeframe Analysis")
-    log.info("2. المدى الموجي - Wave Analysis")
-    log.info("3. القوة - Strength/Momentum")
-    log.info("4. المؤشرات - Technical Indicators (RSI, MACD)")
-    log.info("5. Volume - Volume Analysis")
-    log.info("6. أحدد الاتجاه - Trend Identification")
-    log.info(f"Minimum Confluence: {MIN_CONFIDENCE}/6 steps required")
-    log.info(f"Timeframes: HTF={TIMEFRAMES['HTF']}, MTF={TIMEFRAMES['MTF']}, LTF={TIMEFRAMES['LTF']}")
-    log.info("=" * 60)
+    log.info("="*60)
+    log.info("🚀 STARTING 6-STEP SCANNER")
+    log.info("="*60)
     
     try:
-        # Initialize database
+        # Initialize database (FRESH)
+        log.info("Initializing FRESH database...")
         if not await init_db():
-            log.error("❌ Failed to initialize database")
+            log.error("❌ Database failed")
             return
         
         # Initialize exchange
@@ -1006,38 +1068,30 @@ async def main():
         
         # Startup message
         await tg(f"""
-🚀 YOUR 6-STEP SCANNER IS RUNNING
+🚀 **6-STEP SCANNER STARTED**
 
-Method: Your exact 6-step confluence approach
-Steps: MTF → Wave → Strength → Indicators → Volume → Trend
-Confidence: {MIN_CONFIDENCE}/6 minimum required
-
-Timeframes:
-• HTF ({TIMEFRAMES['HTF']}): Primary Trend
-• MTF ({TIMEFRAMES['MTF']}): Wave Analysis  
-• LTF ({TIMEFRAMES['LTF']}): Entry Timing
-
-Scanner will only alert when ALL steps align with confluence.
+Method: Your exact 6-step confluence
+Minimum: {MIN_CONFIDENCE}/6 steps required
+Timeframes: 4h | 1h | 15m
+Every signal shows complete logic breakdown
         """)
         
-        # Start scanning and monitoring
+        # Start loops
         await asyncio.gather(
-            scan_symbols(exchange),
-            monitor_open_signals(exchange)
+            scan_symbols_loop(exchange),
+            monitor_signals(exchange)
         )
         
     except KeyboardInterrupt:
-        log.info("👋 Stopped by user")
+        log.info("Stopped by user")
     except Exception as e:
-        log.error(f"💥 Fatal error: {e}")
+        log.error(f"Fatal: {e}")
     finally:
-        # Cleanup
         if db_conn:
             await db_conn.close()
         if exchange:
             await exchange.close()
-        log.info("✅ Scanner stopped cleanly")
+        log.info("Clean shutdown")
 
 if __name__ == "__main__":
-    # Run scanner
     asyncio.run(main())
