@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-6-STEP EXPANSION SCANNER
-Detects START of big moves, not just confluence
+Visual Synthesis Scanner - الطريقة البصرية
+Watches all timeframes, wave range, strength, indicators, volume → determines direction
 """
 
 import os
@@ -26,18 +26,19 @@ DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
 TOP_N = int(os.getenv("TOP_N", 60))
-MIN_CONFIDENCE = 2  # Need ALL 5 conditions for expansion start
 
-# Timeframes - Focused on pressure detection
+# Timeframes for visual analysis
 TIMEFRAMES = {
-    "HTF": "4h",    # Overall pressure
-    "MTF": "1h",    # Wave exhaustion
-    "LTF": "15m"    # Entry & explosion detection
+    "WEEKLY": "1w",     # Big picture
+    "DAILY": "1d",      # Primary direction  
+    "H4": "4h",         # Main wave
+    "H1": "1h",         # Entry zone
+    "M15": "15m"        # Trigger
 }
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-log = logging.getLogger("expansion_scanner")
+log = logging.getLogger("visual_scanner")
 db_lock = asyncio.Lock()
 db_conn = None
 exchange = None
@@ -79,13 +80,12 @@ async def init_db():
                 tp REAL NOT NULL,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 status TEXT DEFAULT 'OPEN',
-                timeframe_pressure TEXT,
-                wave_exhaustion TEXT,
-                strength_shift TEXT,
-                volume_confirmation TEXT,
-                expansion_trigger TEXT,
-                expansion_score INTEGER DEFAULT 0,
-                logic_breakdown TEXT,
+                timeframe_alignment TEXT,
+                wave_structure TEXT,
+                strength_level TEXT,
+                indicators_signal TEXT,
+                volume_status TEXT,
+                synthesis_score REAL,
                 signal_hash TEXT UNIQUE
             )
         """)
@@ -98,430 +98,539 @@ async def init_db():
         log.error(f"Database error: {e}")
         return False
 
-# ================ EXPANSION DETECTION LOGIC ================
+# ================ VISUAL SYNTHESIS METHOD ================
 
-def detect_timeframe_pressure(data: Dict[str, pd.DataFrame]) -> Tuple[bool, str, str]:
+def analyze_timeframes_visual(data: Dict[str, pd.DataFrame]) -> Tuple[str, float, str]:
     """
-    1️⃣ TIMEFRAME PRESSURE
-    HTF + MTF + LTF aligned with NO opposing force
+    ١. كل الفريمات (All timeframes)
+    Visual check: Are they aligned? Which direction?
+    Returns: (direction, alignment_score, reason)
     """
     try:
-        htf_df = data['HTF']
-        mtf_df = data['MTF']
-        ltf_df = data['LTF']
+        tf_directions = {}
+        tf_strengths = {}
         
-        # Recent trend direction for each timeframe
-        htf_dir = "UP" if htf_df['close'].iloc[-1] > htf_df['close'].iloc[-20] else "DOWN"
-        mtf_dir = "UP" if mtf_df['close'].iloc[-1] > mtf_df['close'].iloc[-10] else "DOWN"
-        ltf_dir = "UP" if ltf_df['close'].iloc[-1] > ltf_df['close'].iloc[-5] else "DOWN"
+        for tf_name, df in data.items():
+            # Simple visual trend detection
+            prices = df['close'].values
+            
+            # Short-term (last 5% of data)
+            short_len = max(5, len(prices) // 20)
+            short_trend = "UP" if prices[-1] > prices[-short_len] else "DOWN"
+            
+            # Medium-term (last 20% of data)
+            med_len = max(10, len(prices) // 5)
+            med_trend = "UP" if prices[-1] > prices[-med_len] else "DOWN"
+            
+            # Long-term (full period)
+            long_trend = "UP" if prices[-1] > prices[0] else "DOWN"
+            
+            # Determine overall direction for this timeframe
+            trends = [short_trend, med_trend, long_trend]
+            direction = max(set(trends), key=trends.count)
+            
+            # Strength: How clear is the trend?
+            trend_agreement = trends.count(direction) / len(trends)
+            
+            tf_directions[tf_name] = direction
+            tf_strengths[tf_name] = trend_agreement
         
-        # Check alignment (all same direction = maximum pressure)
-        directions = [htf_dir, mtf_dir, ltf_dir]
+        # Check alignment across timeframes
+        directions = list(tf_directions.values())
         
         if all(d == "UP" for d in directions):
-            pressure = True
-            direction = "UP"
-            reason = f"ALL TIMEFRAMES UP | No opposing force detected"
+            alignment_score = min(tf_strengths.values())  # Weakest link
+            return "UP", alignment_score, "✅ جميع الفريمات صاعدة"
         
         elif all(d == "DOWN" for d in directions):
-            pressure = True
-            direction = "DOWN"
-            reason = f"ALL TIMEFRAMES DOWN | No opposing force detected"
+            alignment_score = min(tf_strengths.values())
+            return "DOWN", alignment_score, "✅ جميع الفريمات هابطة"
         
         else:
-            # Check if one timeframe is opposing (weakens pressure)
+            # Mixed - find dominant direction
             up_count = directions.count("UP")
             down_count = directions.count("DOWN")
             
-            if up_count == 2 and down_count == 1:
-                # Majority UP but one timeframe DOWN
-                opposing_tf = "LTF" if ltf_dir == "DOWN" else ("MTF" if mtf_dir == "DOWN" else "HTF")
-                pressure = False
-                direction = "UP"
-                reason = f"OPPOSITION: {opposing_tf} is DOWN | Pressure weakened"
-            
-            elif down_count == 2 and up_count == 1:
-                opposing_tf = "LTF" if ltf_dir == "UP" else ("MTF" if mtf_dir == "UP" else "HTF")
-                pressure = False
-                direction = "DOWN"
-                reason = f"OPPOSITION: {opposing_tf} is UP | Pressure weakened"
-            
+            if up_count > down_count:
+                dominant = "UP"
+                alignment_score = sum([tf_strengths[tf] for tf, d in tf_directions.items() if d == "UP"]) / up_count
+                opposing = "DOWN"
             else:
-                pressure = False
-                direction = "NEUTRAL"
-                reason = f"NO CLEAR PRESSURE | Mixed: HTF:{htf_dir} MTF:{mtf_dir} LTF:{ltf_dir}"
-        
-        return pressure, direction, reason
-        
+                dominant = "DOWN"
+                alignment_score = sum([tf_strengths[tf] for tf, d in tf_directions.items() if d == "DOWN"]) / down_count
+                opposing = "UP"
+            
+            return dominant, alignment_score * 0.7, f"⚠️ {dominant} مهيمن ولكن {opposing} في بعض الفريمات"
+    
     except Exception as e:
-        return False, "NEUTRAL", f"Error: {str(e)}"
+        return "NEUTRAL", 0, f"خطأ: {str(e)}"
 
-def detect_wave_exhaustion(data: Dict[str, pd.DataFrame], direction: str) -> Tuple[bool, str]:
+def analyze_wave_range_visual(data: Dict[str, pd.DataFrame], direction: str) -> Tuple[float, str]:
     """
-    2️⃣ WAVE EXHAUSTION → WAVE RELEASE
-    Small waves failing, then one breaks the rhythm
+    ٢. المدى الموجي (Wave range)
+    Visual check: What's the wave structure? Compression? Expansion?
+    Returns: (wave_score, reason)
     """
     try:
-        mtf_df = data['MTF']
-        prices = mtf_df['close'].values[-30:]
-        highs = mtf_df['high'].values[-30:]
-        lows = mtf_df['low'].values[-30:]
+        # Use H4 for primary wave analysis
+        h4_df = data['H4']
+        prices = h4_df['close'].values[-50:]  # Last 50 candles
         
-        # Find recent swing points
+        # Find swing points
         swing_highs = []
         swing_lows = []
         
         for i in range(3, len(prices)-3):
-            if (highs[i] > highs[i-1] and highs[i] > highs[i-2] and highs[i] > highs[i-3] and
-                highs[i] > highs[i+1] and highs[i] > highs[i+2] and highs[i] > highs[i+3]):
-                swing_highs.append((i, highs[i]))
+            if all(prices[i] > prices[i+j] for j in [-3, -2, -1, 1, 2, 3]):
+                swing_highs.append(prices[i])
             
-            if (lows[i] < lows[i-1] and lows[i] < lows[i-2] and lows[i] < lows[i-3] and
-                lows[i] < lows[i+1] and lows[i] < lows[i+2] and lows[i] < lows[i+3]):
-                swing_lows.append((i, lows[i]))
+            if all(prices[i] < prices[i+j] for j in [-3, -2, -1, 1, 2, 3]):
+                swing_lows.append(prices[i])
         
-        if len(swing_highs) >= 3 and len(swing_lows) >= 3:
-            # Get last 3 swings
-            last_highs = [h[1] for h in swing_highs[-3:]]
-            last_lows = [l[1] for l in swing_lows[-3:]]
-            
-            # Check for compression (smaller waves)
-            high_range = max(last_highs) - min(last_highs)
-            low_range = max(last_lows) - min(last_lows)
-            price_range = prices[-1] * 0.02  # 2% of price as threshold
-            
-            compression_detected = high_range < price_range and low_range < price_range
+        if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+            # Check wave structure
+            last_highs = swing_highs[-2:]
+            last_lows = swing_lows[-2:]
             
             if direction == "UP":
-                # For uptrend: Look for higher lows failing to get lower
-                if (last_lows[-1] > last_lows[-2] and  # Still making higher lows
-                    last_lows[-2] > last_lows[-3] and
-                    compression_detected):
-                    return True, f"COMPRESSION → RELEASE UP | Waves compressed {high_range:.2f}/{low_range:.2f}"
+                # Uptrend should have higher highs AND higher lows
+                higher_highs = last_highs[-1] > last_highs[-2]
+                higher_lows = last_lows[-1] > last_lows[-2]
+                
+                if higher_highs and higher_lows:
+                    wave_score = 0.9
+                    reason = "📈 موجات صاعدة واضحة (قمم وقيعان مرتفعة)"
+                elif higher_lows:  # At least higher lows
+                    wave_score = 0.7
+                    reason = "📈 قيعان مرتفعة ولكن القمم متساوية"
+                else:
+                    wave_score = 0.3
+                    reason = "⚠️ موجة صاعدة ضعيفة"
             
-            elif direction == "DOWN":
-                # For downtrend: Look for lower highs failing to get higher
-                if (last_highs[-1] < last_highs[-2] and  # Still making lower highs
-                    last_highs[-2] < last_highs[-3] and
-                    compression_detected):
-                    return True, f"COMPRESSION → RELEASE DOWN | Waves compressed {high_range:.2f}/{low_range:.2f}"
+            else:  # DOWN
+                # Downtrend should have lower highs AND lower lows
+                lower_highs = last_highs[-1] < last_highs[-2]
+                lower_lows = last_lows[-1] < last_lows[-2]
+                
+                if lower_highs and lower_lows:
+                    wave_score = 0.9
+                    reason = "📉 موجات هابطة واضحة (قمم وقيعان منخفضة)"
+                elif lower_highs:  # At least lower highs
+                    wave_score = 0.7
+                    reason = "📉 قمم منخفضة ولكن القيعان متساوية"
+                else:
+                    wave_score = 0.3
+                    reason = "⚠️ موجة هابطة ضعيفة"
+            
+            # Check for compression (tight range before expansion)
+            recent_range = max(prices[-20:]) - min(prices[-20:])
+            avg_range = np.mean([max(prices[i-20:i]) - min(prices[i-20:i]) for i in range(40, len(prices), 10) if i-20 >= 0])
+            
+            if recent_range < avg_range * 0.7:
+                wave_score += 0.1
+                reason += " | 📊 مدى مضغوط (قبل التوسع)"
         
-        # Look for recent breakout of compression
-        recent_prices = prices[-10:]
-        price_std = np.std(recent_prices)
-        if price_std < (prices[-1] * 0.005):  # Very low volatility
-            return True, f"EXTREME COMPRESSION | Std: {price_std:.4f}"
+        else:
+            wave_score = 0.5
+            reason = "🔍 موجات غير واضحة"
         
-        return False, "NO WAVE EXHAUSTION | Normal wave activity"
-        
+        return min(wave_score, 1.0), reason
+    
     except Exception as e:
-        return False, f"Error: {str(e)}"
+        return 0.5, f"خطأ في تحليل الموجات: {str(e)}"
 
-def detect_strength_shift(data: Dict[str, pd.DataFrame], direction: str) -> Tuple[bool, str]:
+def analyze_strength_visual(data: Dict[str, pd.DataFrame], direction: str) -> Tuple[float, str]:
     """
-    3️⃣ STRENGTH SHIFT
-    Bodies getting larger, speed increasing, closes becoming aggressive
+    ٣. القوة (Strength)
+    Visual check: How strong is the move? Momentum? Candle bodies?
+    Returns: (strength_score, reason)
     """
     try:
-        ltf_df = data['LTF']
+        # Use H1 for strength analysis
+        h1_df = data['H1']
         
-        # Last 5 candles analysis
-        recent = ltf_df.iloc[-5:]
+        # Last 10 candles analysis
+        recent = h1_df.iloc[-10:]
         
-        # Candle body size increase
+        # 1. Candle body strength
         body_sizes = abs(recent['close'] - recent['open'])
         avg_body = body_sizes.mean()
-        last_body = body_sizes.iloc[-1]
         
-        body_increasing = last_body > avg_body * 1.5
-        
-        # Close aggression
         if direction == "UP":
-            # Bullish aggression: Closing near highs
-            recent_high_pct = (recent['close'] - recent['low']) / (recent['high'] - recent['low'])
-            avg_high_pct = recent_high_pct.mean()
-            last_high_pct = recent_high_pct.iloc[-1]
-            
-            close_aggressive = last_high_pct > 0.7 and last_high_pct > avg_high_pct
-        
+            bullish_bodies = recent[recent['close'] > recent['open']]
+            if not bullish_bodies.empty:
+                avg_bullish_body = bullish_bodies['close'] - bullish_bodies['open']
+                body_strength = avg_bullish_body.mean() / avg_body if avg_body > 0 else 0
+            else:
+                body_strength = 0
         else:  # DOWN
-            # Bearish aggression: Closing near lows
-            recent_low_pct = (recent['high'] - recent['close']) / (recent['high'] - recent['low'])
-            avg_low_pct = recent_low_pct.mean()
-            last_low_pct = recent_low_pct.iloc[-1]
-            
-            close_aggressive = last_low_pct > 0.7 and last_low_pct > avg_low_pct
+            bearish_bodies = recent[recent['close'] < recent['open']]
+            if not bearish_bodies.empty:
+                avg_bearish_body = bearish_bodies['open'] - bearish_bodies['close']
+                body_strength = avg_bearish_body.mean() / avg_body if avg_body > 0 else 0
+            else:
+                body_strength = 0
         
-        # Speed increase (momentum)
+        # 2. Close position strength
+        if direction == "UP":
+            # Bullish: Closing near highs is strong
+            close_positions = (recent['close'] - recent['low']) / (recent['high'] - recent['low']).replace(0, 0.001)
+            close_strength = close_positions.mean()
+        else:
+            # Bearish: Closing near lows is strong
+            close_positions = (recent['high'] - recent['close']) / (recent['high'] - recent['low']).replace(0, 0.001)
+            close_strength = close_positions.mean()
+        
+        # 3. Momentum
         price_changes = recent['close'].pct_change().dropna()
-        if len(price_changes) > 1:
-            momentum_increasing = abs(price_changes.iloc[-1]) > abs(price_changes.iloc[-2]) * 1.3
+        if len(price_changes) > 0:
+            if direction == "UP":
+                positive_changes = price_changes[price_changes > 0]
+                momentum = len(positive_changes) / len(price_changes) if len(price_changes) > 0 else 0
+            else:
+                negative_changes = price_changes[price_changes < 0]
+                momentum = len(negative_changes) / len(price_changes) if len(price_changes) > 0 else 0
         else:
-            momentum_increasing = False
+            momentum = 0.5
         
-        # Control shift detection
-        if direction == "UP":
-            # For bullish shift: More green candles, bigger bodies
-            green_candles = (recent['close'] > recent['open']).sum()
-            control_shift = green_candles >= 3 and body_increasing
+        # Combine strength factors
+        strength_score = (body_strength * 0.4 + close_strength * 0.4 + momentum * 0.2)
+        
+        if strength_score > 0.7:
+            strength_text = "قوية جدا"
+        elif strength_score > 0.5:
+            strength_text = "قوية"
+        elif strength_score > 0.3:
+            strength_text = "متوسطة"
         else:
-            red_candles = (recent['close'] < recent['open']).sum()
-            control_shift = red_candles >= 3 and body_increasing
+            strength_text = "ضعيفة"
         
-        if control_shift and (close_aggressive or momentum_increasing):
-            return True, f"CONTROL SHIFT | Bodies: +{(last_body/avg_body-1)*100:.0f}% | Aggressive closes"
+        reason = f"💪 القوة: {strength_text} | الأجساد: {body_strength:.1f}x | الإغلاق: {close_strength:.0%}"
         
-        return False, "NO STRENGTH SHIFT | Normal candle patterns"
-        
+        return min(strength_score, 1.0), reason
+    
     except Exception as e:
-        return False, f"Error: {str(e)}"
+        return 0.5, f"خطأ في تحليل القوة: {str(e)}"
 
-def detect_volume_confirmation(data: Dict[str, pd.DataFrame], direction: str) -> Tuple[bool, str, float]:
+def analyze_indicators_visual(data: Dict[str, pd.DataFrame], direction: str) -> Tuple[float, str]:
     """
-    4️⃣ VOLUME CONFIRMATION
-    Not stop hunt, not noise - BIG PARTICIPATION
+    ٤. المؤشرات (Indicators)
+    Simple RSI + MACD visual check
+    Returns: (indicators_score, reason)
     """
     try:
-        mtf_df = data['MTF']
-        ltf_df = data['LTF']
+        # Use M15 for entry indicators
+        m15_df = data['M15']
+        prices = m15_df['close'].values
         
-        # MTF volume trend (big picture)
-        mtf_volumes = mtf_df['volume'].values[-20:]
-        mtf_avg_volume = np.mean(mtf_volumes[:-5])  # Average of first 15
-        mtf_recent_volume = np.mean(mtf_volumes[-5:])  # Last 5
-        
-        mtf_volume_spike = mtf_recent_volume > mtf_avg_volume * 1.3
-        
-        # LTF volume for entry confirmation
-        ltf_volumes = ltf_df['volume'].values[-10:]
-        ltf_avg_volume = np.mean(ltf_volumes[:-3])
-        ltf_last_volume = ltf_volumes[-1]
-        
-        ltf_volume_spike = ltf_last_volume > ltf_avg_volume * 1.5
-        
-        # Volume-by-price analysis
-        recent = ltf_df.iloc[-5:]
-        
-        if direction == "UP":
-            up_candles = recent[recent['close'] > recent['open']]
-            down_candles = recent[recent['close'] < recent['open']]
+        # RSI
+        if len(prices) >= 14:
+            deltas = np.diff(prices[-14:])
+            gains = deltas[deltas >= 0]
+            losses = -deltas[deltas < 0]
             
-            if not up_candles.empty and not down_candles.empty:
-                up_volume = up_candles['volume'].sum()
-                down_volume = down_candles['volume'].sum()
-                volume_ratio = up_volume / down_volume if down_volume > 0 else 10
-                
-                volume_confirms = volume_ratio > 1.5
-            else:
-                volume_confirms = False
-        
-        else:  # DOWN
-            up_candles = recent[recent['close'] > recent['open']]
-            down_candles = recent[recent['close'] < recent['open']]
+            avg_gain = np.mean(gains) if len(gains) > 0 else 0
+            avg_loss = np.mean(losses) if len(losses) > 0 else 0
             
-            if not up_candles.empty and not down_candles.empty:
-                up_volume = up_candles['volume'].sum()
-                down_volume = down_candles['volume'].sum()
-                volume_ratio = down_volume / up_volume if up_volume > 0 else 10
-                
-                volume_confirms = volume_ratio > 1.5
+            if avg_loss == 0:
+                rsi = 100 if avg_gain > 0 else 0
             else:
-                volume_confirms = False
-        
-        # Big money participation detection
-        big_participation = (mtf_volume_spike or ltf_volume_spike) and volume_confirms
-        
-        volume_ratio_value = ltf_last_volume / ltf_avg_volume if ltf_avg_volume > 0 else 1
-        
-        if big_participation:
-            reason = f"BIG PARTICIPATION | Volume spike: {volume_ratio_value:.1f}x | Confirms direction"
-            return True, reason, volume_ratio_value
+                rs = avg_gain / avg_loss
+                rsi = 100 - (100 / (1 + rs))
         else:
-            reason = f"WEAK PARTICIPATION | Volume: {volume_ratio_value:.1f}x | No confirmation"
-            return False, reason, volume_ratio_value
+            rsi = 50
         
+        # Simple MACD signal
+        if len(prices) >= 26:
+            ema_12 = pd.Series(prices[-26:]).ewm(span=12, adjust=False).mean().iloc[-1]
+            ema_26 = pd.Series(prices[-26:]).ewm(span=26, adjust=False).mean().iloc[-1]
+            macd_line = ema_12 - ema_26
+            macd_hist = pd.Series([macd_line]).ewm(span=9, adjust=False).mean().iloc[-1]
+            histogram = macd_line - macd_hist
+        else:
+            histogram = 0
+        
+        # Check signals
+        rsi_signal = ""
+        if direction == "UP":
+            if rsi < 40:
+                rsi_score = 0.8
+                rsi_signal = "RSI منخفض (شراء)"
+            elif rsi < 60:
+                rsi_score = 0.5
+                rsi_signal = "RSI محايد"
+            else:
+                rsi_score = 0.2
+                rsi_signal = "RSI مرتفع (احتراس)"
+        else:  # DOWN
+            if rsi > 60:
+                rsi_score = 0.8
+                rsi_signal = "RSI مرتفع (بيع)"
+            elif rsi > 40:
+                rsi_score = 0.5
+                rsi_signal = "RSI محايد"
+            else:
+                rsi_score = 0.2
+                rsi_signal = "RSI منخفض (احتراس)"
+        
+        macd_signal = ""
+        if direction == "UP":
+            if histogram > 0:
+                macd_score = 0.8
+                macd_signal = "MACD إيجابي"
+            else:
+                macd_score = 0.3
+                macd_signal = "MACD سلبي"
+        else:  # DOWN
+            if histogram < 0:
+                macd_score = 0.8
+                macd_signal = "MACD سلبي"
+            else:
+                macd_score = 0.3
+                macd_signal = "MACD إيجابي"
+        
+        # Combined score
+        indicators_score = (rsi_score + macd_score) / 2
+        
+        reason = f"📊 المؤشرات: {rsi_signal} ({rsi:.0f}) | {macd_signal}"
+        
+        return indicators_score, reason
+    
     except Exception as e:
-        return False, f"Error: {str(e)}", 1.0
+        return 0.5, f"خطأ في المؤشرات: {str(e)}"
 
-def detect_expansion_trigger(data: Dict[str, pd.DataFrame], direction: str) -> Tuple[bool, str]:
+def analyze_volume_visual(data: Dict[str, pd.DataFrame], direction: str) -> Tuple[float, str]:
     """
-    5️⃣ EXPANSION TRIGGER
-    The actual moment price starts expanding
+    ٥. الفوليوم (Volume)
+    Visual check: Is volume confirming? Increasing?
+    Returns: (volume_score, reason)
     """
     try:
-        ltf_df = data['LTF']
+        # Check multiple timeframes
+        volume_checks = []
+        reasons = []
         
-        # Last 3 candles pattern
-        recent = ltf_df.iloc[-3:]
+        for tf_name in ['H1', 'M15']:
+            df = data[tf_name]
+            
+            # Recent volume vs average
+            recent_vol = df['volume'].values[-10:]
+            prev_vol = df['volume'].values[-20:-10]
+            
+            if len(recent_vol) > 0 and len(prev_vol) > 0:
+                avg_recent = np.mean(recent_vol)
+                avg_prev = np.mean(prev_vol)
+                
+                if avg_prev > 0:
+                    volume_ratio = avg_recent / avg_prev
+                else:
+                    volume_ratio = 1
+                
+                # Volume confirmation
+                price_change = (df['close'].iloc[-1] / df['close'].iloc[-10] - 1) * 100
+                
+                if direction == "UP":
+                    volume_confirms = price_change > 0 and volume_ratio > 1
+                else:
+                    volume_confirms = price_change < 0 and volume_ratio > 1
+                
+                if volume_confirms:
+                    if volume_ratio > 1.5:
+                        score = 0.9
+                        strength = "عالية"
+                    elif volume_ratio > 1.2:
+                        score = 0.7
+                        strength = "جيدة"
+                    else:
+                        score = 0.5
+                        strength = "متوسطة"
+                else:
+                    score = 0.3
+                    strength = "ضعيفة"
+                
+                volume_checks.append(score)
+                reasons.append(f"{tf_name}: {strength} ({volume_ratio:.1f}x)")
         
-        if direction == "UP":
-            # Bullish expansion trigger
-            # 1. Higher lows
-            higher_lows = (recent['low'].iloc[-1] > recent['low'].iloc[-2] and 
-                          recent['low'].iloc[-2] > recent['low'].iloc[-3])
-            
-            # 2. Increasing range
-            ranges = recent['high'] - recent['low']
-            range_increasing = ranges.iloc[-1] > ranges.iloc[-2] > ranges.iloc[-3]
-            
-            # 3. Strong close
-            last_close_pct = (recent['close'].iloc[-1] - recent['low'].iloc[-1]) / (recent['high'].iloc[-1] - recent['low'].iloc[-1])
-            strong_close = last_close_pct > 0.7
-            
-            if higher_lows and range_increasing and strong_close:
-                return True, f"EXPANSION TRIGGER UP | Higher lows + Range expanding + Strong close"
+        if volume_checks:
+            volume_score = np.mean(volume_checks)
+            reason = "📈 الفوليوم: " + " | ".join(reasons)
+        else:
+            volume_score = 0.5
+            reason = "📈 الفوليوم: غير متوفر"
         
-        else:  # DOWN
-            # Bearish expansion trigger
-            # 1. Lower highs
-            lower_highs = (recent['high'].iloc[-1] < recent['high'].iloc[-2] and 
-                          recent['high'].iloc[-2] < recent['high'].iloc[-3])
-            
-            # 2. Increasing range
-            ranges = recent['high'] - recent['low']
-            range_increasing = ranges.iloc[-1] > ranges.iloc[-2] > ranges.iloc[-3]
-            
-            # 3. Weak close
-            last_close_pct = (recent['high'].iloc[-1] - recent['close'].iloc[-1]) / (recent['high'].iloc[-1] - recent['low'].iloc[-1])
-            weak_close = last_close_pct > 0.7
-            
-            if lower_highs and range_increasing and weak_close:
-                return True, f"EXPANSION TRIGGER DOWN | Lower highs + Range expanding + Weak close"
-        
-        # Check for breakout of recent range
-        recent_high = ltf_df['high'].iloc[-10:].max()
-        recent_low = ltf_df['low'].iloc[-10:].min()
-        current_close = ltf_df['close'].iloc[-1]
-        
-        range_size = recent_high - recent_low
-        if range_size > 0:
-            if direction == "UP" and current_close > recent_high + (range_size * 0.1):
-                return True, f"BREAKOUT TRIGGER | Broke above range by {((current_close-recent_high)/recent_low)*100:.1f}%"
-            
-            if direction == "DOWN" and current_close < recent_low - (range_size * 0.1):
-                return True, f"BREAKDOWN TRIGGER | Broke below range by {((recent_low-current_close)/recent_high)*100:.1f}%"
-        
-        return False, "NO EXPANSION TRIGGER | Still inside range"
-        
+        return volume_score, reason
+    
     except Exception as e:
-        return False, f"Error: {str(e)}"
+        return 0.5, f"خطأ في الفوليوم: {str(e)}"
 
-def calculate_expansion_targets(current_price: float, side: str, data: Dict[str, pd.DataFrame]) -> Tuple[float, float, str]:
+def synthesize_direction_visual(scores: Dict[str, float], reasons: Dict[str, str]) -> Tuple[str, float, str]:
     """
-    Calculate SL/TP for expansion moves
-    Entry at START of expansion, TP at logical expansion targets
+    ٦. أحدد الاتجاه (Determine direction)
+    Visual synthesis of all factors
+    """
+    try:
+        # Weighted average (visual trader's intuition)
+        weights = {
+            'timeframes': 0.25,      # Most important: alignment
+            'wave': 0.20,           # Wave structure
+            'strength': 0.20,        # Momentum
+            'indicators': 0.15,      # Confirmation
+            'volume': 0.20          # Participation
+        }
+        
+        total_score = 0
+        for factor, score in scores.items():
+            total_score += score * weights.get(factor, 0.2)
+        
+        # Determine if signal is strong enough
+        if total_score >= 0.7:
+            direction = "UP" if scores.get('timeframes_score', 0) > 0.5 else "DOWN"
+            signal_strength = "قوية جدا 🔥"
+        elif total_score >= 0.6:
+            direction = "UP" if scores.get('timeframes_score', 0) > 0.5 else "DOWN"
+            signal_strength = "قوية ✅"
+        elif total_score >= 0.5:
+            direction = "UP" if scores.get('timeframes_score', 0) > 0.5 else "DOWN"
+            signal_strength = "متوسطة ⚠️"
+        else:
+            return "NEUTRAL", total_score, "❌ الإشارة ضعيفة"
+        
+        # Create synthesis reason
+        synthesis_reason = f"""
+🎯 التوليف البصري:
+• الفريمات: {reasons['timeframes']}
+• الموجة: {reasons['wave']}
+• القوة: {reasons['strength']}
+• المؤشرات: {reasons['indicators']}
+• الفوليوم: {reasons['volume']}
+
+📊 النتيجة: {total_score:.1%} - {signal_strength}
+        """.strip()
+        
+        return direction, total_score, synthesis_reason
+    
+    except Exception as e:
+        return "NEUTRAL", 0, f"خطأ في التوليف: {str(e)}"
+
+def calculate_visual_entry(scores: Dict[str, float], direction: str, current_price: float, data: Dict[str, pd.DataFrame]) -> Tuple[float, float, str]:
+    """
+    Calculate entry based on visual analysis
+    Simple and logical
     """
     logic_lines = []
     
-    mtf_df = data['MTF']
+    h4_df = data['H4']
+    m15_df = data['M15']
     
-    if side == "BUY":
-        # Find nearest support (logical invalidation)
-        recent_lows = mtf_df['low'].values[-20:]
-        support = np.min(recent_lows[-5:])  # Most recent low cluster
-        sl = support * 0.995  # Just below support
+    if direction == "UP":
+        # For longs: Enter near support with buffer
+        recent_low = h4_df['low'].iloc[-10:].min()
+        sl = recent_low * 0.99  # 1% below recent low
         
-        # Expansion target: Previous swing high or measured move
-        recent_highs = mtf_df['high'].values[-20:]
-        resistance = np.max(recent_highs[-10:])
+        # TP: Reward based on strength
+        base_risk = current_price - sl
         
-        # Risk-based TP with expansion logic
-        risk = current_price - sl
-        expansion_multiplier = 2.5  # Expansion moves give 2.5:1+ R:R
-        tp = current_price + (risk * expansion_multiplier)
+        if scores['strength'] > 0.7:
+            rr_ratio = 2.0  # Strong move
+        elif scores['strength'] > 0.5:
+            rr_ratio = 1.5  # Medium move
+        else:
+            rr_ratio = 1.2  # Weak move
         
-        # Ensure TP doesn't exceed major resistance
-        if tp > resistance * 1.05:  # Don't go too far beyond resistance
-            tp = resistance * 1.02
+        tp = current_price + (base_risk * rr_ratio)
         
-        logic_lines.append(f"SL: Below support {support:.2f} (invalidation)")
-        logic_lines.append(f"TP: Expansion target ~{((tp-current_price)/current_price*100):.1f}% move")
-        logic_lines.append(f"R:R: {expansion_multiplier:.1f}:1 (expansion phase)")
+        logic_lines.append(f"الدخول: قرب {current_price:.2f}")
+        logic_lines.append(f"SL: تحت الدعم {recent_low:.2f}")
+        logic_lines.append(f"TP: نسبة {rr_ratio:.1f}:1 حسب القوة")
     
-    else:  # SELL
-        # Find nearest resistance (logical invalidation)
-        recent_highs = mtf_df['high'].values[-20:]
-        resistance = np.max(recent_highs[-5:])
-        sl = resistance * 1.005  # Just above resistance
+    else:  # DOWN
+        recent_high = h4_df['high'].iloc[-10:].max()
+        sl = recent_high * 1.01  # 1% above recent high
         
-        # Expansion target: Previous swing low
-        recent_lows = mtf_df['low'].values[-20:]
-        support = np.min(recent_lows[-10:])
+        base_risk = sl - current_price
         
-        risk = sl - current_price
-        expansion_multiplier = 2.5
-        tp = current_price - (risk * expansion_multiplier)
+        if scores['strength'] > 0.7:
+            rr_ratio = 2.0
+        elif scores['strength'] > 0.5:
+            rr_ratio = 1.5
+        else:
+            rr_ratio = 1.2
         
-        if tp < support * 0.95:
-            tp = support * 0.98
+        tp = current_price - (base_risk * rr_ratio)
         
-        logic_lines.append(f"SL: Above resistance {resistance:.2f} (invalidation)")
-        logic_lines.append(f"TP: Expansion target ~{((current_price-tp)/current_price*100):.1f}% move")
-        logic_lines.append(f"R:R: {expansion_multiplier:.1f}:1 (expansion phase)")
+        logic_lines.append(f"الدخول: قرب {current_price:.2f}")
+        logic_lines.append(f"SL: فوق المقاومة {recent_high:.2f}")
+        logic_lines.append(f"TP: نسبة {rr_ratio:.1f}:1 حسب القوة")
     
-    return sl, tp, " | ".join(logic_lines)
+    risk_pct = abs(current_price - sl) / current_price * 100
+    reward_pct = abs(tp - current_price) / current_price * 100
+    actual_rr = reward_pct / risk_pct if risk_pct > 0 else 0
+    
+    logic_lines.append(f"المخاطرة: {risk_pct:.1f}% | المكافأة: {reward_pct:.1f}%")
+    logic_lines.append(f"نسبة R:R الفعلية: {actual_rr:.1f}:1")
+    
+    return sl, tp, "\n".join(logic_lines)
 
-# ================ MAIN DETECTION ================
+# ================ MAIN VISUAL ANALYSIS ================
 
-async def detect_expansion_start(data: Dict[str, pd.DataFrame], symbol: str) -> Optional[Dict]:
+async def visual_synthesis_analysis(data: Dict[str, pd.DataFrame], symbol: str) -> Optional[Dict]:
     """
-    Detect the START of an expansion phase
-    Returns signal if ALL 5 conditions are met
+    Perform visual synthesis analysis
     """
     try:
-        log.info(f"🔍 Checking {symbol} for expansion start...")
+        log.info(f"🔍 تحليل بصري لـ {symbol}...")
         
-        # 1. TIMEFRAME PRESSURE
-        pressure, direction, pressure_reason = detect_timeframe_pressure(data)
+        # 1. كل الفريمات (All timeframes)
+        direction, tf_score, tf_reason = analyze_timeframes_visual(data)
         
-        if not pressure:
-            log.debug(f"❌ {symbol}: No timeframe pressure - {pressure_reason}")
+        if direction == "NEUTRAL":
+            log.debug(f"❌ {symbol}: لا اتجاه واضح في الفريمات")
             return None
         
-        log.info(f"✅ {symbol}: Timeframe pressure {direction} - {pressure_reason}")
+        # 2. المدى الموجي (Wave range)
+        wave_score, wave_reason = analyze_wave_range_visual(data, direction)
         
-        # 2. WAVE EXHAUSTION
-        wave_exhaustion, wave_reason = detect_wave_exhaustion(data, direction)
+        # 3. القوة (Strength)
+        strength_score, strength_reason = analyze_strength_visual(data, direction)
         
-        if not wave_exhaustion:
-            log.debug(f"❌ {symbol}: No wave exhaustion - {wave_reason}")
+        # 4. المؤشرات (Indicators)
+        indicators_score, indicators_reason = analyze_indicators_visual(data, direction)
+        
+        # 5. الفوليوم (Volume)
+        volume_score, volume_reason = analyze_volume_visual(data, direction)
+        
+        # Collect scores and reasons
+        scores = {
+            'timeframes_score': tf_score,
+            'wave_score': wave_score,
+            'strength_score': strength_score,
+            'indicators_score': indicators_score,
+            'volume_score': volume_score
+        }
+        
+        reasons = {
+            'timeframes': tf_reason,
+            'wave': wave_reason,
+            'strength': strength_reason,
+            'indicators': indicators_reason,
+            'volume': volume_reason
+        }
+        
+        # 6. أحدد الاتجاه (Synthesize direction)
+        final_direction, synthesis_score, synthesis_reason = synthesize_direction_visual(scores, reasons)
+        
+        if final_direction == "NEUTRAL" or synthesis_score < 0.6:
+            log.info(f"❌ {symbol}: النتيجة غير كافية ({synthesis_score:.1%})")
             return None
         
-        log.info(f"✅ {symbol}: Wave exhaustion detected - {wave_reason}")
+        log.info(f"✅ {symbol}: {final_direction} - النتيجة: {synthesis_score:.1%}")
         
-        # 3. STRENGTH SHIFT
-        strength_shift, strength_reason = detect_strength_shift(data, direction)
+        # Get current price
+        current_price = data['M15']['close'].iloc[-1]
+        side = "BUY" if final_direction == "UP" else "SELL"
         
-        if not strength_shift:
-            log.debug(f"❌ {symbol}: No strength shift - {strength_reason}")
-            return None
-        
-        log.info(f"✅ {symbol}: Strength shift detected - {strength_reason}")
-        
-        # 4. VOLUME CONFIRMATION
-        volume_confirm, volume_reason, volume_ratio = detect_volume_confirmation(data, direction)
-        
-        if not volume_confirm:
-            log.debug(f"❌ {symbol}: No volume confirmation - {volume_reason}")
-            return None
-        
-        log.info(f"✅ {symbol}: Volume confirms - {volume_reason}")
-        
-        # 5. EXPANSION TRIGGER
-        expansion_trigger, trigger_reason = detect_expansion_trigger(data, direction)
-        
-        if not expansion_trigger:
-            log.debug(f"❌ {symbol}: No expansion trigger - {trigger_reason}")
-            return None
-        
-        log.info(f"🎯 {symbol}: EXPANSION TRIGGERED! - {trigger_reason}")
-        
-        # ALL 5 CONDITIONS MET - EXPANSION STARTING
-        current_price = data['LTF']['close'].iloc[-1]
-        side = "BUY" if direction == "UP" else "SELL"
-        
-        # Calculate expansion targets
-        sl, tp, sl_tp_logic = calculate_expansion_targets(current_price, side, data)
+        # Calculate entry
+        sl, tp, entry_logic = calculate_visual_entry(scores, final_direction, current_price, data)
         
         # Risk metrics
         risk = abs(current_price - sl)
@@ -539,78 +648,49 @@ async def detect_expansion_start(data: Dict[str, pd.DataFrame], symbol: str) -> 
             'tp': tp,
             'status': 'OPEN',
             
-            'timeframe_pressure': pressure_reason,
-            'wave_exhaustion': wave_reason,
-            'strength_shift': strength_reason,
-            'volume_confirmation': volume_reason,
-            'expansion_trigger': trigger_reason,
-            'expansion_score': 5,  # All 5 conditions met
-            
-            'logic_breakdown': f"""
-🚀 **EXPANSION PHASE STARTING** 🚀
-
-**{symbol} {side}**
-
-1️⃣ TIMEFRAME PRESSURE:
-{pressure_reason}
-
-2️⃣ WAVE EXHAUSTION → RELEASE:
-{wave_reason}
-
-3️⃣ STRENGTH SHIFT (Control Change):
-{strength_reason}
-
-4️⃣ VOLUME CONFIRMATION (Big Participation):
-{volume_reason}
-
-5️⃣ EXPANSION TRIGGER:
-{trigger_reason}
-
-**ENTRY: {current_price:.2f}**
-**SL: {sl:.2f}** (Invalidation)
-**TP: {tp:.2f}** (Expansion target)
-
-Risk: {risk_pct:.1f}% | Reward: {reward_pct:.1f}% | R:R: {rr_ratio:.2f}:1
-
-{sl_tp_logic}
-""".strip(),
+            'timeframe_alignment': tf_reason[:100],
+            'wave_structure': wave_reason[:100],
+            'strength_level': strength_reason[:100],
+            'indicators_signal': indicators_reason[:100],
+            'volume_status': volume_reason[:100],
+            'synthesis_score': synthesis_score,
             
             'signal_hash': hashlib.md5(
                 f"{symbol}:{side}:{current_price:.8f}:{int(time.time())}".encode()
             ).hexdigest()
         }
         
-        log.info(f"🔥 EXPANSION SIGNAL: {symbol} {side} at {current_price:.2f}")
-        log.info(f"   R:R {rr_ratio:.2f}:1 | Risk {risk_pct:.1f}% | Reward {reward_pct:.1f}%")
+        log.info(f"🎯 إشارة: {symbol} {side} عند {current_price:.2f}")
+        log.info(f"   النتيجة: {synthesis_score:.1%} | R:R: {rr_ratio:.1f}:1")
         
         return signal
         
     except Exception as e:
-        log.error(f"Detection error {symbol}: {e}")
+        log.error(f"خطأ في التحليل البصري {symbol}: {e}")
         return None
 
 # ================ MAIN SCANNING ================
 
-async def fetch_multi_timeframe_data(exchange, symbol: str) -> Optional[Dict[str, pd.DataFrame]]:
-    """Fetch data for expansion detection"""
+async def fetch_all_timeframe_data(exchange, symbol: str) -> Optional[Dict[str, pd.DataFrame]]:
+    """Fetch data for all timeframes"""
     data = {}
-    for tf_type, tf in TIMEFRAMES.items():
+    for tf_name, tf in TIMEFRAMES.items():
         try:
             ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=tf, limit=100)
-            if ohlcv and len(ohlcv) > 50:
+            if ohlcv and len(ohlcv) > 30:
                 df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
                 for col in ["open", "high", "low", "close", "volume"]:
                     df[col] = pd.to_numeric(df[col], errors="coerce")
-                data[tf_type] = df
+                data[tf_name] = df
             else:
                 return None
         except Exception as e:
-            log.debug(f"Error fetching {tf}: {e}")
+            log.debug(f"خطأ في جلب بيانات {tf}: {e}")
             return None
     return data
 
 async def save_signal(signal: Dict) -> bool:
-    """Save expansion signal"""
+    """Save signal to database"""
     try:
         async with db_lock:
             async with db_conn.execute(
@@ -625,65 +705,66 @@ async def save_signal(signal: Dict) -> bool:
             await db_conn.execute("""
                 INSERT INTO signals (
                     symbol, side, entry, sl, tp, status,
-                    timeframe_pressure, wave_exhaustion, strength_shift,
-                    volume_confirmation, expansion_trigger, expansion_score,
-                    logic_breakdown, signal_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    timeframe_alignment, wave_structure, strength_level,
+                    indicators_signal, volume_status, synthesis_score,
+                    signal_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 signal['symbol'], signal['side'], signal['entry'], signal['sl'],
-                signal['tp'], signal['status'], signal['timeframe_pressure'],
-                signal['wave_exhaustion'], signal['strength_shift'],
-                signal['volume_confirmation'], signal['expansion_trigger'],
-                signal['expansion_score'], signal['logic_breakdown'],
-                signal['signal_hash']
+                signal['tp'], signal['status'], signal['timeframe_alignment'],
+                signal['wave_structure'], signal['strength_level'],
+                signal['indicators_signal'], signal['volume_status'],
+                signal['synthesis_score'], signal['signal_hash']
             ))
             
             await db_conn.commit()
             return True
             
     except Exception as e:
-        log.error(f"Save error: {e}")
+        log.error(f"خطأ في الحفظ: {e}")
         return False
 
-async def send_expansion_alert(signal: Dict):
-    """Send expansion alert"""
+async def send_visual_alert(signal: Dict):
+    """Send visual synthesis alert"""
     try:
+        side_ar = "شراء" if signal['side'] == "BUY" else "بيع"
+        
         message = f"""
-⚡ **EXPANSION PHASE DETECTED** ⚡
+🎯 **التوليف البصري - الطريقة العربية** 🎯
 
-**{signal['symbol']}** | **ENTER {signal['side']}**
+**{signal['symbol']}** | **دخول {side_ar}**
 
-🎯 **ALL 5 CONDITIONS MET:**
-1️⃣ Timeframe Pressure ✓
-2️⃣ Wave Exhaustion ✓  
-3️⃣ Strength Shift ✓
-4️⃣ Volume Confirmation ✓
-5️⃣ Expansion Trigger ✓
+✅ **التحليل البصري:**
+• **الفريمات:** {signal['timeframe_alignment']}
+• **الموجة:** {signal['wave_structure']}
+• **القوة:** {signal['strength_level']}
+• **المؤشرات:** {signal['indicators_signal']}
+• **الفوليوم:** {signal['volume_status']}
 
-**TRADE:**
-Entry: {signal['entry']:.2f}
-SL: {signal['sl']:.2f} (invalidation)
-TP: {signal['tp']:.2f} (expansion target)
+📊 **نتيجة التوليف:** {signal['synthesis_score']:.1%}
 
-**EXPECT:**
-• Price to expand in next 5min-2hrs
-• Hard move in {signal['side']} direction
-• Big participation move
+💰 **التنفيذ:**
+الدخول: {signal['entry']:.2f}
+وقف الخسارة: {signal['sl']:.2f}
+هدف الربح: {signal['tp']:.2f}
 
-#ExpansionPhase #{signal['side']}
+🔍 **المنطق:**
+أراقب كل الفريمات، أشوف المدى الموجي، القوة، المؤشرات، الفوليوم → أحدد الاتجاه
+
+#الطريقة_البصرية #{side_ar}
 """
         
         await tg(message)
-        log.info(f"Expansion alert sent: {signal['symbol']}")
+        log.info(f"تم إرسال التنبيه: {signal['symbol']}")
         
     except Exception as e:
-        log.error(f"Alert error: {e}")
+        log.error(f"خطأ في التنبيه: {e}")
 
-async def scan_for_expansions(exchange):
-    """Scan for expansion starts"""
+async def visual_scan_loop(exchange):
+    """Main scanning loop"""
     while True:
         try:
-            log.info("🔭 Scanning for expansion phases...")
+            log.info("بدء المسح البصري...")
             
             # Get top pairs
             tickers = await exchange.fetch_tickers()
@@ -692,37 +773,37 @@ async def scan_for_expansions(exchange):
             usdt_pairs.sort(key=lambda x: x[1], reverse=True)
             top_pairs = usdt_pairs[:TOP_N]
             
-            expansions_found = 0
+            signals_found = 0
             
             for symbol, volume in top_pairs:
                 try:
-                    data = await fetch_multi_timeframe_data(exchange, symbol)
+                    data = await fetch_all_timeframe_data(exchange, symbol)
                     if not data:
                         continue
                     
-                    signal = await detect_expansion_start(data, symbol)
+                    signal = await visual_synthesis_analysis(data, symbol)
                     
                     if signal:
                         if await save_signal(signal):
-                            await send_expansion_alert(signal)
-                            expansions_found += 1
+                            await send_visual_alert(signal)
+                            signals_found += 1
                     
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.2)
                     
                 except Exception as e:
-                    log.debug(f"Scan error {symbol}: {e}")
+                    log.debug(f"خطأ {symbol}: {e}")
                     continue
             
-            log.info(f"Scan complete. Found {expansions_found} expansion starts.")
+            log.info(f"تم المسح. وجدت {signals_found} إشارة.")
             
             await asyncio.sleep(SCAN_INTERVAL)
             
         except Exception as e:
-            log.error(f"Scan loop error: {e}")
+            log.error(f"خطأ في حلقة المسح: {e}")
             await asyncio.sleep(30)
 
-async def monitor_expansions(exchange):
-    """Monitor expansion trades"""
+async def monitor_loop(exchange):
+    """Monitor trades"""
     while True:
         try:
             async with db_lock:
@@ -742,28 +823,28 @@ async def monitor_expansions(exchange):
                         
                         if side == "BUY":
                             if current_price >= tp:
-                                await tg(f"✅ {symbol} EXPANSION COMPLETE | Target hit")
+                                await tg(f"✅ {symbol} الهدف تم | دخول: {entry:.2f} → هدف: {tp:.2f}")
                                 await db_conn.execute("UPDATE signals SET status='CLOSED' WHERE id=?", (sig_id,))
                             elif current_price <= sl:
-                                await tg(f"❌ {symbol} EXPANSION FAILED | Invalidated")
+                                await tg(f"❌ {symbol} وقف الخسارة | دخول: {entry:.2f} → وقف: {sl:.2f}")
                                 await db_conn.execute("UPDATE signals SET status='CLOSED' WHERE id=?", (sig_id,))
                         else:
                             if current_price <= tp:
-                                await tg(f"✅ {symbol} EXPANSION COMPLETE | Target hit")
+                                await tg(f"✅ {symbol} الهدف تم | دخول: {entry:.2f} → هدف: {tp:.2f}")
                                 await db_conn.execute("UPDATE signals SET status='CLOSED' WHERE id=?", (sig_id,))
                             elif current_price >= sl:
-                                await tg(f"❌ {symbol} EXPANSION FAILED | Invalidated")
+                                await tg(f"❌ {symbol} وقف الخسارة | دخول: {entry:.2f} → وقف: {sl:.2f}")
                                 await db_conn.execute("UPDATE signals SET status='CLOSED' WHERE id=?", (sig_id,))
                     
                     except Exception as e:
-                        log.debug(f"Monitor error {symbol}: {e}")
+                        log.debug(f"خطأ في المتابعة {symbol}: {e}")
                 
                 await db_conn.commit()
             
-            await asyncio.sleep(15)  # Check every 15 seconds
+            await asyncio.sleep(15)
             
         except Exception as e:
-            log.error(f"Monitor error: {e}")
+            log.error(f"خطأ في المتابعة: {e}")
             await asyncio.sleep(30)
 
 # ---------------- FASTAPI ----------------
@@ -772,24 +853,24 @@ app = FastAPI()
 @app.get("/")
 async def root():
     return {
-        "status": "scanning_for_expansions",
-        "min_conditions": 5,
-        "target": "detect_start_of_big_moves"
+        "status": "visual_synthesis_scanner",
+        "method": "الطريقة البصرية العربية",
+        "timeframes": list(TIMEFRAMES.values())
     }
 
-@app.get("/expansions")
-async def get_expansions():
+@app.get("/signals")
+async def get_signals():
     try:
         async with db_lock:
             async with db_conn.execute("""
-                SELECT symbol, side, entry, sl, tp, expansion_score, timestamp 
+                SELECT symbol, side, entry, sl, tp, synthesis_score, timestamp 
                 FROM signals WHERE status='OPEN' ORDER BY timestamp DESC LIMIT 10
             """) as cursor:
                 rows = await cursor.fetchall()
         
-        expansions = []
+        signals = []
         for row in rows:
-            expansions.append({
+            signals.append({
                 "symbol": row[0],
                 "side": row[1],
                 "entry": row[2],
@@ -799,7 +880,7 @@ async def get_expansions():
                 "time": row[6]
             })
         
-        return {"expansions": expansions}
+        return {"signals": signals}
     except Exception as e:
         return {"error": str(e)}
 
@@ -808,8 +889,8 @@ async def main():
     global exchange
     
     log.info("="*60)
-    log.info("🚀 EXPANSION PHASE SCANNER STARTING")
-    log.info("Looking for START of big moves")
+    log.info("🎯 الماسح الضوئي البصري - الطريقة العربية")
+    log.info("أراقب كل الفريمات، المدى الموجي، القوة، المؤشرات، الفوليوم → أحدد الاتجاه")
     log.info("="*60)
     
     try:
@@ -822,44 +903,42 @@ async def main():
         })
         
         await exchange.fetch_ticker("BTC/USDT")
-        log.info("✅ Exchange connected")
+        log.info("✅ تم الاتصال بالبورصة")
         
-        # Startup message
+        # Startup message in Arabic
         await tg(f"""
-🔥 EXPANSION PHASE SCANNER STARTED
+🎯 **بدء الماسح الضوئي البصري**
 
-I scan for the START of big moves when:
+**الطريقة:**
+أراقب كل الفريمات، أشوف المدى الموجي، القوة، المؤشرات، الفوليوم → أحدد الاتجاه
 
-1️⃣ All timeframes align (no opposing force)
-2️⃣ Waves exhaust → release
-3️⃣ Strength shifts (control changes)
-4️⃣ Volume confirms (big participation)
-5️⃣ Expansion triggers
+**الفريمات المستخدمة:**
+الأسبوعي، اليومي، 4 ساعات، 1 ساعة، 15 دقيقة
 
-When all 5 hit → "ENTER LONG/SHORT"
-Then price expands in next 5min-2hrs
+**المسح:**
+{TOP_N} زوج
 
-Scanning {TOP_N} pairs...
+جاهز للبدء...
         """)
         
         # Start scanning
         await asyncio.gather(
-            scan_for_expansions(exchange),
-            monitor_expansions(exchange)
+            visual_scan_loop(exchange),
+            monitor_loop(exchange)
         )
         
     except KeyboardInterrupt:
-        log.info("Stopped by user")
-        await tg("🛑 Expansion scanner stopped")
+        log.info("تم الإيقاف بواسطة المستخدم")
+        await tg("🛑 توقف الماسح الضوئي")
     except Exception as e:
-        log.error(f"Fatal: {e}")
-        await tg(f"❌ Scanner crashed: {str(e)[:200]}")
+        log.error(f"خطأ فادح: {e}")
+        await tg(f"❌ تعطل الماسح: {str(e)[:200]}")
     finally:
         if db_conn:
             await db_conn.close()
         if exchange:
             await exchange.close()
-        log.info("Clean shutdown")
+        log.info("إغلاق نظيف")
 
 if __name__ == "__main__":
     asyncio.run(main())
