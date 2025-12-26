@@ -4,6 +4,7 @@
 """
 Visual Synthesis Scanner - الطريقة البصرية
 Watches all timeframes, wave range, strength, indicators, volume → determines direction
+FIXED VERSION
 """
 
 import os
@@ -29,11 +30,10 @@ TOP_N = int(os.getenv("TOP_N", 60))
 
 # Timeframes for visual analysis
 TIMEFRAMES = {
-    "WEEKLY": "1w",     # Big picture
     "DAILY": "1d",      # Primary direction  
     "H4": "4h",         # Main wave
-    "H1": "1h",         # Entry zone
-    "M15": "15m"        # Trigger
+    "H1": "1h",         # Strength analysis
+    "M15": "15m"        # Entry & indicators
 }
 
 # ---------------- LOGGING ----------------
@@ -98,7 +98,7 @@ async def init_db():
         log.error(f"Database error: {e}")
         return False
 
-# ================ VISUAL SYNTHESIS METHOD ================
+# ================ VISUAL SYNTHESIS METHOD - FIXED ================
 
 def analyze_timeframes_visual(data: Dict[str, pd.DataFrame]) -> Tuple[str, float, str]:
     """
@@ -172,7 +172,7 @@ def analyze_wave_range_visual(data: Dict[str, pd.DataFrame], direction: str) -> 
     Returns: (wave_score, reason)
     """
     try:
-        # Use H4 for primary wave analysis
+        # Use H4 for primary wave analysis - FIXED: Use 'H4' instead of old timeframe name
         h4_df = data['H4']
         prices = h4_df['close'].values[-50:]  # Last 50 candles
         
@@ -246,7 +246,7 @@ def analyze_strength_visual(data: Dict[str, pd.DataFrame], direction: str) -> Tu
     Returns: (strength_score, reason)
     """
     try:
-        # Use H1 for strength analysis
+        # Use H1 for strength analysis - FIXED: Changed from 'strength' to 'H1'
         h1_df = data['H1']
         
         # Last 10 candles analysis
@@ -319,7 +319,7 @@ def analyze_indicators_visual(data: Dict[str, pd.DataFrame], direction: str) -> 
     Returns: (indicators_score, reason)
     """
     try:
-        # Use M15 for entry indicators
+        # Use M15 for entry indicators - FIXED: 'M15' is correct
         m15_df = data['M15']
         prices = m15_df['close'].values
         
@@ -406,50 +406,51 @@ def analyze_volume_visual(data: Dict[str, pd.DataFrame], direction: str) -> Tupl
     Returns: (volume_score, reason)
     """
     try:
-        # Check multiple timeframes
+        # Check multiple timeframes - FIXED: Using 'H1' and 'M15'
         volume_checks = []
         reasons = []
         
         for tf_name in ['H1', 'M15']:
-            df = data[tf_name]
-            
-            # Recent volume vs average
-            recent_vol = df['volume'].values[-10:]
-            prev_vol = df['volume'].values[-20:-10]
-            
-            if len(recent_vol) > 0 and len(prev_vol) > 0:
-                avg_recent = np.mean(recent_vol)
-                avg_prev = np.mean(prev_vol)
+            if tf_name in data:
+                df = data[tf_name]
                 
-                if avg_prev > 0:
-                    volume_ratio = avg_recent / avg_prev
-                else:
-                    volume_ratio = 1
+                # Recent volume vs average
+                recent_vol = df['volume'].values[-10:]
+                prev_vol = df['volume'].values[-20:-10]
                 
-                # Volume confirmation
-                price_change = (df['close'].iloc[-1] / df['close'].iloc[-10] - 1) * 100
-                
-                if direction == "UP":
-                    volume_confirms = price_change > 0 and volume_ratio > 1
-                else:
-                    volume_confirms = price_change < 0 and volume_ratio > 1
-                
-                if volume_confirms:
-                    if volume_ratio > 1.5:
-                        score = 0.9
-                        strength = "عالية"
-                    elif volume_ratio > 1.2:
-                        score = 0.7
-                        strength = "جيدة"
+                if len(recent_vol) > 0 and len(prev_vol) > 0:
+                    avg_recent = np.mean(recent_vol)
+                    avg_prev = np.mean(prev_vol)
+                    
+                    if avg_prev > 0:
+                        volume_ratio = avg_recent / avg_prev
                     else:
-                        score = 0.5
-                        strength = "متوسطة"
-                else:
-                    score = 0.3
-                    strength = "ضعيفة"
-                
-                volume_checks.append(score)
-                reasons.append(f"{tf_name}: {strength} ({volume_ratio:.1f}x)")
+                        volume_ratio = 1
+                    
+                    # Volume confirmation
+                    price_change = (df['close'].iloc[-1] / df['close'].iloc[-10] - 1) * 100
+                    
+                    if direction == "UP":
+                        volume_confirms = price_change > 0 and volume_ratio > 1
+                    else:
+                        volume_confirms = price_change < 0 and volume_ratio > 1
+                    
+                    if volume_confirms:
+                        if volume_ratio > 1.5:
+                            score = 0.9
+                            strength = "عالية"
+                        elif volume_ratio > 1.2:
+                            score = 0.7
+                            strength = "جيدة"
+                        else:
+                            score = 0.5
+                            strength = "متوسطة"
+                    else:
+                        score = 0.3
+                        strength = "ضعيفة"
+                    
+                    volume_checks.append(score)
+                    reasons.append(f"{tf_name}: {strength} ({volume_ratio:.1f}x)")
         
         if volume_checks:
             volume_score = np.mean(volume_checks)
@@ -520,7 +521,6 @@ def calculate_visual_entry(scores: Dict[str, float], direction: str, current_pri
     logic_lines = []
     
     h4_df = data['H4']
-    m15_df = data['M15']
     
     if direction == "UP":
         # For longs: Enter near support with buffer
@@ -530,9 +530,9 @@ def calculate_visual_entry(scores: Dict[str, float], direction: str, current_pri
         # TP: Reward based on strength
         base_risk = current_price - sl
         
-        if scores['strength'] > 0.7:
+        if scores.get('strength_score', 0) > 0.7:
             rr_ratio = 2.0  # Strong move
-        elif scores['strength'] > 0.5:
+        elif scores.get('strength_score', 0) > 0.5:
             rr_ratio = 1.5  # Medium move
         else:
             rr_ratio = 1.2  # Weak move
@@ -549,9 +549,9 @@ def calculate_visual_entry(scores: Dict[str, float], direction: str, current_pri
         
         base_risk = sl - current_price
         
-        if scores['strength'] > 0.7:
+        if scores.get('strength_score', 0) > 0.7:
             rr_ratio = 2.0
-        elif scores['strength'] > 0.5:
+        elif scores.get('strength_score', 0) > 0.5:
             rr_ratio = 1.5
         else:
             rr_ratio = 1.2
@@ -913,7 +913,7 @@ async def main():
 أراقب كل الفريمات، أشوف المدى الموجي، القوة، المؤشرات، الفوليوم → أحدد الاتجاه
 
 **الفريمات المستخدمة:**
-الأسبوعي، اليومي، 4 ساعات، 1 ساعة، 15 دقيقة
+{', '.join(TIMEFRAMES.values())}
 
 **المسح:**
 {TOP_N} زوج
