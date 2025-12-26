@@ -27,7 +27,7 @@ DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
 TOP_N = int(os.getenv("TOP_N", 60))
-MIN_CONFIDENCE = 3  # Need at least 4 out of 6 steps
+MIN_CONFIDENCE = 6  # Need at least 4 out of 6 steps
 
 # Timeframes for MTF analysis
 TIMEFRAMES = {
