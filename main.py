@@ -31,7 +31,7 @@ SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
 TOP_N = int(os.getenv("TOP_N", 60))
 
 # Synthesis thresholds
-MIN_SYNTHESIS_SCORE = 0.45  # Higher threshold for quality signals
+MIN_SYNTHESIS_SCORE = 0.35  # Higher threshold for quality signals
 CONFLUENCE_REQUIRED = 3    # Minimum number of confirmations
 
 # Timeframes for true multi-timeframe analysis
@@ -68,10 +68,11 @@ exchange = None
 # ---------------- PURE PYTHON TECHNICAL INDICATORS ----------------
 def calculate_ema(prices: np.ndarray, period: int) -> np.ndarray:
     """Calculate Exponential Moving Average (no TA-Lib)"""
-    if len(prices) < period:
-        return np.full_like(prices, np.nan)
+    n = len(prices)
+    if n < period:
+        return np.full(n, np.nan)
     
-    ema = np.zeros_like(prices, dtype=float)
+    ema = np.zeros(n, dtype=float)
     ema[:period-1] = np.nan
     
     # Initial SMA
@@ -82,50 +83,52 @@ def calculate_ema(prices: np.ndarray, period: int) -> np.ndarray:
     multiplier = 2 / (period + 1)
     
     # Calculate EMA
-    for i in range(period, len(prices)):
+    for i in range(period, n):
         ema[i] = (prices[i] - ema[i-1]) * multiplier + ema[i-1]
     
     return ema
 
 def calculate_sma(prices: np.ndarray, period: int) -> np.ndarray:
     """Calculate Simple Moving Average"""
-    if len(prices) < period:
-        return np.full_like(prices, np.nan)
+    n = len(prices)
+    if n < period:
+        return np.full(n, np.nan)
     
-    sma = np.zeros_like(prices, dtype=float)
+    sma = np.zeros(n, dtype=float)
     sma[:period-1] = np.nan
     
-    for i in range(period-1, len(prices)):
+    for i in range(period-1, n):
         sma[i] = np.mean(prices[i-period+1:i+1])
     
     return sma
 
 def calculate_rsi(prices: np.ndarray, period: int = 14) -> np.ndarray:
     """Calculate RSI (no TA-Lib)"""
-    if len(prices) < period + 1:
-        return np.full_like(prices, np.nan)
+    n = len(prices)
+    if n < period + 1:
+        return np.full(n, np.nan)
     
     deltas = np.diff(prices)
     
-    # Separate gains and losses
+    # Initialize arrays
     gains = np.where(deltas > 0, deltas, 0)
     losses = np.where(deltas < 0, -deltas, 0)
+    
+    rsi = np.full(n, np.nan)
     
     # Calculate initial averages
     avg_gain = np.mean(gains[:period])
     avg_loss = np.mean(losses[:period])
     
-    rsi = np.zeros_like(prices)
-    rsi[:period] = np.nan
-    
+    # Handle division by zero
     if avg_loss == 0:
-        rsi[period] = 100
+        rsi[period] = 100 if avg_gain > 0 else 0
     else:
         rs = avg_gain / avg_loss
         rsi[period] = 100 - (100 / (1 + rs))
     
     # Calculate remaining RSI values
-    for i in range(period + 1, len(prices)):
+    for i in range(period + 1, n):
         gain = gains[i-1]
         loss = losses[i-1]
         
@@ -133,7 +136,7 @@ def calculate_rsi(prices: np.ndarray, period: int = 14) -> np.ndarray:
         avg_loss = ((avg_loss * (period - 1)) + loss) / period
         
         if avg_loss == 0:
-            rsi[i] = 100
+            rsi[i] = 100 if avg_gain > 0 else 0
         else:
             rs = avg_gain / avg_loss
             rsi[i] = 100 - (100 / (1 + rs))
@@ -145,12 +148,24 @@ def calculate_macd(prices: np.ndarray, fast: int = 12, slow: int = 26, signal: i
     ema_fast = calculate_ema(prices, fast)
     ema_slow = calculate_ema(prices, slow)
     
+    # Ensure we have valid data
+    if np.all(np.isnan(ema_fast)) or np.all(np.isnan(ema_slow)):
+        n = len(prices)
+        return np.full(n, np.nan), np.full(n, np.nan), np.full(n, np.nan)
+    
     macd_line = ema_fast - ema_slow
-    signal_line = calculate_ema(macd_line[~np.isnan(macd_line)], signal)
+    
+    # Calculate signal line only on non-NaN values
+    macd_valid = macd_line[~np.isnan(macd_line)]
+    if len(macd_valid) >= signal:
+        signal_line = calculate_ema(macd_valid, signal)
+    else:
+        signal_line = np.full(len(macd_valid), np.nan)
     
     # Align lengths
     signal_line_full = np.full_like(macd_line, np.nan)
-    signal_line_full[-len(signal_line):] = signal_line
+    if len(signal_line) > 0:
+        signal_line_full[-len(signal_line):] = signal_line
     
     histogram = macd_line - signal_line_full
     
@@ -158,13 +173,14 @@ def calculate_macd(prices: np.ndarray, fast: int = 12, slow: int = 26, signal: i
 
 def calculate_atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14) -> np.ndarray:
     """Calculate Average True Range (no TA-Lib)"""
-    if len(highs) < period:
-        return np.full_like(highs, np.nan)
+    n = len(highs)
+    if n < period:
+        return np.full(n, np.nan)
     
-    tr = np.zeros(len(highs))
+    tr = np.zeros(n)
     
     # Calculate True Range
-    for i in range(len(highs)):
+    for i in range(n):
         if i == 0:
             tr[i] = highs[i] - lows[i]
         else:
@@ -174,28 +190,29 @@ def calculate_atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, perio
             tr[i] = max(hl, hc, lc)
     
     # Calculate ATR
-    atr = np.zeros_like(tr)
+    atr = np.zeros(n)
     atr[:period-1] = np.nan
     
     # Initial ATR (SMA of first period TRs)
     atr[period-1] = np.mean(tr[:period])
     
     # Wilder's smoothing
-    for i in range(period, len(tr)):
+    for i in range(period, n):
         atr[i] = (atr[i-1] * (period - 1) + tr[i]) / period
     
     return atr
 
 def calculate_adx(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14) -> np.ndarray:
-    """Calculate ADX (no TA-Lib)"""
-    if len(highs) < period * 2:
-        return np.full_like(highs, np.nan)
+    """Calculate ADX (no TA-Lib) - Fixed version"""
+    n = len(highs)
+    if n < period * 2:
+        return np.full(n, np.nan)
     
     # Calculate +DM and -DM
-    plus_dm = np.zeros(len(highs))
-    minus_dm = np.zeros(len(highs))
+    plus_dm = np.zeros(n)
+    minus_dm = np.zeros(n)
     
-    for i in range(1, len(highs)):
+    for i in range(1, n):
         up_move = highs[i] - highs[i-1]
         down_move = lows[i-1] - lows[i]
         
@@ -205,40 +222,51 @@ def calculate_adx(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, perio
             minus_dm[i] = down_move
     
     # Calculate True Range
-    tr = np.zeros(len(highs))
-    for i in range(len(highs)):
-        if i == 0:
-            tr[i] = highs[i] - lows[i]
-        else:
-            hl = highs[i] - lows[i]
-            hc = abs(highs[i] - closes[i-1])
-            lc = abs(lows[i] - closes[i-1])
-            tr[i] = max(hl, hc, lc)
+    tr = np.zeros(n)
+    tr[0] = highs[0] - lows[0]
     
-    # Smooth the values
+    for i in range(1, n):
+        hl = highs[i] - lows[i]
+        hc = abs(highs[i] - closes[i-1])
+        lc = abs(lows[i] - closes[i-1])
+        tr[i] = max(hl, hc, lc)
+    
+    # Smooth function
     def smooth(values, period):
-        smoothed = np.zeros_like(values)
-        smoothed[:period-1] = np.nan
+        n = len(values)
+        smoothed = np.full(n, np.nan)
         
-        # Initial value (sum of first period)
+        if n < period:
+            return smoothed
+        
+        # First value is sum of first period
         smoothed[period-1] = np.sum(values[:period])
         
         # Wilder's smoothing
-        for i in range(period, len(values)):
+        for i in range(period, n):
             smoothed[i] = smoothed[i-1] - (smoothed[i-1] / period) + values[i]
         
         return smoothed
     
+    # Smooth the values
     tr_smooth = smooth(tr, period)
     plus_dm_smooth = smooth(plus_dm, period)
     minus_dm_smooth = smooth(minus_dm, period)
     
     # Calculate +DI and -DI
-    plus_di = 100 * (plus_dm_smooth / tr_smooth)
-    minus_di = 100 * (minus_dm_smooth / tr_smooth)
+    plus_di = np.full(n, np.nan)
+    minus_di = np.full(n, np.nan)
+    dx = np.full(n, np.nan)
     
-    # Calculate DX
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+    for i in range(period-1, n):
+        if tr_smooth[i] > 0:
+            plus_di[i] = 100 * (plus_dm_smooth[i] / tr_smooth[i])
+            minus_di[i] = 100 * (minus_dm_smooth[i] / tr_smooth[i])
+            
+            # Calculate DX
+            di_sum = plus_di[i] + minus_di[i]
+            if di_sum > 0:
+                dx[i] = 100 * abs(plus_di[i] - minus_di[i]) / di_sum
     
     # Calculate ADX (smoothed DX)
     adx = smooth(dx, period)
@@ -537,12 +565,14 @@ def analyze_momentum(data: Dict[str, pd.DataFrame], direction: TrendDirection) -
         
         # Calculate momentum using ROC
         def calculate_roc(prices, period):
-            if len(prices) < period + 1:
-                return np.full_like(prices, np.nan)
-            roc = np.zeros_like(prices)
+            n = len(prices)
+            if n < period + 1:
+                return np.full(n, np.nan)
+            roc = np.zeros(n)
             roc[:period] = np.nan
-            for i in range(period, len(prices)):
-                roc[i] = ((prices[i] - prices[i-period]) / prices[i-period]) * 100
+            for i in range(period, n):
+                if prices[i-period] != 0:
+                    roc[i] = ((prices[i] - prices[i-period]) / prices[i-period]) * 100
             return roc
         
         roc = calculate_roc(prices, period=10)
@@ -602,6 +632,7 @@ def analyze_ema_confluence(data: Dict[str, pd.DataFrame], direction: TrendDirect
         
         # Analyze EMA alignment across key timeframes
         key_timeframes = ['DAILY', 'H4', 'H1']
+        tf_count = 0
         
         for tf in key_timeframes:
             df = data.get(tf)
@@ -628,36 +659,59 @@ def analyze_ema_confluence(data: Dict[str, pd.DataFrame], direction: TrendDirect
             
             if direction in [TrendDirection.BULLISH, TrendDirection.STRONG_BULLISH]:
                 # Bullish: Price above EMAs, EMAs in bullish order
-                price_above_emas = all(current_price > ema for ema in ema_values.values())
-                emas_bullish = all(ema_values[9] > ema_values[21] > ema_values[50]) if len(ema_values) >= 3 else False
-                
-                if price_above_emas and emas_bullish:
-                    tf_score = 1.0
-                    ema_signal = f"{tf}: Strong Bullish Alignment"
-                elif price_above_emas:
-                    tf_score = 0.7
-                    ema_signal = f"{tf}: Price Above EMAs"
-                elif current_price > ema_values.get(200, 0):
-                    tf_score = 0.6
-                    ema_signal = f"{tf}: Above 200 EMA"
+                if ema_values:
+                    # Check if price is above all EMAs
+                    price_above_all = True
+                    for ema in ema_values.values():
+                        if current_price <= ema:
+                            price_above_all = False
+                            break
+                    
+                    # Check EMA bullish alignment (fast > medium > slow)
+                    emas_bullish = False
+                    if 9 in ema_values and 21 in ema_values and 50 in ema_values:
+                        emas_bullish = ema_values[9] > ema_values[21] > ema_values[50]
+                    
+                    if price_above_all and emas_bullish:
+                        tf_score = 1.0
+                        ema_signal = f"{tf}: Strong Bullish Alignment"
+                    elif price_above_all:
+                        tf_score = 0.7
+                        ema_signal = f"{tf}: Price Above EMAs"
+                    elif 200 in ema_values and current_price > ema_values[200]:
+                        tf_score = 0.6
+                        ema_signal = f"{tf}: Above 200 EMA"
             
             elif direction in [TrendDirection.BEARISH, TrendDirection.STRONG_BEARISH]:
                 # Bearish: Price below EMAs, EMAs in bearish order
-                price_below_emas = all(current_price < ema for ema in ema_values.values())
-                emas_bearish = all(ema_values[9] < ema_values[21] < ema_values[50]) if len(ema_values) >= 3 else False
-                
-                if price_below_emas and emas_bearish:
-                    tf_score = 1.0
-                    ema_signal = f"{tf}: Strong Bearish Alignment"
-                elif price_below_emas:
-                    tf_score = 0.7
-                    ema_signal = f"{tf}: Price Below EMAs"
-                elif current_price < ema_values.get(200, 0):
-                    tf_score = 0.6
-                    ema_signal = f"{tf}: Below 200 EMA"
+                if ema_values:
+                    # Check if price is below all EMAs
+                    price_below_all = True
+                    for ema in ema_values.values():
+                        if current_price >= ema:
+                            price_below_all = False
+                            break
+                    
+                    # Check EMA bearish alignment (fast < medium < slow)
+                    emas_bearish = False
+                    if 9 in ema_values and 21 in ema_values and 50 in ema_values:
+                        emas_bearish = ema_values[9] < ema_values[21] < ema_values[50]
+                    
+                    if price_below_all and emas_bearish:
+                        tf_score = 1.0
+                        ema_signal = f"{tf}: Strong Bearish Alignment"
+                    elif price_below_all:
+                        tf_score = 0.7
+                        ema_signal = f"{tf}: Price Below EMAs"
+                    elif 200 in ema_values and current_price < ema_values[200]:
+                        tf_score = 0.6
+                        ema_signal = f"{tf}: Below 200 EMA"
             
             confluence_score += tf_score
-            ema_signals.append(ema_signal)
+            tf_count += 1
+            if ema_signal:
+                ema_signals.append(ema_signal)
+            
             confluence_details[tf] = {
                 'score': tf_score,
                 'signal': ema_signal,
@@ -666,10 +720,12 @@ def analyze_ema_confluence(data: Dict[str, pd.DataFrame], direction: TrendDirect
             }
         
         # Average the confluence score
-        if confluence_details:
-            confluence_score = confluence_score / len(confluence_details)
+        if tf_count > 0:
+            confluence_score = confluence_score / tf_count
+        else:
+            confluence_score = 0.5
         
-        confluence_text = " | ".join([s for s in ema_signals if s])
+        confluence_text = " | ".join(ema_signals) if ema_signals else "No clear EMA signals"
         
         return confluence_score, confluence_text, confluence_details
         
@@ -902,7 +958,7 @@ def identify_trend(data: Dict[str, pd.DataFrame]) -> Tuple[TrendDirection, float
         
         # 3. Slope of moving averages
         if not np.isnan(sma_20[-1]) and not np.isnan(sma_20[-10]):
-            sma_20_slope = (sma_20[-1] - sma_20[-10]) / sma_20[-10]
+            sma_20_slope = (sma_20[-1] - sma_20[-10]) / sma_20[-10] if sma_20[-10] != 0 else 0
         else:
             sma_20_slope = 0
         
@@ -1215,6 +1271,10 @@ def find_support_levels(data: Dict[str, pd.DataFrame]) -> List[float]:
         # Split price range into bins
         price_min = np.min(prices)
         price_max = np.max(prices)
+        
+        if price_min == price_max:
+            return []
+        
         bins = 10
         bin_size = (price_max - price_min) / bins
         
@@ -1257,6 +1317,10 @@ def find_resistance_levels(data: Dict[str, pd.DataFrame]) -> List[float]:
         # Split price range into bins
         price_min = np.min(prices)
         price_max = np.max(prices)
+        
+        if price_min == price_max:
+            return []
+        
         bins = 10
         bin_size = (price_max - price_min) / bins
         
@@ -1342,7 +1406,8 @@ async def check_advanced_duplicate(symbol: str, side: str, current_price: float,
                 SELECT COUNT(*) FROM signals 
                 WHERE wave_hash = ? AND timestamp > datetime('now', '-8 hours')
             """, (wave_hash,)) as cursor:
-                same_wave = (await cursor.fetchone())[0]
+                result = await cursor.fetchone()
+                same_wave = result[0] if result else 0
             
             if same_wave > 0:
                 log.debug(f"{symbol}: Same wave structure detected recently")
@@ -1355,7 +1420,8 @@ async def check_advanced_duplicate(symbol: str, side: str, current_price: float,
                 AND timestamp > datetime('now', '-12 hours')
                 AND status = 'OPEN'
             """, (symbol, side)) as cursor:
-                recent_signals = (await cursor.fetchone())[0]
+                result = await cursor.fetchone()
+                recent_signals = result[0] if result else 0
             
             if recent_signals >= 1:
                 log.debug(f"{symbol}: Already has open {side} signal")
@@ -1380,7 +1446,8 @@ async def check_advanced_duplicate(symbol: str, side: str, current_price: float,
                     cursor.execute("""
                         SELECT (julianday('now') - julianday(?)) * 24
                     """, (last_time,))
-                    hours_passed = cursor.fetchone()[0] or 0
+                    hours_result = cursor.fetchone()
+                    hours_passed = hours_result[0] if hours_result else 0
                     conn.close()
                     
                     # If less than 2% price movement in last 6 hours, skip
@@ -1476,7 +1543,8 @@ async def scanning_loop(exchange):
                                 "SELECT COUNT(*) FROM signals WHERE signal_hash = ?",
                                 (signal['signal_hash'],)
                             ) as cursor:
-                                exists = (await cursor.fetchone())[0]
+                                result = await cursor.fetchone()
+                                exists = result[0] if result else 0
                             
                             if exists == 0:
                                 # Insert new signal
@@ -1533,8 +1601,8 @@ async def send_advanced_telegram_alert(signal: Dict):
         sl = signal['sl']
         tp = signal['tp']
         
-        risk_pct = abs(entry - sl) / entry * 100
-        reward_pct = abs(tp - entry) / entry * 100
+        risk_pct = abs(entry - sl) / entry * 100 if entry != 0 else 0
+        reward_pct = abs(tp - entry) / entry * 100 if entry != 0 else 0
         rr_ratio = reward_pct / risk_pct if risk_pct > 0 else 0
         
         # Parse support/resistance levels
@@ -1624,11 +1692,11 @@ async def monitoring_loop(exchange):
                     
                     # Calculate PnL
                     if side == "BUY":
-                        pnl_percent = ((current_price - entry) / entry) * 100
+                        pnl_percent = ((current_price - entry) / entry) * 100 if entry != 0 else 0
                         should_close_tp = current_price >= tp
                         should_close_sl = current_price <= sl
                     else:  # SELL
-                        pnl_percent = ((entry - current_price) / entry) * 100
+                        pnl_percent = ((entry - current_price) / entry) * 100 if entry != 0 else 0
                         should_close_tp = current_price <= tp
                         should_close_sl = current_price >= sl
                     
