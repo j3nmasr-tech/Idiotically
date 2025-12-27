@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-MEXC Futures Predictive Scanner - نظام المضاعفة السريع
-Public API Version - No Authentication Required
+MEXC Futures Hyper Profit Scanner - نظام المضاعفة السريع
+Public API Version - Dynamic Symbol Detection
 """
 
 import os
@@ -23,6 +23,7 @@ from fastapi import FastAPI
 import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+import re
 
 # ---------------- CONFIG ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -31,40 +32,31 @@ DB_PATH = "/app/data/mexc_signals.db"
 
 # HYPER PROFIT SETTINGS - للربح السريع
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 30))  # 30 ثانية فقط للمسح السريع
-TOP_N = int(os.getenv("TOP_N", 80))  # أكثر عملات متقلبة
+TOP_N = int(os.getenv("TOP_N", 100))  # أكثر عملات متقلبة
 
 # ULTRA STRICT FILTERS للمضاعفة السريعة
-MIN_PREDICTION_CONFIDENCE = 0.50  # 75% ثقة كحد أدنى
-MIN_EXPLOSION_SCORE = 0.50        # 80% للانفجارات
-MIN_CRASH_SCORE = 0.50            # 80% للانهيارات
+MIN_PREDICTION_CONFIDENCE = 0.75  # 75% ثقة كحد أدنى
+MIN_EXPLOSION_SCORE = 0.80        # 80% للانفجارات
+MIN_CRASH_SCORE = 0.80            # 80% للانهيارات
 CONFLUENCE_REQUIRED = 4           # 4 تأكيدات من 6 (صارم)
-MIN_EXPECTED_MOVE = 1.0           # 4% حركة متوقعة كحد أدنى
-MIN_COMPRESSION = 0.50            # 85% تكثف كحد أدنى
+MIN_EXPECTED_MOVE = 4.0           # 4% حركة متوقعة كحد أدنى
+MIN_COMPRESSION = 0.85            # 85% تكثف كحد أدنى
 
 # Timeframes for ultra-fast detection
 TIMEFRAMES = {
-    "DAILY": "1d",
-    "H4": "4h", 
     "H1": "1h",
     "M15": "15m",
     "M5": "5m",   # إضافة فريم 5 دقائق للكشف المبكر
 }
 
-# High Volatility Coins Target
-HIGH_VOLATILITY_COINS = [
-    # Meme Coins - تقلبات عالية
-    "PEPE/USDT", "WIF/USDT", "BONK/USDT", "FLOKI/USDT",
-    "MEME/USDT", "SHIB/USDT", "DOGE/USDT", 
-    
-    # Small Caps - حركات كبيرة
-    "1000BONK/USDT", "LADYS/USDT", "TURBO/USDT", "AIDOGE/USDT",
-    
-    # High Beta Alts
-    "GALA/USDT", "APE/USDT", "GMT/USDT", "SAND/USDT",
-    "MANA/USDT", "ENJ/USDT", "CHZ/USDT",
-    
-    # Leveraged Tokens
-    "3L/USDT", "3S/USDT", "BULL/USDT", "BEAR/USDT",
+# High Volatility Keywords - للكشف التلقائي
+HIGH_VOL_KEYWORDS = [
+    'pepe', 'wif', 'bonk', 'floki', 'meme', 'doge', 'shib',
+    'turbo', 'gala', 'ape', 'gmt', 'sand', 'mana', 'enj',
+    'chz', 'axs', 'ilv', 'ygg', 'rndr', 'agix', 'fet',
+    'ocean', 'render', 'ai', 'meme', 'elon', 'kishu',
+    'akita', 'hokk', 'saitama', 'wojak', 'smurf',
+    '1000', '10000', 'baby', 'mini', 'micro',
 ]
 
 # ---------------- LOGGING ----------------
@@ -179,8 +171,8 @@ async def send_hyper_signal_alert(signal: Dict):
 • **التكثف:** {signal.get('compression_score', 0):.1%} 
 • **التباعد:** {signal.get('divergence_score', 0):.1%}
 • **الحجم:** {signal.get('volume_score', 0):.1%}
-• **المستويات:** {signal.get('breakdown_score', 0):.1%}
-• **التأكيدات:** {signal.get('confirmations', 0)}/6
+• **المستويات:** {signal.get('structure_score', 0):.1%}
+• **التأكيدات:** {signal.get('confirmations', 0)}/4
 
 ━━━━━━━━━━━━━━━━━━
 💰 **مستويات التداول:**
@@ -311,7 +303,7 @@ def detect_hyper_compression(data: Dict[str, pd.DataFrame]) -> Tuple[float, str,
         
         # 1. Calculate volatility on multiple timeframes
         h1_atr = calculate_atr(h1_highs, h1_lows, h1_prices, 14)
-        current_h1_atr = h1_atr[-1] if not np.isnan(h1_atr[-1]) else 0
+        current_h1_atr = h1_atr[-1] if len(h1_atr) > 0 and not np.isnan(h1_atr[-1]) else 0
         avg_h1_atr = np.mean(h1_atr[-20:-5]) if len(h1_atr) >= 20 else current_h1_atr
         
         h1_volatility = current_h1_atr / h1_prices[-1] if h1_prices[-1] != 0 else 0
@@ -336,6 +328,7 @@ def detect_hyper_compression(data: Dict[str, pd.DataFrame]) -> Tuple[float, str,
             signals.append("لا يوجد تكثف")
         
         # 3. Range contraction
+        range_contraction = 0
         if avg_h1_atr > 0:
             range_contraction = (avg_h1_atr - current_h1_atr) / avg_h1_atr
             if range_contraction > 0.4:
@@ -343,14 +336,16 @@ def detect_hyper_compression(data: Dict[str, pd.DataFrame]) -> Tuple[float, str,
                 signals.append(f"تقلص النطاق: {range_contraction:.0%}")
         
         # 4. Price squeezing (Bollinger Band-like)
-        h1_sma = np.mean(h1_prices[-20:])
-        h1_std = np.std(h1_prices[-20:])
-        
-        if h1_std > 0:
-            squeeze_ratio = (h1_highs[-1] - h1_lows[-1]) / h1_std
-            if squeeze_ratio < 1.0:
-                compression_score += 0.10
-                signals.append("ضغط بولنجر")
+        squeeze_ratio = 0
+        if len(h1_prices) >= 20:
+            h1_sma = np.mean(h1_prices[-20:])
+            h1_std = np.std(h1_prices[-20:])
+            
+            if h1_std > 0:
+                squeeze_ratio = (h1_highs[-1] - h1_lows[-1]) / h1_std
+                if squeeze_ratio < 1.0:
+                    compression_score += 0.10
+                    signals.append("ضغط بولنجر")
         
         compression_score = min(1.0, compression_score)
         
@@ -358,8 +353,8 @@ def detect_hyper_compression(data: Dict[str, pd.DataFrame]) -> Tuple[float, str,
             'compression_score': compression_score,
             'h1_volatility_pct': h1_volatility * 100,
             'm15_volatility_pct': m15_volatility * 100,
-            'range_contraction_pct': range_contraction * 100 if 'range_contraction' in locals() else 0,
-            'squeeze_ratio': squeeze_ratio if 'squeeze_ratio' in locals() else 0,
+            'range_contraction_pct': range_contraction * 100,
+            'squeeze_ratio': squeeze_ratio,
         }
         
         return compression_score, " | ".join(signals), details
@@ -409,7 +404,9 @@ def analyze_liquidity_breakout(data: Dict[str, pd.DataFrame]) -> Tuple[float, st
         
         # Price-volume correlation
         h1_prices = h1_df['close'].values[-10:]
-        h1_volume_trend = np.corrcoef(h1_prices, h1_volumes[-10:])[0,1] if len(h1_prices) >= 10 else 0
+        h1_volume_trend = 0
+        if len(h1_prices) >= 10 and len(h1_volumes) >= 10:
+            h1_volume_trend = np.corrcoef(h1_prices, h1_volumes[-10:])[0,1] if not np.any(np.isnan(h1_volumes[-10:])) else 0
         
         if not np.isnan(h1_volume_trend):
             if h1_volume_trend > 0.7:
@@ -425,7 +422,7 @@ def analyze_liquidity_breakout(data: Dict[str, pd.DataFrame]) -> Tuple[float, st
             'liquidity_score': liquidity_score,
             'h1_volume_ratio': h1_volume_ratio,
             'm15_volume_ratio': m15_volume_ratio,
-            'volume_correlation': h1_volume_trend if not np.isnan(h1_volume_trend) else 0,
+            'volume_correlation': h1_volume_trend,
         }
         
         return liquidity_score, " | ".join(signals), details
@@ -535,9 +532,14 @@ def analyze_price_structure(data: Dict[str, pd.DataFrame]) -> Tuple[float, str, 
         signals = []
         
         # Proximity to key levels
+        nearest_support = 0
+        nearest_resistance = 0
+        support_distance = 100
+        resistance_distance = 100
+        
         if support_levels:
             nearest_support = min(support_levels, key=lambda x: abs(x - current_price))
-            support_distance = abs(current_price - nearest_support) / current_price * 100
+            support_distance = abs(current_price - nearest_support) / current_price * 100 if current_price != 0 else 100
             
             if support_distance < 1.0:
                 structure_score += 0.30
@@ -548,7 +550,7 @@ def analyze_price_structure(data: Dict[str, pd.DataFrame]) -> Tuple[float, str, 
         
         if resistance_levels:
             nearest_resistance = min(resistance_levels, key=lambda x: abs(x - current_price))
-            resistance_distance = abs(nearest_resistance - current_price) / current_price * 100
+            resistance_distance = abs(nearest_resistance - current_price) / current_price * 100 if current_price != 0 else 100
             
             if resistance_distance < 1.0:
                 structure_score += 0.30
@@ -575,8 +577,8 @@ def analyze_price_structure(data: Dict[str, pd.DataFrame]) -> Tuple[float, str, 
             'structure_score': structure_score,
             'support_levels': sorted(list(set(support_levels)))[-3:],
             'resistance_levels': sorted(list(set(resistance_levels)))[:3],
-            'nearest_support': nearest_support if 'nearest_support' in locals() else 0,
-            'nearest_resistance': nearest_resistance if 'nearest_resistance' in locals() else 0,
+            'nearest_support': nearest_support,
+            'nearest_resistance': nearest_resistance,
         }
         
         return structure_score, " | ".join(signals), details
@@ -783,6 +785,75 @@ async def init_db():
         log.error(f"Database error: {e}")
         return False
 
+# ================ SYMBOL DISCOVERY ================
+
+async def discover_mexc_symbols():
+    """Discover available symbols on MEXC dynamically"""
+    try:
+        log.info("🔍 Discovering available symbols on MEXC...")
+        
+        exchange = ccxt.mexc({
+            "enableRateLimit": True,
+            "timeout": 30000,
+        })
+        
+        # Load markets
+        markets = await exchange.load_markets()
+        
+        # Filter for USDT pairs with spot trading
+        usdt_symbols = []
+        for symbol, market in markets.items():
+            if (symbol.endswith('/USDT') and 
+                market.get('spot', False) and
+                market.get('active', False) and
+                market.get('type', '') == 'spot'):
+                usdt_symbols.append(symbol)
+        
+        await exchange.close()
+        
+        log.info(f"✅ Found {len(usdt_symbols)} USDT pairs on MEXC")
+        
+        # Filter for high volatility symbols
+        high_vol_symbols = []
+        for symbol in usdt_symbols:
+            symbol_lower = symbol.lower()
+            # Check for high volatility keywords
+            if any(keyword in symbol_lower for keyword in HIGH_VOL_KEYWORDS):
+                high_vol_symbols.append(symbol)
+        
+        # Also include some major coins
+        major_coins = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 
+                      'ADA/USDT', 'AVAX/USDT', 'DOT/USDT', 'MATIC/USDT']
+        
+        for coin in major_coins:
+            if coin in usdt_symbols and coin not in high_vol_symbols:
+                high_vol_symbols.append(coin)
+        
+        # Limit to TOP_N
+        final_symbols = high_vol_symbols[:TOP_N]
+        
+        # If we don't have enough high-vol symbols, add more from the list
+        if len(final_symbols) < TOP_N // 2:
+            additional_needed = TOP_N - len(final_symbols)
+            additional_symbols = [s for s in usdt_symbols if s not in final_symbols][:additional_needed]
+            final_symbols.extend(additional_symbols)
+        
+        log.info(f"📊 Selected {len(final_symbols)} symbols for scanning")
+        log.info(f"Sample symbols: {final_symbols[:10]}")
+        
+        return final_symbols
+        
+    except Exception as e:
+        log.error(f"Error discovering symbols: {e}")
+        # Fallback to a hardcoded list
+        fallback_symbols = [
+            "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT",
+            "AVAX/USDT", "DOT/USDT", "MATIC/USDT", "DOGE/USDT", "SHIB/USDT",
+            "PEPE/USDT", "WIF/USDT", "BONK/USDT", "FLOKI/USDT", "MEME/USDT",
+            "GALA/USDT", "APE/USDT", "GMT/USDT", "SAND/USDT", "MANA/USDT",
+        ]
+        return fallback_symbols[:TOP_N]
+
 # ================ DATA FETCHING ================
 
 async def fetch_mexc_data(exchange, symbol: str) -> Optional[Dict[str, pd.DataFrame]]:
@@ -821,53 +892,75 @@ async def scan_hyper_signals():
     """Main scanner for hyper profit signals"""
     log.info("🚀 Starting MEXC Hyper Profit Scanner")
     
-    await tg("""
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        await tg("""
 🚀 **بدء الماسح الفائق - MEXC Futures**
 
-✅ **النظام مُحسّن للربح السريع:**
-• **الفلاتر الصارمة:** ثقة 75%+ فقط
-• **التكثف الفائق:** 85%+ للحركات الكبيرة
-• **4 تأكيدات:** من أصل 4 تحليلات
-• **الحركة الدنيا:** 4%+ متوقعة
-
-🎯 **التركيز على:**
-• عملات الميمز المتقلبة (PEPE, WIF, BONK)
-• العملات الصغيرة ذات الحركات الكبيرة
-• الأوقات عالية السيولة
-
-⚡ **جاهز للمضاعفة السريعة...**
+✅ **جاري اكتشاف الرموز المتاحة على MEXC...**
+✅ **سيركز النظام على الأعلى تقلباً**
+✅ **جاهز للمضاعفة السريعة...**
 """)
+    
+    # Get symbols dynamically
+    target_symbols = await discover_mexc_symbols()
+    
+    # Initialize exchange
+    global exchange
+    if exchange is None:
+        exchange = ccxt.mexc({
+            "enableRateLimit": True,
+            "timeout": 30000,
+        })
+    
+    # Track statistics
+    scan_count = 0
+    signals_found_total = 0
     
     while True:
         try:
+            scan_count += 1
             log.info("=" * 60)
-            log.info("Starting hyper scan cycle...")
+            log.info(f"Scan cycle #{scan_count} - Analyzing {len(target_symbols)} symbols")
             
-            # Initialize exchange
-            global exchange
-            if exchange is None:
-                exchange = ccxt.mexc({
-                    "enableRateLimit": True,
-                    "timeout": 30000,
-                })
+            # Shuffle symbols for better distribution
+            import random
+            random.shuffle(target_symbols)
             
-            # Focus on high volatility coins
-            target_symbols = HIGH_VOLATILITY_COINS[:TOP_N]
-            log.info(f"Scanning {len(target_symbols)} high-volatility coins")
-            
-            signals_found = 0
+            signals_found_cycle = 0
             
             for symbol in target_symbols:
                 try:
-                    log.debug(f"Analyzing {symbol}...")
+                    # Skip if we already have an open signal for this symbol
+                    async with db_lock:
+                        async with db_conn.execute("""
+                            SELECT COUNT(*) FROM hyper_signals 
+                            WHERE symbol = ? AND status = 'OPEN'
+                            AND timestamp > datetime('now', '-2 hours')
+                        """, (symbol,)) as cursor:
+                            result = await cursor.fetchone()
+                            if result and result[0] > 0:
+                                continue
                     
-                    # Fetch data
-                    data = await fetch_mexc_data(exchange, symbol)
+                    # Fetch data with timeout
+                    try:
+                        data_task = asyncio.create_task(fetch_mexc_data(exchange, symbol))
+                        data = await asyncio.wait_for(data_task, timeout=5.0)
+                    except asyncio.TimeoutError:
+                        log.debug(f"Timeout fetching {symbol}, skipping...")
+                        continue
+                    except Exception as e:
+                        log.debug(f"Fetch error for {symbol}: {e}")
+                        continue
+                    
                     if not data:
                         continue
                     
                     # Get current price
                     current_price = data['M15']['close'].iloc[-1]
+                    
+                    # Skip if price is too low (potential junk coins)
+                    if current_price < 0.000001:  # Less than 0.000001 USDT
+                        continue
                     
                     # Run hyper prediction
                     prediction = predict_hyper_move(data)
@@ -982,23 +1075,33 @@ async def scan_hyper_signals():
                         await db_conn.commit()
                         
                         # Send alert
-                        await send_hyper_signal_alert(signal)
-                        signals_found += 1
+                        if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+                            await send_hyper_signal_alert(signal)
+                        
+                        signals_found_cycle += 1
+                        signals_found_total += 1
                         
                         log.info(f"✅ HYPER SIGNAL: {symbol} {side}")
                         log.info(f"   Type: {prediction['type']}, Conf: {prediction['confidence']:.1%}")
                         log.info(f"   Move: {prediction['predicted_move_pct']:+.1f}%, Lev: {prediction['recommended_leverage']}x")
+                        log.info(f"   Price: {current_price:.8f}, R/R: {rr_ratio:.1f}:1")
                     
-                    # Rate limiting
-                    await asyncio.sleep(0.3)
+                    # Rate limiting - faster for hyper scanning
+                    await asyncio.sleep(0.2)
                     
                 except Exception as e:
                     log.error(f"Error analyzing {symbol}: {e}")
                     continue
             
-            log.info(f"Scan complete. Found {signals_found} hyper signals.")
+            log.info(f"✅ Scan #{scan_count} complete. Found {signals_found_cycle} signals. Total: {signals_found_total}")
+            
+            # Update symbols every 10 scans (5 minutes)
+            if scan_count % 10 == 0:
+                log.info("🔄 Refreshing symbol list...")
+                target_symbols = await discover_mexc_symbols()
             
             # Wait for next scan
+            log.info(f"⏳ Waiting {SCAN_INTERVAL} seconds for next scan...")
             await asyncio.sleep(SCAN_INTERVAL)
             
         except Exception as e:
@@ -1022,7 +1125,6 @@ async def root():
             "min_compression": MIN_COMPRESSION,
             "min_move_pct": MIN_EXPECTED_MOVE,
         },
-        "focus_coins": HIGH_VOLATILITY_COINS[:20],
     }
 
 # ================ MAIN ================
@@ -1030,7 +1132,7 @@ async def root():
 async def main():
     # Telegram check
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram credentials not set")
+        log.warning("⚠️ Telegram credentials not set - alerts disabled")
     else:
         log.info("✅ Telegram credentials found")
     
@@ -1042,10 +1144,11 @@ async def main():
     log.info("=" * 70)
     log.info("🚀 MEXC HYPER PROFIT SCANNER - PUBLIC API")
     log.info("=" * 70)
-    log.info(f"Focus: {len(HIGH_VOLATILITY_COINS)} high-volatility coins")
     log.info(f"Scan interval: {SCAN_INTERVAL}s")
     log.info(f"Min confidence: {MIN_PREDICTION_CONFIDENCE:.0%}")
     log.info(f"Min confirmations: {CONFLUENCE_REQUIRED}")
+    log.info(f"Min compression: {MIN_COMPRESSION:.0%}")
+    log.info(f"Min expected move: {MIN_EXPECTED_MOVE}%")
     log.info("=" * 70)
     
     # Send startup message
@@ -1062,8 +1165,9 @@ async def main():
 • الثقة الدنيا: {MIN_PREDICTION_CONFIDENCE:.0%}
 • التكثف الدنيا: {MIN_COMPRESSION:.0%}
 • الحركة الدنيا: {MIN_EXPECTED_MOVE}%
+• التأكيدات الدنيا: {CONFLUENCE_REQUIRED}
 
-**التركيز على العملات المتقلبة...**
+**جاري اكتشاف الرموز المتاحة...**
 
 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """)
@@ -1085,6 +1189,7 @@ async def main():
         if db_conn:
             await db_conn.close()
         executor.shutdown()
+        log.info("Shutdown complete")
 
 if __name__ == "__main__":
     # Install required packages
@@ -1095,9 +1200,10 @@ if __name__ == "__main__":
         import httpx
         import fastapi
         import aiosqlite
+        import uvicorn
     except ImportError as e:
         log.error(f"Missing package: {e}")
-        log.info("Run: pip install ccxt pandas numpy httpx fastapi aiosqlite requests")
+        log.info("Run: pip install ccxt pandas numpy httpx fastapi aiosqlite requests uvicorn")
         exit(1)
     
     # Run scanner
