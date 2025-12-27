@@ -33,8 +33,8 @@ SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
 TOP_N = int(os.getenv("TOP_N", 60))
 
 # Synthesis thresholds
-MIN_SYNTHESIS_SCORE = 0.35  # Higher threshold for quality signals
-CONFLUENCE_REQUIRED = 3    # Minimum number of confirmations
+MIN_SYNTHESIS_SCORE = 0.25  # Higher threshold for quality signals
+CONFLUENCE_REQUIRED = 2    # Minimum number of confirmations
 
 # Timeframes for true multi-timeframe analysis
 TIMEFRAMES = {
