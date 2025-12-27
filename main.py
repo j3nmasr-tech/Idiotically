@@ -143,162 +143,36 @@ def calculate_rsi(prices: np.ndarray, period: int = 14) -> np.ndarray:
     
     return rsi
 
-def calculate_macd(prices: np.ndarray, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Calculate MACD (no TA-Lib)"""
-    ema_fast = calculate_ema(prices, fast)
-    ema_slow = calculate_ema(prices, slow)
-    
-    # Ensure we have valid data
-    if np.all(np.isnan(ema_fast)) or np.all(np.isnan(ema_slow)):
-        n = len(prices)
-        return np.full(n, np.nan), np.full(n, np.nan), np.full(n, np.nan)
-    
-    macd_line = ema_fast - ema_slow
-    
-    # Calculate signal line only on non-NaN values
-    macd_valid = macd_line[~np.isnan(macd_line)]
-    if len(macd_valid) >= signal:
-        signal_line = calculate_ema(macd_valid, signal)
-    else:
-        signal_line = np.full(len(macd_valid), np.nan)
-    
-    # Align lengths
-    signal_line_full = np.full_like(macd_line, np.nan)
-    if len(signal_line) > 0:
-        signal_line_full[-len(signal_line):] = signal_line
-    
-    histogram = macd_line - signal_line_full
-    
-    return macd_line, signal_line_full, histogram
-
-def calculate_atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14) -> np.ndarray:
-    """Calculate Average True Range (no TA-Lib)"""
-    n = len(highs)
-    if n < period:
-        return np.full(n, np.nan)
-    
-    tr = np.zeros(n)
-    
-    # Calculate True Range
-    for i in range(n):
-        if i == 0:
-            tr[i] = highs[i] - lows[i]
-        else:
-            hl = highs[i] - lows[i]
-            hc = abs(highs[i] - closes[i-1])
-            lc = abs(lows[i] - closes[i-1])
-            tr[i] = max(hl, hc, lc)
-    
-    # Calculate ATR
-    atr = np.zeros(n)
-    atr[:period-1] = np.nan
-    
-    # Initial ATR (SMA of first period TRs)
-    atr[period-1] = np.mean(tr[:period])
-    
-    # Wilder's smoothing
-    for i in range(period, n):
-        atr[i] = (atr[i-1] * (period - 1) + tr[i]) / period
-    
-    return atr
-
-def calculate_adx(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14) -> np.ndarray:
-    """Calculate ADX (no TA-Lib) - Fixed version"""
-    n = len(highs)
-    if n < period * 2:
-        return np.full(n, np.nan)
-    
-    # Calculate +DM and -DM
-    plus_dm = np.zeros(n)
-    minus_dm = np.zeros(n)
-    
-    for i in range(1, n):
-        up_move = highs[i] - highs[i-1]
-        down_move = lows[i-1] - lows[i]
-        
-        if up_move > down_move and up_move > 0:
-            plus_dm[i] = up_move
-        elif down_move > up_move and down_move > 0:
-            minus_dm[i] = down_move
-    
-    # Calculate True Range
-    tr = np.zeros(n)
-    tr[0] = highs[0] - lows[0]
-    
-    for i in range(1, n):
-        hl = highs[i] - lows[i]
-        hc = abs(highs[i] - closes[i-1])
-        lc = abs(lows[i] - closes[i-1])
-        tr[i] = max(hl, hc, lc)
-    
-    # Smooth function
-    def smooth(values, period):
-        n = len(values)
-        smoothed = np.full(n, np.nan)
-        
-        if n < period:
-            return smoothed
-        
-        # First value is sum of first period
-        smoothed[period-1] = np.sum(values[:period])
-        
-        # Wilder's smoothing
-        for i in range(period, n):
-            smoothed[i] = smoothed[i-1] - (smoothed[i-1] / period) + values[i]
-        
-        return smoothed
-    
-    # Smooth the values
-    tr_smooth = smooth(tr, period)
-    plus_dm_smooth = smooth(plus_dm, period)
-    minus_dm_smooth = smooth(minus_dm, period)
-    
-    # Calculate +DI and -DI
-    plus_di = np.full(n, np.nan)
-    minus_di = np.full(n, np.nan)
-    dx = np.full(n, np.nan)
-    
-    for i in range(period-1, n):
-        if tr_smooth[i] > 0:
-            plus_di[i] = 100 * (plus_dm_smooth[i] / tr_smooth[i])
-            minus_di[i] = 100 * (minus_dm_smooth[i] / tr_smooth[i])
-            
-            # Calculate DX
-            di_sum = plus_di[i] + minus_di[i]
-            if di_sum > 0:
-                dx[i] = 100 * abs(plus_di[i] - minus_di[i]) / di_sum
-    
-    # Calculate ADX (smoothed DX)
-    adx = smooth(dx, period)
-    
-    return adx
-
-# ---------------- TELEGRAM ----------------
-async def tg(msg: str):
-    """Send Telegram message"""
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram credentials missing")
-        return
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            await client.post(url, json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": msg,
-                "parse_mode": "HTML"
-            })
-        log.info("Telegram message sent")
-    except Exception as e:
-        log.warning(f"Telegram failed: {e}")
-
 # ---------------- DATABASE ----------------
+async def check_and_add_column(column_name: str, column_type: str):
+    """Check if a column exists and add it if it doesn't"""
+    try:
+        # Check if column exists
+        async with db_conn.execute(f"PRAGMA table_info(signals)") as cursor:
+            columns = await cursor.fetchall()
+            column_names = [col[1] for col in columns]
+            
+            if column_name not in column_names:
+                log.info(f"Adding missing column: {column_name}")
+                await db_conn.execute(f"ALTER TABLE signals ADD COLUMN {column_name} {column_type}")
+                await db_conn.commit()
+                log.info(f"✅ Column {column_name} added successfully")
+                return True
+            else:
+                log.debug(f"Column {column_name} already exists")
+                return True
+    except Exception as e:
+        log.error(f"Error adding column {column_name}: {e}")
+        return False
+
 async def init_db():
-    """Initialize database"""
+    """Initialize database with automatic schema updates"""
     global db_conn
     try:
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
         db_conn = await aiosqlite.connect(DB_PATH)
         
+        # Create main table if it doesn't exist (original schema)
         await db_conn.execute("""
             CREATE TABLE IF NOT EXISTS signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -309,44 +183,55 @@ async def init_db():
                 tp REAL NOT NULL,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 status TEXT DEFAULT 'OPEN',
-                
-                -- Analysis Results
-                mtf_alignment TEXT,
+                timeframe_alignment TEXT,
                 wave_structure TEXT,
-                momentum_score REAL,
-                ema_alignment TEXT,
-                rsi_signal TEXT,
-                volume_analysis TEXT,
-                trend_strength REAL,
-                
-                -- Confluence Tracking
-                confirmations INTEGER DEFAULT 0,
+                strength_level TEXT,
+                indicators_signal TEXT,
+                volume_status TEXT,
                 synthesis_score REAL,
-                
-                -- Technical Levels
-                support_levels TEXT,
-                resistance_levels TEXT,
-                
-                -- Signal Management
-                signal_hash TEXT UNIQUE,
-                price_hash TEXT,
-                wave_hash TEXT,
-                
-                -- Trade Management
                 close_reason TEXT,
                 close_price REAL,
                 close_timestamp DATETIME,
-                pnl_percent REAL
+                pnl_percent REAL,
+                signal_hash TEXT UNIQUE,
+                price_hash TEXT
             )
         """)
         
-        # Create indexes
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_hash ON signals(signal_hash)")
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_price_hash ON signals(price_hash)")
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON signals(status)")
         await db_conn.commit()
+        log.info("✅ Main table created/verified")
         
-        log.info("✅ Database initialized with advanced schema")
+        # Check and add ALL missing columns for advanced analysis
+        required_columns = [
+            ("mtf_alignment", "TEXT"),
+            ("momentum_score", "REAL"),
+            ("ema_alignment", "TEXT"),
+            ("rsi_signal", "TEXT"),
+            ("volume_analysis", "TEXT"),
+            ("trend_strength", "REAL"),
+            ("confirmations", "INTEGER"),
+            ("support_levels", "TEXT"),
+            ("resistance_levels", "TEXT"),
+            ("wave_hash", "TEXT"),
+        ]
+        
+        for column_name, column_type in required_columns:
+            if not await check_and_add_column(column_name, column_type):
+                log.error(f"Failed to add required column: {column_name}")
+                # Continue anyway, we'll handle missing columns gracefully
+        
+        # Create indexes (will ignore if already exist)
+        try:
+            await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_price_hash ON signals(price_hash)")
+            await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_wave_hash ON signals(wave_hash)")
+            await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_symbol_timestamp ON signals(symbol, timestamp)")
+            await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON signals(status)")
+            await db_conn.commit()
+            log.info("✅ Database indexes created/verified")
+        except Exception as e:
+            log.warning(f"Index creation warning: {e}")
+        
+        log.info("✅ Database ready with all required columns")
         return True
         
     except Exception as e:
@@ -368,16 +253,15 @@ async def analyze_multi_timeframe(data: Dict[str, pd.DataFrame]) -> Tuple[TrendD
     try:
         timeframe_scores = {}
         timeframe_details = {}
-        ema_alignments = {}
         
         for tf_name, df in data.items():
-            if len(df) < 100:
+            if len(df) < 50:
                 timeframe_scores[tf_name] = 0
                 continue
             
             prices = df['close'].values
             
-            # Calculate EMAs for this timeframe using pure Python
+            # Calculate EMAs for this timeframe
             ema_signals = {}
             for ema_name, period in EMA_PERIODS.items():
                 if len(prices) >= period:
@@ -407,8 +291,6 @@ async def analyze_multi_timeframe(data: Dict[str, pd.DataFrame]) -> Tuple[TrendD
                 elif ema_signals.get('FAST', 0) < ema_signals.get('MEDIUM', 0):
                     alignment_score = -0.6
                     alignment_details.append("Death Cross Setup")
-            
-            ema_alignments[tf_name] = alignment_details
             
             # Price position relative to EMAs
             current_price = prices[-1]
@@ -465,7 +347,6 @@ async def analyze_multi_timeframe(data: Dict[str, pd.DataFrame]) -> Tuple[TrendD
         details = {
             'scores': timeframe_scores,
             'details': timeframe_details,
-            'ema_alignments': ema_alignments,
             'weighted_average': avg_score
         }
         
@@ -481,9 +362,8 @@ def analyze_wave_structure(data: Dict[str, pd.DataFrame]) -> Tuple[float, str, D
     try:
         # Focus on H4 and Daily for wave analysis
         h4_df = data.get('H4')
-        daily_df = data.get('DAILY')
         
-        if h4_df is None or daily_df is None or len(h4_df) < 50 or len(daily_df) < 100:
+        if h4_df is None or len(h4_df) < 50:
             return 0.5, "Insufficient data", {}
         
         wave_details = {}
@@ -552,16 +432,10 @@ def analyze_momentum(data: Dict[str, pd.DataFrame], direction: TrendDirection) -
     """Analyze momentum using multiple indicators"""
     try:
         h1_df = data.get('H1')
-        if h1_df is None or len(h1_df) < 50:
+        if h1_df is None or len(h1_df) < 20:
             return 0.5, "Insufficient data", {}
         
         prices = h1_df['close'].values
-        highs = h1_df['high'].values
-        lows = h1_df['low'].values
-        
-        # Calculate ATR for volatility
-        atr = calculate_atr(highs, lows, prices, period=14)
-        current_atr = atr[-1] if not np.isnan(atr[-1]) else 0
         
         # Calculate momentum using ROC
         def calculate_roc(prices, period):
@@ -578,43 +452,36 @@ def analyze_momentum(data: Dict[str, pd.DataFrame], direction: TrendDirection) -
         roc = calculate_roc(prices, period=10)
         current_roc = roc[-1] if not np.isnan(roc[-1]) else 0
         
-        # Calculate ADX for trend strength
-        adx = calculate_adx(highs, lows, prices, period=14)
-        current_adx = adx[-1] if not np.isnan(adx[-1]) else 0
-        
-        # Calculate MACD
-        macd, signal, hist = calculate_macd(prices)
-        current_macd = macd[-1] if not np.isnan(macd[-1]) else 0
+        # Calculate RSI for momentum
+        rsi = calculate_rsi(prices, period=14)
+        current_rsi = rsi[-1] if not np.isnan(rsi[-1]) else 50
         
         # Determine momentum score
         momentum_score = 0.5
         
         if direction in [TrendDirection.BULLISH, TrendDirection.STRONG_BULLISH]:
-            if current_roc > 0 and current_macd > 0:
+            if current_roc > 1 and current_rsi < 70:
                 momentum_score = 0.8
-                if current_adx > 25:
-                    momentum_score = 0.9
             elif current_roc > 0:
                 momentum_score = 0.7
+            else:
+                momentum_score = 0.4
         
         elif direction in [TrendDirection.BEARISH, TrendDirection.STRONG_BEARISH]:
-            if current_roc < 0 and current_macd < 0:
+            if current_roc < -1 and current_rsi > 30:
                 momentum_score = 0.8
-                if current_adx > 25:
-                    momentum_score = 0.9
             elif current_roc < 0:
                 momentum_score = 0.7
+            else:
+                momentum_score = 0.4
         
         # Create momentum details
         momentum_details = {
-            'atr': float(current_atr),
             'roc': float(current_roc),
-            'adx': float(current_adx),
-            'macd': float(current_macd),
-            'atr_percent': float((current_atr / prices[-1]) * 100) if prices[-1] > 0 else 0
+            'rsi': float(current_rsi)
         }
         
-        momentum_text = f"Momentum: ROC={current_roc:+.2f}%, ADX={current_adx:.1f}"
+        momentum_text = f"Momentum: ROC={current_roc:+.2f}%, RSI={current_rsi:.1f}"
         
         return momentum_score, momentum_text, momentum_details
         
@@ -636,12 +503,12 @@ def analyze_ema_confluence(data: Dict[str, pd.DataFrame], direction: TrendDirect
         
         for tf in key_timeframes:
             df = data.get(tf)
-            if df is None or len(df) < 100:
+            if df is None or len(df) < 50:
                 continue
             
             prices = df['close'].values
             
-            # Calculate EMAs using pure Python
+            # Calculate EMAs
             ema_values = {}
             for period in [9, 21, 50, 200]:
                 if len(prices) >= period:
@@ -752,7 +619,7 @@ def analyze_rsi_confluence(data: Dict[str, pd.DataFrame], direction: TrendDirect
             
             prices = df['close'].values
             
-            # Calculate RSI using pure Python
+            # Calculate RSI
             rsi = calculate_rsi(prices, period=RSI_PERIOD)
             current_rsi = rsi[-1] if not np.isnan(rsi[-1]) else 50
             
@@ -869,11 +736,6 @@ def analyze_volume_profile(data: Dict[str, pd.DataFrame], direction: TrendDirect
             signal = ""
             
             if direction in [TrendDirection.BULLISH, TrendDirection.STRONG_BULLISH]:
-                # For bullish: volume should increase on up moves
-                recent_up_days = sum(1 for i in range(-5, 0) if i < 0 and prices[i] > prices[i-1])
-                recent_volume_up = sum(volumes[i] for i in range(-5, 0) if i < 0 and prices[i] > prices[i-1])
-                avg_volume_up = recent_volume_up / recent_up_days if recent_up_days > 0 else 0
-                
                 if volume_ratio > 1.5 and prices[-1] > vwap:
                     tf_score = 0.9
                     signal = f"{tf}: High Volume Breakout ({volume_ratio:.1f}x)"
@@ -888,11 +750,6 @@ def analyze_volume_profile(data: Dict[str, pd.DataFrame], direction: TrendDirect
                     signal = f"{tf}: Low Volume Caution ({volume_ratio:.1f}x)"
             
             elif direction in [TrendDirection.BEARISH, TrendDirection.STRONG_BEARISH]:
-                # For bearish: volume should increase on down moves
-                recent_down_days = sum(1 for i in range(-5, 0) if i < 0 and prices[i] < prices[i-1])
-                recent_volume_down = sum(volumes[i] for i in range(-5, 0) if i < 0 and prices[i] < prices[i-1])
-                avg_volume_down = recent_volume_down / recent_down_days if recent_down_days > 0 else 0
-                
                 if volume_ratio > 1.5 and prices[-1] < vwap:
                     tf_score = 0.9
                     signal = f"{tf}: High Volume Breakdown ({volume_ratio:.1f}x)"
@@ -939,34 +796,30 @@ def identify_trend(data: Dict[str, pd.DataFrame]) -> Tuple[TrendDirection, float
     try:
         # Use Daily timeframe for primary trend
         daily_df = data.get('DAILY')
-        if daily_df is None or len(daily_df) < 100:
+        if daily_df is None or len(daily_df) < 50:
             return TrendDirection.NEUTRAL, 0.5, {}
         
         prices = daily_df['close'].values
         
-        # Calculate trend indicators using pure Python
+        # Calculate trend indicators
         # 1. SMA trends
         sma_20 = calculate_sma(prices, 20)
         sma_50 = calculate_sma(prices, 50)
         sma_200 = calculate_sma(prices, 200)
         
-        # 2. ADX for trend strength
-        highs = daily_df['high'].values
-        lows = daily_df['low'].values
-        adx = calculate_adx(highs, lows, prices, period=14)
-        current_adx = adx[-1] if not np.isnan(adx[-1]) else 0
-        
-        # 3. Slope of moving averages
-        if not np.isnan(sma_20[-1]) and not np.isnan(sma_20[-10]):
-            sma_20_slope = (sma_20[-1] - sma_20[-10]) / sma_20[-10] if sma_20[-10] != 0 else 0
+        # 2. Calculate slope
+        if len(prices) >= 20:
+            recent_prices = prices[-20:]
+            x = np.arange(len(recent_prices))
+            slope, intercept = np.polyfit(x, recent_prices, 1)
+            slope_percent = (slope / recent_prices[0]) * 100 if recent_prices[0] != 0 else 0
         else:
-            sma_20_slope = 0
+            slope_percent = 0
         
         current_price = prices[-1]
         
         # Determine trend
         trend_score = 0
-        trend_strength = current_adx / 100  # Normalize ADX to 0-1
         
         # Check if price above/below key MAs
         price_above_20 = current_price > sma_20[-1] if not np.isnan(sma_20[-1]) else False
@@ -995,20 +848,22 @@ def identify_trend(data: Dict[str, pd.DataFrame]) -> Tuple[TrendDirection, float
         elif ma_bearish:
             trend_score -= 0.3
         
-        if sma_20_slope > 0.02:  # 2% slope up
+        if slope_percent > 0.5:  # 0.5% slope up
             trend_score += 0.1
-        elif sma_20_slope < -0.02:  # 2% slope down
+        elif slope_percent < -0.5:  # 0.5% slope down
             trend_score -= 0.1
         
         # Normalize trend score
         trend_score = max(-1, min(1, trend_score))
         
         # Determine trend direction
-        if trend_score >= 0.7 and trend_strength > 0.25:
+        trend_strength = abs(trend_score)
+        
+        if trend_score >= 0.7:
             direction = TrendDirection.STRONG_BULLISH
         elif trend_score >= 0.3:
             direction = TrendDirection.BULLISH
-        elif trend_score <= -0.7 and trend_strength > 0.25:
+        elif trend_score <= -0.7:
             direction = TrendDirection.STRONG_BEARISH
         elif trend_score <= -0.3:
             direction = TrendDirection.BEARISH
@@ -1018,12 +873,11 @@ def identify_trend(data: Dict[str, pd.DataFrame]) -> Tuple[TrendDirection, float
         trend_details = {
             'trend_score': trend_score,
             'trend_strength': trend_strength,
-            'adx': float(current_adx),
             'price_above_20': price_above_20,
             'price_above_50': price_above_50,
             'price_above_200': price_above_200,
             'ma_alignment': 'BULLISH' if ma_bullish else 'BEARISH' if ma_bearish else 'NEUTRAL',
-            'sma_20_slope': float(sma_20_slope * 100)  # Percentage
+            'slope_percent': float(slope_percent)
         }
         
         return direction, trend_strength, trend_details
@@ -1138,7 +992,7 @@ async def generate_signal(data: Dict[str, pd.DataFrame], symbol: str) -> Optiona
         support_levels = find_support_levels(data)
         resistance_levels = find_resistance_levels(data)
         
-        # Create signal
+        # Create signal - include BOTH old and new field names for compatibility
         signal = {
             'symbol': symbol,
             'side': side,
@@ -1147,7 +1001,7 @@ async def generate_signal(data: Dict[str, pd.DataFrame], symbol: str) -> Optiona
             'tp': tp,
             'status': 'OPEN',
             
-            # Analysis results
+            # New advanced analysis fields
             'mtf_alignment': mtf_direction.value,
             'wave_structure': wave_pattern[:100],
             'momentum_score': momentum_score,
@@ -1167,7 +1021,13 @@ async def generate_signal(data: Dict[str, pd.DataFrame], symbol: str) -> Optiona
             # Signal management
             'signal_hash': signal_hash,
             'price_hash': price_hash,
-            'wave_hash': wave_hash
+            'wave_hash': wave_hash,
+            
+            # Old field names for backward compatibility
+            'timeframe_alignment': f"MTF: {mtf_direction.value}",
+            'strength_level': f"Momentum: {momentum_score:.1%}",
+            'indicators_signal': f"EMA: {ema_text[:50]} | RSI: {rsi_text[:50]}",
+            'volume_status': volume_text[:100]
         }
         
         log.info(f"✅ ADVANCED SIGNAL: {symbol} {side} @ {current_price:.4f}")
@@ -1182,73 +1042,38 @@ async def generate_signal(data: Dict[str, pd.DataFrame], symbol: str) -> Optiona
 def calculate_advanced_sltp(current_price: float, side: str, data: Dict[str, pd.DataFrame]) -> Tuple[float, float, str]:
     """Advanced SL/TP calculation using technical levels"""
     try:
-        daily_df = data.get('DAILY')
         h4_df = data.get('H4')
         
-        if daily_df is None or h4_df is None:
-            return current_price * 0.98, current_price * 1.04, "Default 1:2 R:R"
+        if h4_df is None or len(h4_df) < 20:
+            # Default values
+            if side == "BUY":
+                sl = current_price * 0.98
+                tp = current_price * 1.04
+                return sl, tp, "Default 1:2 R:R"
+            else:
+                sl = current_price * 1.02
+                tp = current_price * 0.96
+                return sl, tp, "Default 1:2 R:R"
         
         if side == "BUY":
-            # Find nearest support levels
-            support_levels = find_support_levels(data)
-            if support_levels:
-                # Use the strongest support above current price
-                valid_supports = [s for s in support_levels if s < current_price]
-                if valid_supports:
-                    nearest_support = max(valid_supports)
-                    sl = nearest_support * 0.995  # 0.5% below support
-                else:
-                    # Use recent low
-                    recent_low = h4_df['low'].iloc[-20:].min()
-                    sl = recent_low * 0.99
-            else:
-                recent_low = h4_df['low'].iloc[-20:].min()
-                sl = recent_low * 0.99
+            # Use recent low as support
+            recent_low = h4_df['low'].iloc[-20:].min()
+            sl = recent_low * 0.99  # 1% below support
             
             risk = current_price - sl
             tp = current_price + (risk * 2.5)  # 1:2.5 R:R
             
-            # Adjust TP to nearest resistance
-            resistance_levels = find_resistance_levels(data)
-            if resistance_levels:
-                valid_resistances = [r for r in resistance_levels if r > current_price]
-                if valid_resistances:
-                    nearest_resistance = min(valid_resistances)
-                    if nearest_resistance < tp:
-                        tp = nearest_resistance * 0.995  # Just below resistance
-            
-            return sl, tp, "SL below support, TP below resistance"
+            return sl, tp, f"SL below support {recent_low:.2f}, TP 1:2.5 R:R"
         
         else:  # SELL
-            # Find nearest resistance levels
-            resistance_levels = find_resistance_levels(data)
-            if resistance_levels:
-                # Use the strongest resistance below current price
-                valid_resistances = [r for r in resistance_levels if r > current_price]
-                if valid_resistances:
-                    nearest_resistance = min(valid_resistances)
-                    sl = nearest_resistance * 1.005  # 0.5% above resistance
-                else:
-                    # Use recent high
-                    recent_high = h4_df['high'].iloc[-20:].max()
-                    sl = recent_high * 1.01
-            else:
-                recent_high = h4_df['high'].iloc[-20:].max()
-                sl = recent_high * 1.01
+            # Use recent high as resistance
+            recent_high = h4_df['high'].iloc[-20:].max()
+            sl = recent_high * 1.01  # 1% above resistance
             
             risk = sl - current_price
             tp = current_price - (risk * 2.5)  # 1:2.5 R:R
             
-            # Adjust TP to nearest support
-            support_levels = find_support_levels(data)
-            if support_levels:
-                valid_supports = [s for s in support_levels if s < current_price]
-                if valid_supports:
-                    nearest_support = max(valid_supports)
-                    if nearest_support > tp:
-                        tp = nearest_support * 1.005  # Just above support
-            
-            return sl, tp, "SL above resistance, TP above support"
+            return sl, tp, f"SL above resistance {recent_high:.2f}, TP 1:2.5 R:R"
         
     except Exception as e:
         log.error(f"Advanced SL/TP error: {e}")
@@ -1262,43 +1087,27 @@ def find_support_levels(data: Dict[str, pd.DataFrame]) -> List[float]:
     """Find key support levels"""
     try:
         h4_df = data.get('H4')
-        if h4_df is None or len(h4_df) < 100:
+        if h4_df is None or len(h4_df) < 50:
             return []
         
-        prices = h4_df['low'].values[-100:]
+        prices = h4_df['low'].values[-50:]
         
-        # Simple method: find price clusters (histogram peaks)
-        # Split price range into bins
-        price_min = np.min(prices)
-        price_max = np.max(prices)
+        # Simple method: find recent lows
+        recent_lows = []
+        for i in range(2, len(prices)-2):
+            if (prices[i] < prices[i-1] and prices[i] < prices[i-2] and
+                prices[i] < prices[i+1] and prices[i] < prices[i+2]):
+                recent_lows.append(prices[i])
         
-        if price_min == price_max:
+        # Get unique lows and sort
+        if recent_lows:
+            unique_lows = sorted(list(set(recent_lows)))
+            # Filter levels below current price
+            current_price = h4_df['close'].iloc[-1]
+            support_levels = [level for level in unique_lows if level < current_price]
+            return sorted(support_levels)[-3:]  # Return top 3 supports
+        else:
             return []
-        
-        bins = 10
-        bin_size = (price_max - price_min) / bins
-        
-        # Count prices in each bin
-        bin_counts = []
-        for i in range(bins):
-            bin_low = price_min + i * bin_size
-            bin_high = price_min + (i + 1) * bin_size
-            count = np.sum((prices >= bin_low) & (prices < bin_high))
-            bin_counts.append((bin_low, bin_high, count))
-        
-        # Find bins with highest counts
-        bin_counts.sort(key=lambda x: x[2], reverse=True)
-        support_levels = []
-        
-        for bin_low, bin_high, count in bin_counts[:5]:
-            if count > 5:  # Minimum 5 occurrences
-                support_levels.append((bin_low + bin_high) / 2)
-        
-        # Filter levels that are below current price
-        current_price = h4_df['close'].iloc[-1]
-        support_levels = [level for level in support_levels if level < current_price]
-        
-        return sorted(support_levels)[:3]  # Return top 3 supports
         
     except Exception as e:
         log.debug(f"Support levels error: {e}")
@@ -1308,43 +1117,27 @@ def find_resistance_levels(data: Dict[str, pd.DataFrame]) -> List[float]:
     """Find key resistance levels"""
     try:
         h4_df = data.get('H4')
-        if h4_df is None or len(h4_df) < 100:
+        if h4_df is None or len(h4_df) < 50:
             return []
         
-        prices = h4_df['high'].values[-100:]
+        prices = h4_df['high'].values[-50:]
         
-        # Simple method: find price clusters (histogram peaks)
-        # Split price range into bins
-        price_min = np.min(prices)
-        price_max = np.max(prices)
+        # Simple method: find recent highs
+        recent_highs = []
+        for i in range(2, len(prices)-2):
+            if (prices[i] > prices[i-1] and prices[i] > prices[i-2] and
+                prices[i] > prices[i+1] and prices[i] > prices[i+2]):
+                recent_highs.append(prices[i])
         
-        if price_min == price_max:
+        # Get unique highs and sort
+        if recent_highs:
+            unique_highs = sorted(list(set(recent_highs)))
+            # Filter levels above current price
+            current_price = h4_df['close'].iloc[-1]
+            resistance_levels = [level for level in unique_highs if level > current_price]
+            return sorted(resistance_levels)[:3]  # Return top 3 resistances
+        else:
             return []
-        
-        bins = 10
-        bin_size = (price_max - price_min) / bins
-        
-        # Count prices in each bin
-        bin_counts = []
-        for i in range(bins):
-            bin_low = price_min + i * bin_size
-            bin_high = price_min + (i + 1) * bin_size
-            count = np.sum((prices >= bin_low) & (prices < bin_high))
-            bin_counts.append((bin_low, bin_high, count))
-        
-        # Find bins with highest counts
-        bin_counts.sort(key=lambda x: x[2], reverse=True)
-        resistance_levels = []
-        
-        for bin_low, bin_high, count in bin_counts[:5]:
-            if count > 5:  # Minimum 5 occurrences
-                resistance_levels.append((bin_low + bin_high) / 2)
-        
-        # Filter levels that are above current price
-        current_price = h4_df['close'].iloc[-1]
-        resistance_levels = [level for level in resistance_levels if level > current_price]
-        
-        return sorted(resistance_levels)[:3]  # Return top 3 resistances
         
     except Exception as e:
         log.debug(f"Resistance levels error: {e}")
@@ -1358,7 +1151,7 @@ async def fetch_ohlcv_data(exchange, symbol: str) -> Optional[Dict[str, pd.DataF
     
     for tf_name, tf in TIMEFRAMES.items():
         try:
-            ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=tf, limit=200)
+            ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=tf, limit=100)
             
             if ohlcv and len(ohlcv) >= 50:
                 df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -1394,66 +1187,75 @@ async def fetch_ohlcv_data(exchange, symbol: str) -> Optional[Dict[str, pd.DataF
 
 async def check_advanced_duplicate(symbol: str, side: str, current_price: float,
                                  synthesis_score: float, wave_hash: str) -> Tuple[bool, str]:
-    """Advanced duplicate signal prevention"""
+    """Advanced duplicate signal prevention with fallback"""
     try:
         # Create price condition hash
         price_conditions = f"{symbol}:{side}:{current_price:.6f}:{synthesis_score:.3f}:{wave_hash}"
         price_hash = hashlib.md5(price_conditions.encode()).hexdigest()
         
         async with db_lock:
-            # Check for same wave structure in last 8 hours
-            async with db_conn.execute("""
-                SELECT COUNT(*) FROM signals 
-                WHERE wave_hash = ? AND timestamp > datetime('now', '-8 hours')
-            """, (wave_hash,)) as cursor:
-                result = await cursor.fetchone()
-                same_wave = result[0] if result else 0
-            
-            if same_wave > 0:
-                log.debug(f"{symbol}: Same wave structure detected recently")
-                return True, price_hash
+            # First check if wave_hash column exists
+            try:
+                async with db_conn.execute("""
+                    SELECT COUNT(*) FROM signals 
+                    WHERE wave_hash = ? AND timestamp > datetime('now', '-8 hours')
+                """, (wave_hash,)) as cursor:
+                    result = await cursor.fetchone()
+                    same_wave = result[0] if result else 0
+                
+                if same_wave > 0:
+                    log.debug(f"{symbol}: Same wave structure detected recently")
+                    return True, price_hash
+            except Exception as e:
+                log.debug(f"Wave hash check failed (column may not exist yet): {e}")
+                # Continue with other checks
             
             # Check for same symbol and side in last 12 hours (max 1 signal)
-            async with db_conn.execute("""
-                SELECT COUNT(*) FROM signals 
-                WHERE symbol = ? AND side = ? 
-                AND timestamp > datetime('now', '-12 hours')
-                AND status = 'OPEN'
-            """, (symbol, side)) as cursor:
-                result = await cursor.fetchone()
-                recent_signals = result[0] if result else 0
-            
-            if recent_signals >= 1:
-                log.debug(f"{symbol}: Already has open {side} signal")
-                return True, price_hash
-            
-            # Check price movement from last signal
-            async with db_conn.execute("""
-                SELECT entry, timestamp FROM signals 
-                WHERE symbol = ? AND side = ?
-                ORDER BY timestamp DESC LIMIT 1
-            """, (symbol, side)) as cursor:
-                result = await cursor.fetchone()
+            try:
+                async with db_conn.execute("""
+                    SELECT COUNT(*) FROM signals 
+                    WHERE symbol = ? AND side = ? 
+                    AND timestamp > datetime('now', '-12 hours')
+                    AND status = 'OPEN'
+                """, (symbol, side)) as cursor:
+                    result = await cursor.fetchone()
+                    recent_signals = result[0] if result else 0
                 
-                if result:
-                    last_entry, last_time = result
-                    price_change = abs(current_price - last_entry) / last_entry * 100
+                if recent_signals >= 1:
+                    log.debug(f"{symbol}: Already has open {side} signal")
+                    return True, price_hash
+            except Exception as e:
+                log.debug(f"Recent signals check failed: {e}")
+            
+            # Check price movement from last signal (using price_hash as fallback)
+            try:
+                async with db_conn.execute("""
+                    SELECT entry, timestamp FROM signals 
+                    WHERE symbol = ? AND side = ?
+                    ORDER BY timestamp DESC LIMIT 1
+                """, (symbol, side)) as cursor:
+                    result = await cursor.fetchone()
                     
-                    # Calculate hours since last signal
-                    import sqlite3
-                    conn = sqlite3.connect(DB_PATH)
-                    cursor = conn.cursor()
-                    cursor.execute("""
-                        SELECT (julianday('now') - julianday(?)) * 24
-                    """, (last_time,))
-                    hours_result = cursor.fetchone()
-                    hours_passed = hours_result[0] if hours_result else 0
-                    conn.close()
-                    
-                    # If less than 2% price movement in last 6 hours, skip
-                    if hours_passed < 6 and price_change < 2.0:
-                        log.debug(f"{symbol}: Insufficient price movement ({price_change:.2f}% in {hours_passed:.1f}h)")
-                        return True, price_hash
+                    if result:
+                        last_entry, last_time = result
+                        price_change = abs(current_price - last_entry) / last_entry * 100
+                        
+                        # If less than 2% price movement in last 6 hours, skip
+                        import sqlite3
+                        conn = sqlite3.connect(DB_PATH)
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            SELECT (julianday('now') - julianday(?)) * 24
+                        """, (last_time,))
+                        hours_result = cursor.fetchone()
+                        hours_passed = hours_result[0] if hours_result else 0
+                        conn.close()
+                        
+                        if hours_passed < 6 and price_change < 2.0:
+                            log.debug(f"{symbol}: Insufficient price movement ({price_change:.2f}% in {hours_passed:.1f}h)")
+                            return True, price_hash
+            except Exception as e:
+                log.debug(f"Price movement check failed: {e}")
         
         return False, price_hash
         
@@ -1490,7 +1292,7 @@ async def scanning_loop(exchange):
             log.info("=" * 60)
             log.info("Starting new synthesis scan cycle...")
             
-            # Get top volume pairs
+            # Get top volume pairs - FIXED: Use TOP_N from config, lower volume filter
             try:
                 tickers = await exchange.fetch_tickers()
                 usdt_pairs = []
@@ -1498,13 +1300,13 @@ async def scanning_loop(exchange):
                 for symbol, ticker in tickers.items():
                     if symbol.endswith('/USDT'):
                         volume = ticker.get('quoteVolume', 0)
-                        if volume > 5000000:  # $5M minimum volume for quality
+                        if volume > 100000:  # Reduced from $5M to $100K to get more pairs
                             usdt_pairs.append((symbol, volume))
                 
                 usdt_pairs.sort(key=lambda x: x[1], reverse=True)
-                top_pairs = usdt_pairs[:TOP_N]
+                top_pairs = usdt_pairs[:TOP_N]  # Use TOP_N from config
                 
-                log.info(f"Found {len(top_pairs)} pairs with >$5M volume")
+                log.info(f"Found {len(top_pairs)} pairs (top {TOP_N} by volume)")
                 
             except Exception as e:
                 log.error(f"Error fetching tickers: {e}")
@@ -1547,37 +1349,68 @@ async def scanning_loop(exchange):
                                 exists = result[0] if result else 0
                             
                             if exists == 0:
-                                # Insert new signal
-                                await db_conn.execute("""
-                                    INSERT INTO signals (
-                                        symbol, side, entry, sl, tp, status,
-                                        mtf_alignment, wave_structure, momentum_score,
-                                        ema_alignment, rsi_signal, volume_analysis,
-                                        trend_strength, confirmations, synthesis_score,
-                                        support_levels, resistance_levels,
-                                        signal_hash, price_hash, wave_hash
-                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                """, (
-                                    signal['symbol'], signal['side'], signal['entry'], signal['sl'],
-                                    signal['tp'], signal['status'], signal['mtf_alignment'],
-                                    signal['wave_structure'], signal['momentum_score'],
-                                    signal['ema_alignment'], signal['rsi_signal'], signal['volume_analysis'],
-                                    signal['trend_strength'], signal['confirmations'], signal['synthesis_score'],
-                                    signal['support_levels'], signal['resistance_levels'],
-                                    signal['signal_hash'], price_hash, signal['wave_hash']
-                                ))
-                                
-                                await db_conn.commit()
-                                
-                                # Send detailed Telegram alert
-                                await send_advanced_telegram_alert(signal)
-                                signals_found += 1
-                                log.info(f"✅ Advanced signal sent for {symbol}")
+                                # Insert new signal with BOTH old and new field names
+                                try:
+                                    await db_conn.execute("""
+                                        INSERT INTO signals (
+                                            symbol, side, entry, sl, tp, status,
+                                            timeframe_alignment, wave_structure, strength_level,
+                                            indicators_signal, volume_status, synthesis_score,
+                                            mtf_alignment, momentum_score, ema_alignment,
+                                            rsi_signal, volume_analysis, trend_strength,
+                                            confirmations, support_levels, resistance_levels,
+                                            signal_hash, price_hash, wave_hash
+                                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    """, (
+                                        signal['symbol'], signal['side'], signal['entry'], signal['sl'],
+                                        signal['tp'], signal['status'], 
+                                        signal['timeframe_alignment'], signal['wave_structure'], 
+                                        signal['strength_level'], signal['indicators_signal'], 
+                                        signal['volume_status'], signal['synthesis_score'],
+                                        signal['mtf_alignment'], signal['momentum_score'],
+                                        signal['ema_alignment'], signal['rsi_signal'],
+                                        signal['volume_analysis'], signal['trend_strength'],
+                                        signal['confirmations'], signal['support_levels'],
+                                        signal['resistance_levels'], signal['signal_hash'],
+                                        price_hash, signal['wave_hash']
+                                    ))
+                                    
+                                    await db_conn.commit()
+                                    
+                                    # Send detailed Telegram alert
+                                    await send_advanced_telegram_alert(signal)
+                                    signals_found += 1
+                                    log.info(f"✅ Advanced signal sent for {symbol}")
+                                except Exception as e:
+                                    log.error(f"Database insert error for {symbol}: {e}")
+                                    # Try with simpler insert (backward compatibility)
+                                    try:
+                                        await db_conn.execute("""
+                                            INSERT INTO signals (
+                                                symbol, side, entry, sl, tp, status,
+                                                timeframe_alignment, wave_structure, strength_level,
+                                                indicators_signal, volume_status, synthesis_score,
+                                                signal_hash, price_hash
+                                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                        """, (
+                                            signal['symbol'], signal['side'], signal['entry'], signal['sl'],
+                                            signal['tp'], signal['status'], 
+                                            signal['timeframe_alignment'], signal['wave_structure'], 
+                                            signal['strength_level'], signal['indicators_signal'], 
+                                            signal['volume_status'], signal['synthesis_score'],
+                                            signal['signal_hash'], price_hash
+                                        ))
+                                        await db_conn.commit()
+                                        await send_advanced_telegram_alert(signal)
+                                        signals_found += 1
+                                        log.info(f"✅ Advanced signal sent (simplified insert) for {symbol}")
+                                    except Exception as e2:
+                                        log.error(f"Simplified insert also failed for {symbol}: {e2}")
                             else:
                                 log.debug(f"Final duplicate check failed for {symbol}")
                     
                     # Respect rate limits
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.5)
                     
                 except Exception as e:
                     log.error(f"Error processing {symbol}: {e}")
@@ -1663,93 +1496,6 @@ async def send_advanced_telegram_alert(signal: Dict):
 """
         await tg(simplified)
 
-# ================ MONITORING LOOP ================
-
-async def monitoring_loop(exchange):
-    """Monitor open positions"""
-    log.info("Starting advanced monitoring loop...")
-    
-    while True:
-        try:
-            async with db_lock:
-                async with db_conn.execute("""
-                    SELECT id, symbol, side, entry, sl, tp, synthesis_score FROM signals 
-                    WHERE status='OPEN'
-                """) as cursor:
-                    open_positions = await cursor.fetchall()
-            
-            if open_positions:
-                log.info(f"Monitoring {len(open_positions)} open positions")
-            
-            for pos_id, symbol, side, entry, sl, tp, score in open_positions:
-                try:
-                    # Get current price
-                    ticker = await exchange.fetch_ticker(symbol)
-                    current_price = ticker.get('last')
-                    
-                    if not current_price:
-                        continue
-                    
-                    # Calculate PnL
-                    if side == "BUY":
-                        pnl_percent = ((current_price - entry) / entry) * 100 if entry != 0 else 0
-                        should_close_tp = current_price >= tp
-                        should_close_sl = current_price <= sl
-                    else:  # SELL
-                        pnl_percent = ((entry - current_price) / entry) * 100 if entry != 0 else 0
-                        should_close_tp = current_price <= tp
-                        should_close_sl = current_price >= sl
-                    
-                    # Close position if needed
-                    if should_close_tp or should_close_sl:
-                        close_reason = "TP_HIT" if should_close_tp else "SL_HIT"
-                        
-                        async with db_lock:
-                            await db_conn.execute("""
-                                UPDATE signals SET 
-                                    status = 'CLOSED',
-                                    close_reason = ?,
-                                    close_price = ?,
-                                    close_timestamp = CURRENT_TIMESTAMP,
-                                    pnl_percent = ?
-                                WHERE id = ?
-                            """, (close_reason, current_price, pnl_percent, pos_id))
-                            
-                            await db_conn.commit()
-                        
-                        # Send detailed closure notification
-                        side_ar = "شراء" if side == "BUY" else "بيع"
-                        result = "✅ هدف الربح" if close_reason == "TP_HIT" else "❌ وقف الخسارة"
-                        
-                        closure_message = f"""
-{result}
-
-**{symbol}** | **{side_ar}**
-الجودة الأصلية: {score:.1%}
-
-• الدخول: {entry:.4f}
-• الإغلاق: {current_price:.4f}
-• {close_reason.replace('_', ' ')}: {tp if close_reason == 'TP_HIT' else sl:.4f}
-
-• الربح/الخسارة: {'+' if pnl_percent > 0 else ''}{pnl_percent:.2f}%
-
-#إغلاق #{"ربح" if pnl_percent > 0 else "خسارة"}
-"""
-                        
-                        await tg(closure_message)
-                        log.info(f"{'✅' if close_reason == 'TP_HIT' else '❌'} {symbol}: {close_reason} | PnL: {pnl_percent:.2f}%")
-                
-                except Exception as e:
-                    log.error(f"Monitor error for {symbol}: {e}")
-                    continue
-            
-            # Wait before next check
-            await asyncio.sleep(15)
-            
-        except Exception as e:
-            log.error(f"Monitoring loop error: {e}")
-            await asyncio.sleep(30)
-
 # ================ WEB API ================
 
 app = FastAPI(title="Advanced Visual Synthesis Scanner")
@@ -1763,103 +1509,9 @@ async def root():
         "version": "3.0 - Professional (Pure Python)",
         "min_score": MIN_SYNTHESIS_SCORE,
         "min_confirmations": CONFLUENCE_REQUIRED,
-        "analysis_methods": [
-            "Multi-Timeframe Analysis",
-            "Wave Structure Analysis",
-            "Momentum & Strength",
-            "EMA Alignment",
-            "RSI Confluence",
-            "Volume Analysis",
-            "Trend Identification"
-        ]
+        "top_n": TOP_N,
+        "scan_interval": SCAN_INTERVAL
     }
-
-@app.get("/analysis/{symbol}")
-async def analyze_symbol(symbol: str):
-    """Perform real-time analysis on a symbol"""
-    try:
-        global exchange
-        if not exchange:
-            return {"error": "Exchange not initialized"}
-        
-        data = await fetch_ohlcv_data(exchange, f"{symbol}/USDT")
-        if not data:
-            return {"error": "Failed to fetch data"}
-        
-        # Perform all analyses
-        mtf_direction, mtf_score, mtf_details = await analyze_multi_timeframe(data)
-        wave_score, wave_pattern, wave_details = analyze_wave_structure(data)
-        momentum_score, momentum_text, momentum_details = analyze_momentum(data, mtf_direction)
-        ema_score, ema_text, ema_details = analyze_ema_confluence(data, mtf_direction)
-        rsi_score, rsi_text, rsi_details = analyze_rsi_confluence(data, mtf_direction)
-        volume_score, volume_text, volume_details = analyze_volume_profile(data, mtf_direction)
-        trend_direction, trend_strength, trend_details = identify_trend(data)
-        
-        # Calculate synthesis
-        scores = {
-            'mtf': mtf_score,
-            'wave': wave_score,
-            'momentum': momentum_score,
-            'ema': ema_score,
-            'rsi': rsi_score,
-            'volume': volume_score,
-            'trend': trend_strength
-        }
-        
-        weights = {
-            'mtf': 0.25, 'wave': 0.15, 'momentum': 0.15,
-            'ema': 0.20, 'rsi': 0.10, 'volume': 0.10, 'trend': 0.05
-        }
-        
-        synthesis_score = sum(scores[key] * weights[key] for key in weights)
-        confirmations = sum(1 for key in scores if scores[key] > 0.6)
-        
-        return {
-            "symbol": f"{symbol}/USDT",
-            "mtf_analysis": {
-                "direction": mtf_direction.value,
-                "score": mtf_score,
-                "details": mtf_details
-            },
-            "wave_analysis": {
-                "pattern": wave_pattern,
-                "score": wave_score,
-                "details": wave_details
-            },
-            "momentum_analysis": {
-                "score": momentum_score,
-                "text": momentum_text,
-                "details": momentum_details
-            },
-            "ema_analysis": {
-                "score": ema_score,
-                "text": ema_text,
-                "details": ema_details
-            },
-            "rsi_analysis": {
-                "score": rsi_score,
-                "text": rsi_text,
-                "details": rsi_details
-            },
-            "volume_analysis": {
-                "score": volume_score,
-                "text": volume_text,
-                "details": volume_details
-            },
-            "trend_analysis": {
-                "direction": trend_direction.value,
-                "strength": trend_strength,
-                "details": trend_details
-            },
-            "synthesis": {
-                "score": synthesis_score,
-                "confirmations": confirmations,
-                "would_signal": synthesis_score >= MIN_SYNTHESIS_SCORE and confirmations >= CONFLUENCE_REQUIRED
-            }
-        }
-        
-    except Exception as e:
-        return {"error": str(e)}
 
 # ================ MAIN ================
 
@@ -1869,8 +1521,9 @@ async def main():
     log.info("=" * 70)
     log.info("🚀 ADVANCED VISUAL SYNTHESIS SCANNER - PROFESSIONAL EDITION")
     log.info("=" * 70)
-    log.info("Methodology: Multi-Timeframe Wave Analysis with 7-Point Confirmation")
+    log.info(f"Methodology: Multi-Timeframe Wave Analysis with 7-Point Confirmation")
     log.info(f"Minimum Score: {MIN_SYNTHESIS_SCORE}, Required Confirmations: {CONFLUENCE_REQUIRED}")
+    log.info(f"Top N pairs: {TOP_N}, Scan Interval: {SCAN_INTERVAL}s")
     log.info("=" * 70)
     
     # Initialize database
@@ -1895,24 +1548,27 @@ async def main():
         return
     
     # Send startup message
-    await tg("""
+    await tg(f"""
 🚀 **الماسح الضوئي المتقدم - بدون TA-Lib**
 
 ✅ **تم بدء التشغيل بنجاح**
 ✅ **جميع المؤشرات مكتوبة بلغة بايثون البحتة**
 ✅ **لا حاجة لتثبيت مكتبات خارجية**
 
+**الإعدادات:**
+• الحد الأدنى للجودة: {MIN_SYNTHESIS_SCORE}
+• التوكيدات المطلوبة: {CONFLUENCE_REQUIRED}
+• عدد الأزواج: {TOP_N}
+• فاصل المسح: {SCAN_INTERVAL} ثانية
+
 **المنهجية المتطورة تعمل بكامل طاقتها!**
 
 جاهز للعمل...
 """)
     
-    # Start scanning and monitoring loops
+    # Start scanning loop
     try:
-        await asyncio.gather(
-            scanning_loop(exchange),
-            monitoring_loop(exchange)
-        )
+        await scanning_loop(exchange)
     except KeyboardInterrupt:
         log.info("Scanner stopped by user")
         await tg("🛑 توقف الماسح يدوياً")
