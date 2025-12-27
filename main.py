@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-Visual Synthesis Scanner - الإصدار المؤكد للإرسال بدون تكرار
+Visual Synthesis Scanner - الإصدار المتقدم
+Advanced Multi-Timeframe Wave & Synthesis Analysis
 """
 
 import os
@@ -15,8 +16,12 @@ import httpx
 import ccxt.async_support as ccxt
 import pandas as pd
 import numpy as np
-from fastapi import FastAPI
 from typing import Dict, List, Optional, Tuple, Any
+from enum import Enum
+from fastapi import FastAPI
+import talib
+from scipy import stats
+import json
 
 # ---------------- CONFIG ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -26,16 +31,33 @@ DB_PATH = "/app/data/signals.db"
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
 TOP_N = int(os.getenv("TOP_N", 60))
 
-# Easier thresholds for more signals
-MIN_SYNTHESIS_SCORE = 0.25  # Lowered from 0.6
+# Synthesis thresholds
+MIN_SYNTHESIS_SCORE = 0.45  # Higher threshold for quality signals
+CONFLUENCE_REQUIRED = 3    # Minimum number of confirmations
 
-# Timeframes - using fewer for reliability
+# Timeframes for true multi-timeframe analysis
 TIMEFRAMES = {
+    "MONTHLY": "1M",
+    "WEEKLY": "1w",
     "DAILY": "1d",
     "H4": "4h",
     "H1": "1h",
     "M15": "15m"
 }
+
+# EMA Periods for multi-EMA analysis
+EMA_PERIODS = {
+    "FAST": 9,
+    "MEDIUM": 21,
+    "SLOW": 50,
+    "LONG": 200
+}
+
+# RSI Settings
+RSI_PERIOD = 14
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 30
+RSI_NEUTRAL = 50
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -63,35 +85,13 @@ async def tg(msg: str):
         log.warning(f"Telegram failed: {e}")
 
 # ---------------- DATABASE ----------------
-async def check_and_add_column(column_name: str, column_type: str):
-    """Check if a column exists and add it if it doesn't"""
-    try:
-        # Check if column exists
-        async with db_conn.execute(f"PRAGMA table_info(signals)") as cursor:
-            columns = await cursor.fetchall()
-            column_names = [col[1] for col in columns]
-            
-            if column_name not in column_names:
-                log.info(f"Adding missing column: {column_name}")
-                await db_conn.execute(f"ALTER TABLE signals ADD COLUMN {column_name} {column_type}")
-                await db_conn.commit()
-                log.info(f"✅ Column {column_name} added successfully")
-                return True
-            else:
-                log.debug(f"Column {column_name} already exists")
-                return True
-    except Exception as e:
-        log.error(f"Error adding column {column_name}: {e}")
-        return False
-
 async def init_db():
-    """Initialize database with automatic schema updates"""
+    """Initialize database"""
     global db_conn
     try:
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
         db_conn = await aiosqlite.connect(DB_PATH)
         
-        # Create main table if it doesn't exist
         await db_conn.execute("""
             CREATE TABLE IF NOT EXISTS signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -102,388 +102,798 @@ async def init_db():
                 tp REAL NOT NULL,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 status TEXT DEFAULT 'OPEN',
-                timeframe_alignment TEXT,
+                
+                -- Analysis Results
+                mtf_alignment TEXT,
                 wave_structure TEXT,
-                strength_level TEXT,
-                indicators_signal TEXT,
-                volume_status TEXT,
+                momentum_score REAL,
+                ema_alignment TEXT,
+                rsi_signal TEXT,
+                volume_analysis TEXT,
+                trend_strength REAL,
+                
+                -- Confluence Tracking
+                confirmations INTEGER DEFAULT 0,
                 synthesis_score REAL,
+                
+                -- Technical Levels
+                support_levels TEXT,
+                resistance_levels TEXT,
+                
+                -- Signal Management
+                signal_hash TEXT UNIQUE,
+                price_hash TEXT,
+                wave_hash TEXT,
+                
+                -- Trade Management
                 close_reason TEXT,
                 close_price REAL,
                 close_timestamp DATETIME,
-                pnl_percent REAL,
-                signal_hash TEXT UNIQUE
+                pnl_percent REAL
             )
         """)
         
+        # Create indexes
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_hash ON signals(signal_hash)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_price_hash ON signals(price_hash)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON signals(status)")
         await db_conn.commit()
-        log.info("✅ Main table created/verified")
         
-        # Check and add missing columns
-        required_columns = [
-            ("price_hash", "TEXT"),
-        ]
-        
-        for column_name, column_type in required_columns:
-            if not await check_and_add_column(column_name, column_type):
-                log.error(f"Failed to add required column: {column_name}")
-                return False
-        
-        # Create indexes (will ignore if already exist)
-        try:
-            await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_price_hash ON signals(price_hash)")
-            await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_symbol_timestamp ON signals(symbol, timestamp)")
-            await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON signals(status)")
-            await db_conn.commit()
-            log.info("✅ Database indexes created/verified")
-        except Exception as e:
-            log.warning(f"Index creation warning (likely already exist): {e}")
-        
-        log.info("✅ Database ready with all required columns")
+        log.info("✅ Database initialized with advanced schema")
         return True
         
     except Exception as e:
         log.error(f"Database error: {e}")
         return False
 
-# ================ SIMPLIFIED ANALYSIS - MORE SIGNALS ================
+# ================ ADVANCED ANALYSIS MODULES ================
 
-def analyze_timeframes_simple(data: Dict[str, pd.DataFrame]) -> Tuple[str, float, str]:
-    """Simplified timeframe analysis"""
+class TrendDirection(Enum):
+    STRONG_BULLISH = "STRONG_BULLISH"
+    BULLISH = "BULLISH"
+    NEUTRAL = "NEUTRAL"
+    BEARISH = "BEARISH"
+    STRONG_BEARISH = "STRONG_BEARISH"
+
+# ---------- 1. MULTI-TIMEFRAME ANALYSIS (أراقب كل الفريمات) ----------
+async def analyze_multi_timeframe(data: Dict[str, pd.DataFrame]) -> Tuple[TrendDirection, float, Dict]:
+    """Advanced MTF analysis with EMA alignment"""
     try:
-        scores = []
-        reasons = []
+        timeframe_scores = {}
+        timeframe_details = {}
+        ema_alignments = {}
         
         for tf_name, df in data.items():
-            prices = df['close'].values
-            if len(prices) < 10:
+            if len(df) < 100:
+                timeframe_scores[tf_name] = 0
                 continue
             
-            # Simple trend: Compare last price to 10-period average
-            recent_avg = np.mean(prices[-10:])
-            current = prices[-1]
+            prices = df['close']
             
-            if current > recent_avg * 1.01:  # 1% above average
-                scores.append(1.0)
-                reasons.append(f"{tf_name}: UP")
-            elif current < recent_avg * 0.99:  # 1% below average
-                scores.append(1.0)
-                reasons.append(f"{tf_name}: DOWN")
-            else:
-                scores.append(0.5)
-                reasons.append(f"{tf_name}: NEUTRAL")
+            # Calculate EMAs for this timeframe
+            ema_signals = {}
+            for ema_name, period in EMA_PERIODS.items():
+                if len(prices) >= period:
+                    ema = talib.EMA(prices.values, timeperiod=period)
+                    if not np.isnan(ema[-1]):
+                        ema_signals[ema_name] = float(ema[-1])
+            
+            # Determine EMA alignment
+            alignment_score = 0
+            alignment_details = []
+            
+            if len(ema_signals) >= 3:
+                # Check if EMAs are in bullish alignment (fast > medium > slow)
+                if (ema_signals.get('FAST', 0) > ema_signals.get('MEDIUM', 0) > 
+                    ema_signals.get('SLOW', 0) > ema_signals.get('LONG', 0)):
+                    alignment_score = 1.0
+                    alignment_details.append("EMAs Bullish Stack")
+                # Check if EMAs are in bearish alignment (fast < medium < slow)
+                elif (ema_signals.get('FAST', 0) < ema_signals.get('MEDIUM', 0) < 
+                      ema_signals.get('SLOW', 0) < ema_signals.get('LONG', 0)):
+                    alignment_score = -1.0
+                    alignment_details.append("EMAs Bearish Stack")
+                # Check for golden cross/death cross
+                elif ema_signals.get('FAST', 0) > ema_signals.get('MEDIUM', 0):
+                    alignment_score = 0.6
+                    alignment_details.append("Golden Cross Setup")
+                elif ema_signals.get('FAST', 0) < ema_signals.get('MEDIUM', 0):
+                    alignment_score = -0.6
+                    alignment_details.append("Death Cross Setup")
+            
+            ema_alignments[tf_name] = alignment_details
+            
+            # Price position relative to EMAs
+            current_price = prices.iloc[-1]
+            price_score = 0
+            
+            if 'FAST' in ema_signals and 'LONG' in ema_signals:
+                if current_price > ema_signals['FAST'] > ema_signals['LONG']:
+                    price_score = 0.8
+                elif current_price < ema_signals['FAST'] < ema_signals['LONG']:
+                    price_score = -0.8
+                elif current_price > ema_signals['LONG']:
+                    price_score = 0.4
+                else:
+                    price_score = -0.4
+            
+            # Combine scores
+            timeframe_score = (alignment_score + price_score) / 2
+            timeframe_scores[tf_name] = timeframe_score
+            timeframe_details[tf_name] = {
+                'score': timeframe_score,
+                'price': current_price,
+                'emas': ema_signals,
+                'alignment': alignment_details
+            }
         
-        if not scores:
-            return "NEUTRAL", 0.0, "No data"
+        # Weight timeframes (higher weight to higher timeframes)
+        weights = {
+            'MONTHLY': 1.5, 'WEEKLY': 1.3, 'DAILY': 1.2,
+            'H4': 1.0, 'H1': 0.8, 'M15': 0.5
+        }
         
-        avg_score = np.mean(scores)
+        weighted_scores = []
+        for tf, score in timeframe_scores.items():
+            if tf in weights:
+                weighted_scores.append(score * weights[tf])
         
-        # Determine dominant direction
-        up_count = sum(1 for r in reasons if "UP" in r)
-        down_count = sum(1 for r in reasons if "DOWN" in r)
+        if not weighted_scores:
+            return TrendDirection.NEUTRAL, 0.0, {}
         
-        if up_count > down_count:
-            direction = "UP"
-        elif down_count > up_count:
-            direction = "DOWN"
+        avg_score = np.mean(weighted_scores)
+        
+        # Determine trend direction
+        if avg_score >= 0.7:
+            direction = TrendDirection.STRONG_BULLISH
+        elif avg_score >= 0.3:
+            direction = TrendDirection.BULLISH
+        elif avg_score <= -0.7:
+            direction = TrendDirection.STRONG_BEARISH
+        elif avg_score <= -0.3:
+            direction = TrendDirection.BEARISH
         else:
-            direction = "NEUTRAL"
+            direction = TrendDirection.NEUTRAL
         
-        reason = " | ".join(reasons[:3])  # First 3 reasons only
+        details = {
+            'scores': timeframe_scores,
+            'details': timeframe_details,
+            'ema_alignments': ema_alignments,
+            'weighted_average': avg_score
+        }
         
-        return direction, avg_score, reason
+        return direction, avg_score, details
         
     except Exception as e:
-        log.error(f"Timeframe error: {e}")
-        return "NEUTRAL", 0.0, f"Error: {e}"
+        log.error(f"MTF analysis error: {e}")
+        return TrendDirection.NEUTRAL, 0.0, {}
 
-def analyze_wave_simple(data: Dict[str, pd.DataFrame], direction: str) -> Tuple[float, str]:
-    """Simplified wave analysis"""
+# ---------- 2. WAVE ANALYSIS (المدى الموجي) ----------
+def analyze_wave_structure(data: Dict[str, pd.DataFrame]) -> Tuple[float, str, Dict]:
+    """Advanced wave structure analysis using multiple timeframes"""
     try:
+        # Focus on H4 and Daily for wave analysis
         h4_df = data.get('H4')
-        if h4_df is None or len(h4_df) < 20:
-            return 0.6, "Insufficient data"
+        daily_df = data.get('DAILY')
         
-        prices = h4_df['close'].values[-20:]
+        if h4_df is None or daily_df is None or len(h4_df) < 50 or len(daily_df) < 100:
+            return 0.5, "Insufficient data", {}
         
-        # Simple wave detection: higher highs for uptrend, lower lows for downtrend
-        if direction == "UP":
-            # Check if recent prices are making higher highs
-            recent_high = np.max(prices[-5:])
-            prev_high = np.max(prices[-10:-5])
+        wave_details = {}
+        
+        # Analyze H4 for shorter waves
+        h4_prices = h4_df['close'].values[-50:]
+        h4_highs = h4_df['high'].values[-50:]
+        h4_lows = h4_df['low'].values[-50:]
+        
+        # Find swing highs and lows
+        swing_highs = []
+        swing_lows = []
+        
+        for i in range(2, len(h4_prices)-2):
+            if (h4_highs[i] > h4_highs[i-1] and h4_highs[i] > h4_highs[i-2] and
+                h4_highs[i] > h4_highs[i+1] and h4_highs[i] > h4_highs[i+2]):
+                swing_highs.append((i, h4_highs[i]))
             
-            if recent_high > prev_high:
-                return 0.8, "Higher highs detected"
-            else:
-                return 0.5, "No clear higher highs"
+            if (h4_lows[i] < h4_lows[i-1] and h4_lows[i] < h4_lows[i-2] and
+                h4_lows[i] < h4_lows[i+1] and h4_lows[i] < h4_lows[i+2]):
+                swing_lows.append((i, h4_lows[i]))
         
-        elif direction == "DOWN":
-            # Check if recent prices are making lower lows
-            recent_low = np.min(prices[-5:])
-            prev_low = np.min(prices[-10:-5])
+        # Analyze wave structure
+        if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+            # Check for higher highs and higher lows (uptrend)
+            if (swing_highs[-1][1] > swing_highs[-2][1] and 
+                swing_lows[-1][1] > swing_lows[-2][1]):
+                wave_score = 0.8
+                wave_pattern = "Impulsive Uptrend (Higher Highs & Lows)"
             
-            if recent_low < prev_low:
-                return 0.8, "Lower lows detected"
+            # Check for lower highs and lower lows (downtrend)
+            elif (swing_highs[-1][1] < swing_highs[-2][1] and 
+                  swing_lows[-1][1] < swing_lows[-2][1]):
+                wave_score = 0.8
+                wave_pattern = "Impulsive Downtrend (Lower Highs & Lows)"
+            
+            # Check for consolidation
+            elif (abs(swing_highs[-1][1] - swing_highs[-2][1]) < swing_highs[-2][1] * 0.02 and
+                  abs(swing_lows[-1][1] - swing_lows[-2][1]) < swing_lows[-2][1] * 0.02):
+                wave_score = 0.5
+                wave_pattern = "Consolidation/Range"
+            
             else:
-                return 0.5, "No clear lower lows"
+                wave_score = 0.6
+                wave_pattern = "Corrective/Complex Structure"
         
-        return 0.6, "Neutral wave pattern"
+        else:
+            wave_score = 0.5
+            wave_pattern = "No clear wave structure"
+        
+        wave_details = {
+            'swing_highs': len(swing_highs),
+            'swing_lows': len(swing_lows),
+            'pattern': wave_pattern,
+            'current_high': float(h4_highs[-1]),
+            'current_low': float(h4_lows[-1])
+        }
+        
+        return wave_score, wave_pattern, wave_details
         
     except Exception as e:
-        log.error(f"Wave error: {e}")
-        return 0.5, f"Error: {e}"
+        log.error(f"Wave analysis error: {e}")
+        return 0.5, f"Error: {e}", {}
 
-def analyze_strength_simple(data: Dict[str, pd.DataFrame], direction: str) -> Tuple[float, str]:
-    """Simplified strength analysis"""
+# ---------- 3. MOMENTUM/STRENGTH ANALYSIS (القوة) ----------
+def analyze_momentum(data: Dict[str, pd.DataFrame], direction: TrendDirection) -> Tuple[float, str, Dict]:
+    """Analyze momentum using multiple indicators"""
     try:
         h1_df = data.get('H1')
-        if h1_df is None or len(h1_df) < 10:
-            return 0.6, "Insufficient data"
+        if h1_df is None or len(h1_df) < 50:
+            return 0.5, "Insufficient data", {}
         
-        recent = h1_df.iloc[-5:]  # Last 5 candles
+        prices = h1_df['close'].values
+        highs = h1_df['high'].values
+        lows = h1_df['low'].values
         
-        # Calculate bullish/bearish pressure
-        if direction == "UP":
-            bullish_candles = sum(recent['close'] > recent['open'])
-            score = bullish_candles / 5
-            strength = "Bullish pressure"
-        else:  # DOWN
-            bearish_candles = sum(recent['close'] < recent['open'])
-            score = bearish_candles / 5
-            strength = "Bearish pressure"
+        # Calculate ATR for volatility
+        atr = talib.ATR(highs, lows, prices, timeperiod=14)
+        current_atr = atr[-1] if not np.isnan(atr[-1]) else 0
         
-        return score, strength
+        # Calculate momentum using ROC
+        roc = talib.ROC(prices, timeperiod=10)
+        current_roc = roc[-1] if not np.isnan(roc[-1]) else 0
         
-    except Exception as e:
-        log.error(f"Strength error: {e}")
-        return 0.5, f"Error: {e}"
-
-def analyze_indicators_simple(data: Dict[str, pd.DataFrame], direction: str) -> Tuple[float, str]:
-    """Simplified indicators - just RSI"""
-    try:
-        m15_df = data.get('M15')
-        if m15_df is None or len(m15_df) < 14:
-            return 0.6, "Insufficient data"
+        # Calculate ADX for trend strength
+        adx = talib.ADX(highs, lows, prices, timeperiod=14)
+        current_adx = adx[-1] if not np.isnan(adx[-1]) else 0
         
-        prices = m15_df['close'].values[-14:]
+        # Calculate MACD
+        macd, macd_signal, macd_hist = talib.MACD(prices)
+        current_macd = macd[-1] if not np.isnan(macd[-1]) else 0
         
-        # Simple RSI calculation
-        deltas = np.diff(prices)
-        gains = deltas[deltas > 0]
-        losses = -deltas[deltas < 0]
+        # Determine momentum score
+        momentum_score = 0.5
         
-        avg_gain = np.mean(gains) if len(gains) > 0 else 0
-        avg_loss = np.mean(losses) if len(losses) > 0 else 0
+        if direction in [TrendDirection.BULLISH, TrendDirection.STRONG_BULLISH]:
+            if current_roc > 0 and current_macd > 0:
+                momentum_score = 0.8
+                if current_adx > 25:
+                    momentum_score = 0.9
+            elif current_roc > 0:
+                momentum_score = 0.7
         
-        if avg_loss == 0:
-            rsi = 100 if avg_gain > 0 else 0
-        else:
-            rs = avg_gain / avg_loss
-            rsi = 100 - (100 / (1 + rs))
+        elif direction in [TrendDirection.BEARISH, TrendDirection.STRONG_BEARISH]:
+            if current_roc < 0 and current_macd < 0:
+                momentum_score = 0.8
+                if current_adx > 25:
+                    momentum_score = 0.9
+            elif current_roc < 0:
+                momentum_score = 0.7
         
-        # Check if RSI supports direction
-        if direction == "UP":
-            if rsi < 50:  # Oversold or neutral
-                return 0.8, f"RSI {rsi:.0f} (Supports UP)"
-            else:
-                return 0.4, f"RSI {rsi:.0f} (Caution)"
-        else:  # DOWN
-            if rsi > 50:  # Overbought or neutral
-                return 0.8, f"RSI {rsi:.0f} (Supports DOWN)"
-            else:
-                return 0.4, f"RSI {rsi:.0f} (Caution)"
+        # Create momentum details
+        momentum_details = {
+            'atr': float(current_atr),
+            'roc': float(current_roc),
+            'adx': float(current_adx),
+            'macd': float(current_macd),
+            'atr_percent': float((current_atr / prices[-1]) * 100) if prices[-1] > 0 else 0
+        }
         
-    except Exception as e:
-        log.error(f"Indicators error: {e}")
-        return 0.5, f"Error: {e}"
-
-def analyze_volume_simple(data: Dict[str, pd.DataFrame], direction: str) -> Tuple[float, str]:
-    """Simplified volume analysis"""
-    try:
-        m15_df = data.get('M15')
-        if m15_df is None or len(m15_df) < 10:
-            return 0.6, "Insufficient data"
+        momentum_text = f"Momentum: ROC={current_roc:+.2f}%, ADX={current_adx:.1f}"
         
-        recent_volume = m15_df['volume'].values[-5:].mean()
-        prev_volume = m15_df['volume'].values[-10:-5].mean()
-        
-        if prev_volume == 0:
-            volume_ratio = 1
-        else:
-            volume_ratio = recent_volume / prev_volume
-        
-        if volume_ratio > 1.2:
-            return 0.8, f"Volume increasing ({volume_ratio:.1f}x)"
-        elif volume_ratio > 0.8:
-            return 0.6, f"Volume normal ({volume_ratio:.1f}x)"
-        else:
-            return 0.4, f"Volume low ({volume_ratio:.1f}x)"
+        return momentum_score, momentum_text, momentum_details
         
     except Exception as e:
-        log.error(f"Volume error: {e}")
-        return 0.5, f"Error: {e}"
+        log.error(f"Momentum analysis error: {e}")
+        return 0.5, f"Error: {e}", {}
 
-def calculate_simple_sltp(current_price: float, side: str, data: Dict[str, pd.DataFrame]) -> Tuple[float, float, str]:
-    """Simple SL/TP calculation"""
+# ---------- 4. EMA ANALYSIS (المؤشرات - EMA) ----------
+def analyze_ema_confluence(data: Dict[str, pd.DataFrame], direction: TrendDirection) -> Tuple[float, str, Dict]:
+    """Analyze EMA alignment across timeframes"""
     try:
-        h4_df = data.get('H4')
-        if h4_df is None or len(h4_df) < 20:
-            # Default values if no data
-            if side == "BUY":
-                sl = current_price * 0.98  # 2% stop loss
-                tp = current_price * 1.04  # 4% take profit
-            else:
-                sl = current_price * 1.02  # 2% stop loss
-                tp = current_price * 0.96  # 4% take profit
-            
-            return sl, tp, "Default 1:2 R:R"
+        confluence_score = 0
+        confluence_details = {}
+        ema_signals = []
         
-        if side == "BUY":
-            # Find recent support
-            recent_low = h4_df['low'].iloc[-10:].min()
-            sl = recent_low * 0.99  # 1% below support
-            
-            risk = current_price - sl
-            tp = current_price + (risk * 2)  # 1:2 risk reward
-            
-            return sl, tp, f"SL below {recent_low:.2f}, TP 1:2 R:R"
+        # Analyze EMA alignment across key timeframes
+        key_timeframes = ['DAILY', 'H4', 'H1']
         
-        else:  # SELL
-            # Find recent resistance
-            recent_high = h4_df['high'].iloc[-10:].max()
-            sl = recent_high * 1.01  # 1% above resistance
+        for tf in key_timeframes:
+            df = data.get(tf)
+            if df is None or len(df) < 100:
+                continue
             
-            risk = sl - current_price
-            tp = current_price - (risk * 2)  # 1:2 risk reward
+            prices = df['close'].values
             
-            return sl, tp, f"SL above {recent_high:.2f}, TP 1:2 R:R"
-        
-    except Exception as e:
-        log.error(f"SL/TP error: {e}")
-        # Fallback values
-        if side == "BUY":
-            return current_price * 0.98, current_price * 1.04, "Error fallback"
-        else:
-            return current_price * 1.02, current_price * 0.96, "Error fallback"
-
-# ================ SIGNAL GENERATION WITH DEDUPLICATION ================
-
-async def check_duplicate_signal(symbol: str, side: str, current_price: float, 
-                                tf_score: float, wave_score: float) -> Tuple[bool, str]:
-    """Check if similar signal was recently sent"""
-    try:
-        # Create price condition hash (based on market conditions, not time)
-        price_conditions = f"{symbol}:{side}:{current_price:.4f}:{tf_score:.2f}:{wave_score:.2f}"
-        price_hash = hashlib.md5(price_conditions.encode()).hexdigest()
-        
-        async with db_lock:
-            # Check for same price conditions in last 4 hours
-            async with db_conn.execute("""
-                SELECT COUNT(*) FROM signals 
-                WHERE price_hash = ? AND timestamp > datetime('now', '-4 hours')
-            """, (price_hash,)) as cursor:
-                same_conditions = (await cursor.fetchone())[0]
+            # Calculate EMAs
+            ema_values = {}
+            for period in [9, 21, 50, 200]:
+                if len(prices) >= period:
+                    ema = talib.EMA(prices, timeperiod=period)
+                    if not np.isnan(ema[-1]):
+                        ema_values[period] = float(ema[-1])
             
-            if same_conditions > 0:
-                log.debug(f"{symbol}: Same market conditions detected recently")
-                return True, price_hash
+            if len(ema_values) < 2:
+                continue
             
-            # Check for same symbol and side in last 6 hours (max 2 signals)
-            async with db_conn.execute("""
-                SELECT COUNT(*) FROM signals 
-                WHERE symbol = ? AND side = ? 
-                AND timestamp > datetime('now', '-6 hours')
-                AND status = 'OPEN'
-            """, (symbol, side)) as cursor:
-                recent_signals = (await cursor.fetchone())[0]
+            # Check EMA alignment
+            current_price = prices[-1]
+            ema_signal = ""
+            tf_score = 0
             
-            if recent_signals >= 2:
-                log.debug(f"{symbol}: Too many recent {side} signals ({recent_signals})")
-                return True, price_hash
-            
-            # Check if price hasn't moved much from last signal
-            async with db_conn.execute("""
-                SELECT entry FROM signals 
-                WHERE symbol = ? AND side = ? 
-                AND timestamp > datetime('now', '-2 hours')
-                ORDER BY timestamp DESC LIMIT 1
-            """, (symbol, side)) as cursor:
-                result = await cursor.fetchone()
+            if direction in [TrendDirection.BULLISH, TrendDirection.STRONG_BULLISH]:
+                # Bullish: Price above EMAs, EMAs in bullish order
+                price_above_emas = all(current_price > ema for ema in ema_values.values())
+                emas_bullish = all(ema_values[9] > ema_values[21] > ema_values[50]) if len(ema_values) >= 3 else False
                 
-                if result:
-                    last_entry = result[0]
-                    price_change = abs(current_price - last_entry) / last_entry * 100
-                    
-                    if price_change < 0.5:  # Less than 0.5% price change
-                        log.debug(f"{symbol}: Price hasn't moved enough ({price_change:.2f}%)")
-                        return True, price_hash
+                if price_above_emas and emas_bullish:
+                    tf_score = 1.0
+                    ema_signal = f"{tf}: Strong Bullish Alignment"
+                elif price_above_emas:
+                    tf_score = 0.7
+                    ema_signal = f"{tf}: Price Above EMAs"
+                elif current_price > ema_values.get(200, 0):
+                    tf_score = 0.6
+                    ema_signal = f"{tf}: Above 200 EMA"
+            
+            elif direction in [TrendDirection.BEARISH, TrendDirection.STRONG_BEARISH]:
+                # Bearish: Price below EMAs, EMAs in bearish order
+                price_below_emas = all(current_price < ema for ema in ema_values.values())
+                emas_bearish = all(ema_values[9] < ema_values[21] < ema_values[50]) if len(ema_values) >= 3 else False
+                
+                if price_below_emas and emas_bearish:
+                    tf_score = 1.0
+                    ema_signal = f"{tf}: Strong Bearish Alignment"
+                elif price_below_emas:
+                    tf_score = 0.7
+                    ema_signal = f"{tf}: Price Below EMAs"
+                elif current_price < ema_values.get(200, 0):
+                    tf_score = 0.6
+                    ema_signal = f"{tf}: Below 200 EMA"
+            
+            confluence_score += tf_score
+            ema_signals.append(ema_signal)
+            confluence_details[tf] = {
+                'score': tf_score,
+                'signal': ema_signal,
+                'emas': ema_values,
+                'price': float(current_price)
+            }
         
-        return False, price_hash
+        # Average the confluence score
+        if confluence_details:
+            confluence_score = confluence_score / len(confluence_details)
+        
+        confluence_text = " | ".join([s for s in ema_signals if s])
+        
+        return confluence_score, confluence_text, confluence_details
         
     except Exception as e:
-        log.error(f"Duplicate check error: {e}")
-        # If error, create a random hash and allow the signal
-        return False, hashlib.md5(f"{symbol}:{time.time_ns()}".encode()).hexdigest()
+        log.error(f"EMA analysis error: {e}")
+        return 0.5, f"Error: {e}", {}
 
-async def generate_signal_simple(data: Dict[str, pd.DataFrame], symbol: str) -> Optional[Dict]:
-    """Generate signal with simple logic and duplicate prevention"""
+# ---------- 5. RSI ANALYSIS (المؤشرات - RSI) ----------
+def analyze_rsi_confluence(data: Dict[str, pd.DataFrame], direction: TrendDirection) -> Tuple[float, str, Dict]:
+    """Analyze RSI across multiple timeframes"""
     try:
-        log.info(f"Analyzing {symbol}...")
+        rsi_details = {}
+        rsi_signals = []
+        total_score = 0
+        tf_count = 0
         
-        # 1. Timeframe analysis
-        direction, tf_score, tf_reason = analyze_timeframes_simple(data)
+        # Analyze RSI on key timeframes
+        key_timeframes = ['DAILY', 'H4', 'H1', 'M15']
         
-        if direction == "NEUTRAL":
-            log.debug(f"{symbol}: No clear direction")
+        for tf in key_timeframes:
+            df = data.get(tf)
+            if df is None or len(df) < 30:
+                continue
+            
+            prices = df['close'].values
+            
+            # Calculate RSI
+            rsi = talib.RSI(prices, timeperiod=RSI_PERIOD)
+            current_rsi = rsi[-1] if not np.isnan(rsi[-1]) else 50
+            
+            # Determine RSI signal
+            tf_score = 0
+            signal = ""
+            
+            if direction in [TrendDirection.BULLISH, TrendDirection.STRONG_BULLISH]:
+                if current_rsi < RSI_OVERSOLD:
+                    tf_score = 0.9
+                    signal = f"{tf}: RSI Oversold ({current_rsi:.1f})"
+                elif current_rsi < RSI_NEUTRAL:
+                    tf_score = 0.7
+                    signal = f"{tf}: RSI Bullish Zone ({current_rsi:.1f})"
+                elif current_rsi < RSI_OVERBOUGHT:
+                    tf_score = 0.5
+                    signal = f"{tf}: RSI Neutral ({current_rsi:.1f})"
+                else:
+                    tf_score = 0.3
+                    signal = f"{tf}: RSI Overbought ({current_rsi:.1f})"
+            
+            elif direction in [TrendDirection.BEARISH, TrendDirection.STRONG_BEARISH]:
+                if current_rsi > RSI_OVERBOUGHT:
+                    tf_score = 0.9
+                    signal = f"{tf}: RSI Overbought ({current_rsi:.1f})"
+                elif current_rsi > RSI_NEUTRAL:
+                    tf_score = 0.7
+                    signal = f"{tf}: RSI Bearish Zone ({current_rsi:.1f})"
+                elif current_rsi > RSI_OVERSOLD:
+                    tf_score = 0.5
+                    signal = f"{tf}: RSI Neutral ({current_rsi:.1f})"
+                else:
+                    tf_score = 0.3
+                    signal = f"{tf}: RSI Oversold ({current_rsi:.1f})"
+            else:
+                # Neutral direction
+                if current_rsi < 40:
+                    tf_score = 0.6
+                    signal = f"{tf}: RSI Approaching Oversold ({current_rsi:.1f})"
+                elif current_rsi > 60:
+                    tf_score = 0.6
+                    signal = f"{tf}: RSI Approaching Overbought ({current_rsi:.1f})"
+                else:
+                    tf_score = 0.5
+                    signal = f"{tf}: RSI Neutral ({current_rsi:.1f})"
+            
+            total_score += tf_score
+            tf_count += 1
+            rsi_signals.append(signal)
+            
+            rsi_details[tf] = {
+                'rsi': float(current_rsi),
+                'score': tf_score,
+                'signal': signal,
+                'zone': get_rsi_zone(current_rsi)
+            }
+        
+        # Calculate average RSI score
+        if tf_count > 0:
+            avg_score = total_score / tf_count
+        else:
+            avg_score = 0.5
+        
+        rsi_text = " | ".join(rsi_signals)
+        
+        return avg_score, rsi_text, rsi_details
+        
+    except Exception as e:
+        log.error(f"RSI analysis error: {e}")
+        return 0.5, f"Error: {e}", {}
+
+def get_rsi_zone(rsi_value: float) -> str:
+    """Get RSI zone description"""
+    if rsi_value < 30:
+        return "OVERSOLD"
+    elif rsi_value < 50:
+        return "BULLISH_ZONE"
+    elif rsi_value < 70:
+        return "BEARISH_ZONE"
+    else:
+        return "OVERBOUGHT"
+
+# ---------- 6. VOLUME ANALYSIS (Volume) ----------
+def analyze_volume_profile(data: Dict[str, pd.DataFrame], direction: TrendDirection) -> Tuple[float, str, Dict]:
+    """Advanced volume analysis"""
+    try:
+        volume_details = {}
+        volume_signals = []
+        total_score = 0
+        tf_count = 0
+        
+        # Analyze volume across timeframes
+        key_timeframes = ['DAILY', 'H4', 'H1']
+        
+        for tf in key_timeframes:
+            df = data.get(tf)
+            if df is None or len(df) < 20:
+                continue
+            
+            prices = df['close'].values
+            volumes = df['volume'].values
+            
+            # Calculate volume indicators
+            current_volume = volumes[-1]
+            avg_volume = np.mean(volumes[-20:])
+            volume_ratio = current_volume / avg_volume if avg_volume > 0 else 1
+            
+            # Calculate Volume Weighted Average Price (VWAP) for recent period
+            typical_price = (df['high'] + df['low'] + df['close']) / 3
+            vwap = (typical_price * df['volume']).sum() / df['volume'].sum()
+            
+            # Check if volume confirms price action
+            tf_score = 0.5
+            signal = ""
+            
+            if direction in [TrendDirection.BULLISH, TrendDirection.STRONG_BULLISH]:
+                # For bullish: volume should increase on up moves
+                recent_up_days = sum(1 for i in range(-5, 0) if i < 0 and prices[i] > prices[i-1])
+                recent_volume_up = sum(volumes[i] for i in range(-5, 0) if i < 0 and prices[i] > prices[i-1])
+                avg_volume_up = recent_volume_up / recent_up_days if recent_up_days > 0 else 0
+                
+                if volume_ratio > 1.5 and prices[-1] > vwap:
+                    tf_score = 0.9
+                    signal = f"{tf}: High Volume Breakout ({volume_ratio:.1f}x)"
+                elif volume_ratio > 1.2 and prices[-1] > vwap:
+                    tf_score = 0.7
+                    signal = f"{tf}: Volume Confirmed Uptrend ({volume_ratio:.1f}x)"
+                elif volume_ratio > 1.0:
+                    tf_score = 0.6
+                    signal = f"{tf}: Average Volume ({volume_ratio:.1f}x)"
+                else:
+                    tf_score = 0.4
+                    signal = f"{tf}: Low Volume Caution ({volume_ratio:.1f}x)"
+            
+            elif direction in [TrendDirection.BEARISH, TrendDirection.STRONG_BEARISH]:
+                # For bearish: volume should increase on down moves
+                recent_down_days = sum(1 for i in range(-5, 0) if i < 0 and prices[i] < prices[i-1])
+                recent_volume_down = sum(volumes[i] for i in range(-5, 0) if i < 0 and prices[i] < prices[i-1])
+                avg_volume_down = recent_volume_down / recent_down_days if recent_down_days > 0 else 0
+                
+                if volume_ratio > 1.5 and prices[-1] < vwap:
+                    tf_score = 0.9
+                    signal = f"{tf}: High Volume Breakdown ({volume_ratio:.1f}x)"
+                elif volume_ratio > 1.2 and prices[-1] < vwap:
+                    tf_score = 0.7
+                    signal = f"{tf}: Volume Confirmed Downtrend ({volume_ratio:.1f}x)"
+                elif volume_ratio > 1.0:
+                    tf_score = 0.6
+                    signal = f"{tf}: Average Volume ({volume_ratio:.1f}x)"
+                else:
+                    tf_score = 0.4
+                    signal = f"{tf}: Low Volume Caution ({volume_ratio:.1f}x)"
+            
+            total_score += tf_score
+            tf_count += 1
+            volume_signals.append(signal)
+            
+            volume_details[tf] = {
+                'volume_ratio': float(volume_ratio),
+                'current_volume': float(current_volume),
+                'avg_volume': float(avg_volume),
+                'vwap': float(vwap),
+                'score': tf_score,
+                'signal': signal
+            }
+        
+        # Calculate average volume score
+        if tf_count > 0:
+            avg_score = total_score / tf_count
+        else:
+            avg_score = 0.5
+        
+        volume_text = " | ".join(volume_signals)
+        
+        return avg_score, volume_text, volume_details
+        
+    except Exception as e:
+        log.error(f"Volume analysis error: {e}")
+        return 0.5, f"Error: {e}", {}
+
+# ---------- 7. TREND IDENTIFICATION (أحدد الاتجاه) ----------
+def identify_trend(data: Dict[str, pd.DataFrame]) -> Tuple[TrendDirection, float, Dict]:
+    """Comprehensive trend identification"""
+    try:
+        # Use Daily timeframe for primary trend
+        daily_df = data.get('DAILY')
+        if daily_df is None or len(daily_df) < 100:
+            return TrendDirection.NEUTRAL, 0.5, {}
+        
+        prices = daily_df['close'].values
+        
+        # Calculate trend indicators
+        # 1. SMA trends
+        sma_20 = talib.SMA(prices, timeperiod=20)
+        sma_50 = talib.SMA(prices, timeperiod=50)
+        sma_200 = talib.SMA(prices, timeperiod=200)
+        
+        # 2. ADX for trend strength
+        highs = daily_df['high'].values
+        lows = daily_df['low'].values
+        adx = talib.ADX(highs, lows, prices, timeperiod=14)
+        current_adx = adx[-1] if not np.isnan(adx[-1]) else 0
+        
+        # 3. Slope of moving averages
+        if not np.isnan(sma_20[-1]) and not np.isnan(sma_20[-10]):
+            sma_20_slope = (sma_20[-1] - sma_20[-10]) / sma_20[-10]
+        else:
+            sma_20_slope = 0
+        
+        current_price = prices[-1]
+        
+        # Determine trend
+        trend_score = 0
+        trend_strength = current_adx / 100  # Normalize ADX to 0-1
+        
+        # Check if price above/below key MAs
+        price_above_20 = current_price > sma_20[-1] if not np.isnan(sma_20[-1]) else False
+        price_above_50 = current_price > sma_50[-1] if not np.isnan(sma_50[-1]) else False
+        price_above_200 = current_price > sma_200[-1] if not np.isnan(sma_200[-1]) else False
+        
+        # Check MA alignment
+        ma_bullish = False
+        ma_bearish = False
+        
+        if (not np.isnan(sma_20[-1]) and not np.isnan(sma_50[-1]) and 
+            not np.isnan(sma_200[-1])):
+            ma_bullish = sma_20[-1] > sma_50[-1] > sma_200[-1]
+            ma_bearish = sma_20[-1] < sma_50[-1] < sma_200[-1]
+        
+        # Calculate trend score
+        if price_above_200:
+            trend_score += 0.3
+        if price_above_50:
+            trend_score += 0.2
+        if price_above_20:
+            trend_score += 0.1
+        
+        if ma_bullish:
+            trend_score += 0.3
+        elif ma_bearish:
+            trend_score -= 0.3
+        
+        if sma_20_slope > 0.02:  # 2% slope up
+            trend_score += 0.1
+        elif sma_20_slope < -0.02:  # 2% slope down
+            trend_score -= 0.1
+        
+        # Normalize trend score
+        trend_score = max(-1, min(1, trend_score))
+        
+        # Determine trend direction
+        if trend_score >= 0.7 and trend_strength > 0.25:
+            direction = TrendDirection.STRONG_BULLISH
+        elif trend_score >= 0.3:
+            direction = TrendDirection.BULLISH
+        elif trend_score <= -0.7 and trend_strength > 0.25:
+            direction = TrendDirection.STRONG_BEARISH
+        elif trend_score <= -0.3:
+            direction = TrendDirection.BEARISH
+        else:
+            direction = TrendDirection.NEUTRAL
+        
+        trend_details = {
+            'trend_score': trend_score,
+            'trend_strength': trend_strength,
+            'adx': float(current_adx),
+            'price_above_20': price_above_20,
+            'price_above_50': price_above_50,
+            'price_above_200': price_above_200,
+            'ma_alignment': 'BULLISH' if ma_bullish else 'BEARISH' if ma_bearish else 'NEUTRAL',
+            'sma_20_slope': float(sma_20_slope * 100)  # Percentage
+        }
+        
+        return direction, trend_strength, trend_details
+        
+    except Exception as e:
+        log.error(f"Trend identification error: {e}")
+        return TrendDirection.NEUTRAL, 0.5, {}
+
+# ================ SIGNAL SYNTHESIS ================
+
+async def generate_signal(data: Dict[str, pd.DataFrame], symbol: str) -> Optional[Dict]:
+    """Generate signal using advanced synthesis analysis"""
+    try:
+        log.info(f"🔍 Analyzing {symbol} with advanced synthesis...")
+        
+        # 1. MULTI-TIMEFRAME ANALYSIS (أراقب كل الفريمات)
+        mtf_direction, mtf_score, mtf_details = await analyze_multi_timeframe(data)
+        
+        if mtf_direction == TrendDirection.NEUTRAL:
+            log.debug(f"{symbol}: No clear MTF direction")
             return None
         
-        log.info(f"{symbol}: Direction {direction}, Score: {tf_score:.2f}")
+        log.info(f"{symbol}: MTF Direction: {mtf_direction.value}, Score: {mtf_score:.2f}")
         
-        # 2. Other analyses
-        wave_score, wave_reason = analyze_wave_simple(data, direction)
-        strength_score, strength_reason = analyze_strength_simple(data, direction)
-        indicators_score, indicators_reason = analyze_indicators_simple(data, direction)
-        volume_score, volume_reason = analyze_volume_simple(data, direction)
+        # 2. WAVE ANALYSIS (المدى الموجي)
+        wave_score, wave_pattern, wave_details = analyze_wave_structure(data)
         
-        # 3. Calculate total score (simple average)
-        scores = [tf_score, wave_score, strength_score, indicators_score, volume_score]
-        total_score = np.mean(scores)
+        # 3. MOMENTUM ANALYSIS (القوة)
+        momentum_score, momentum_text, momentum_details = analyze_momentum(data, mtf_direction)
         
-        log.info(f"{symbol}: Total score {total_score:.2f}")
+        # 4. EMA ANALYSIS (المؤشرات - EMA)
+        ema_score, ema_text, ema_details = analyze_ema_confluence(data, mtf_direction)
         
-        # 4. Check if score is good enough
-        if total_score < MIN_SYNTHESIS_SCORE:
-            log.debug(f"{symbol}: Score too low ({total_score:.2f} < {MIN_SYNTHESIS_SCORE})")
+        # 5. RSI ANALYSIS (المؤشرات - RSI)
+        rsi_score, rsi_text, rsi_details = analyze_rsi_confluence(data, mtf_direction)
+        
+        # 6. VOLUME ANALYSIS (Volume)
+        volume_score, volume_text, volume_details = analyze_volume_profile(data, mtf_direction)
+        
+        # 7. TREND IDENTIFICATION (أحدد الاتجاه)
+        trend_direction, trend_strength, trend_details = identify_trend(data)
+        
+        # Check if all analyses agree on direction
+        side = "BUY" if mtf_direction in [TrendDirection.BULLISH, TrendDirection.STRONG_BULLISH] else "SELL"
+        
+        # Calculate synthesis score (weighted average)
+        weights = {
+            'mtf': 0.25,      # Multi-timeframe analysis
+            'wave': 0.15,     # Wave structure
+            'momentum': 0.15, # Momentum
+            'ema': 0.20,      # EMA alignment
+            'rsi': 0.10,      # RSI confluence
+            'volume': 0.10,   # Volume confirmation
+            'trend': 0.05     # Trend strength
+        }
+        
+        scores = {
+            'mtf': mtf_score,
+            'wave': wave_score,
+            'momentum': momentum_score,
+            'ema': ema_score,
+            'rsi': rsi_score,
+            'volume': volume_score,
+            'trend': trend_strength
+        }
+        
+        # Calculate weighted synthesis score
+        synthesis_score = sum(scores[key] * weights[key] for key in weights)
+        
+        # Count confirmations (scores above threshold)
+        confirmations = sum(1 for key in scores if scores[key] > 0.6)
+        
+        log.info(f"{symbol}: Synthesis Score: {synthesis_score:.2f}, Confirmations: {confirmations}/{len(scores)}")
+        
+        # Check minimum requirements
+        if synthesis_score < MIN_SYNTHESIS_SCORE:
+            log.debug(f"{symbol}: Synthesis score too low ({synthesis_score:.2f} < {MIN_SYNTHESIS_SCORE})")
             return None
         
-        # 5. Get current price
+        if confirmations < CONFLUENCE_REQUIRED:
+            log.debug(f"{symbol}: Insufficient confirmations ({confirmations} < {CONFLUENCE_REQUIRED})")
+            return None
+        
+        # Check if trend direction matches MTF direction
+        if (mtf_direction in [TrendDirection.BULLISH, TrendDirection.STRONG_BULLISH] and
+            trend_direction in [TrendDirection.BEARISH, TrendDirection.STRONG_BEARISH]):
+            log.debug(f"{symbol}: Trend direction conflict")
+            return None
+        
+        # Get current price
         current_price = data['M15']['close'].iloc[-1]
-        side = "BUY" if direction == "UP" else "SELL"
         
-        # 6. Check for duplicates BEFORE calculating SL/TP
-        is_duplicate, price_hash = await check_duplicate_signal(
-            symbol, side, current_price, tf_score, wave_score
-        )
-        
-        if is_duplicate:
-            return None
-        
-        # 7. Calculate SL/TP
-        sl, tp, sltp_logic = calculate_simple_sltp(current_price, side, data)
+        # Calculate SL/TP using advanced methods
+        sl, tp, sltp_logic = calculate_advanced_sltp(current_price, side, data)
         
         # Calculate risk/reward
         risk = abs(current_price - sl)
         reward = abs(tp - current_price)
         rr_ratio = reward / risk if risk > 0 else 0
         
-        # Skip if R:R is too poor
-        if rr_ratio < 1.0:
+        if rr_ratio < 1.5:  # Minimum 1.5:1 R:R
             log.debug(f"{symbol}: Poor R:R ratio ({rr_ratio:.1f}:1)")
             return None
         
-        # 8. Create unique signal hash
+        # Create unique hashes for duplicate prevention
+        price_hash = hashlib.md5(f"{symbol}:{side}:{current_price:.8f}".encode()).hexdigest()
+        wave_hash = hashlib.md5(f"{symbol}:{wave_pattern}".encode()).hexdigest()
         unique_id = f"{symbol}:{side}:{current_price:.8f}:{time.time_ns()}"
         signal_hash = hashlib.md5(unique_id.encode()).hexdigest()
+        
+        # Find key support/resistance levels
+        support_levels = find_support_levels(data)
+        resistance_levels = find_resistance_levels(data)
         
         # Create signal
         signal = {
@@ -494,24 +904,190 @@ async def generate_signal_simple(data: Dict[str, pd.DataFrame], symbol: str) -> 
             'tp': tp,
             'status': 'OPEN',
             
-            'timeframe_alignment': tf_reason[:80],
-            'wave_structure': wave_reason[:80],
-            'strength_level': strength_reason[:80],
-            'indicators_signal': indicators_reason[:80],
-            'volume_status': volume_reason[:80],
-            'synthesis_score': total_score,
+            # Analysis results
+            'mtf_alignment': mtf_direction.value,
+            'wave_structure': wave_pattern[:100],
+            'momentum_score': momentum_score,
+            'ema_alignment': ema_text[:200],
+            'rsi_signal': rsi_text[:200],
+            'volume_analysis': volume_text[:200],
+            'trend_strength': trend_strength,
             
+            # Confluence tracking
+            'confirmations': confirmations,
+            'synthesis_score': synthesis_score,
+            
+            # Technical levels
+            'support_levels': json.dumps(support_levels),
+            'resistance_levels': json.dumps(resistance_levels),
+            
+            # Signal management
             'signal_hash': signal_hash,
-            'price_hash': price_hash
+            'price_hash': price_hash,
+            'wave_hash': wave_hash
         }
         
-        log.info(f"✅ SIGNAL: {symbol} {side} @ {current_price:.4f} | Score: {total_score:.2f} | R:R: {rr_ratio:.1f}:1")
+        log.info(f"✅ ADVANCED SIGNAL: {symbol} {side} @ {current_price:.4f}")
+        log.info(f"   Score: {synthesis_score:.2f}, Confirmations: {confirmations}, R:R: {rr_ratio:.1f}:1")
         
         return signal
         
     except Exception as e:
-        log.error(f"Signal generation error for {symbol}: {e}")
+        log.error(f"Advanced signal generation error for {symbol}: {e}")
         return None
+
+def calculate_advanced_sltp(current_price: float, side: str, data: Dict[str, pd.DataFrame]) -> Tuple[float, float, str]:
+    """Advanced SL/TP calculation using technical levels"""
+    try:
+        daily_df = data.get('DAILY')
+        h4_df = data.get('H4')
+        
+        if daily_df is None or h4_df is None:
+            return current_price * 0.98, current_price * 1.04, "Default 1:2 R:R"
+        
+        if side == "BUY":
+            # Find nearest support levels
+            support_levels = find_support_levels(data)
+            if support_levels:
+                # Use the strongest support above current price
+                valid_supports = [s for s in support_levels if s < current_price]
+                if valid_supports:
+                    nearest_support = max(valid_supports)
+                    sl = nearest_support * 0.995  # 0.5% below support
+                else:
+                    # Use recent low
+                    recent_low = h4_df['low'].iloc[-20:].min()
+                    sl = recent_low * 0.99
+            else:
+                recent_low = h4_df['low'].iloc[-20:].min()
+                sl = recent_low * 0.99
+            
+            risk = current_price - sl
+            tp = current_price + (risk * 2.5)  # 1:2.5 R:R
+            
+            # Adjust TP to nearest resistance
+            resistance_levels = find_resistance_levels(data)
+            if resistance_levels:
+                valid_resistances = [r for r in resistance_levels if r > current_price]
+                if valid_resistances:
+                    nearest_resistance = min(valid_resistances)
+                    if nearest_resistance < tp:
+                        tp = nearest_resistance * 0.995  # Just below resistance
+            
+            return sl, tp, "SL below support, TP below resistance"
+        
+        else:  # SELL
+            # Find nearest resistance levels
+            resistance_levels = find_resistance_levels(data)
+            if resistance_levels:
+                # Use the strongest resistance below current price
+                valid_resistances = [r for r in resistance_levels if r > current_price]
+                if valid_resistances:
+                    nearest_resistance = min(valid_resistances)
+                    sl = nearest_resistance * 1.005  # 0.5% above resistance
+                else:
+                    # Use recent high
+                    recent_high = h4_df['high'].iloc[-20:].max()
+                    sl = recent_high * 1.01
+            else:
+                recent_high = h4_df['high'].iloc[-20:].max()
+                sl = recent_high * 1.01
+            
+            risk = sl - current_price
+            tp = current_price - (risk * 2.5)  # 1:2.5 R:R
+            
+            # Adjust TP to nearest support
+            support_levels = find_support_levels(data)
+            if support_levels:
+                valid_supports = [s for s in support_levels if s < current_price]
+                if valid_supports:
+                    nearest_support = max(valid_supports)
+                    if nearest_support > tp:
+                        tp = nearest_support * 1.005  # Just above support
+            
+            return sl, tp, "SL above resistance, TP above support"
+        
+    except Exception as e:
+        log.error(f"Advanced SL/TP error: {e}")
+        # Fallback
+        if side == "BUY":
+            return current_price * 0.98, current_price * 1.04, "Error fallback"
+        else:
+            return current_price * 1.02, current_price * 0.96, "Error fallback"
+
+def find_support_levels(data: Dict[str, pd.DataFrame]) -> List[float]:
+    """Find key support levels"""
+    try:
+        h4_df = data.get('H4')
+        if h4_df is None or len(h4_df) < 100:
+            return []
+        
+        prices = h4_df['low'].values[-100:]
+        
+        # Use K-means clustering to find price clusters (support levels)
+        from sklearn.cluster import KMeans
+        import numpy as np
+        
+        # Reshape for clustering
+        X = prices.reshape(-1, 1)
+        
+        # Find 3-5 support levels
+        n_clusters = min(5, len(prices) // 20)
+        if n_clusters < 2:
+            return []
+        
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        kmeans.fit(X)
+        
+        # Get cluster centers (support levels)
+        support_levels = sorted([float(center[0]) for center in kmeans.cluster_centers_])
+        
+        # Filter levels that are below current price
+        current_price = h4_df['close'].iloc[-1]
+        support_levels = [level for level in support_levels if level < current_price]
+        
+        return support_levels[:3]  # Return top 3 supports
+        
+    except Exception as e:
+        log.debug(f"Support levels error: {e}")
+        return []
+
+def find_resistance_levels(data: Dict[str, pd.DataFrame]) -> List[float]:
+    """Find key resistance levels"""
+    try:
+        h4_df = data.get('H4')
+        if h4_df is None or len(h4_df) < 100:
+            return []
+        
+        prices = h4_df['high'].values[-100:]
+        
+        # Use K-means clustering to find price clusters (resistance levels)
+        from sklearn.cluster import KMeans
+        import numpy as np
+        
+        # Reshape for clustering
+        X = prices.reshape(-1, 1)
+        
+        # Find 3-5 resistance levels
+        n_clusters = min(5, len(prices) // 20)
+        if n_clusters < 2:
+            return []
+        
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        kmeans.fit(X)
+        
+        # Get cluster centers (resistance levels)
+        resistance_levels = sorted([float(center[0]) for center in kmeans.cluster_centers_])
+        
+        # Filter levels that are above current price
+        current_price = h4_df['close'].iloc[-1]
+        resistance_levels = [level for level in resistance_levels if level > current_price]
+        
+        return resistance_levels[:3]  # Return top 3 resistances
+        
+    except Exception as e:
+        log.debug(f"Resistance levels error: {e}")
+        return []
 
 # ================ DATA FETCHING ================
 
@@ -521,9 +1097,9 @@ async def fetch_ohlcv_data(exchange, symbol: str) -> Optional[Dict[str, pd.DataF
     
     for tf_name, tf in TIMEFRAMES.items():
         try:
-            ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=tf, limit=50)
+            ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=tf, limit=200)
             
-            if ohlcv and len(ohlcv) >= 20:
+            if ohlcv and len(ohlcv) >= 50:
                 df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
                 
                 # Convert to numeric
@@ -533,7 +1109,7 @@ async def fetch_ohlcv_data(exchange, symbol: str) -> Optional[Dict[str, pd.DataF
                 # Remove any NaN values
                 df = df.dropna()
                 
-                if len(df) >= 15:
+                if len(df) >= 50:
                     data[tf_name] = df
                 else:
                     log.debug(f"{symbol} {tf}: Not enough data after cleaning")
@@ -544,7 +1120,7 @@ async def fetch_ohlcv_data(exchange, symbol: str) -> Optional[Dict[str, pd.DataF
             log.debug(f"{symbol} {tf} fetch error: {e}")
             continue
     
-    # Check if we have all required timeframes
+    # Check if we have minimum required data
     required_tfs = ['DAILY', 'H4', 'H1', 'M15']
     for tf in required_tfs:
         if tf not in data:
@@ -553,19 +1129,102 @@ async def fetch_ohlcv_data(exchange, symbol: str) -> Optional[Dict[str, pd.DataF
     
     return data
 
-# ================ SCANNING LOOP ================
+# ================ DUPLICATE PREVENTION ================
+
+async def check_advanced_duplicate(symbol: str, side: str, current_price: float,
+                                 synthesis_score: float, wave_hash: str) -> Tuple[bool, str]:
+    """Advanced duplicate signal prevention"""
+    try:
+        # Create price condition hash
+        price_conditions = f"{symbol}:{side}:{current_price:.6f}:{synthesis_score:.3f}:{wave_hash}"
+        price_hash = hashlib.md5(price_conditions.encode()).hexdigest()
+        
+        async with db_lock:
+            # Check for same wave structure in last 8 hours
+            async with db_conn.execute("""
+                SELECT COUNT(*) FROM signals 
+                WHERE wave_hash = ? AND timestamp > datetime('now', '-8 hours')
+            """, (wave_hash,)) as cursor:
+                same_wave = (await cursor.fetchone())[0]
+            
+            if same_wave > 0:
+                log.debug(f"{symbol}: Same wave structure detected recently")
+                return True, price_hash
+            
+            # Check for same symbol and side in last 12 hours (max 1 signal)
+            async with db_conn.execute("""
+                SELECT COUNT(*) FROM signals 
+                WHERE symbol = ? AND side = ? 
+                AND timestamp > datetime('now', '-12 hours')
+                AND status = 'OPEN'
+            """, (symbol, side)) as cursor:
+                recent_signals = (await cursor.fetchone())[0]
+            
+            if recent_signals >= 1:
+                log.debug(f"{symbol}: Already has open {side} signal")
+                return True, price_hash
+            
+            # Check price movement from last signal
+            async with db_conn.execute("""
+                SELECT entry, timestamp FROM signals 
+                WHERE symbol = ? AND side = ?
+                ORDER BY timestamp DESC LIMIT 1
+            """, (symbol, side)) as cursor:
+                result = await cursor.fetchone()
+                
+                if result:
+                    last_entry, last_time = result
+                    price_change = abs(current_price - last_entry) / last_entry * 100
+                    
+                    # Calculate hours since last signal
+                    import sqlite3
+                    conn = sqlite3.connect(DB_PATH)
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT (julianday('now') - julianday(?)) * 24
+                    """, (last_time,))
+                    hours_passed = cursor.fetchone()[0] or 0
+                    conn.close()
+                    
+                    # If less than 2% price movement in last 6 hours, skip
+                    if hours_passed < 6 and price_change < 2.0:
+                        log.debug(f"{symbol}: Insufficient price movement ({price_change:.2f}% in {hours_passed:.1f}h)")
+                        return True, price_hash
+        
+        return False, price_hash
+        
+    except Exception as e:
+        log.error(f"Duplicate check error: {e}")
+        return False, hashlib.md5(f"{symbol}:{time.time_ns()}".encode()).hexdigest()
+
+# ================ MAIN SCANNING LOOP ================
 
 async def scanning_loop(exchange):
     """Main scanning loop"""
-    log.info("🚀 Starting scanner with duplicate prevention")
+    log.info("🚀 Starting ADVANCED scanner with synthesis analysis")
     
-    # Test Telegram
-    await tg("🚀 Scanner started with duplicate prevention!")
+    await tg("""
+🚀 **بدء الماسح الضوئي المتقدم - التحليل الموجي المتعدد**
+
+✅ **المنهجية المتطورة:**
+1. **التحليل متعدد الفريمات** (MTF Analysis)
+2. **الهيكل الموجي** (Wave Structure)
+3. **الزخم والقوة** (Momentum & Strength)
+4. **محاذاة المتوسطات** (EMA Alignment)
+5. **توافق RSI** (RSI Confluence)
+6. **تحليل الفوليوم** (Volume Analysis)
+7. **تحديد الاتجاه** (Trend Identification)
+
+🎯 **نظام التوكيد:** يتطلب ٣ مؤشرات تأكيد على الأقل
+📊 **الجودة الدنيا:** ٦٥٪
+
+جاهز للعمل...
+""")
     
     while True:
         try:
-            log.info("=" * 50)
-            log.info("Starting new scan cycle...")
+            log.info("=" * 60)
+            log.info("Starting new synthesis scan cycle...")
             
             # Get top volume pairs
             try:
@@ -575,13 +1234,13 @@ async def scanning_loop(exchange):
                 for symbol, ticker in tickers.items():
                     if symbol.endswith('/USDT'):
                         volume = ticker.get('quoteVolume', 0)
-                        if volume > 1000000:  # $1M minimum volume
+                        if volume > 5000000:  # $5M minimum volume for quality
                             usdt_pairs.append((symbol, volume))
                 
                 usdt_pairs.sort(key=lambda x: x[1], reverse=True)
                 top_pairs = usdt_pairs[:TOP_N]
                 
-                log.info(f"Found {len(top_pairs)} pairs with sufficient volume")
+                log.info(f"Found {len(top_pairs)} pairs with >$5M volume")
                 
             except Exception as e:
                 log.error(f"Error fetching tickers: {e}")
@@ -592,17 +1251,27 @@ async def scanning_loop(exchange):
             
             for symbol, volume in top_pairs:
                 try:
-                    log.debug(f"Processing {symbol}...")
+                    log.debug(f"Processing {symbol} (Volume: ${volume:,.0f})...")
                     
                     # Fetch data
                     data = await fetch_ohlcv_data(exchange, symbol)
                     if not data:
                         continue
                     
-                    # Generate signal
-                    signal = await generate_signal_simple(data, symbol)
+                    # Generate advanced signal
+                    signal = await generate_signal(data, symbol)
                     
                     if signal:
+                        # Advanced duplicate check
+                        is_duplicate, price_hash = await check_advanced_duplicate(
+                            signal['symbol'], signal['side'], signal['entry'],
+                            signal['synthesis_score'], signal['wave_hash']
+                        )
+                        
+                        if is_duplicate:
+                            log.debug(f"{symbol}: Advanced duplicate check failed")
+                            continue
+                        
                         # Save to database
                         async with db_lock:
                             # Final duplicate check with signal hash
@@ -617,65 +1286,39 @@ async def scanning_loop(exchange):
                                 await db_conn.execute("""
                                     INSERT INTO signals (
                                         symbol, side, entry, sl, tp, status,
-                                        timeframe_alignment, wave_structure, strength_level,
-                                        indicators_signal, volume_status, synthesis_score,
-                                        signal_hash, price_hash
-                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                        mtf_alignment, wave_structure, momentum_score,
+                                        ema_alignment, rsi_signal, volume_analysis,
+                                        trend_strength, confirmations, synthesis_score,
+                                        support_levels, resistance_levels,
+                                        signal_hash, price_hash, wave_hash
+                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                                 """, (
                                     signal['symbol'], signal['side'], signal['entry'], signal['sl'],
-                                    signal['tp'], signal['status'], signal['timeframe_alignment'],
-                                    signal['wave_structure'], signal['strength_level'],
-                                    signal['indicators_signal'], signal['volume_status'],
-                                    signal['synthesis_score'], signal['signal_hash'], signal['price_hash']
+                                    signal['tp'], signal['status'], signal['mtf_alignment'],
+                                    signal['wave_structure'], signal['momentum_score'],
+                                    signal['ema_alignment'], signal['rsi_signal'], signal['volume_analysis'],
+                                    signal['trend_strength'], signal['confirmations'], signal['synthesis_score'],
+                                    signal['support_levels'], signal['resistance_levels'],
+                                    signal['signal_hash'], price_hash, signal['wave_hash']
                                 ))
                                 
                                 await db_conn.commit()
                                 
-                                # Send Telegram alert
-                                side_ar = "شراء" if signal['side'] == "BUY" else "بيع"
-                                risk_pct = abs(signal['entry'] - signal['sl']) / signal['entry'] * 100
-                                reward_pct = abs(signal['tp'] - signal['entry']) / signal['entry'] * 100
-                                rr_ratio = reward_pct / risk_pct if risk_pct > 0 else 0
-                                
-                                message = f"""
-🎯 **إشارة تداول جديدة**
-
-**{signal['symbol']}** | **{side_ar}**
-
-📊 **التحليل:**
-• الفريمات: {signal['timeframe_alignment']}
-• الموجة: {signal['wave_structure']}
-• القوة: {signal['strength_level']}
-• المؤشرات: {signal['indicators_signal']}
-• الفوليوم: {signal['volume_status']}
-
-📈 **الجودة: {signal['synthesis_score']:.1%}**
-
-💰 **التنفيذ:**
-• الدخول: {signal['entry']:.4f}
-• وقف الخسارة: {signal['sl']:.4f}
-• هدف الربح: {signal['tp']:.4f}
-• نسبة الربح/المخاطرة: {rr_ratio:.1f}:1
-
-⏰ **المتابعة التلقائية مفعلة**
-
-#{side_ar} #تداول
-"""
-                                
-                                await tg(message)
+                                # Send detailed Telegram alert
+                                await send_advanced_telegram_alert(signal)
                                 signals_found += 1
-                                log.info(f"✅ Signal sent for {symbol}")
+                                log.info(f"✅ Advanced signal sent for {symbol}")
                             else:
                                 log.debug(f"Final duplicate check failed for {symbol}")
                     
-                    # Small delay between symbols
-                    await asyncio.sleep(0.5)
+                    # Respect rate limits
+                    await asyncio.sleep(0.3)
                     
                 except Exception as e:
                     log.error(f"Error processing {symbol}: {e}")
                     continue
             
-            log.info(f"Scan complete. Found {signals_found} new signals.")
+            log.info(f"Advanced scan complete. Found {signals_found} high-quality signals.")
             
             # Wait for next scan
             log.info(f"Waiting {SCAN_INTERVAL} seconds for next scan...")
@@ -685,17 +1328,87 @@ async def scanning_loop(exchange):
             log.error(f"Scan loop error: {e}")
             await asyncio.sleep(30)
 
-# ================ MONITORING ================
+async def send_advanced_telegram_alert(signal: Dict):
+    """Send detailed Telegram alert for advanced signal"""
+    try:
+        side_ar = "شراء" if signal['side'] == "BUY" else "بيع"
+        entry = signal['entry']
+        sl = signal['sl']
+        tp = signal['tp']
+        
+        risk_pct = abs(entry - sl) / entry * 100
+        reward_pct = abs(tp - entry) / entry * 100
+        rr_ratio = reward_pct / risk_pct if risk_pct > 0 else 0
+        
+        # Parse support/resistance levels
+        try:
+            support_levels = json.loads(signal.get('support_levels', '[]'))
+            resistance_levels = json.loads(signal.get('resistance_levels', '[]'))
+        except:
+            support_levels = []
+            resistance_levels = []
+        
+        message = f"""
+🎯 **إشارة تداول متقدمة - التحليل الموجي**
+
+**{signal['symbol']}** | **{side_ar}**
+📊 **الجودة: {signal['synthesis_score']:.1%}** | **التوكيدات: {signal['confirmations']}/7**
+
+━━━━━━━━━━━━━━━━━━
+📈 **التحليل الفني:**
+
+• **الفريمات المتعددة:** {signal['mtf_alignment']}
+• **الهيكل الموجي:** {signal['wave_structure']}
+• **الزخم:** {signal['momentum_score']:.1%}
+• **المتوسطات:** {signal['ema_alignment'][:100]}
+• **RSI:** {signal['rsi_signal'][:100]}
+• **الفوليوم:** {signal['volume_analysis'][:100]}
+• **قوة الاتجاه:** {signal['trend_strength']:.1%}
+
+━━━━━━━━━━━━━━━━━━
+💰 **مستويات التداول:**
+
+• **الدخول:** `{entry:.4f}`
+• **وقف الخسارة:** `{sl:.4f}` ({risk_pct:.1f}%)
+• **هدف الربح:** `{tp:.4f}` ({reward_pct:.1f}%)
+• **نسبة الربح/المخاطرة:** **{rr_ratio:.1f}:1**
+
+"""
+        
+        if support_levels:
+            message += f"• **الدعوم:** {', '.join([f'{s:.2f}' for s in support_levels])}\n"
+        if resistance_levels:
+            message += f"• **المقاومات:** {', '.join([f'{r:.2f}' for r in resistance_levels])}\n"
+        
+        message += f"""
+━━━━━━━━━━━━━━━━━━
+⏰ **المتابعة التلقائية مفعلة**
+
+#{side_ar} #تداول_متقدم #التحليل_الموجي
+"""
+        
+        await tg(message)
+        
+    except Exception as e:
+        log.error(f"Telegram alert error: {e}")
+        # Send simplified alert
+        simplified = f"""
+✅ **إشارة جديدة:** {signal['symbol']} {signal['side']}
+الدخول: {signal['entry']:.4f} | الجودة: {signal['synthesis_score']:.1%}
+"""
+        await tg(simplified)
+
+# ================ MONITORING LOOP ================
 
 async def monitoring_loop(exchange):
     """Monitor open positions"""
-    log.info("Starting monitoring loop...")
+    log.info("Starting advanced monitoring loop...")
     
     while True:
         try:
             async with db_lock:
                 async with db_conn.execute("""
-                    SELECT id, symbol, side, entry, sl, tp FROM signals 
+                    SELECT id, symbol, side, entry, sl, tp, synthesis_score FROM signals 
                     WHERE status='OPEN'
                 """) as cursor:
                     open_positions = await cursor.fetchall()
@@ -703,7 +1416,7 @@ async def monitoring_loop(exchange):
             if open_positions:
                 log.info(f"Monitoring {len(open_positions)} open positions")
             
-            for pos_id, symbol, side, entry, sl, tp in open_positions:
+            for pos_id, symbol, side, entry, sl, tp, score in open_positions:
                 try:
                     # Get current price
                     ticker = await exchange.fetch_ticker(symbol)
@@ -712,28 +1425,20 @@ async def monitoring_loop(exchange):
                     if not current_price:
                         continue
                     
-                    # Check if position should be closed
-                    close_reason = None
-                    pnl_percent = 0
-                    
+                    # Calculate PnL
                     if side == "BUY":
-                        if current_price >= tp:
-                            close_reason = "TP_HIT"
-                            pnl_percent = ((current_price - entry) / entry) * 100
-                        elif current_price <= sl:
-                            close_reason = "SL_HIT"
-                            pnl_percent = ((current_price - entry) / entry) * 100
-                    
+                        pnl_percent = ((current_price - entry) / entry) * 100
+                        should_close_tp = current_price >= tp
+                        should_close_sl = current_price <= sl
                     else:  # SELL
-                        if current_price <= tp:
-                            close_reason = "TP_HIT"
-                            pnl_percent = ((entry - current_price) / entry) * 100
-                        elif current_price >= sl:
-                            close_reason = "SL_HIT"
-                            pnl_percent = ((entry - current_price) / entry) * 100
+                        pnl_percent = ((entry - current_price) / entry) * 100
+                        should_close_tp = current_price <= tp
+                        should_close_sl = current_price >= sl
                     
                     # Close position if needed
-                    if close_reason:
+                    if should_close_tp or should_close_sl:
+                        close_reason = "TP_HIT" if should_close_tp else "SL_HIT"
+                        
                         async with db_lock:
                             await db_conn.execute("""
                                 UPDATE signals SET 
@@ -747,25 +1452,26 @@ async def monitoring_loop(exchange):
                             
                             await db_conn.commit()
                         
-                        # Send notification
+                        # Send detailed closure notification
                         side_ar = "شراء" if side == "BUY" else "بيع"
-                        result = "هدف الربح" if close_reason == "TP_HIT" else "وقف الخسارة"
+                        result = "✅ هدف الربح" if close_reason == "TP_HIT" else "❌ وقف الخسارة"
                         
-                        await tg(f"""
-{'✅' if close_reason == 'TP_HIT' else '❌'} **تم إغلاق الصفقة**
+                        closure_message = f"""
+{result}
 
 **{symbol}** | **{side_ar}**
-النتيجة: {result}
+الجودة الأصلية: {score:.1%}
 
 • الدخول: {entry:.4f}
 • الإغلاق: {current_price:.4f}
-• {result}: {tp if close_reason == 'TP_HIT' else sl:.4f}
+• {close_reason.replace('_', ' ')}: {tp if close_reason == 'TP_HIT' else sl:.4f}
 
 • الربح/الخسارة: {'+' if pnl_percent > 0 else ''}{pnl_percent:.2f}%
 
 #إغلاق #{"ربح" if pnl_percent > 0 else "خسارة"}
-""")
+"""
                         
+                        await tg(closure_message)
                         log.info(f"{'✅' if close_reason == 'TP_HIT' else '❌'} {symbol}: {close_reason} | PnL: {pnl_percent:.2f}%")
                 
                 except Exception as e:
@@ -773,7 +1479,7 @@ async def monitoring_loop(exchange):
                     continue
             
             # Wait before next check
-            await asyncio.sleep(10)
+            await asyncio.sleep(15)
             
         except Exception as e:
             log.error(f"Monitoring loop error: {e}")
@@ -781,146 +1487,112 @@ async def monitoring_loop(exchange):
 
 # ================ WEB API ================
 
-app = FastAPI()
+app = FastAPI(title="Advanced Visual Synthesis Scanner")
 
 @app.get("/")
 async def root():
     return {
         "status": "running",
-        "scanner": "Visual Synthesis Scanner",
-        "version": "2.0 - No Duplicates",
+        "scanner": "Advanced Visual Synthesis Scanner",
+        "methodology": "Multi-Timeframe Wave Analysis",
+        "version": "3.0 - Professional",
         "min_score": MIN_SYNTHESIS_SCORE,
-        "scan_interval": SCAN_INTERVAL
+        "min_confirmations": CONFLUENCE_REQUIRED,
+        "analysis_methods": [
+            "Multi-Timeframe Analysis",
+            "Wave Structure Analysis",
+            "Momentum & Strength",
+            "EMA Alignment",
+            "RSI Confluence",
+            "Volume Analysis",
+            "Trend Identification"
+        ]
     }
 
-@app.get("/test-telegram")
-async def test_telegram():
-    """Test Telegram connectivity"""
+@app.get("/analysis/{symbol}")
+async def analyze_symbol(symbol: str):
+    """Perform real-time analysis on a symbol"""
     try:
-        await tg("🔔 Test message from scanner API")
-        return {"status": "success", "message": "Test message sent"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-@app.get("/force-scan")
-async def force_scan():
-    """Force an immediate scan"""
-    return {
-        "status": "queued",
-        "message": "Scan will run on next cycle",
-        "note": "Use /test-signal for immediate test"
-    }
-
-@app.get("/test-signal")
-async def test_signal():
-    """Generate and send a test signal"""
-    try:
-        test_signal = {
-            'symbol': 'BTC/USDT',
-            'side': 'BUY',
-            'entry': 50000.00,
-            'sl': 49000.00,
-            'tp': 52000.00,
-            'synthesis_score': 0.75
+        global exchange
+        if not exchange:
+            return {"error": "Exchange not initialized"}
+        
+        data = await fetch_ohlcv_data(exchange, f"{symbol}/USDT")
+        if not data:
+            return {"error": "Failed to fetch data"}
+        
+        # Perform all analyses
+        mtf_direction, mtf_score, mtf_details = await analyze_multi_timeframe(data)
+        wave_score, wave_pattern, wave_details = analyze_wave_structure(data)
+        momentum_score, momentum_text, momentum_details = analyze_momentum(data, mtf_direction)
+        ema_score, ema_text, ema_details = analyze_ema_confluence(data, mtf_direction)
+        rsi_score, rsi_text, rsi_details = analyze_rsi_confluence(data, mtf_direction)
+        volume_score, volume_text, volume_details = analyze_volume_profile(data, mtf_direction)
+        trend_direction, trend_strength, trend_details = identify_trend(data)
+        
+        # Calculate synthesis
+        scores = {
+            'mtf': mtf_score,
+            'wave': wave_score,
+            'momentum': momentum_score,
+            'ema': ema_score,
+            'rsi': rsi_score,
+            'volume': volume_score,
+            'trend': trend_strength
         }
         
-        side_ar = "شراء" if test_signal['side'] == "BUY" else "بيع"
+        weights = {
+            'mtf': 0.25, 'wave': 0.15, 'momentum': 0.15,
+            'ema': 0.20, 'rsi': 0.10, 'volume': 0.10, 'trend': 0.05
+        }
         
-        await tg(f"""
-🧪 **إشارة اختبار**
-
-**{test_signal['symbol']}** | **{side_ar}**
-
-هذه إشارة اختبار للتأكد من عمل النظام.
-
-• الدخول: {test_signal['entry']:.2f}
-• وقف الخسارة: {test_signal['sl']:.2f}
-• هدف الربح: {test_signal['tp']:.2f}
-• الجودة: {test_signal['synthesis_score']:.1%}
-
-#اختبار #تست
-""")
+        synthesis_score = sum(scores[key] * weights[key] for key in weights)
+        confirmations = sum(1 for key in scores if scores[key] > 0.6)
         
         return {
-            "status": "success",
-            "message": "Test signal sent",
-            "signal": test_signal
+            "symbol": f"{symbol}/USDT",
+            "mtf_analysis": {
+                "direction": mtf_direction.value,
+                "score": mtf_score,
+                "details": mtf_details
+            },
+            "wave_analysis": {
+                "pattern": wave_pattern,
+                "score": wave_score,
+                "details": wave_details
+            },
+            "momentum_analysis": {
+                "score": momentum_score,
+                "text": momentum_text,
+                "details": momentum_details
+            },
+            "ema_analysis": {
+                "score": ema_score,
+                "text": ema_text,
+                "details": ema_details
+            },
+            "rsi_analysis": {
+                "score": rsi_score,
+                "text": rsi_text,
+                "details": rsi_details
+            },
+            "volume_analysis": {
+                "score": volume_score,
+                "text": volume_text,
+                "details": volume_details
+            },
+            "trend_analysis": {
+                "direction": trend_direction.value,
+                "strength": trend_strength,
+                "details": trend_details
+            },
+            "synthesis": {
+                "score": synthesis_score,
+                "confirmations": confirmations,
+                "would_signal": synthesis_score >= MIN_SYNTHESIS_SCORE and confirmations >= CONFLUENCE_REQUIRED
+            }
         }
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-@app.get("/stats")
-async def get_stats():
-    """Get scanner statistics"""
-    try:
-        async with db_lock:
-            async with db_conn.execute("SELECT COUNT(*) FROM signals WHERE status='OPEN'") as cursor:
-                open_count = (await cursor.fetchone())[0]
-            
-            async with db_conn.execute("SELECT COUNT(*) FROM signals WHERE status='CLOSED'") as cursor:
-                closed_count = (await cursor.fetchone())[0]
-            
-            async with db_conn.execute("SELECT COUNT(*) FROM signals") as cursor:
-                total_count = (await cursor.fetchone())[0]
-            
-            # Try to get duplicate prevention stats (might fail if price_hash column doesn't exist yet)
-            try:
-                async with db_conn.execute("""
-                    SELECT COUNT(DISTINCT price_hash) as unique_signals,
-                           COUNT(*) as total_attempts
-                    FROM signals 
-                    WHERE timestamp > datetime('now', '-24 hours')
-                """) as cursor:
-                    dup_stats = await cursor.fetchone()
-                    if dup_stats and dup_stats[0] is not None:
-                        unique_signals = dup_stats[0]
-                        total_attempts = dup_stats[1]
-                        duplicates_blocked = total_attempts - unique_signals if total_attempts > unique_signals else 0
-                    else:
-                        unique_signals = total_count
-                        duplicates_blocked = 0
-            except:
-                unique_signals = total_count
-                duplicates_blocked = 0
         
-        return {
-            "open_positions": open_count,
-            "closed_positions": closed_count,
-            "total_signals": total_count,
-            "unique_signals_24h": unique_signals,
-            "duplicates_blocked_24h": duplicates_blocked,
-            "scan_interval": SCAN_INTERVAL,
-            "min_score": MIN_SYNTHESIS_SCORE,
-            "duplicate_prevention": "ACTIVE"
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.get("/recent-signals")
-async def get_recent_signals(limit: int = 10):
-    """Get recent signals"""
-    try:
-        async with db_lock:
-            # Set row factory to get dictionaries
-            db_conn.row_factory = aiosqlite.Row
-            
-            async with db_conn.execute("""
-                SELECT symbol, side, entry, sl, tp, synthesis_score, timestamp, status
-                FROM signals 
-                ORDER BY timestamp DESC 
-                LIMIT ?
-            """, (limit,)) as cursor:
-                rows = await cursor.fetchall()
-                
-                signals = []
-                for row in rows:
-                    signals.append(dict(row))
-                
-                return {
-                    "status": "success",
-                    "signals": signals,
-                    "count": len(signals)
-                }
     except Exception as e:
         return {"error": str(e)}
 
@@ -929,9 +1601,12 @@ async def get_recent_signals(limit: int = 10):
 async def main():
     global exchange
     
-    log.info("=" * 60)
-    log.info("🚀 VISUAL SCANNER - NO DUPLICATE SIGNALS")
-    log.info("=" * 60)
+    log.info("=" * 70)
+    log.info("🚀 ADVANCED VISUAL SYNTHESIS SCANNER - PROFESSIONAL EDITION")
+    log.info("=" * 70)
+    log.info("Methodology: Multi-Timeframe Wave Analysis with 7-Point Confirmation")
+    log.info(f"Minimum Score: {MIN_SYNTHESIS_SCORE}, Required Confirmations: {CONFLUENCE_REQUIRED}")
+    log.info("=" * 70)
     
     # Initialize database
     if not await init_db():
@@ -954,28 +1629,6 @@ async def main():
         log.error(f"Failed to connect to exchange: {e}")
         return
     
-    # Send startup message
-    await tg(f"""
-🚀 **الماسح الضوئي البصري - بدون إشارات مكررة**
-
-✅ **تم بدء التشغيل بنجاح**
-
-**ميزات مكافحة التكرار:**
-• فحص التكرار بالسعر والظروف
-• حد أقصى إشارتين لكل زوج في 6 ساعات
-• منع الإشارات المتشابهة في 4 ساعات
-• تتبع تغير الأسعار
-
-**الإعدادات:**
-• الحد الأدنى للجودة: {MIN_SYNTHESIS_SCORE}
-• فاصل المسح: {SCAN_INTERVAL} ثانية
-• عدد الأزواج: {TOP_N}
-
-جاهز للعمل! سيبدأ المسح الآن...
-
-#بدء #تشغيل
-""")
-    
     # Start scanning and monitoring loops
     try:
         await asyncio.gather(
@@ -993,7 +1646,19 @@ async def main():
             await exchange.close()
         if db_conn:
             await db_conn.close()
-        log.info("Scanner shutdown complete")
+        log.info("Advanced scanner shutdown complete")
 
 if __name__ == "__main__":
+    # Install required packages if not present
+    import subprocess
+    import sys
+    
+    required_packages = ['ta-lib', 'scikit-learn', 'scipy']
+    for package in required_packages:
+        try:
+            __import__(package.replace('-', '_'))
+        except ImportError:
+            log.warning(f"Installing {package}...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+    
     asyncio.run(main())
