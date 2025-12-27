@@ -14,6 +14,7 @@ import logging
 import hashlib
 import aiosqlite
 import httpx
+import requests
 import ccxt.async_support as ccxt
 import pandas as pd
 import numpy as np
@@ -21,6 +22,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from enum import Enum
 from fastapi import FastAPI
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 # ---------------- CONFIG ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -64,36 +66,129 @@ log = logging.getLogger("visual_scanner")
 db_lock = asyncio.Lock()
 db_conn = None
 exchange = None
+executor = ThreadPoolExecutor(max_workers=3)
 
-# ================ TELEGRAM UTILITIES ================
+# ================ TELEGRAM UTILITIES (FIXED) ================
 
-async def tg(message: str, parse_mode: str = "Markdown"):
-    """Send message to Telegram"""
+async def tg_sync_backup(message: str):
+    """Backup sync Telegram sender using requests"""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram credentials not set")
+        log.warning("Telegram credentials not set in backup method")
         return False
     
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True,
+            "disable_notification": False
+        }
+        
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            executor, 
+            lambda: requests.post(url, json=payload, timeout=15)
+        )
+        
+        if response.status_code == 200:
+            log.info("✅ Telegram message sent successfully (backup method)")
+            return True
+        else:
+            log.error(f"❌ Backup Telegram error {response.status_code}: {response.text[:100]}")
+            return False
+            
+    except Exception as e:
+        log.error(f"Backup Telegram error: {str(e)[:100]}")
+        return False
+
+async def tg(message: str, parse_mode: str = "Markdown"):
+    """Send message to Telegram - primary with httpx, fallback to requests"""
+    if not TELEGRAM_TOKEN:
+        log.error("❌ TELEGRAM_BOT_TOKEN is not set!")
+        log.error("Set it with: export TELEGRAM_BOT_TOKEN='your_bot_token'")
+        return False
+    
+    if not TELEGRAM_CHAT_ID:
+        log.error("❌ TELEGRAM_CHAT_ID is not set!")
+        log.error("Set it with: export TELEGRAM_CHAT_ID='your_chat_id'")
+        return False
+    
+    # Clean message for logging
+    log_message = message.replace('\n', ' ').strip()[:100]
+    log.info(f"📤 Attempting to send Telegram: {log_message}...")
+    
+    # Method 1: Try httpx first (async)
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             payload = {
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": message,
                 "parse_mode": parse_mode,
-                "disable_web_page_preview": True
+                "disable_web_page_preview": True,
+                "disable_notification": False
             }
             
             response = await client.post(url, json=payload)
             
             if response.status_code == 200:
-                log.debug(f"Telegram message sent successfully")
+                log.info("✅ Telegram sent successfully via httpx")
                 return True
+            elif response.status_code == 400:
+                log.warning(f"Bad request, trying without markdown...")
+                # Try without markdown
+                payload["parse_mode"] = None
+                response2 = await client.post(url, json=payload)
+                if response2.status_code == 200:
+                    log.info("✅ Telegram sent without markdown")
+                    return True
+                else:
+                    log.error(f"Still failed: {response2.status_code}")
+                    return await tg_sync_backup(message)
             else:
-                log.error(f"Telegram API error: {response.status_code} - {response.text}")
-                return False
+                log.warning(f"httpx failed ({response.status_code}), trying backup...")
+                return await tg_sync_backup(message)
                 
+    except httpx.TimeoutException:
+        log.warning("httpx timeout, trying backup...")
+        return await tg_sync_backup(message)
     except Exception as e:
-        log.error(f"Telegram send error: {e}")
+        log.warning(f"httpx error: {str(e)[:100]}, trying backup...")
+        return await tg_sync_backup(message)
+
+async def test_telegram():
+    """Test Telegram connection"""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.error("❌ Telegram credentials are NOT set!")
+        log.error("Please set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID environment variables")
+        return False
+    
+    test_msg = """
+🤖 *Telegram Connection Test*
+
+✅ Scanner is starting...
+✅ Telegram integration is being tested
+✅ If you see this message, Telegram is working!
+
+*Bot:* Visual Synthesis Scanner
+*Time:* {time}
+*Status:* READY
+""".format(time=time.strftime("%Y-%m-%d %H:%M:%S"))
+    
+    log.info("Testing Telegram connection...")
+    result = await tg(test_msg)
+    
+    if result:
+        log.info("✅ Telegram test PASSED - Messages will be sent")
+        return True
+    else:
+        log.error("❌ Telegram test FAILED - Check your credentials")
+        log.error("1. Make sure TELEGRAM_BOT_TOKEN is correct")
+        log.error("2. Make sure TELEGRAM_CHAT_ID is correct")
+        log.error("3. Make sure the bot is started with /start")
+        log.error("4. Make sure the bot has permission to send messages")
         return False
 
 # ---------------- PURE PYTHON TECHNICAL INDICATORS ----------------
@@ -1300,6 +1395,7 @@ async def scanning_loop(exchange):
     """Main scanning loop"""
     log.info("🚀 Starting ADVANCED scanner with synthesis analysis")
     
+    # Send startup message
     await tg("""
 🚀 **بدء الماسح الضوئي المتقدم - التحليل الموجي المتعدد**
 
@@ -1315,7 +1411,7 @@ async def scanning_loop(exchange):
 🎯 **نظام التوكيد:** يتطلب ٣ مؤشرات تأكيد على الأقل
 📊 **الجودة الدنيا:** ٣٥٪
 
-جاهز للعمل...
+📡 **جاهز للعمل والمسح...**
 """)
     
     while True:
@@ -1552,9 +1648,21 @@ async def main():
     log.info("=" * 70)
     log.info("🚀 ADVANCED VISUAL SYNTHESIS SCANNER - PROFESSIONAL EDITION")
     log.info("=" * 70)
-    log.info(f"Methodology: Multi-Timeframe Wave Analysis with 7-Point Confirmation")
-    log.info(f"Minimum Score: {MIN_SYNTHESIS_SCORE}, Required Confirmations: {CONFLUENCE_REQUIRED}")
-    log.info(f"Top N pairs: {TOP_N}, Scan Interval: {SCAN_INTERVAL}s")
+    
+    # === تحقق من إعدادات التليجرام ===
+    log.info(f"📱 Telegram Token: {'✅ SET' if TELEGRAM_TOKEN else '❌ NOT SET'}")
+    log.info(f"📱 Telegram Chat ID: {'✅ SET' if TELEGRAM_CHAT_ID else '❌ NOT SET'}")
+    
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("⚠️ Telegram credentials are not set. Alerts will NOT be sent!")
+        log.warning("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID environment variables")
+        log.warning("Example: export TELEGRAM_BOT_TOKEN='123456:ABC-DEF1234'")
+        log.warning("Example: export TELEGRAM_CHAT_ID='-1001234567890'")
+    else:
+        log.info("✅ Telegram credentials verified")
+    
+    log.info(f"🎯 Minimum Score: {MIN_SYNTHESIS_SCORE}, Required Confirmations: {CONFLUENCE_REQUIRED}")
+    log.info(f"📊 Top N pairs: {TOP_N}, Scan Interval: {SCAN_INTERVAL}s")
     log.info("=" * 70)
     
     # Initialize database
@@ -1578,8 +1686,16 @@ async def main():
         log.error(f"Failed to connect to exchange: {e}")
         return
     
+    # Test Telegram connection
+    if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+        telegram_ok = await test_telegram()
+        if not telegram_ok:
+            log.warning("Proceeding without Telegram notifications...")
+    else:
+        log.warning("Telegram credentials missing. Running without notifications.")
+    
     # Send startup message
-    await tg(f"""
+    startup_msg = f"""
 🚀 **الماسح الضوئي المتقدم - بدون TA-Lib**
 
 ✅ **تم بدء التشغيل بنجاح**
@@ -1594,8 +1710,10 @@ async def main():
 
 **المنهجية المتطورة تعمل بكامل طاقتها!**
 
-جاهز للعمل...
-""")
+{time.strftime('%Y-%m-%d %H:%M:%S')}
+"""
+    
+    await tg(startup_msg)
     
     # Start scanning loop
     try:
@@ -1611,6 +1729,7 @@ async def main():
             await exchange.close()
         if db_conn:
             await db_conn.close()
+        executor.shutdown()
         log.info("Advanced scanner shutdown complete")
 
 if __name__ == "__main__":
@@ -1618,7 +1737,7 @@ if __name__ == "__main__":
     import subprocess
     import sys
     
-    required_packages = ['ccxt', 'pandas', 'numpy', 'httpx', 'fastapi', 'aiosqlite']
+    required_packages = ['ccxt', 'pandas', 'numpy', 'httpx', 'fastapi', 'aiosqlite', 'requests']
     missing_packages = []
     
     for package in required_packages:
@@ -1630,6 +1749,14 @@ if __name__ == "__main__":
     if missing_packages:
         log.warning(f"Installing missing packages: {missing_packages}")
         subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing_packages)
+        log.info("✅ All packages installed. Restarting...")
+        # Restart after installation
+        os.execv(sys.executable, [sys.executable] + sys.argv)
     
     # Run the scanner
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.info("Scanner stopped by user")
+    except Exception as e:
+        log.error(f"Fatal error: {e}")
