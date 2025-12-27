@@ -31,7 +31,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_PATH = "/app/data/mexc_signals.db"
 
 # HYPER PROFIT SETTINGS - للربح السريع
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 30))  # 30 ثانية للمسح
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 90))  # 30 ثانية للمسح
 TOP_N = int(os.getenv("TOP_N", 200))  # 200 رمز الأعلى حسب الحجم
 
 # ULTRA STRICT FILTERS للمضاعفة السريعة
