@@ -29,12 +29,12 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_PATH = "/app/data/signals.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))
-TOP_N = int(os.getenv("TOP_N", 60))
+TOP_N = int(os.getenv("TOP_N", 70))
 
 # PREDICTIVE thresholds
-MIN_PREDICTION_CONFIDENCE = 0.65  # Minimum confidence for predictions
-MIN_EXPLOSION_SCORE = 0.70        # للانفجارات القوية
-MIN_CRASH_SCORE = 0.70            # للانهيارات القوية
+MIN_PREDICTION_CONFIDENCE = 0.25  # Minimum confidence for predictions
+MIN_EXPLOSION_SCORE = 0.30        # للانفجارات القوية
+MIN_CRASH_SCORE = 0.30            # للانهيارات القوية
 CONFLUENCE_REQUIRED = 3           # Minimum number of confirmations
 
 # Timeframes for true multi-timeframe analysis
@@ -333,8 +333,9 @@ def detect_volatility_compression(data: Dict[str, pd.DataFrame]) -> Tuple[float,
             compression_signals.append("لا يوجد تكثف")
         
         # 4. اكتشاف تقلص النطاق مع الوقت
-        if len(h4_ranges) >= 10:
-            range_decline = (avg_h4_range - recent_h4_range) / avg_h4_range if avg_h4_range > 0 else 0
+        range_decline = 0
+        if len(h4_ranges) >= 10 and avg_h4_range > 0:
+            range_decline = (avg_h4_range - recent_h4_range) / avg_h4_range
             if range_decline > 0.3:  # تقلص أكثر من 30%
                 compression_score += 0.15
                 compression_signals.append(f"تقلص النطاق: {range_decline:.1%}")
@@ -347,16 +348,20 @@ def detect_volatility_compression(data: Dict[str, pd.DataFrame]) -> Tuple[float,
         resistance_band = h4_highs_sorted[-3:]  # أعلى 3 مستويات
         support_band = h4_lows_sorted[:3]       # أدنى 3 مستويات
         
-        distance_to_resistance = min([abs(current_price - r) / current_price for r in resistance_band]) if resistance_band else 1
-        distance_to_support = min([abs(current_price - s) / current_price for s in support_band]) if support_band else 1
+        distance_to_resistance = 1
+        distance_to_support = 1
         
-        if distance_to_resistance < 0.02:  # أقل من 2% من المقاومة
-            compression_score += 0.10
-            compression_signals.append("قرب من مقاومة رئيسية")
+        if resistance_band:
+            distance_to_resistance = min([abs(current_price - r) / current_price for r in resistance_band])
+            if distance_to_resistance < 0.02:  # أقل من 2% من المقاومة
+                compression_score += 0.10
+                compression_signals.append("قرب من مقاومة رئيسية")
         
-        if distance_to_support < 0.02:  # أقل من 2% من الدعم
-            compression_score += 0.10
-            compression_signals.append("قرب من دعم رئيسي")
+        if support_band:
+            distance_to_support = min([abs(current_price - s) / current_price for s in support_band])
+            if distance_to_support < 0.02:  # أقل من 2% من الدعم
+                compression_score += 0.10
+                compression_signals.append("قرب من دعم رئيسي")
         
         # تحديد النتيجة النهائية
         compression_score = min(1.0, compression_score)
@@ -368,7 +373,7 @@ def detect_volatility_compression(data: Dict[str, pd.DataFrame]) -> Tuple[float,
             'h1_volatility_pct': float(h1_volatility * 100),
             'avg_h4_range_pct': float(avg_h4_range * 100),
             'recent_h4_range_pct': float(recent_h4_range * 100),
-            'range_decline_pct': float(range_decline * 100) if 'range_decline' in locals() else 0,
+            'range_decline_pct': float(range_decline * 100),
             'distance_to_resistance_pct': float(distance_to_resistance * 100),
             'distance_to_support_pct': float(distance_to_support * 100),
             'resistance_levels': [float(r) for r in resistance_band],
@@ -440,7 +445,6 @@ def detect_momentum_divergence(data: Dict[str, pd.DataFrame]) -> Tuple[float, st
         ema_12 = calculate_ema(h4_prices, 12) if len(h4_prices) >= 12 else np.array([])
         ema_26 = calculate_ema(h4_prices, 26) if len(h4_prices) >= 26 else np.array([])
         
-        macd_divergence_score = 0
         if len(ema_12) >= 5 and len(ema_26) >= 5 and not np.isnan(ema_12[-1]) and not np.isnan(ema_26[-1]):
             macd_line = ema_12[-5:] - ema_26[-5:]
             
@@ -503,8 +507,6 @@ def analyze_volume_spikes(data: Dict[str, pd.DataFrame]) -> Tuple[float, str, Di
             
             volumes = df['volume'].values[-30:]
             prices = df['close'].values[-30:]
-            highs = df['high'].values[-30:]
-            lows = df['low'].values[-30:]
             
             # 1. حساب متوسط الحجم
             avg_volume = np.mean(volumes[:-5]) if len(volumes) > 5 else np.mean(volumes)
@@ -532,8 +534,12 @@ def analyze_volume_spikes(data: Dict[str, pd.DataFrame]) -> Tuple[float, str, Di
             
             # 5. تحليل اتجاه الحجم مع السعر
             if len(prices) >= 5:
-                price_change = (prices[-1] - prices[-5]) / prices[-5] * 100
-                volume_trend = (recent_avg_volume - np.mean(volumes[-10:-5])) / np.mean(volumes[-10:-5]) * 100 if len(volumes) >= 10 else 0
+                price_change = (prices[-1] - prices[-5]) / prices[-5] * 100 if prices[-5] != 0 else 0
+                
+                if len(volumes) >= 10:
+                    volume_trend = (recent_avg_volume - np.mean(volumes[-10:-5])) / np.mean(volumes[-10:-5]) * 100 if np.mean(volumes[-10:-5]) > 0 else 0
+                else:
+                    volume_trend = 0
                 
                 # زيادة الحجم مع حركة سعر ضعيفة = تراكم
                 if volume_ratio > 1.8 and abs(price_change) < 1.0:
@@ -615,9 +621,14 @@ def analyze_support_resistance_breakdown(data: Dict[str, pd.DataFrame]) -> Tuple
         breakdown_score = 0
         breakdown_signals = []
         
+        nearest_resistance = None
+        distance_to_res = 100
+        nearest_support = None
+        distance_to_sup = 100
+        
         if resistance_levels:
             nearest_resistance = min(resistance_levels, key=lambda x: abs(x - current_price))
-            distance_to_res = (nearest_resistance - current_price) / current_price * 100
+            distance_to_res = (nearest_resistance - current_price) / current_price * 100 if current_price != 0 else 100
             
             if distance_to_res < 1.0:  # أقل من 1%
                 breakdown_score += 0.40
@@ -628,7 +639,7 @@ def analyze_support_resistance_breakdown(data: Dict[str, pd.DataFrame]) -> Tuple
         
         if support_levels:
             nearest_support = min(support_levels, key=lambda x: abs(x - current_price))
-            distance_to_sup = (current_price - nearest_support) / current_price * 100
+            distance_to_sup = (current_price - nearest_support) / current_price * 100 if current_price != 0 else 100
             
             if distance_to_sup < 1.0:  # أقل من 1%
                 breakdown_score += 0.40
@@ -639,14 +650,15 @@ def analyze_support_resistance_breakdown(data: Dict[str, pd.DataFrame]) -> Tuple
         
         # 3. تحليل اختبارات متعددة للمستويات
         test_breakdown_score = 0
+        recent_tests = 0
         if len(h4_prices) >= 20:
-            recent_tests = 0
-            level_to_test = nearest_resistance if 'nearest_resistance' in locals() else nearest_support if 'nearest_support' in locals() else None
+            level_to_test = nearest_resistance if nearest_resistance is not None else nearest_support
             
             if level_to_test:
                 for i in range(-10, 0):  # آخر 10 شمعات H4
-                    if abs(h4_prices[i] - level_to_test) / level_to_test < 0.005:  # أقل من 0.5%
-                        recent_tests += 1
+                    if i < len(h4_prices):
+                        if abs(h4_prices[i] - level_to_test) / level_to_test < 0.005:  # أقل من 0.5%
+                            recent_tests += 1
             
             if recent_tests >= 3:
                 test_breakdown_score = 0.35
@@ -658,13 +670,13 @@ def analyze_support_resistance_breakdown(data: Dict[str, pd.DataFrame]) -> Tuple
         
         details = {
             'breakdown_score': total_score,
-            'nearest_resistance': float(nearest_resistance) if 'nearest_resistance' in locals() else 0,
-            'nearest_support': float(nearest_support) if 'nearest_support' in locals() else 0,
-            'distance_to_resistance_pct': float(distance_to_res) if 'distance_to_res' in locals() else 0,
-            'distance_to_support_pct': float(distance_to_sup) if 'distance_to_sup' in locals() else 0,
+            'nearest_resistance': float(nearest_resistance) if nearest_resistance is not None else 0,
+            'nearest_support': float(nearest_support) if nearest_support is not None else 0,
+            'distance_to_resistance_pct': float(distance_to_res),
+            'distance_to_support_pct': float(distance_to_sup),
             'support_levels': [float(s) for s in support_levels[-5:]],
             'resistance_levels': [float(r) for r in resistance_levels[-5:]],
-            'recent_tests': recent_tests if 'recent_tests' in locals() else 0
+            'recent_tests': recent_tests
         }
         
         return total_score, analysis_text, details
@@ -690,8 +702,12 @@ def detect_price_action_extremes(data: Dict[str, pd.DataFrame]) -> Tuple[float, 
         h4_prices = h4_df['close'].values[-30:]
         
         # 1. تحليل المدى اليومي
-        daily_ranges = [(daily_highs[i] - daily_lows[i]) / daily_prices[i] for i in range(len(daily_prices))]
-        avg_daily_range = np.mean(daily_ranges[-20:]) if len(daily_ranges) >= 20 else np.mean(daily_ranges)
+        daily_ranges = []
+        for i in range(len(daily_prices)):
+            if daily_prices[i] != 0:
+                daily_ranges.append((daily_highs[i] - daily_lows[i]) / daily_prices[i])
+        
+        avg_daily_range = np.mean(daily_ranges[-20:]) if len(daily_ranges) >= 20 else np.mean(daily_ranges) if daily_ranges else 0
         current_daily_range = (daily_highs[-1] - daily_lows[-1]) / daily_prices[-1] if daily_prices[-1] != 0 else 0
         
         # 2. تحديد إذا كان السعر عند أقصى المدى
@@ -712,7 +728,9 @@ def detect_price_action_extremes(data: Dict[str, pd.DataFrame]) -> Tuple[float, 
             extremes_signals.append(f"مدى سعري ضيق ({range_ratio:.1f}x)")
         
         # 3. تحليل موقع السعر داخل الشمعة
-        candle_position = (daily_prices[-1] - daily_lows[-1]) / (daily_highs[-1] - daily_lows[-1]) if daily_highs[-1] != daily_lows[-1] else 0.5
+        candle_position = 0.5
+        if daily_highs[-1] != daily_lows[-1]:
+            candle_position = (daily_prices[-1] - daily_lows[-1]) / (daily_highs[-1] - daily_lows[-1])
         
         if candle_position > 0.85:  # قرب قمة الشمعة
             extremes_score += 0.15
@@ -722,7 +740,8 @@ def detect_price_action_extremes(data: Dict[str, pd.DataFrame]) -> Tuple[float, 
             extremes_signals.append("سعر عند قاع المدى اليومي")
         
         # 4. تحليل الاتجاه المفرط
-        if len(daily_prices) >= 10:
+        trend_strength = 0
+        if len(daily_prices) >= 10 and daily_prices[-10] != 0:
             trend_strength = (daily_prices[-1] - daily_prices[-10]) / daily_prices[-10] * 100
             
             if trend_strength > 15:  # صعود أكثر من 15%
@@ -742,7 +761,7 @@ def detect_price_action_extremes(data: Dict[str, pd.DataFrame]) -> Tuple[float, 
             'current_daily_range_pct': float(current_daily_range * 100),
             'avg_daily_range_pct': float(avg_daily_range * 100),
             'candle_position': float(candle_position),
-            'trend_strength_pct': float(trend_strength) if 'trend_strength' in locals() else 0,
+            'trend_strength_pct': float(trend_strength),
             'signals': extremes_signals
         }
         
@@ -805,29 +824,31 @@ def predict_explosion_crash(data: Dict[str, pd.DataFrame]) -> Dict:
         daily_df = data.get('DAILY')
         rsi_extreme_score = 0.5
         rsi_signal = "RSI طبيعي"
+        current_rsi = 50
         
         if daily_df is not None and len(daily_df) >= 30:
             daily_prices = daily_df['close'].values
             daily_rsi = calculate_rsi(daily_prices, 14)
-            current_rsi = daily_rsi[-1] if len(daily_rsi) > 0 and not np.isnan(daily_rsi[-1]) else 50
-            
-            if current_rsi > 80:
-                rsi_extreme_score = 0.85
-                rsi_signal = f"RSI تشبع شراء خطير ({current_rsi:.1f})"
-            elif current_rsi > 75:
-                rsi_extreme_score = 0.70
-                rsi_signal = f"RSI تشبع شراء ({current_rsi:.1f})"
-            elif current_rsi < 20:
-                rsi_extreme_score = 0.85
-                rsi_signal = f"RSI تشبع بيع خطير ({current_rsi:.1f})"
-            elif current_rsi < 25:
-                rsi_extreme_score = 0.70
-                rsi_signal = f"RSI تشبع بيع ({current_rsi:.1f})"
+            if len(daily_rsi) > 0 and not np.isnan(daily_rsi[-1]):
+                current_rsi = daily_rsi[-1]
+                
+                if current_rsi > 80:
+                    rsi_extreme_score = 0.85
+                    rsi_signal = f"RSI تشبع شراء خطير ({current_rsi:.1f})"
+                elif current_rsi > 75:
+                    rsi_extreme_score = 0.70
+                    rsi_signal = f"RSI تشبع شراء ({current_rsi:.1f})"
+                elif current_rsi < 20:
+                    rsi_extreme_score = 0.85
+                    rsi_signal = f"RSI تشبع بيع خطير ({current_rsi:.1f})"
+                elif current_rsi < 25:
+                    rsi_extreme_score = 0.70
+                    rsi_signal = f"RSI تشبع بيع ({current_rsi:.1f})"
         
         analyses['rsi'] = {
             'score': rsi_extreme_score,
             'text': rsi_signal,
-            'details': {'current_rsi': current_rsi if 'current_rsi' in locals() else 50}
+            'details': {'current_rsi': current_rsi}
         }
         
         # 7. تحديد النتيجة النهائية
@@ -869,9 +890,12 @@ def predict_explosion_crash(data: Dict[str, pd.DataFrame]) -> Dict:
         is_bullish_divergence = "BULLISH" in str(divergence_info)
         is_bearish_divergence = "BEARISH" in str(divergence_info)
         
+        bearish_div_score = divergence_details.get('bearish_divergence_score', 0)
+        bullish_div_score = divergence_details.get('bullish_divergence_score', 0)
+        
         # سيناريو 1: انفجار صعودي قوي
         if (compression_strong and is_bullish_divergence and breakdown_strong and 
-            divergence_details.get('bearish_divergence_score', 0) < divergence_details.get('bullish_divergence_score', 0)):
+            bearish_div_score < bullish_div_score):
             prediction_type = "EXPLOSION"
             confidence = max(confidence, 0.75)
             predicted_move_pct = 3.0 + (compression_score * 2)  # 3-5%
@@ -879,7 +903,7 @@ def predict_explosion_crash(data: Dict[str, pd.DataFrame]) -> Dict:
         
         # سيناريو 2: انهيار هبوطي قوي
         elif (compression_strong and is_bearish_divergence and breakdown_strong and 
-              divergence_details.get('bearish_divergence_score', 0) > divergence_details.get('bullish_divergence_score', 0)):
+              bearish_div_score > bullish_div_score):
             prediction_type = "CRASH"
             confidence = max(confidence, 0.75)
             predicted_move_pct = -(2.5 + (compression_score * 2.5))  # -2.5 إلى -5%
@@ -955,6 +979,116 @@ def predict_explosion_crash(data: Dict[str, pd.DataFrame]) -> Dict:
             'scores': {}
         }
 
+# ================ DATABASE FUNCTIONS ================
+
+async def check_and_add_column(column_name: str, column_type: str):
+    """Check if a column exists and add it if it doesn't"""
+    try:
+        # Check if column exists
+        async with db_conn.execute(f"PRAGMA table_info(signals)") as cursor:
+            columns = await cursor.fetchall()
+            column_names = [col[1] for col in columns]
+            
+            if column_name not in column_names:
+                log.info(f"Adding missing column: {column_name}")
+                await db_conn.execute(f"ALTER TABLE signals ADD COLUMN {column_name} {column_type}")
+                await db_conn.commit()
+                log.info(f"✅ Column {column_name} added successfully")
+                return True
+            else:
+                log.debug(f"Column {column_name} already exists")
+                return True
+    except Exception as e:
+        log.error(f"Error adding column {column_name}: {e}")
+        return False
+
+async def init_db():
+    """Initialize database with predictive analysis columns"""
+    global db_conn
+    try:
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+        db_conn = await aiosqlite.connect(DB_PATH)
+        
+        # Create basic table if it doesn't exist
+        await db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                entry REAL NOT NULL,
+                sl REAL NOT NULL,
+                tp REAL NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'OPEN',
+                signal_hash TEXT UNIQUE,
+                price_hash TEXT,
+                close_reason TEXT,
+                close_price REAL,
+                close_timestamp DATETIME,
+                pnl_percent REAL
+            )
+        """)
+        
+        await db_conn.commit()
+        log.info("✅ Basic table created/verified")
+        
+        # Check and add ALL missing columns for predictive analysis
+        required_columns = [
+            # Predictive analysis fields
+            ("prediction_type", "TEXT"),
+            ("prediction_confidence", "REAL"),
+            ("predicted_move_pct", "REAL"),
+            ("prediction_timeframe", "TEXT"),
+            ("risk_level", "TEXT"),
+            
+            # Analysis scores
+            ("compression_score", "REAL"),
+            ("divergence_score", "REAL"),
+            ("volume_score", "REAL"),
+            ("breakdown_score", "REAL"),
+            ("extremes_score", "REAL"),
+            ("rsi_score", "REAL"),
+            
+            # Confluence tracking
+            ("confirmations", "INTEGER"),
+            ("weighted_score", "REAL"),
+            
+            # Technical levels
+            ("support_levels", "TEXT"),
+            ("resistance_levels", "TEXT"),
+            
+            # For backward compatibility
+            ("timeframe_alignment", "TEXT"),
+            ("wave_structure", "TEXT"),
+            ("strength_level", "TEXT"),
+            ("indicators_signal", "TEXT"),
+            ("volume_status", "TEXT"),
+            ("synthesis_score", "REAL"),
+        ]
+        
+        for column_name, column_type in required_columns:
+            if not await check_and_add_column(column_name, column_type):
+                log.warning(f"Failed to add column: {column_name}")
+        
+        # Create indexes (will ignore if already exist)
+        try:
+            await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_symbol_timestamp ON signals(symbol, timestamp)")
+            await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON signals(status)")
+            await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_hash ON signals(signal_hash)")
+            await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_prediction_type ON signals(prediction_type)")
+            await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_prediction_confidence ON signals(prediction_confidence)")
+            await db_conn.commit()
+            log.info("✅ Database indexes created/verified")
+        except Exception as e:
+            log.warning(f"Index creation warning: {e}")
+        
+        log.info("✅ Database ready with all predictive columns")
+        return True
+        
+    except Exception as e:
+        log.error(f"Database error: {e}")
+        return False
+
 # ================ SIGNAL GENERATION WITH PREDICTIVE ANALYSIS ================
 
 async def generate_predictive_signal(data: Dict[str, pd.DataFrame], symbol: str) -> Optional[Dict]:
@@ -1025,7 +1159,7 @@ async def generate_predictive_signal(data: Dict[str, pd.DataFrame], symbol: str)
             prices = h4_df['low'].values[-50:]
             current_h4_price = h4_df['close'].iloc[-1]
             
-            # Simple support/resistance detection
+            # Simple support detection
             for i in range(2, len(prices)-2):
                 if (prices[i] < prices[i-1] and prices[i] < prices[i-2] and
                     prices[i] < prices[i+1] and prices[i] < prices[i+2]):
@@ -1033,6 +1167,7 @@ async def generate_predictive_signal(data: Dict[str, pd.DataFrame], symbol: str)
                         support_levels.append(float(prices[i]))
             
             prices_high = h4_df['high'].values[-50:]
+            # Simple resistance detection
             for i in range(2, len(prices_high)-2):
                 if (prices_high[i] > prices_high[i-1] and prices_high[i] > prices_high[i-2] and
                     prices_high[i] > prices_high[i+1] and prices_high[i] > prices_high[i+2]):
@@ -1096,90 +1231,6 @@ async def generate_predictive_signal(data: Dict[str, pd.DataFrame], symbol: str)
     except Exception as e:
         log.error(f"Predictive signal generation error for {symbol}: {e}")
         return None
-
-# ================ DATABASE FUNCTIONS ================
-
-async def init_db():
-    """Initialize database with predictive analysis columns"""
-    global db_conn
-    try:
-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-        db_conn = await aiosqlite.connect(DB_PATH)
-        
-        # Create main table if it doesn't exist
-        await db_conn.execute("""
-            CREATE TABLE IF NOT EXISTS signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                side TEXT NOT NULL,
-                entry REAL NOT NULL,
-                sl REAL NOT NULL,
-                tp REAL NOT NULL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                status TEXT DEFAULT 'OPEN',
-                
-                -- Predictive analysis fields
-                prediction_type TEXT,
-                prediction_confidence REAL,
-                predicted_move_pct REAL,
-                prediction_timeframe TEXT,
-                risk_level TEXT,
-                
-                -- Analysis scores
-                compression_score REAL,
-                divergence_score REAL,
-                volume_score REAL,
-                breakdown_score REAL,
-                extremes_score REAL,
-                rsi_score REAL,
-                
-                -- Confluence tracking
-                confirmations INTEGER,
-                weighted_score REAL,
-                
-                -- Technical levels
-                support_levels TEXT,
-                resistance_levels TEXT,
-                
-                -- Signal management
-                signal_hash TEXT UNIQUE,
-                price_hash TEXT,
-                
-                -- For backward compatibility
-                timeframe_alignment TEXT,
-                wave_structure TEXT,
-                strength_level TEXT,
-                indicators_signal TEXT,
-                volume_status TEXT,
-                synthesis_score REAL,
-                
-                close_reason TEXT,
-                close_price REAL,
-                close_timestamp DATETIME,
-                pnl_percent REAL
-            )
-        """)
-        
-        await db_conn.commit()
-        log.info("✅ Database created with predictive analysis columns")
-        
-        # Create indexes
-        try:
-            await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_prediction_type ON signals(prediction_type)")
-            await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_prediction_confidence ON signals(prediction_confidence)")
-            await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_signal_hash ON signals(signal_hash)")
-            await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_symbol_timestamp ON signals(symbol, timestamp)")
-            await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON signals(status)")
-            await db_conn.commit()
-            log.info("✅ Database indexes created")
-        except Exception as e:
-            log.warning(f"Index creation warning: {e}")
-        
-        return True
-        
-    except Exception as e:
-        log.error(f"Database error: {e}")
-        return False
 
 # ================ DATA FETCHING ================
 
@@ -1358,36 +1409,24 @@ async def scanning_loop(exchange):
                             
                             if exists == 0:
                                 try:
-                                    # Insert with all predictive fields
-                                    await db_conn.execute("""
-                                        INSERT INTO signals (
-                                            symbol, side, entry, sl, tp, status,
-                                            prediction_type, prediction_confidence, predicted_move_pct,
-                                            prediction_timeframe, risk_level,
-                                            compression_score, divergence_score, volume_score,
-                                            breakdown_score, extremes_score, rsi_score,
-                                            confirmations, weighted_score,
-                                            support_levels, resistance_levels,
-                                            signal_hash, price_hash,
-                                            timeframe_alignment, wave_structure, strength_level,
-                                            indicators_signal, volume_status, synthesis_score
-                                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                    """, (
-                                        signal['symbol'], signal['side'], signal['entry'], signal['sl'],
-                                        signal['tp'], signal['status'],
-                                        signal['prediction_type'], signal['prediction_confidence'],
-                                        signal['predicted_move_pct'], signal['prediction_timeframe'],
-                                        signal['risk_level'],
-                                        signal['compression_score'], signal['divergence_score'],
-                                        signal['volume_score'], signal['breakdown_score'],
-                                        signal['extremes_score'], signal['rsi_score'],
-                                        signal['confirmations'], signal['weighted_score'],
-                                        signal['support_levels'], signal['resistance_levels'],
-                                        signal['signal_hash'], signal['price_hash'],
-                                        signal['timeframe_alignment'], signal['wave_structure'],
-                                        signal['strength_level'], signal['indicators_signal'],
-                                        signal['volume_status'], signal['synthesis_score']
-                                    ))
+                                    # Build column list and values
+                                    columns = []
+                                    values = []
+                                    
+                                    # Add all signal fields
+                                    for key, value in signal.items():
+                                        if key != 'status':  # status is set by default
+                                            columns.append(key)
+                                            values.append(value)
+                                    
+                                    # Create SQL query
+                                    placeholders = ', '.join(['?'] * len(values))
+                                    column_names = ', '.join(columns)
+                                    
+                                    await db_conn.execute(f"""
+                                        INSERT INTO signals ({column_names}, status) 
+                                        VALUES ({placeholders}, 'OPEN')
+                                    """, values)
                                     
                                     await db_conn.commit()
                                     
@@ -1397,6 +1436,26 @@ async def scanning_loop(exchange):
                                     log.info(f"✅ Predictive signal sent for {symbol}")
                                 except Exception as e:
                                     log.error(f"Database insert error for {symbol}: {e}")
+                                    # Try simplified insert
+                                    try:
+                                        await db_conn.execute("""
+                                            INSERT INTO signals (
+                                                symbol, side, entry, sl, tp, status,
+                                                signal_hash, price_hash,
+                                                prediction_type, prediction_confidence
+                                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                        """, (
+                                            signal['symbol'], signal['side'], signal['entry'], signal['sl'],
+                                            signal['tp'], 'OPEN',
+                                            signal['signal_hash'], signal['price_hash'],
+                                            signal['prediction_type'], signal['prediction_confidence']
+                                        ))
+                                        await db_conn.commit()
+                                        await send_predictive_telegram_alert(signal)
+                                        signals_found += 1
+                                        log.info(f"✅ Predictive signal sent (simplified) for {symbol}")
+                                    except Exception as e2:
+                                        log.error(f"Simplified insert also failed: {e2}")
                             else:
                                 log.debug(f"Final duplicate check failed for {symbol}")
                     
@@ -1467,15 +1526,15 @@ async def send_predictive_telegram_alert(signal: Dict):
 ━━━━━━━━━━━━━━━━━━
 📈 **التحليل التنبؤي:**
 
-• **التكثف السعري:** {signal['compression_score']:.1%}
-• **التباعد الزخمي:** {signal['divergence_score']:.1%}
-• **زيادة الحجم:** {signal['volume_score']:.1%}
-• **ضغط المستويات:** {signal['breakdown_score']:.1%}
-• **التطرف السعري:** {signal['extremes_score']:.1%}
-• **تشبع RSI:** {signal['rsi_score']:.1%}
+• **التكثف السعري:** {signal.get('compression_score', 0):.1%}
+• **التباعد الزخمي:** {signal.get('divergence_score', 0):.1%}
+• **زيادة الحجم:** {signal.get('volume_score', 0):.1%}
+• **ضغط المستويات:** {signal.get('breakdown_score', 0):.1%}
+• **التطرف السعري:** {signal.get('extremes_score', 0):.1%}
+• **تشبع RSI:** {signal.get('rsi_score', 0):.1%}
 
-• **التوكيدات:** {signal['confirmations']}/6
-• **الحركة المتوقعة:** {signal['predicted_move_pct']:+.1f}%
+• **التوكيدات:** {signal.get('confirmations', 0)}/6
+• **الحركة المتوقعة:** {signal.get('predicted_move_pct', 0):+.1f}%
 
 ━━━━━━━━━━━━━━━━━━
 💰 **مستويات التداول:**
