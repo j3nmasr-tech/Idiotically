@@ -4,6 +4,7 @@
 """
 Visual Synthesis Scanner - الإصدار المتقدم
 Advanced Multi-Timeframe Wave & Synthesis Analysis
+(NO TA-Lib REQUIRED - Pure Python Implementation)
 """
 
 import os
@@ -19,8 +20,6 @@ import numpy as np
 from typing import Dict, List, Optional, Tuple, Any
 from enum import Enum
 from fastapi import FastAPI
-import talib
-from scipy import stats
 import json
 
 # ---------------- CONFIG ----------------
@@ -65,6 +64,186 @@ log = logging.getLogger("visual_scanner")
 db_lock = asyncio.Lock()
 db_conn = None
 exchange = None
+
+# ---------------- PURE PYTHON TECHNICAL INDICATORS ----------------
+def calculate_ema(prices: np.ndarray, period: int) -> np.ndarray:
+    """Calculate Exponential Moving Average (no TA-Lib)"""
+    if len(prices) < period:
+        return np.full_like(prices, np.nan)
+    
+    ema = np.zeros_like(prices, dtype=float)
+    ema[:period-1] = np.nan
+    
+    # Initial SMA
+    sma = np.mean(prices[:period])
+    ema[period-1] = sma
+    
+    # Multiplier
+    multiplier = 2 / (period + 1)
+    
+    # Calculate EMA
+    for i in range(period, len(prices)):
+        ema[i] = (prices[i] - ema[i-1]) * multiplier + ema[i-1]
+    
+    return ema
+
+def calculate_sma(prices: np.ndarray, period: int) -> np.ndarray:
+    """Calculate Simple Moving Average"""
+    if len(prices) < period:
+        return np.full_like(prices, np.nan)
+    
+    sma = np.zeros_like(prices, dtype=float)
+    sma[:period-1] = np.nan
+    
+    for i in range(period-1, len(prices)):
+        sma[i] = np.mean(prices[i-period+1:i+1])
+    
+    return sma
+
+def calculate_rsi(prices: np.ndarray, period: int = 14) -> np.ndarray:
+    """Calculate RSI (no TA-Lib)"""
+    if len(prices) < period + 1:
+        return np.full_like(prices, np.nan)
+    
+    deltas = np.diff(prices)
+    
+    # Separate gains and losses
+    gains = np.where(deltas > 0, deltas, 0)
+    losses = np.where(deltas < 0, -deltas, 0)
+    
+    # Calculate initial averages
+    avg_gain = np.mean(gains[:period])
+    avg_loss = np.mean(losses[:period])
+    
+    rsi = np.zeros_like(prices)
+    rsi[:period] = np.nan
+    
+    if avg_loss == 0:
+        rsi[period] = 100
+    else:
+        rs = avg_gain / avg_loss
+        rsi[period] = 100 - (100 / (1 + rs))
+    
+    # Calculate remaining RSI values
+    for i in range(period + 1, len(prices)):
+        gain = gains[i-1]
+        loss = losses[i-1]
+        
+        avg_gain = ((avg_gain * (period - 1)) + gain) / period
+        avg_loss = ((avg_loss * (period - 1)) + loss) / period
+        
+        if avg_loss == 0:
+            rsi[i] = 100
+        else:
+            rs = avg_gain / avg_loss
+            rsi[i] = 100 - (100 / (1 + rs))
+    
+    return rsi
+
+def calculate_macd(prices: np.ndarray, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Calculate MACD (no TA-Lib)"""
+    ema_fast = calculate_ema(prices, fast)
+    ema_slow = calculate_ema(prices, slow)
+    
+    macd_line = ema_fast - ema_slow
+    signal_line = calculate_ema(macd_line[~np.isnan(macd_line)], signal)
+    
+    # Align lengths
+    signal_line_full = np.full_like(macd_line, np.nan)
+    signal_line_full[-len(signal_line):] = signal_line
+    
+    histogram = macd_line - signal_line_full
+    
+    return macd_line, signal_line_full, histogram
+
+def calculate_atr(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14) -> np.ndarray:
+    """Calculate Average True Range (no TA-Lib)"""
+    if len(highs) < period:
+        return np.full_like(highs, np.nan)
+    
+    tr = np.zeros(len(highs))
+    
+    # Calculate True Range
+    for i in range(len(highs)):
+        if i == 0:
+            tr[i] = highs[i] - lows[i]
+        else:
+            hl = highs[i] - lows[i]
+            hc = abs(highs[i] - closes[i-1])
+            lc = abs(lows[i] - closes[i-1])
+            tr[i] = max(hl, hc, lc)
+    
+    # Calculate ATR
+    atr = np.zeros_like(tr)
+    atr[:period-1] = np.nan
+    
+    # Initial ATR (SMA of first period TRs)
+    atr[period-1] = np.mean(tr[:period])
+    
+    # Wilder's smoothing
+    for i in range(period, len(tr)):
+        atr[i] = (atr[i-1] * (period - 1) + tr[i]) / period
+    
+    return atr
+
+def calculate_adx(highs: np.ndarray, lows: np.ndarray, closes: np.ndarray, period: int = 14) -> np.ndarray:
+    """Calculate ADX (no TA-Lib)"""
+    if len(highs) < period * 2:
+        return np.full_like(highs, np.nan)
+    
+    # Calculate +DM and -DM
+    plus_dm = np.zeros(len(highs))
+    minus_dm = np.zeros(len(highs))
+    
+    for i in range(1, len(highs)):
+        up_move = highs[i] - highs[i-1]
+        down_move = lows[i-1] - lows[i]
+        
+        if up_move > down_move and up_move > 0:
+            plus_dm[i] = up_move
+        elif down_move > up_move and down_move > 0:
+            minus_dm[i] = down_move
+    
+    # Calculate True Range
+    tr = np.zeros(len(highs))
+    for i in range(len(highs)):
+        if i == 0:
+            tr[i] = highs[i] - lows[i]
+        else:
+            hl = highs[i] - lows[i]
+            hc = abs(highs[i] - closes[i-1])
+            lc = abs(lows[i] - closes[i-1])
+            tr[i] = max(hl, hc, lc)
+    
+    # Smooth the values
+    def smooth(values, period):
+        smoothed = np.zeros_like(values)
+        smoothed[:period-1] = np.nan
+        
+        # Initial value (sum of first period)
+        smoothed[period-1] = np.sum(values[:period])
+        
+        # Wilder's smoothing
+        for i in range(period, len(values)):
+            smoothed[i] = smoothed[i-1] - (smoothed[i-1] / period) + values[i]
+        
+        return smoothed
+    
+    tr_smooth = smooth(tr, period)
+    plus_dm_smooth = smooth(plus_dm, period)
+    minus_dm_smooth = smooth(minus_dm, period)
+    
+    # Calculate +DI and -DI
+    plus_di = 100 * (plus_dm_smooth / tr_smooth)
+    minus_di = 100 * (minus_dm_smooth / tr_smooth)
+    
+    # Calculate DX
+    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
+    
+    # Calculate ADX (smoothed DX)
+    adx = smooth(dx, period)
+    
+    return adx
 
 # ---------------- TELEGRAM ----------------
 async def tg(msg: str):
@@ -168,13 +347,13 @@ async def analyze_multi_timeframe(data: Dict[str, pd.DataFrame]) -> Tuple[TrendD
                 timeframe_scores[tf_name] = 0
                 continue
             
-            prices = df['close']
+            prices = df['close'].values
             
-            # Calculate EMAs for this timeframe
+            # Calculate EMAs for this timeframe using pure Python
             ema_signals = {}
             for ema_name, period in EMA_PERIODS.items():
                 if len(prices) >= period:
-                    ema = talib.EMA(prices.values, timeperiod=period)
+                    ema = calculate_ema(prices, period)
                     if not np.isnan(ema[-1]):
                         ema_signals[ema_name] = float(ema[-1])
             
@@ -204,7 +383,7 @@ async def analyze_multi_timeframe(data: Dict[str, pd.DataFrame]) -> Tuple[TrendD
             ema_alignments[tf_name] = alignment_details
             
             # Price position relative to EMAs
-            current_price = prices.iloc[-1]
+            current_price = prices[-1]
             price_score = 0
             
             if 'FAST' in ema_signals and 'LONG' in ema_signals:
@@ -300,6 +479,9 @@ def analyze_wave_structure(data: Dict[str, pd.DataFrame]) -> Tuple[float, str, D
                 swing_lows.append((i, h4_lows[i]))
         
         # Analyze wave structure
+        wave_score = 0.5
+        wave_pattern = "No clear pattern"
+        
         if len(swing_highs) >= 2 and len(swing_lows) >= 2:
             # Check for higher highs and higher lows (uptrend)
             if (swing_highs[-1][1] > swing_highs[-2][1] and 
@@ -322,10 +504,6 @@ def analyze_wave_structure(data: Dict[str, pd.DataFrame]) -> Tuple[float, str, D
             else:
                 wave_score = 0.6
                 wave_pattern = "Corrective/Complex Structure"
-        
-        else:
-            wave_score = 0.5
-            wave_pattern = "No clear wave structure"
         
         wave_details = {
             'swing_highs': len(swing_highs),
@@ -354,19 +532,28 @@ def analyze_momentum(data: Dict[str, pd.DataFrame], direction: TrendDirection) -
         lows = h1_df['low'].values
         
         # Calculate ATR for volatility
-        atr = talib.ATR(highs, lows, prices, timeperiod=14)
+        atr = calculate_atr(highs, lows, prices, period=14)
         current_atr = atr[-1] if not np.isnan(atr[-1]) else 0
         
         # Calculate momentum using ROC
-        roc = talib.ROC(prices, timeperiod=10)
+        def calculate_roc(prices, period):
+            if len(prices) < period + 1:
+                return np.full_like(prices, np.nan)
+            roc = np.zeros_like(prices)
+            roc[:period] = np.nan
+            for i in range(period, len(prices)):
+                roc[i] = ((prices[i] - prices[i-period]) / prices[i-period]) * 100
+            return roc
+        
+        roc = calculate_roc(prices, period=10)
         current_roc = roc[-1] if not np.isnan(roc[-1]) else 0
         
         # Calculate ADX for trend strength
-        adx = talib.ADX(highs, lows, prices, timeperiod=14)
+        adx = calculate_adx(highs, lows, prices, period=14)
         current_adx = adx[-1] if not np.isnan(adx[-1]) else 0
         
         # Calculate MACD
-        macd, macd_signal, macd_hist = talib.MACD(prices)
+        macd, signal, hist = calculate_macd(prices)
         current_macd = macd[-1] if not np.isnan(macd[-1]) else 0
         
         # Determine momentum score
@@ -423,11 +610,11 @@ def analyze_ema_confluence(data: Dict[str, pd.DataFrame], direction: TrendDirect
             
             prices = df['close'].values
             
-            # Calculate EMAs
+            # Calculate EMAs using pure Python
             ema_values = {}
             for period in [9, 21, 50, 200]:
                 if len(prices) >= period:
-                    ema = talib.EMA(prices, timeperiod=period)
+                    ema = calculate_ema(prices, period)
                     if not np.isnan(ema[-1]):
                         ema_values[period] = float(ema[-1])
             
@@ -509,8 +696,8 @@ def analyze_rsi_confluence(data: Dict[str, pd.DataFrame], direction: TrendDirect
             
             prices = df['close'].values
             
-            # Calculate RSI
-            rsi = talib.RSI(prices, timeperiod=RSI_PERIOD)
+            # Calculate RSI using pure Python
+            rsi = calculate_rsi(prices, period=RSI_PERIOD)
             current_rsi = rsi[-1] if not np.isnan(rsi[-1]) else 50
             
             # Determine RSI signal
@@ -701,16 +888,16 @@ def identify_trend(data: Dict[str, pd.DataFrame]) -> Tuple[TrendDirection, float
         
         prices = daily_df['close'].values
         
-        # Calculate trend indicators
+        # Calculate trend indicators using pure Python
         # 1. SMA trends
-        sma_20 = talib.SMA(prices, timeperiod=20)
-        sma_50 = talib.SMA(prices, timeperiod=50)
-        sma_200 = talib.SMA(prices, timeperiod=200)
+        sma_20 = calculate_sma(prices, 20)
+        sma_50 = calculate_sma(prices, 50)
+        sma_200 = calculate_sma(prices, 200)
         
         # 2. ADX for trend strength
         highs = daily_df['high'].values
         lows = daily_df['low'].values
-        adx = talib.ADX(highs, lows, prices, timeperiod=14)
+        adx = calculate_adx(highs, lows, prices, period=14)
         current_adx = adx[-1] if not np.isnan(adx[-1]) else 0
         
         # 3. Slope of moving averages
@@ -1024,29 +1211,34 @@ def find_support_levels(data: Dict[str, pd.DataFrame]) -> List[float]:
         
         prices = h4_df['low'].values[-100:]
         
-        # Use K-means clustering to find price clusters (support levels)
-        from sklearn.cluster import KMeans
-        import numpy as np
+        # Simple method: find price clusters (histogram peaks)
+        # Split price range into bins
+        price_min = np.min(prices)
+        price_max = np.max(prices)
+        bins = 10
+        bin_size = (price_max - price_min) / bins
         
-        # Reshape for clustering
-        X = prices.reshape(-1, 1)
+        # Count prices in each bin
+        bin_counts = []
+        for i in range(bins):
+            bin_low = price_min + i * bin_size
+            bin_high = price_min + (i + 1) * bin_size
+            count = np.sum((prices >= bin_low) & (prices < bin_high))
+            bin_counts.append((bin_low, bin_high, count))
         
-        # Find 3-5 support levels
-        n_clusters = min(5, len(prices) // 20)
-        if n_clusters < 2:
-            return []
+        # Find bins with highest counts
+        bin_counts.sort(key=lambda x: x[2], reverse=True)
+        support_levels = []
         
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        kmeans.fit(X)
-        
-        # Get cluster centers (support levels)
-        support_levels = sorted([float(center[0]) for center in kmeans.cluster_centers_])
+        for bin_low, bin_high, count in bin_counts[:5]:
+            if count > 5:  # Minimum 5 occurrences
+                support_levels.append((bin_low + bin_high) / 2)
         
         # Filter levels that are below current price
         current_price = h4_df['close'].iloc[-1]
         support_levels = [level for level in support_levels if level < current_price]
         
-        return support_levels[:3]  # Return top 3 supports
+        return sorted(support_levels)[:3]  # Return top 3 supports
         
     except Exception as e:
         log.debug(f"Support levels error: {e}")
@@ -1061,29 +1253,34 @@ def find_resistance_levels(data: Dict[str, pd.DataFrame]) -> List[float]:
         
         prices = h4_df['high'].values[-100:]
         
-        # Use K-means clustering to find price clusters (resistance levels)
-        from sklearn.cluster import KMeans
-        import numpy as np
+        # Simple method: find price clusters (histogram peaks)
+        # Split price range into bins
+        price_min = np.min(prices)
+        price_max = np.max(prices)
+        bins = 10
+        bin_size = (price_max - price_min) / bins
         
-        # Reshape for clustering
-        X = prices.reshape(-1, 1)
+        # Count prices in each bin
+        bin_counts = []
+        for i in range(bins):
+            bin_low = price_min + i * bin_size
+            bin_high = price_min + (i + 1) * bin_size
+            count = np.sum((prices >= bin_low) & (prices < bin_high))
+            bin_counts.append((bin_low, bin_high, count))
         
-        # Find 3-5 resistance levels
-        n_clusters = min(5, len(prices) // 20)
-        if n_clusters < 2:
-            return []
+        # Find bins with highest counts
+        bin_counts.sort(key=lambda x: x[2], reverse=True)
+        resistance_levels = []
         
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        kmeans.fit(X)
-        
-        # Get cluster centers (resistance levels)
-        resistance_levels = sorted([float(center[0]) for center in kmeans.cluster_centers_])
+        for bin_low, bin_high, count in bin_counts[:5]:
+            if count > 5:  # Minimum 5 occurrences
+                resistance_levels.append((bin_low + bin_high) / 2)
         
         # Filter levels that are above current price
         current_price = h4_df['close'].iloc[-1]
         resistance_levels = [level for level in resistance_levels if level > current_price]
         
-        return resistance_levels[:3]  # Return top 3 resistances
+        return sorted(resistance_levels)[:3]  # Return top 3 resistances
         
     except Exception as e:
         log.debug(f"Resistance levels error: {e}")
@@ -1495,7 +1692,7 @@ async def root():
         "status": "running",
         "scanner": "Advanced Visual Synthesis Scanner",
         "methodology": "Multi-Timeframe Wave Analysis",
-        "version": "3.0 - Professional",
+        "version": "3.0 - Professional (Pure Python)",
         "min_score": MIN_SYNTHESIS_SCORE,
         "min_confirmations": CONFLUENCE_REQUIRED,
         "analysis_methods": [
@@ -1629,6 +1826,19 @@ async def main():
         log.error(f"Failed to connect to exchange: {e}")
         return
     
+    # Send startup message
+    await tg("""
+🚀 **الماسح الضوئي المتقدم - بدون TA-Lib**
+
+✅ **تم بدء التشغيل بنجاح**
+✅ **جميع المؤشرات مكتوبة بلغة بايثون البحتة**
+✅ **لا حاجة لتثبيت مكتبات خارجية**
+
+**المنهجية المتطورة تعمل بكامل طاقتها!**
+
+جاهز للعمل...
+""")
+    
     # Start scanning and monitoring loops
     try:
         await asyncio.gather(
@@ -1649,16 +1859,22 @@ async def main():
         log.info("Advanced scanner shutdown complete")
 
 if __name__ == "__main__":
-    # Install required packages if not present
+    # Check for required packages
     import subprocess
     import sys
     
-    required_packages = ['ta-lib', 'scikit-learn', 'scipy']
+    required_packages = ['ccxt', 'pandas', 'numpy', 'httpx', 'fastapi', 'aiosqlite']
+    missing_packages = []
+    
     for package in required_packages:
         try:
-            __import__(package.replace('-', '_'))
+            __import__(package)
         except ImportError:
-            log.warning(f"Installing {package}...")
-            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+            missing_packages.append(package)
     
+    if missing_packages:
+        log.warning(f"Installing missing packages: {missing_packages}")
+        subprocess.check_call([sys.executable, "-m", "pip", "install"] + missing_packages)
+    
+    # Run the scanner
     asyncio.run(main())
