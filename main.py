@@ -63,13 +63,35 @@ async def tg(msg: str):
         log.warning(f"Telegram failed: {e}")
 
 # ---------------- DATABASE ----------------
+async def check_and_add_column(column_name: str, column_type: str):
+    """Check if a column exists and add it if it doesn't"""
+    try:
+        # Check if column exists
+        async with db_conn.execute(f"PRAGMA table_info(signals)") as cursor:
+            columns = await cursor.fetchall()
+            column_names = [col[1] for col in columns]
+            
+            if column_name not in column_names:
+                log.info(f"Adding missing column: {column_name}")
+                await db_conn.execute(f"ALTER TABLE signals ADD COLUMN {column_name} {column_type}")
+                await db_conn.commit()
+                log.info(f"✅ Column {column_name} added successfully")
+                return True
+            else:
+                log.debug(f"Column {column_name} already exists")
+                return True
+    except Exception as e:
+        log.error(f"Error adding column {column_name}: {e}")
+        return False
+
 async def init_db():
-    """Initialize database"""
+    """Initialize database with automatic schema updates"""
     global db_conn
     try:
         os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
         db_conn = await aiosqlite.connect(DB_PATH)
         
+        # Create main table if it doesn't exist
         await db_conn.execute("""
             CREATE TABLE IF NOT EXISTS signals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,17 +112,34 @@ async def init_db():
                 close_price REAL,
                 close_timestamp DATETIME,
                 pnl_percent REAL,
-                signal_hash TEXT UNIQUE,
-                price_hash TEXT
+                signal_hash TEXT UNIQUE
             )
         """)
         
-        # Create index for faster duplicate checks
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_price_hash ON signals(price_hash)")
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_symbol_timestamp ON signals(symbol, timestamp)")
-        
         await db_conn.commit()
-        log.info("✅ Database ready")
+        log.info("✅ Main table created/verified")
+        
+        # Check and add missing columns
+        required_columns = [
+            ("price_hash", "TEXT"),
+        ]
+        
+        for column_name, column_type in required_columns:
+            if not await check_and_add_column(column_name, column_type):
+                log.error(f"Failed to add required column: {column_name}")
+                return False
+        
+        # Create indexes (will ignore if already exist)
+        try:
+            await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_price_hash ON signals(price_hash)")
+            await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_symbol_timestamp ON signals(symbol, timestamp)")
+            await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON signals(status)")
+            await db_conn.commit()
+            log.info("✅ Database indexes created/verified")
+        except Exception as e:
+            log.warning(f"Index creation warning (likely already exist): {e}")
+        
+        log.info("✅ Database ready with all required columns")
         return True
         
     except Exception as e:
@@ -824,17 +863,25 @@ async def get_stats():
             async with db_conn.execute("SELECT COUNT(*) FROM signals") as cursor:
                 total_count = (await cursor.fetchone())[0]
             
-            # Get duplicate prevention stats
-            async with db_conn.execute("""
-                SELECT COUNT(DISTINCT price_hash) as unique_signals,
-                       COUNT(*) as total_attempts
-                FROM signals 
-                WHERE timestamp > datetime('now', '-24 hours')
-            """) as cursor:
-                dup_stats = await cursor.fetchone()
-                unique_signals = dup_stats[0]
-                total_attempts = dup_stats[1]
-                duplicates_blocked = total_attempts - unique_signals if total_attempts > unique_signals else 0
+            # Try to get duplicate prevention stats (might fail if price_hash column doesn't exist yet)
+            try:
+                async with db_conn.execute("""
+                    SELECT COUNT(DISTINCT price_hash) as unique_signals,
+                           COUNT(*) as total_attempts
+                    FROM signals 
+                    WHERE timestamp > datetime('now', '-24 hours')
+                """) as cursor:
+                    dup_stats = await cursor.fetchone()
+                    if dup_stats and dup_stats[0] is not None:
+                        unique_signals = dup_stats[0]
+                        total_attempts = dup_stats[1]
+                        duplicates_blocked = total_attempts - unique_signals if total_attempts > unique_signals else 0
+                    else:
+                        unique_signals = total_count
+                        duplicates_blocked = 0
+            except:
+                unique_signals = total_count
+                duplicates_blocked = 0
         
         return {
             "open_positions": open_count,
@@ -854,7 +901,9 @@ async def get_recent_signals(limit: int = 10):
     """Get recent signals"""
     try:
         async with db_lock:
-            await db_conn.row_factory = aiosqlite.Row
+            # Set row factory to get dictionaries
+            db_conn.row_factory = aiosqlite.Row
+            
             async with db_conn.execute("""
                 SELECT symbol, side, entry, sl, tp, synthesis_score, timestamp, status
                 FROM signals 
