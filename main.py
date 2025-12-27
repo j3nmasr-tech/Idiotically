@@ -65,6 +65,37 @@ db_lock = asyncio.Lock()
 db_conn = None
 exchange = None
 
+# ================ TELEGRAM UTILITIES ================
+
+async def tg(message: str, parse_mode: str = "Markdown"):
+    """Send message to Telegram"""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram credentials not set")
+        return False
+    
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            payload = {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "parse_mode": parse_mode,
+                "disable_web_page_preview": True
+            }
+            
+            response = await client.post(url, json=payload)
+            
+            if response.status_code == 200:
+                log.debug(f"Telegram message sent successfully")
+                return True
+            else:
+                log.error(f"Telegram API error: {response.status_code} - {response.text}")
+                return False
+                
+    except Exception as e:
+        log.error(f"Telegram send error: {e}")
+        return False
+
 # ---------------- PURE PYTHON TECHNICAL INDICATORS ----------------
 def calculate_ema(prices: np.ndarray, period: int) -> np.ndarray:
     """Calculate Exponential Moving Average (no TA-Lib)"""
@@ -1282,7 +1313,7 @@ async def scanning_loop(exchange):
 7. **تحديد الاتجاه** (Trend Identification)
 
 🎯 **نظام التوكيد:** يتطلب ٣ مؤشرات تأكيد على الأقل
-📊 **الجودة الدنيا:** ٦٥٪
+📊 **الجودة الدنيا:** ٣٥٪
 
 جاهز للعمل...
 """)
