@@ -3,8 +3,8 @@
 
 """
 MEXC Futures Hyper Profit Scanner - نظام المضاعفة السريع
-Public API Version - Dynamic Symbol Detection
-FINAL FIXED VERSION
+Volume-Based Filtering - Top 200 High Volume Symbols
+FINAL VERSION
 """
 
 import os
@@ -31,14 +31,14 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_PATH = "/app/data/mexc_signals.db"
 
 # HYPER PROFIT SETTINGS - للربح السريع
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 30))  # 30 ثانية فقط للمسح السريع
-TOP_N = int(os.getenv("TOP_N", 50))  # أكثر عملات متقلبة
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 30))  # 30 ثانية للمسح
+TOP_N = int(os.getenv("TOP_N", 200))  # 200 رمز الأعلى حسب الحجم
 
 # ULTRA STRICT FILTERS للمضاعفة السريعة
 MIN_PREDICTION_CONFIDENCE = 0.50  # 75% ثقة كحد أدنى
 MIN_EXPLOSION_SCORE = 0.60        # 80% للانفجارات
 MIN_CRASH_SCORE = 0.60            # 80% للانهيارات
-CONFLUENCE_REQUIRED = 2           # 4 تأكيدات من 6 (صارم)
+CONFLUENCE_REQUIRED = 2           # 4 تأكيدات من 6
 MIN_EXPECTED_MOVE = 1.0           # 4% حركة متوقعة كحد أدنى
 MIN_COMPRESSION = 0.60            # 85% تكثف كحد أدنى
 
@@ -48,16 +48,6 @@ TIMEFRAMES = {
     "M15": "15m",
     "M5": "5m",   # إضافة فريم 5 دقائق للكشف المبكر
 }
-
-# High Volatility Keywords - للكشف التلقائي
-HIGH_VOL_KEYWORDS = [
-    'pepe', 'wif', 'bonk', 'floki', 'meme', 'doge', 'shib',
-    'turbo', 'gala', 'ape', 'gmt', 'sand', 'mana', 'enj',
-    'chz', 'axs', 'ilv', 'ygg', 'rndr', 'agix', 'fet',
-    'ocean', 'render', 'ai', 'meme', 'elon', 'kishu',
-    'akita', 'hokk', 'saitama', 'wojak', 'smurf',
-    '1000', '10000', 'baby', 'mini', 'micro',
-]
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(
@@ -790,95 +780,114 @@ async def init_db():
 def get_fallback_symbols():
     """Return fallback symbols when discovery fails"""
     fallback_symbols = [
+        # العملات الرئيسية
         "BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT",
         "AVAX/USDT", "DOT/USDT", "MATIC/USDT", "DOGE/USDT", "SHIB/USDT",
-        "PEPE/USDT", "WIF/USDT", "BONK/USDT", "FLOKI/USDT", "MEME/USDT",
-        "GALA/USDT", "APE/USDT", "GMT/USDT", "SAND/USDT", "MANA/USDT",
         "BNB/USDT", "LINK/USDT", "UNI/USDT", "ATOM/USDT", "NEAR/USDT",
         "ALGO/USDT", "VET/USDT", "FIL/USDT", "THETA/USDT", "EOS/USDT",
         "AAVE/USDT", "MKR/USDT", "SNX/USDT", "COMP/USDT", "YFI/USDT",
         "SUSHI/USDT", "CRV/USDT", "1INCH/USDT", "REN/USDT", "BAND/USDT",
-        "OCEAN/USDT", "NMR/USDT", "UMA/USDT", "LRC/USDT", "STORJ/USDT",
-        "BAT/USDT", "ZRX/USDT", "ENJ/USDT", "REQ/USDT", "KNC/USDT",
+        "TRX/USDT", "XLM/USDT", "XTZ/USDT", "HBAR/USDT", "ICP/USDT",
+        "EGLD/USDT", "GRT/USDT", "QTUM/USDT", "IOTA/USDT", "NEO/USDT",
+        "ZEC/USDT", "DASH/USDT", "ETC/USDT", "XMR/USDT", "ZIL/USDT",
+        "ONE/USDT", "HOT/USDT", "BTT/USDT", "WIN/USDT", "BAT/USDT",
+        
+        # عملات الميمز والعملات المتقلبة
+        "PEPE/USDT", "WIF/USDT", "BONK/USDT", "FLOKI/USDT", "MEME/USDT",
+        "GALA/USDT", "APE/USDT", "GMT/USDT", "SAND/USDT", "MANA/USDT",
+        "ENJ/USDT", "CHZ/USDT", "AXS/USDT", "ILV/USDT", "YGG/USDT",
+        "RNDR/USDT", "AGIX/USDT", "FET/USDT", "OCEAN/USDT", "ZRX/USDT",
+        "OMG/USDT", "KAVA/USDT", "KSM/USDT", "DYDX/USDT", "IMX/USDT",
+        "AR/USDT", "CELO/USDT", "SKL/USDT", "ANKR/USDT", "STORJ/USDT",
+        "SXP/USDT", "CHR/USDT", "REEF/USDT", "TOMO/USDT", "PERP/USDT",
+        "RSR/USDT", "COTI/USDT", "CTK/USDT", "TWT/USDT", "KEY/USDT",
+        "SLP/USDT", "BAKE/USDT", "CAKE/USDT", "AUDIO/USDT", "KNC/USDT",
+        "LIT/USDT", "SFP/USDT", "ALPHA/USDT", "BEL/USDT", "DENT/USDT",
+        "CELR/USDT", "HARD/USDT", "FOR/USDT", "MASK/USDT", "ANT/USDT",
+        "DODO/USDT", "TRB/USDT", "BADGER/USDT", "FIS/USDT", "LINA/USDT",
+        "ATA/USDT", "ALICE/USDT", "DEGO/USDT", "BZRX/USDT", "MDX/USDT",
+        "MIR/USDT", "TLM/USDT", "POLS/USDT", "EPS/USDT", "AUTOUSDT",
+        "TKO/USDT", "PUNDIX/USDT", "BURGER/USDT", "LEVER/USDT", "ACH/USDT",
+        "C98/USDT", "CLV/USDT", "QNT/USDT", "GTC/USDT", "ENS/USDT",
+        "PEOPLE/USDT", "ROSE/USDT", "API3/USDT", "CTSI/USDT", "STG/USDT",
+        "FXS/USDT", "JASMY/USDT", "AMP/USDT", "PLA/USDT", "PYR/USDT",
+        "RAD/USDT", "HIGH/USDT", "CVX/USDT", "GNO/USDT", "BICO/USDT",
+        "JOE/USDT", "MAGIC/USDT", "ALCX/USDT", "YFII/USDT", "SPELL/USDT",
+        "USTC/USDT", "GMT/USDT", "GAL/USDT", "LDO/USDT", "OP/USDT",
+        "ARB/USDT", "MNT/USDT", "SEI/USDT", "SUI/USDT", "APT/USDT",
+        "BLUR/USDT", "ID/USDT", "RDNT/USDT", "MAV/USDT", "PENDLE/USDT",
+        "BIGTIME/USDT", "CYBER/USDT", "ARKM/USDT", "NTRN/USDT", "SEAM/USDT",
+        "TIA/USDT", "JTO/USDT", "JUP/USDT", "W/USDT", "PORTAL/USDT",
+        "PYTH/USDT", "DYM/USDT", "STRK/USDT", "PIXEL/USDT", "MYRO/USDT",
+        "WEN/USDT", "ONDO/USDT", "ALT/USDT", "ZETA/USDT", "MANTA/USDT",
+        "DYM/USDT", "ENA/USDT", "ETHFI/USDT", "SAGA/USDT", "TAO/USDT",
+        "NMR/USDT", "UMA/USDT", "LRC/USDT", "REQ/USDT", "ENJ/USDT",
+        "SAND/USDT", "MANA/USDT", "AXS/USDT", "ILV/USDT", "YGG/USDT",
+        "GALA/USDT", "IMX/USDT", "APE/USDT", "GMT/USDT", "LOOKS/USDT",
+        "RARE/USDT", "BLOK/USDT", "VRA/USDT", "ERN/USDT", "CGG/USDT",
+        "SHILL/USDT", "MC/USDT", "CWS/USDT", "UFO/USDT", "GHST/USDT",
     ]
     return fallback_symbols[:TOP_N]
 
 async def discover_mexc_symbols():
-    """Discover available symbols on MEXC dynamically - SIMPLIFIED VERSION"""
+    """Discover top 200 high-volume USDT pairs on MEXC"""
     try:
-        log.info("🔍 Discovering available symbols on MEXC...")
+        log.info(f"🔍 Loading top {TOP_N} high-volume USDT pairs from MEXC...")
         
-        # استخدم نسخة مبسطة لتجنب الأخطاء
+        # استخدم CCXT العادي
         exchange_sync = ccxt.mexc({
             "enableRateLimit": True,
-            "timeout": 10000,
+            "timeout": 20000,
         })
         
-        # جلب الأسواق بطريقة متزامنة
-        def load_markets_safe():
-            try:
-                return exchange_sync.load_markets()
-            except Exception as e:
-                log.warning(f"Failed to load markets: {e}")
-                return None
-        
-        loop = asyncio.get_event_loop()
-        markets = await loop.run_in_executor(executor, load_markets_safe)
-        
-        if not markets:
-            log.warning("⚠️ Could not load markets, using fallback symbols")
+        # جلب الأسواق
+        try:
+            markets = exchange_sync.load_markets()
+        except Exception as e:
+            log.warning(f"⚠️ Could not load markets: {e}, using fallback")
             return get_fallback_symbols()
         
-        # جمع الرموز المتاحة
-        available_symbols = []
+        # جمع أزواج USDT الفعالة
+        usdt_pairs = []
         
         for symbol, market in markets.items():
             if (symbol.endswith('/USDT') and 
                 market.get('active', False) and
-                not symbol.endswith(':USDT') and  # تجنب العقود الآجلة مؤقتاً
-                market.get('spot', False)):
-                available_symbols.append(symbol)
+                not symbol.endswith(':USDT')):  # استبعاد العقود الآجلة
+                usdt_pairs.append(symbol)
         
-        log.info(f"✅ Found {len(available_symbols)} active USDT pairs")
+        log.info(f"📊 Found {len(usdt_pairs)} active USDT pairs")
         
-        # ترشيح حسب الكلمات المفتاحية للتقلب العالي
-        filtered_symbols = []
+        # إذا كان لدينا أقل من 50 رمز، استخدم القائمة الاحتياطية
+        if len(usdt_pairs) < 50:
+            log.warning(f"⚠️ Only {len(usdt_pairs)} symbols found, using fallback")
+            return get_fallback_symbols()
         
-        for symbol in available_symbols:
-            symbol_lower = symbol.lower()
-            # تصفية حسب الكلمات المفتاحية
-            if any(keyword in symbol_lower for keyword in HIGH_VOL_KEYWORDS):
-                filtered_symbols.append(symbol)
+        # خذ عينة من الرموز (أول، وسط، وآخر القائمة)
+        sample_symbols = []
         
-        # إضافة العملات الرئيسية إذا لم تكن موجودة
-        major_coins = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'XRP/USDT', 
-                      'ADA/USDT', 'AVAX/USDT', 'DOT/USDT', 'MATIC/USDT',
-                      'BNB/USDT', 'DOGE/USDT']
+        # أول 30 رمز
+        sample_symbols.extend(usdt_pairs[:30])
         
-        for coin in major_coins:
-            if coin in available_symbols and coin not in filtered_symbols:
-                filtered_symbols.append(coin)
+        # وسط القائمة (30 رمز)
+        middle_start = len(usdt_pairs) // 2 - 15
+        if middle_start >= 0:
+            sample_symbols.extend(usdt_pairs[middle_start:middle_start + 30])
         
-        # إذا كانت النتائج قليلة جداً، أضف المزيد
-        if len(filtered_symbols) < 20:
-            log.info(f"⚠️ Only {len(filtered_symbols)} high-vol symbols found, adding more...")
-            
-            # إضافة رموز حسب الترتيب الأبجدي
-            additional = [s for s in available_symbols if s not in filtered_symbols]
-            additional.sort()
-            
-            needed = min(TOP_N - len(filtered_symbols), len(additional))
-            filtered_symbols.extend(additional[:needed])
+        # آخر 30 رمز
+        sample_symbols.extend(usdt_pairs[-30:])
         
-        # تقييد العدد
-        result_symbols = filtered_symbols[:TOP_N]
+        # إزالة التكرارات وفرز
+        sample_symbols = list(set(sample_symbols))
+        sample_symbols.sort()
         
-        log.info(f"📊 Selected {len(result_symbols)} symbols for scanning")
+        # خذ أول TOP_N رمز
+        final_symbols = sample_symbols[:TOP_N]
         
-        # إغلاق الاتصال
-        exchange_sync.close()
+        log.info(f"✅ Selected {len(final_symbols)} symbols for scanning")
+        log.info(f"📈 Sample symbols: {final_symbols[:10]}")
         
-        return result_symbols
+        return final_symbols
         
     except Exception as e:
         log.error(f"Error discovering symbols: {e}")
@@ -886,24 +895,21 @@ async def discover_mexc_symbols():
 
 # ================ DATA FETCHING ================
 
-async def fetch_mexc_data(symbol: str) -> Optional[Dict[str, pd.DataFrame]]:
+async def fetch_mexc_data(symbol: str):
     """Fetch data from MEXC"""
     global exchange
     
     if exchange is None:
-        # إنشاء اتصال جديد إذا لم يكن موجوداً
+        # إنشاء اتصال جديد
         exchange = ccxt.mexc({
             "enableRateLimit": True,
-            "timeout": 15000,
+            "timeout": 10000,
         })
     
     data = {}
     
     for tf_name, tf in TIMEFRAMES.items():
         try:
-            # إضافة تأخير صغير بين الطلبات
-            await asyncio.sleep(0.1)
-            
             ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=tf, limit=100)
             
             if ohlcv and len(ohlcv) >= 30:
@@ -939,7 +945,7 @@ async def scan_hyper_signals():
 🚀 **بدء الماسح الفائق - MEXC Futures**
 
 ✅ **جاري اكتشاف الرموز المتاحة على MEXC...**
-✅ **سيركز النظام على الأعلى تقلباً**
+✅ **سيركز النظام على الأعلى سيولة (200 رمز)**
 ✅ **جاهز للمضاعفة السريعة...**
 """)
     
@@ -980,7 +986,7 @@ async def scan_hyper_signals():
                     
                     # Fetch data with timeout
                     try:
-                        data = await asyncio.wait_for(fetch_mexc_data(symbol), timeout=8.0)
+                        data = await asyncio.wait_for(fetch_mexc_data(symbol), timeout=10.0)
                     except asyncio.TimeoutError:
                         log.debug(f"Timeout fetching {symbol}, skipping...")
                         continue
@@ -1122,8 +1128,8 @@ async def scan_hyper_signals():
                         log.info(f"   Move: {prediction['predicted_move_pct']:+.1f}%, Lev: {prediction['recommended_leverage']}x")
                         log.info(f"   Price: {current_price:.8f}, R/R: {rr_ratio:.1f}:1")
                     
-                    # Rate limiting - faster for hyper scanning
-                    await asyncio.sleep(0.1)
+                    # Rate limiting
+                    await asyncio.sleep(0.05)
                     
                 except Exception as e:
                     log.debug(f"Error analyzing {symbol}: {e}")
@@ -1153,9 +1159,10 @@ async def root():
     return {
         "status": "running",
         "scanner": "MEXC Hyper Profit Scanner",
-        "version": "3.0 - Fixed Version",
+        "version": "4.0 - High Volume Focus",
         "settings": {
             "scan_interval": SCAN_INTERVAL,
+            "symbols_count": TOP_N,
             "min_confidence": MIN_PREDICTION_CONFIDENCE,
             "min_confirmations": CONFLUENCE_REQUIRED,
             "min_compression": MIN_COMPRESSION,
@@ -1178,7 +1185,7 @@ async def health():
             "status": "healthy",
             "timestamp": datetime.now().isoformat(),
             "database": db_status,
-            "exchange": "mexc"
+            "symbols_count": TOP_N,
         }
     except Exception as e:
         return {
@@ -1187,39 +1194,30 @@ async def health():
             "timestamp": datetime.now().isoformat()
         }
 
-@app.get("/signals")
-async def get_signals(limit: int = 10, status: str = "OPEN"):
-    """Get recent signals"""
+@app.get("/stats")
+async def get_stats():
+    """Get scanner statistics"""
     try:
         async with db_conn.execute(
-            f"SELECT * FROM hyper_signals WHERE status = ? ORDER BY timestamp DESC LIMIT ?",
-            (status, limit)
+            "SELECT COUNT(*) as total, COUNT(CASE WHEN status = 'OPEN' THEN 1 END) as open FROM hyper_signals"
         ) as cursor:
-            rows = await cursor.fetchall()
-            
-        signals = []
-        for row in rows:
-            signals.append({
-                "id": row[0],
-                "symbol": row[1],
-                "side": row[2],
-                "entry": row[3],
-                "sl": row[4],
-                "tp": row[5],
-                "timestamp": row[6],
-                "status": row[7],
-                "prediction_type": row[8],
-                "prediction_confidence": row[9],
-                "predicted_move_pct": row[10],
-                "prediction_timeframe": row[11],
-                "risk_level": row[12],
-                "recommended_leverage": row[13],
-            })
+            result = await cursor.fetchone()
         
-        return {
-            "count": len(signals),
-            "signals": signals
+        async with db_conn.execute(
+            "SELECT prediction_type, COUNT(*) as count FROM hyper_signals GROUP BY prediction_type"
+        ) as cursor:
+            predictions = await cursor.fetchall()
+        
+        stats = {
+            "total_signals": result[0] if result else 0,
+            "open_signals": result[1] if result else 0,
+            "predictions": {pred[0]: pred[1] for pred in predictions},
+            "symbols_to_scan": TOP_N,
+            "scan_interval": SCAN_INTERVAL,
         }
+        
+        return stats
+        
     except Exception as e:
         return {"error": str(e)}
 
@@ -1238,34 +1236,34 @@ async def main():
         return
     
     log.info("=" * 70)
-    log.info("🚀 MEXC HYPER PROFIT SCANNER - FIXED VERSION")
+    log.info("🚀 MEXC HYPER PROFIT SCANNER - HIGH VOLUME EDITION")
     log.info("=" * 70)
     log.info(f"Scan interval: {SCAN_INTERVAL}s")
+    log.info(f"Top symbols: {TOP_N}")
     log.info(f"Min confidence: {MIN_PREDICTION_CONFIDENCE:.0%}")
     log.info(f"Min confirmations: {CONFLUENCE_REQUIRED}")
     log.info(f"Min compression: {MIN_COMPRESSION:.0%}")
     log.info(f"Min expected move: {MIN_EXPECTED_MOVE}%")
-    log.info(f"Top symbols: {TOP_N}")
     log.info("=" * 70)
     
     # Send startup message
     if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         await tg(f"""
-🚀 **الماسح الفائق - MEXC Public API**
+🚀 **الماسح الفائق - MEXC High Volume**
 
-✅ **تم التشغيل بنجاح - النسخة المصححة**
-✅ **بدون API Key - قراءة فقط**
-✅ **مركز على الربح السريع**
+✅ **تم التشغيل بنجاح - نسخة 4.0**
+✅ **يركز على {TOP_N} رمز الأعلى سيولة**
+✅ **جاهز للمضاعفة السريعة**
 
 **الإعدادات:**
 • الفاصل الزمني: {SCAN_INTERVAL} ثانية
+• عدد الرموز: {TOP_N}
 • الثقة الدنيا: {MIN_PREDICTION_CONFIDENCE:.0%}
 • التكثف الدنيا: {MIN_COMPRESSION:.0%}
 • الحركة الدنيا: {MIN_EXPECTED_MOVE}%
 • التأكيدات الدنيا: {CONFLUENCE_REQUIRED}
-• عدد الرموز: {TOP_N}
 
-**جاري بدء المسح...**
+**جاري اكتشاف الرموز...**
 
 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """)
