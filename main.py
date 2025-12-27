@@ -797,7 +797,7 @@ async def discover_mexc_symbols():
             "timeout": 30000,
         })
         
-        # Load markets
+        # التصحيح: استخدم await فقط مع load_markets_async
         markets = await exchange.load_markets()
         
         # Filter for USDT pairs with spot trading
