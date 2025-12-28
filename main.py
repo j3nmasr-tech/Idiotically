@@ -5,7 +5,7 @@
 🔥 ELLIOTT WAVE + INDICATORS HIGH-FREQUENCY SCANNER
 Professional-grade high-frequency signal generator
 Trend from Elliott Waves, Entries from Indicators
-FIXED VERSION - No duplicate signals with deduplication
+FIXED VERSION - Complete notifications for entry/exit
 """
 
 import os
@@ -865,6 +865,7 @@ class ElliottIndicatorsScanner:
         log.info("TARGET: 3-8% moves within minutes to hours")
         log.info(f"SCAN INTERVAL: {SCAN_INTERVAL} seconds")
         log.info(f"DEDUPLICATION: Active with {DEDUPLICATION_CONFIG['cooldown_same_side']}s cooldown")
+        log.info("NOTIFICATIONS: Signal + Entry + TP/SL alerts enabled")
         log.info("=" * 70)
         
         # Initialize database
@@ -989,9 +990,14 @@ class ElliottIndicatorsScanner:
 • Price similarity: {DEDUPLICATION_CONFIG['price_similarity_threshold']}%
 • Max signals per hour: {DEDUPLICATION_CONFIG['max_signals_per_hour']}
 
+<b>🔔 NOTIFICATIONS:</b>
+• Signal alerts ✓
+• Entry execution alerts ✓
+• TP/SL closure alerts ✓
+
 <b>✅ STATUS: ACTIVE AND SCANNING</b>
 
-#ElliottScanner #HighFrequency #NoDuplicates
+#ElliottScanner #HighFrequency #CompleteAlerts
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -1157,11 +1163,111 @@ class ElliottIndicatorsScanner:
 
 <b>⚠️ ملاحظة:</b>
 هذه إشارة عالية التردد مع نظام مكافحة التكرار.
-يتم حظر الإشارات المماثلة تلقائياً.
+سيصلك إشعار عند الدخول وعند الإغلاق.
 
 #{side_text} #موجات_إليوت #مؤشرات #لا_تكرار
 """
         return message
+    
+    async def send_trade_trigger_notification(self, symbol: str, side: str, entry_price: float):
+        """Send notification when trade is triggered/entered"""
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            return
+        
+        try:
+            side_emoji = "🟢" if side == "LONG" else "🔴"
+            side_text = "شراء" if side == "LONG" else "بيع"
+            
+            message = f"""
+{side_emoji} <b>تم تنفيذ الصفقة</b> ⚡
+
+<b>{symbol}</b> | {side_text}
+
+<b>🎯 تم الدخول بالسعر:</b>
+<code>{entry_price:.6f}</code>
+
+<b>📊 حالة الصفقة:</b>
+• النوع: {side_text}
+• السعر: <code>{entry_price:.6f}</code>
+• الحالة: <b>نشط</b>
+
+<b>⚠️ المتابعة:</b>
+يتم متابعة الصفقة تلقائياً.
+ستصلك إشعار عند الوصول لوقف الخسارة أو هدف الربح.
+
+#{side_text} #تنفيذ #متابعة
+"""
+            
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(url, json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": message,
+                    "parse_mode": "HTML"
+                })
+            
+            log.info(f"{side_emoji} Trade triggered: {symbol} {side} @ {entry_price:.4f}")
+            
+        except Exception as e:
+            log.error(f"Trigger notification error: {e}")
+    
+    async def send_trade_close_notification(self, symbol: str, side: str, pnl_percent: float, 
+                                           close_reason: str, entry_price: float, 
+                                           close_price: float, risk_reward: float):
+        """Send notification when trade hits TP/SL"""
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            return
+        
+        try:
+            if close_reason == "TP_HIT":
+                emoji = "✅"
+                result_text = "هدف الربح"
+                result_emoji = "🎯"
+                color = "🟢"
+            else:  # SL_HIT
+                emoji = "❌"
+                result_text = "وقف الخسارة"
+                result_emoji = "🛑"
+                color = "🔴"
+            
+            side_text = "شراء" if side == "LONG" else "بيع"
+            
+            # Format P&L with sign
+            pnl_formatted = f"+{pnl_percent:.2f}%" if pnl_percent > 0 else f"{pnl_percent:.2f}%"
+            
+            message = f"""
+{emoji} <b>تم إغلاق الصفقة</b> {result_emoji}
+
+<b>{symbol}</b> | {side_text}
+
+{color} <b>النتيجة: {result_text}</b>
+
+<b>📊 تفاصيل التنفيذ:</b>
+• نوع الدخول: {side_text}
+• سعر الدخول: <code>{entry_price:.6f}</code>
+• سعر الإغلاق: <code>{close_price:.6f}</code>
+• نسبة الربح/الخسارة: <b>{pnl_formatted}</b>
+• نسبة الربح/المخاطرة المحققة: {risk_reward:.1f}:1
+
+<b>📈 الملخص:</b>
+{emoji} <b>{result_text}</b> - {symbol} {side_text}
+{color} النسبة: <b>{pnl_formatted}</b>
+
+#{side_text} #إغلاق #{"ربح" if close_reason == "TP_HIT" else "خسارة"}
+"""
+            
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(url, json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": message,
+                    "parse_mode": "HTML"
+                })
+            
+            log.info(f"{emoji} Trade closed: {symbol} {side} {pnl_formatted} ({close_reason})")
+            
+        except Exception as e:
+            log.error(f"Close notification error: {e}")
     
     async def send_telegram_alert(self, signal: HighFreqSignal):
         """Send Telegram alert"""
@@ -1185,7 +1291,7 @@ class ElliottIndicatorsScanner:
             log.error(f"Telegram error: {e}")
     
     async def monitor_positions(self):
-        """Monitor and close positions with deduplication cleanup"""
+        """Monitor and close positions with complete notifications"""
         while True:
             try:
                 # Get open positions
@@ -1214,6 +1320,9 @@ class ElliottIndicatorsScanner:
                             """, (current_price, pos_id))
                             
                             await self.db.commit()
+                            
+                            # SEND TRIGGER NOTIFICATION
+                            await self.send_trade_trigger_notification(symbol, side, current_price)
                             
                             log.info(f"✅ Position triggered: {symbol} {side} @ {current_price:.4f}")
                         
@@ -1245,6 +1354,14 @@ class ElliottIndicatorsScanner:
                                     pnl_percent = ((entry - current_price) / entry) * 100
                             
                             if close_reason:
+                                # Get risk_reward from database
+                                async with self.db.execute("""
+                                    SELECT risk_reward FROM high_freq_signals WHERE id = ?
+                                """, (pos_id,)) as cursor:
+                                    row = await cursor.fetchone()
+                                    risk_reward = row[0] if row else 0
+                                
+                                # Update database
                                 await self.db.execute("""
                                     UPDATE high_freq_signals SET 
                                         status = 'CLOSED',
@@ -1264,10 +1381,16 @@ class ElliottIndicatorsScanner:
                                 if hasattr(self.scanner, 'active_signal_ids'):
                                     self.scanner.active_signal_ids.discard(pos_id)
                                 
-                                if close_reason == "TP_HIT":
-                                    log.info(f"✅ Winner: {symbol} {side} +{pnl_percent:.2f}%")
-                                else:
-                                    log.info(f"❌ Loss: {symbol} {side} {pnl_percent:.2f}%")
+                                # SEND CLOSE NOTIFICATION
+                                await self.send_trade_close_notification(
+                                    symbol=symbol,
+                                    side=side,
+                                    pnl_percent=pnl_percent,
+                                    close_reason=close_reason,
+                                    entry_price=entry,
+                                    close_price=current_price,
+                                    risk_reward=risk_reward
+                                )
                     
                     except Exception as e:
                         log.error(f"Monitor error for {symbol}: {e}")
@@ -1287,7 +1410,7 @@ class ElliottIndicatorsScanner:
     
     async def high_freq_scanning(self):
         """Main high-frequency scanning loop"""
-        log.info("🚀 Starting high-frequency scanning with deduplication...")
+        log.info("🚀 Starting high-frequency scanning with complete notifications...")
         
         while True:
             try:
@@ -1415,15 +1538,16 @@ class ElliottIndicatorsScanner:
 • دورات المسح: {self.scan_cycle}
 • الإشارات النشطة حالياً: {active_count}
 
-<b>🛡️ فعالية نظام مكافحة التكرار:</b>
-تم حظر {stats.get('signals_filtered', 0)} إشارة مكررة
-معدل التكرار: {stats.get('signals_filtered', 0) / max(1, stats['signals_generated'] + stats.get('signals_filtered', 0)):.1%}
+<b>🔔 نظام الإشعارات:</b>
+• إشعارات الإشارات ✓
+• إشعارات الدخول ✓
+• إشعارات الإغلاق (TP/SL) ✓
 
 <b>🎯 الفلسفة المحققة:</b>
 الاتجاه من موجات إليوت، الدخول من المؤشرات.
-إشارات عالية التردد مع منع التكرار التلقائي.
+إشارات عالية التردد مع إشعارات كاملة من البداية للنهاية.
 
-#إحصائيات #موجات_إليوت #لا_تكرار
+#إحصائيات #موجات_إليوت #إشعارات_كاملة
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -1507,7 +1631,8 @@ async def start_http_server(scanner, port=8000):
                     scanner.db.row_factory = aiosqlite.Row
                     async with scanner.db.execute("""
                         SELECT symbol, side, entry_price, expected_move, risk_reward,
-                               confluence_score, timeframe_used, created_at
+                               confluence_score, timeframe_used, created_at, status,
+                               close_reason, pnl_percent
                         FROM high_freq_signals 
                         ORDER BY created_at DESC 
                         LIMIT 20
