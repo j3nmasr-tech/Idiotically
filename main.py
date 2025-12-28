@@ -16,7 +16,6 @@ import httpx
 import ccxt.async_support as ccxt
 import pandas as pd
 import numpy as np
-from scipy import stats
 from fastapi import FastAPI
 from typing import Dict, List, Optional, Tuple, Any, Set
 from dataclasses import dataclass
@@ -28,7 +27,7 @@ DB_PATH = "/app/data/pro_signals.db"
 
 # Scanning parameters
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))  # 1 minute for high precision
-TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 100))    # Focus on high-volume pairs only
+TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 90))    # Focus on high-volume pairs only
 MIN_VOLUME_USD = 50000  # $5M minimum daily volume
 
 # Timeframes for multi-timeframe analysis
@@ -187,6 +186,34 @@ class ProfessionalMarketAnalyzer:
         rs = gain / loss
         rsi = 100 - (100 / (1 + rs))
         return rsi
+    
+    def polyfit_fixed(self, x, y, degree=1):
+        """Simple polynomial fit without scipy"""
+        if len(x) != len(y):
+            raise ValueError("x and y must have same length")
+        
+        n = len(x)
+        if n < 2:
+            return [0, np.mean(y)]
+        
+        # Simple linear regression for degree=1
+        if degree == 1:
+            x_mean = np.mean(x)
+            y_mean = np.mean(y)
+            
+            numerator = np.sum((x - x_mean) * (y - y_mean))
+            denominator = np.sum((x - x_mean) ** 2)
+            
+            if denominator == 0:
+                return [0, y_mean]
+            
+            slope = numerator / denominator
+            intercept = y_mean - slope * x_mean
+            
+            return [slope, intercept]
+        else:
+            # For higher degrees, use numpy polyfit
+            return np.polyfit(x, y, degree)
     
     def analyze_market_structure(self, df: pd.DataFrame, 
                                 higher_tf_direction: str = None) -> MarketStructure:
@@ -358,8 +385,12 @@ class ProfessionalMarketAnalyzer:
         # Check for momentum loss (RSI flattening during price movement)
         recent_rsi = rsi_values[-5:]
         if len(recent_rsi) >= 5:
-            rsi_slope = np.polyfit(range(5), recent_rsi, 1)[0]
-            price_slope = np.polyfit(range(5), price_values[-5:], 1)[0]
+            x = list(range(5))
+            rsi_coeff = self.polyfit_fixed(x, recent_rsi)
+            price_coeff = self.polyfit_fixed(x, price_values[-5:])
+            
+            rsi_slope = rsi_coeff[0]
+            price_slope = price_coeff[0]
             
             if abs(price_slope) > 0.001 and abs(rsi_slope) < 0.0001:
                 momentum_loss = True
@@ -445,8 +476,9 @@ class ProfessionalMarketAnalyzer:
         volume_ratio = recent_volume / avg_volume if avg_volume > 0 else 1.0
         
         # Determine volume trend
-        volume_slope = np.polyfit(range(len(volumes[-10:])), volumes[-10:], 1)[0]
-        price_slope = np.polyfit(range(len(prices[-10:])), prices[-10:], 1)[0]
+        x = list(range(len(volumes[-10:])))
+        volume_slope = self.polyfit_fixed(x, volumes[-10:])[0]
+        price_slope = self.polyfit_fixed(x, prices[-10:])[0]
         
         if volume_slope > 0 and price_slope > 0:
             volume_trend = "ACCUMULATING"
