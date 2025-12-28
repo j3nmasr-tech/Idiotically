@@ -5,6 +5,7 @@
 🔥 ELLIOTT WAVE + INDICATORS HIGH-FREQUENCY SCANNER
 Professional-grade high-frequency signal generator
 Trend from Elliott Waves, Entries from Indicators
+FIXED VERSION - No DataFrame comparison errors
 """
 
 import os
@@ -133,6 +134,13 @@ class HighFrequencyScanner:
         Returns trend direction for context
         """
         try:
+            # Check if dataframes are valid
+            if df_4h is None or df_1h is None:
+                return self._get_default_trend()
+            
+            if len(df_4h) < 20 or len(df_1h) < 20:
+                return self._get_default_trend()
+            
             # Get trends from both timeframes
             trend_4h = self._get_simple_trend(df_4h)
             trend_1h = self._get_simple_trend(df_1h)
@@ -166,13 +174,17 @@ class HighFrequencyScanner:
             
         except Exception as e:
             log.error(f"Elliott trend error: {e}")
-            return ElliottTrend(
-                direction="NEUTRAL",
-                strength=0.5,
-                wave_position="UNKNOWN",
-                wave_maturity=0.5,
-                trend_source="ERROR"
-            )
+            return self._get_default_trend()
+    
+    def _get_default_trend(self) -> ElliottTrend:
+        """Get default trend when analysis fails"""
+        return ElliottTrend(
+            direction="NEUTRAL",
+            strength=0.5,
+            wave_position="UNKNOWN",
+            wave_maturity=0.5,
+            trend_source="ERROR"
+        )
     
     def _get_simple_trend(self, df: pd.DataFrame) -> Dict[str, Any]:
         """Simple trend detection using price structure"""
@@ -286,16 +298,8 @@ class HighFrequencyScanner:
         Analyze RSI, EMA, Volume for entry signals
         """
         try:
-            if len(df) < 30:
-                return IndicatorSignal(
-                    rsi_signal="NEUTRAL",
-                    rsi_value=50,
-                    ema_signal="NEUTRAL",
-                    ema_distance_pct=0,
-                    volume_signal="NEUTRAL",
-                    volume_ratio=1.0,
-                    strength_score=0.5
-                )
+            if df is None or len(df) < 30:
+                return self._get_default_indicators()
             
             current_price = df['close'].iloc[-1]
             
@@ -360,17 +364,18 @@ class HighFrequencyScanner:
             volume_ratio = recent_volume / avg_volume if avg_volume > 0 else 1.0
             
             volume_signal = "NEUTRAL"
-            price_change = (current_price - df['close'].iloc[-5]) / df['close'].iloc[-5] * 100
-            
-            if volume_ratio > 1.5:
-                if price_change > 0.5:
-                    volume_signal = "CONFIRMING"
-                elif price_change < -0.5:
-                    volume_signal = "CONFIRMING"
-                else:
-                    volume_signal = "NEUTRAL"
-            elif volume_ratio < 0.7:
-                volume_signal = "DIVERGING"
+            if len(df) >= 5:
+                price_change = (current_price - df['close'].iloc[-5]) / df['close'].iloc[-5] * 100
+                
+                if volume_ratio > 1.5:
+                    if price_change > 0.5:
+                        volume_signal = "CONFIRMING"
+                    elif price_change < -0.5:
+                        volume_signal = "CONFIRMING"
+                    else:
+                        volume_signal = "NEUTRAL"
+                elif volume_ratio < 0.7:
+                    volume_signal = "DIVERGING"
             
             # 4. Market Strength Score
             strength_factors = []
@@ -413,15 +418,19 @@ class HighFrequencyScanner:
             
         except Exception as e:
             log.error(f"Indicator analysis error: {e}")
-            return IndicatorSignal(
-                rsi_signal="NEUTRAL",
-                rsi_value=50,
-                ema_signal="NEUTRAL",
-                ema_distance_pct=0,
-                volume_signal="NEUTRAL",
-                volume_ratio=1.0,
-                strength_score=0.5
-            )
+            return self._get_default_indicators()
+    
+    def _get_default_indicators(self) -> IndicatorSignal:
+        """Get default indicators when analysis fails"""
+        return IndicatorSignal(
+            rsi_signal="NEUTRAL",
+            rsi_value=50,
+            ema_signal="NEUTRAL",
+            ema_distance_pct=0,
+            volume_signal="NEUTRAL",
+            volume_ratio=1.0,
+            strength_score=0.5
+        )
     
     # ========== HIGH-FREQUENCY SIGNAL GENERATION ==========
     
@@ -429,15 +438,24 @@ class HighFrequencyScanner:
                                  symbol: str) -> Optional[HighFreqSignal]:
         """
         Generate high-frequency signal based on Elliott trend + Indicators
+        FIXED: No DataFrame comparison with None
         """
         try:
-            # Get timeframe data
+            # Get timeframe data with proper None checks
             tf_4h = multi_tf_data.get("4H")
             tf_1h = multi_tf_data.get("1H")
             tf_15m = multi_tf_data.get("15M")
             tf_5m = multi_tf_data.get("5M")
             
-            if None in [tf_4h, tf_1h, tf_15m, tf_5m]:
+            # Check if any timeframe is None or invalid
+            if tf_4h is None or tf_1h is None or tf_15m is None or tf_5m is None:
+                log.debug(f"{symbol}: Missing timeframe data")
+                return None
+            
+            # Check if dataframes have enough data
+            if (len(tf_4h) < 20 or len(tf_1h) < 20 or 
+                len(tf_15m) < 20 or len(tf_5m) < 20):
+                log.debug(f"{symbol}: Insufficient data")
                 return None
             
             # 1. Elliott Wave Trend Analysis (context only)
@@ -869,9 +887,6 @@ class ElliottIndicatorsScanner:
     async def save_signal(self, signal: HighFreqSignal) -> bool:
         """Save signal to database"""
         try:
-            # Check if we should save this signal
-            # Allow multiple signals but with some filtering
-            
             # Insert signal
             await self.db.execute("""
                 INSERT INTO high_freq_signals (
@@ -1097,8 +1112,11 @@ class ElliottIndicatorsScanner:
                         # Fetch data
                         multi_tf_data = await self.fetch_timeframe_data(symbol)
                         
-                        # Need key timeframes
-                        if len(multi_tf_data) < 4:
+                        # Need key timeframes - check individually
+                        required_tfs = ["4H", "1H", "15M", "5M"]
+                        has_all_data = all(tf in multi_tf_data for tf in required_tfs)
+                        
+                        if not has_all_data:
                             continue
                         
                         # Generate high-frequency signal
