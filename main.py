@@ -1968,220 +1968,262 @@ class CompleteAggressiveScanner:
         except Exception as e:
             self.engine.logger.logger.error(f"Cleanup error: {e}")
 
-# ================ FASTAPI WEB INTERFACE ================
-app = FastAPI(
-    title="Aggressive Wave Expansion Hunter",
-    description="Professional-grade aggressive wave transition hunting system",
-    version="2.0.0"
-)
-
-scanner = None
-
-@app.on_event("startup")
-async def startup_event():
-    """Startup FastAPI with scanner"""
-    global scanner
-    scanner = CompleteAggressiveScanner()
-    # Don't start scanner automatically in web mode
-    # Let it be started manually via endpoint
-
-@app.get("/")
-async def root():
-    """Root endpoint with system info"""
-    return {
-        "system": "Aggressive Wave Expansion Hunter",
-        "version": "2.0.0",
-        "status": "ready",
-        "endpoints": {
-            "/start": "Start the aggressive hunter",
-            "/stop": "Stop the hunter",
-            "/stats": "Get hunter statistics",
-            "/recent": "Get recent signals",
-            "/performance": "Get performance metrics",
-            "/config": "Get current configuration"
-        }
-    }
-
-@app.post("/start")
-async def start_hunter():
-    """Start the aggressive hunter"""
-    global scanner
+# ================ SIMPLE HTTP INTERFACE (No FastAPI) ================
+class SimpleHTTPServer:
+    """Simple HTTP server for monitoring"""
     
-    if scanner is None:
-        scanner = CompleteAggressiveScanner()
-    
-    # Run scanner in background
-    asyncio.create_task(scanner.run())
-    
-    return {
-        "status": "started",
-        "message": "Aggressive hunter started in background",
-        "timestamp": datetime.now().isoformat()
-    }
-
-@app.post("/stop")
-async def stop_hunter():
-    """Stop the hunter"""
-    # This would need proper task management in production
-    return {
-        "status": "stopping",
-        "message": "Hunter stop requested (send KeyboardInterrupt)",
-        "note": "In production, implement proper task cancellation"
-    }
-
-@app.get("/stats")
-async def get_hunter_stats():
-    """Get hunter statistics"""
-    if scanner is None or scanner.engine is None:
-        return {"error": "Hunter not initialized"}
-    
-    try:
-        engine_stats = scanner.engine.get_performance_stats()
-        logger_stats = scanner.engine.logger.get_stats()
+    def __init__(self, scanner):
+        self.scanner = scanner
+        self.server = None
         
-        return {
-            "hunter": {
-                "scan_cycles": scanner.scan_cycle,
-                "scans_completed": scanner.scans_completed,
-                "pairs_scanned": scanner.pairs_scanned,
-                "active_positions": len(scanner.active_positions),
-                "uptime_seconds": time.time() - scanner.start_time
+    async def handle_request(self, reader, writer):
+        """Handle HTTP requests"""
+        try:
+            request = await reader.read(1024)
+            request_str = request.decode('utf-8')
+            
+            # Parse request line
+            lines = request_str.split('\r\n')
+            if not lines:
+                writer.write(b'HTTP/1.1 400 Bad Request\r\n\r\n')
+                await writer.drain()
+                writer.close()
+                return
+            
+            request_line = lines[0]
+            method, path, _ = request_line.split(' ')
+            
+            response = ""
+            
+            if path == '/':
+                response = self._get_root_response()
+            elif path == '/stats':
+                response = self._get_stats_response()
+            elif path == '/recent':
+                response = await self._get_recent_response()
+            elif path == '/performance':
+                response = await self._get_performance_response()
+            elif path == '/config':
+                response = self._get_config_response()
+            else:
+                response = self._get_not_found_response()
+            
+            # Send response
+            writer.write(f'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{response}'.encode())
+            await writer.drain()
+            writer.close()
+            
+        except Exception as e:
+            error_response = json.dumps({"error": str(e)})
+            writer.write(f'HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{error_response}'.encode())
+            await writer.drain()
+            writer.close()
+    
+    def _get_root_response(self):
+        """Root endpoint response"""
+        return json.dumps({
+            "system": "Aggressive Wave Expansion Hunter",
+            "version": "2.0.0",
+            "status": "running",
+            "endpoints": {
+                "/": "System info",
+                "/stats": "Hunter statistics",
+                "/recent": "Recent signals",
+                "/performance": "Performance metrics",
+                "/config": "Configuration"
+            }
+        }, indent=2)
+    
+    def _get_stats_response(self):
+        """Stats endpoint response"""
+        if self.scanner.engine is None:
+            return json.dumps({"error": "Hunter not initialized"})
+        
+        try:
+            engine_stats = self.scanner.engine.get_performance_stats()
+            logger_stats = self.scanner.engine.logger.get_stats()
+            
+            response = {
+                "hunter": {
+                    "scan_cycles": self.scanner.scan_cycle,
+                    "scans_completed": self.scanner.scans_completed,
+                    "pairs_scanned": self.scanner.pairs_scanned,
+                    "active_positions": len(self.scanner.active_positions),
+                    "uptime_seconds": time.time() - self.scanner.start_time
+                },
+                "engine": engine_stats,
+                "logger": logger_stats
+            }
+            
+            return json.dumps(response, indent=2)
+            
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+    
+    async def _get_recent_response(self):
+        """Recent signals endpoint response"""
+        if self.scanner.db is None:
+            return json.dumps({"error": "Database not initialized"})
+        
+        try:
+            self.scanner.db.row_factory = aiosqlite.Row
+            async with self.scanner.db.execute("""
+                SELECT symbol, side, entry_price, stop_loss, take_profit,
+                       target_pct, risk_reward, overall_conviction,
+                       compression_score, volume_spike_ratio,
+                       status, created_at, pnl_percent, close_reason
+                FROM aggressive_signals 
+                ORDER BY created_at DESC 
+                LIMIT 20
+            """) as cursor:
+                rows = await cursor.fetchall()
+                
+                signals = []
+                for row in rows:
+                    signals.append(dict(row))
+                
+                response = {
+                    "signals": signals,
+                    "count": len(signals),
+                    "hunting_style": "Aggressive wave expansion"
+                }
+                
+                return json.dumps(response, indent=2)
+                
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+    
+    async def _get_performance_response(self):
+        """Performance metrics endpoint response"""
+        if self.scanner.db is None:
+            return json.dumps({"error": "Database not initialized"})
+        
+        try:
+            # Get win/loss stats
+            async with self.scanner.db.execute("""
+                SELECT 
+                    COUNT(*) as total_trades,
+                    SUM(CASE WHEN close_reason = 'TP_HIT' THEN 1 ELSE 0 END) as wins,
+                    SUM(CASE WHEN close_reason = 'SL_HIT' THEN 1 ELSE 0 END) as losses,
+                    AVG(CASE WHEN close_reason = 'TP_HIT' THEN pnl_percent END) as avg_win,
+                    AVG(CASE WHEN close_reason = 'SL_HIT' THEN pnl_percent END) as avg_loss,
+                    MAX(CASE WHEN close_reason = 'TP_HIT' THEN pnl_percent END) as best_win,
+                    MIN(CASE WHEN close_reason = 'SL_HIT' THEN pnl_percent END) as worst_loss,
+                    SUM(pnl_percent) as total_pnl
+                FROM aggressive_signals 
+                WHERE status = 'CLOSED'
+            """) as cursor:
+                perf = await cursor.fetchone()
+            
+            response = {
+                "trading_performance": dict(perf) if perf else {},
+                "hunter_philosophy": "Aggressive expansion hunting with asymmetric payoff",
+                "expected_win_rate": "40-50%",
+                "risk_profile": "Many small losses, Few big winners"
+            }
+            
+            return json.dumps(response, indent=2)
+            
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+    
+    def _get_config_response(self):
+        """Configuration endpoint response"""
+        response = {
+            "scanning": {
+                "interval_seconds": SCAN_INTERVAL,
+                "top_pairs": TOP_N_VOLUME,
+                "min_volume_usd": MIN_VOLUME_USD,
+                "timeframes": list(TIMEFRAMES.keys())
             },
-            "engine": engine_stats,
-            "logger": logger_stats,
-            "configuration": {
-                "scan_interval": SCAN_INTERVAL,
-                "max_positions": MAX_POSITIONS,
+            "trading": {
+                "max_stop_loss_pct": MAX_STOP_LOSS_PCT,
                 "min_target_pct": MIN_TARGET_PCT,
                 "max_target_pct": MAX_TARGET_PCT,
-                "max_stop_loss_pct": MAX_STOP_LOSS_PCT,
-                "min_risk_reward": MIN_RISK_REWARD
-            }
+                "min_risk_reward": MIN_RISK_REWARD,
+                "max_positions": MAX_POSITIONS
+            },
+            "indicators": {
+                "ema_periods": EMA_PERIODS,
+                "rsi_period": RSI_PERIOD,
+                "rsi_overbought": RSI_OVERBOUGHT,
+                "rsi_oversold": RSI_OVERSOLD
+            },
+            "philosophy": "Aggressive wave expansion hunting - Losses are fuel for explosive winners"
         }
         
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.get("/recent")
-async def get_recent_signals(limit: int = 20):
-    """Get recent aggressive signals"""
-    if scanner is None or scanner.db is None:
-        return {"error": "Hunter not initialized"}
+        return json.dumps(response, indent=2)
     
-    try:
-        scanner.db.row_factory = aiosqlite.Row
-        async with scanner.db.execute("""
-            SELECT symbol, side, entry_price, stop_loss, take_profit,
-                   target_pct, risk_reward, overall_conviction,
-                   compression_score, volume_spike_ratio,
-                   status, created_at, pnl_percent, close_reason
-            FROM aggressive_signals 
-            ORDER BY created_at DESC 
-            LIMIT ?
-        """, (limit,)) as cursor:
-            rows = await cursor.fetchall()
-            
-            signals = []
-            for row in rows:
-                signals.append(dict(row))
-            
-            return {
-                "signals": signals,
-                "count": len(signals),
-                "hunting_style": "Aggressive wave expansion"
-            }
-            
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.get("/performance")
-async def get_performance_metrics():
-    """Get detailed performance metrics"""
-    if scanner is None or scanner.db is None:
-        return {"error": "Hunter not initialized"}
+    def _get_not_found_response(self):
+        """404 Not Found response"""
+        return json.dumps({"error": "Endpoint not found", "available_endpoints": ["/", "/stats", "/recent", "/performance", "/config"]})
     
-    try:
-        # Get win/loss stats
-        async with scanner.db.execute("""
-            SELECT 
-                COUNT(*) as total_trades,
-                SUM(CASE WHEN close_reason = 'TP_HIT' THEN 1 ELSE 0 END) as wins,
-                SUM(CASE WHEN close_reason = 'SL_HIT' THEN 1 ELSE 0 END) as losses,
-                AVG(CASE WHEN close_reason = 'TP_HIT' THEN pnl_percent END) as avg_win,
-                AVG(CASE WHEN close_reason = 'SL_HIT' THEN pnl_percent END) as avg_loss,
-                MAX(CASE WHEN close_reason = 'TP_HIT' THEN pnl_percent END) as best_win,
-                MIN(CASE WHEN close_reason = 'SL_HIT' THEN pnl_percent END) as worst_loss,
-                SUM(pnl_percent) as total_pnl
-            FROM aggressive_signals 
-            WHERE status = 'CLOSED'
-        """) as cursor:
-            perf = await cursor.fetchone()
-            
-        # Get compression stats
-        async with scanner.db.execute("""
-            SELECT 
-                AVG(compression_score) as avg_compression,
-                AVG(ema_spread_pct) as avg_ema_spread,
-                AVG(volume_spike_ratio) as avg_volume_spike,
-                COUNT(*) as total_compressions
-            FROM compression_history
-        """) as cursor:
-            compression = await cursor.fetchone()
+    async def start(self, host='0.0.0.0', port=8000):
+        """Start the HTTP server"""
+        self.server = await asyncio.start_server(
+            self.handle_request,
+            host,
+            port
+        )
         
-        return {
-            "trading_performance": dict(perf) if perf else {},
-            "compression_analysis": dict(compression) if compression else {},
-            "hunter_philosophy": "Aggressive expansion hunting with asymmetric payoff",
-            "expected_win_rate": "40-50%",
-            "risk_profile": "Many small losses, Few big winners"
-        }
+        self.scanner.engine.logger.logger.info(f"🌐 HTTP server started on {host}:{port}")
         
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.get("/config")
-async def get_configuration():
-    """Get current configuration"""
-    return {
-        "scanning": {
-            "interval_seconds": SCAN_INTERVAL,
-            "top_pairs": TOP_N_VOLUME,
-            "min_volume_usd": MIN_VOLUME_USD,
-            "timeframes": list(TIMEFRAMES.keys())
-        },
-        "trading": {
-            "max_stop_loss_pct": MAX_STOP_LOSS_PCT,
-            "min_target_pct": MIN_TARGET_PCT,
-            "max_target_pct": MAX_TARGET_PCT,
-            "min_risk_reward": MIN_RISK_REWARD,
-            "max_positions": MAX_POSITIONS
-        },
-        "indicators": {
-            "ema_periods": EMA_PERIODS,
-            "rsi_period": RSI_PERIOD,
-            "rsi_overbought": RSI_OVERBOUGHT,
-            "rsi_oversold": RSI_OVERSOLD
-        },
-        "philosophy": "Aggressive wave expansion hunting - Losses are fuel for explosive winners"
-    }
+        async with self.server:
+            await self.server.serve_forever()
+    
+    async def stop(self):
+        """Stop the HTTP server"""
+        if self.server:
+            self.server.close()
+            await self.server.wait_closed()
+            self.scanner.engine.logger.logger.info("HTTP server stopped")
 
 # ================ MAIN EXECUTION ================
+async def main():
+    """
+    Main execution function.
+    Run the aggressive hunter with HTTP monitoring.
+    """
+    
+    # Create the hunter
+    hunter = CompleteAggressiveScanner()
+    
+    # Create HTTP server
+    http_server = SimpleHTTPServer(hunter)
+    
+    try:
+        # Initialize hunter
+        await hunter.initialize()
+        
+        # Start HTTP server in background
+        http_task = asyncio.create_task(http_server.start())
+        
+        # Run hunter
+        await hunter.run()
+        
+    except KeyboardInterrupt:
+        print("\n🛑 Hunter stopped by user")
+        
+        # Stop HTTP server
+        await http_server.stop()
+        
+    except Exception as e:
+        print(f"\n🚨 Hunter crashed: {e}")
+        import traceback
+        traceback.print_exc()
+        
+        # Stop HTTP server
+        await http_server.stop()
+        
+    finally:
+        # Cleanup
+        await hunter.cleanup()
+
 if __name__ == "__main__":
     """
     Main execution block.
     Run with: python aggressive_hunter.py
     """
     
-    # Create and run the hunter
-    hunter = CompleteAggressiveScanner()
-    
-    try:
-        # Run the hunter
-        asyncio.run(hunter.run())
-        
-    except KeyboardInterrupt:
-        print("\n🛑 Hunter stopped by user")
-    except Exception as e:
-        print(f"\n🚨 Hunter crashed: {e}")
-        import traceback
-        traceback.print_exc()
+    # Run the main async function
+    asyncio.run(main())
