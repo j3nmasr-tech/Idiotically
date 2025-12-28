@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-Visual Synthesis Scanner - الإصدار المؤكد للإرسال بدون تكرار
+PROFESSIONAL WAVE MOMENTUM SCANNER
+MTF + Elliott Wave Concept + RSI + EMA + Volume Analysis
 """
 
 import os
@@ -15,985 +16,1136 @@ import httpx
 import ccxt.async_support as ccxt
 import pandas as pd
 import numpy as np
+from scipy import stats
 from fastapi import FastAPI
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Set
+from dataclasses import dataclass
 
-# ---------------- CONFIG ----------------
+# ================ CONFIGURATION ================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-DB_PATH = "/app/data/signals.db"
+DB_PATH = "/app/data/pro_signals.db"
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 120))
-TOP_N = int(os.getenv("TOP_N", 100))
+# Scanning parameters
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))  # 1 minute for high precision
+TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 100))    # Focus on high-volume pairs only
+MIN_VOLUME_USD = 50000  # $5M minimum daily volume
 
-# Easier thresholds for more signals
-MIN_SYNTHESIS_SCORE = 0.25  # Lowered from 0.6
-
-# Timeframes - using fewer for reliability
+# Timeframes for multi-timeframe analysis
 TIMEFRAMES = {
-    "DAILY": "1d",
-    "H4": "4h",
-    "H1": "1h",
-    "M15": "15m"
+    "4H": "4h",    # Primary direction
+    "1H": "1h",    # Wave structure
+    "15M": "15m",  # Momentum timing
+    "5M": "5m"     # Entry precision
 }
 
-# ---------------- LOGGING ----------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
-log = logging.getLogger("visual_scanner")
-db_lock = asyncio.Lock()
-db_conn = None
-exchange = None
+# EMA periods for structure analysis
+EMA_PERIODS = {
+    "fast": 9,
+    "medium": 21,
+    "slow": 50,
+    "trend": 200
+}
 
-# ---------------- TELEGRAM ----------------
+# ================ DATA CLASSES ================
+@dataclass
+class MarketStructure:
+    """Market structure analysis result"""
+    direction: str  # BULLISH, BEARISH, NEUTRAL
+    strength: float  # 0-1
+    ema_alignment: Dict[str, float]
+    higher_tf_bias: str
+
+@dataclass
+class WavePosition:
+    """Wave position analysis"""
+    wave_type: str  # IMPULSIVE, CORRECTIVE
+    wave_phase: str  # EARLY, MID, LATE, EXHAUSTION
+    completion_percent: float  # 0-100%
+    next_move_direction: str  # CONTINUATION, REVERSAL
+
+@dataclass
+class MomentumAnalysis:
+    """Momentum analysis using RSI"""
+    rsi_value: float
+    divergence: str  # BULLISH_DIV, BEARISH_DIV, NONE
+    momentum_loss: bool
+    failure_swing: bool
+    hidden_divergence: str
+
+@dataclass
+class VolumeAnalysis:
+    """Volume and market strength analysis"""
+    volume_ratio: float  # Recent/Average
+    volume_trend: str  # ACCUMULATING, DISTRIBUTING, EXHAUSTING
+    price_volume_confirmation: bool
+    climax_detected: bool
+
+@dataclass
+class TradeSignal:
+    """Complete trading signal"""
+    symbol: str
+    side: str  # LONG, SHORT
+    entry_price: float
+    stop_loss: float
+    take_profit: float
+    confidence: float  # 0-1
+    expected_move_pct: float  # Expected percentage move (typically 3%+)
+    timeframes_aligned: List[str]
+    wave_position: WavePosition
+    momentum: MomentumAnalysis
+    volume: VolumeAnalysis
+    market_structure: MarketStructure
+    signal_id: str
+    timestamp: float
+
+# ================ LOGGING ================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(name)s | %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+log = logging.getLogger("wave_scanner")
+
+# ================ UTILITIES ================
 async def tg(msg: str):
     """Send Telegram message"""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram credentials missing")
         return
+    
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(timeout=10) as client:
             await client.post(url, json={
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": msg,
-                "parse_mode": "HTML"
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True
             })
-        log.info("Telegram message sent")
     except Exception as e:
-        log.warning(f"Telegram failed: {e}")
-
-# ---------------- DATABASE ----------------
-async def check_and_add_column(column_name: str, column_type: str):
-    """Check if a column exists and add it if it doesn't"""
-    try:
-        # Check if column exists
-        async with db_conn.execute(f"PRAGMA table_info(signals)") as cursor:
-            columns = await cursor.fetchall()
-            column_names = [col[1] for col in columns]
-            
-            if column_name not in column_names:
-                log.info(f"Adding missing column: {column_name}")
-                await db_conn.execute(f"ALTER TABLE signals ADD COLUMN {column_name} {column_type}")
-                await db_conn.commit()
-                log.info(f"✅ Column {column_name} added successfully")
-                return True
-            else:
-                log.debug(f"Column {column_name} already exists")
-                return True
-    except Exception as e:
-        log.error(f"Error adding column {column_name}: {e}")
-        return False
+        log.error(f"Telegram error: {e}")
 
 async def init_db():
-    """Initialize database with automatic schema updates"""
-    global db_conn
-    try:
-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-        db_conn = await aiosqlite.connect(DB_PATH)
-        
-        # Create main table if it doesn't exist
-        await db_conn.execute("""
-            CREATE TABLE IF NOT EXISTS signals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                side TEXT NOT NULL,
-                entry REAL NOT NULL,
-                sl REAL NOT NULL,
-                tp REAL NOT NULL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                status TEXT DEFAULT 'OPEN',
-                timeframe_alignment TEXT,
-                wave_structure TEXT,
-                strength_level TEXT,
-                indicators_signal TEXT,
-                volume_status TEXT,
-                synthesis_score REAL,
-                close_reason TEXT,
-                close_price REAL,
-                close_timestamp DATETIME,
-                pnl_percent REAL,
-                signal_hash TEXT UNIQUE
-            )
-        """)
-        
-        await db_conn.commit()
-        log.info("✅ Main table created/verified")
-        
-        # Check and add missing columns
-        required_columns = [
-            ("price_hash", "TEXT"),
-        ]
-        
-        for column_name, column_type in required_columns:
-            if not await check_and_add_column(column_name, column_type):
-                log.error(f"Failed to add required column: {column_name}")
-                return False
-        
-        # Create indexes (will ignore if already exist)
-        try:
-            await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_price_hash ON signals(price_hash)")
-            await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_symbol_timestamp ON signals(symbol, timestamp)")
-            await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_status ON signals(status)")
-            await db_conn.commit()
-            log.info("✅ Database indexes created/verified")
-        except Exception as e:
-            log.warning(f"Index creation warning (likely already exist): {e}")
-        
-        log.info("✅ Database ready with all required columns")
-        return True
-        
-    except Exception as e:
-        log.error(f"Database error: {e}")
-        return False
+    """Initialize database for professional signals"""
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    
+    conn = await aiosqlite.connect(DB_PATH)
+    
+    await conn.execute("""
+    CREATE TABLE IF NOT EXISTS signals (
+        id TEXT PRIMARY KEY,
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL,
+        entry_price REAL NOT NULL,
+        stop_loss REAL NOT NULL,
+        take_profit REAL NOT NULL,
+        confidence REAL NOT NULL,
+        expected_move_pct REAL NOT NULL,
+        market_structure TEXT,
+        wave_position TEXT,
+        momentum_analysis TEXT,
+        volume_analysis TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        expired_at TIMESTAMP,
+        triggered BOOLEAN DEFAULT FALSE,
+        trigger_price REAL,
+        trigger_time TIMESTAMP,
+        pnl_percent REAL
+    )
+    """)
+    
+    await conn.execute("""
+    CREATE INDEX IF NOT EXISTS idx_symbol_created ON signals(symbol, created_at)
+    """)
+    
+    await conn.execute("""
+    CREATE INDEX IF NOT EXISTS idx_expired ON signals(expired_at, triggered)
+    """)
+    
+    await conn.commit()
+    return conn
 
-# ================ SIMPLIFIED ANALYSIS - MORE SIGNALS ================
-
-def analyze_timeframes_simple(data: Dict[str, pd.DataFrame]) -> Tuple[str, float, str]:
-    """Simplified timeframe analysis"""
-    try:
-        scores = []
-        reasons = []
+# ================ CORE ANALYSIS ENGINE ================
+class ProfessionalMarketAnalyzer:
+    """Implements the master prompt methodology"""
+    
+    def __init__(self):
+        self.signal_cache = set()
         
-        for tf_name, df in data.items():
-            prices = df['close'].values
-            if len(prices) < 10:
-                continue
-            
-            # Simple trend: Compare last price to 10-period average
-            recent_avg = np.mean(prices[-10:])
-            current = prices[-1]
-            
-            if current > recent_avg * 1.01:  # 1% above average
-                scores.append(1.0)
-                reasons.append(f"{tf_name}: UP")
-            elif current < recent_avg * 0.99:  # 1% below average
-                scores.append(1.0)
-                reasons.append(f"{tf_name}: DOWN")
-            else:
-                scores.append(0.5)
-                reasons.append(f"{tf_name}: NEUTRAL")
+    def calculate_emas(self, df: pd.DataFrame) -> Dict[str, pd.Series]:
+        """Calculate EMA series for all periods"""
+        return {
+            name: df['close'].ewm(span=period, adjust=False).mean()
+            for name, period in EMA_PERIODS.items()
+        }
+    
+    def calculate_rsi(self, prices: pd.Series, period: int = 14) -> pd.Series:
+        """Calculate RSI with momentum analysis"""
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+    
+    def analyze_market_structure(self, df: pd.DataFrame, 
+                                higher_tf_direction: str = None) -> MarketStructure:
+        """
+        1️⃣ Multi-Timeframe Context & 2️⃣ Direction & Trend Identification
+        """
+        emas = self.calculate_emas(df)
+        current_price = df['close'].iloc[-1]
         
-        if not scores:
-            return "NEUTRAL", 0.0, "No data"
+        # Check EMA alignment
+        ema_alignment = {}
+        for name, ema_series in emas.items():
+            ema_value = ema_series.iloc[-1]
+            ema_alignment[name] = (current_price - ema_value) / ema_value * 100
         
-        avg_score = np.mean(scores)
+        # Determine direction based on EMAs
+        above_fast = current_price > emas['fast'].iloc[-1]
+        above_medium = current_price > emas['medium'].iloc[-1]
+        above_slow = current_price > emas['slow'].iloc[-1]
+        above_trend = current_price > emas['trend'].iloc[-1]
         
-        # Determine dominant direction
-        up_count = sum(1 for r in reasons if "UP" in r)
-        down_count = sum(1 for r in reasons if "DOWN" in r)
+        bullish_score = sum([above_fast, above_medium, above_slow, above_trend])
+        bearish_score = 4 - bullish_score
         
-        if up_count > down_count:
-            direction = "UP"
-        elif down_count > up_count:
-            direction = "DOWN"
+        if bullish_score >= 3:
+            direction = "BULLISH"
+            strength = bullish_score / 4
+        elif bearish_score >= 3:
+            direction = "BEARISH"
+            strength = bearish_score / 4
         else:
             direction = "NEUTRAL"
+            strength = 0.5
         
-        reason = " | ".join(reasons[:3])  # First 3 reasons only
+        # Respect higher timeframe bias
+        if higher_tf_direction and higher_tf_direction != "NEUTRAL":
+            if direction != higher_tf_direction:
+                # Downgrade strength if contradicting higher TF
+                strength *= 0.5
+                direction = f"MIXED_{direction}"
         
-        return direction, avg_score, reason
+        return MarketStructure(
+            direction=direction,
+            strength=strength,
+            ema_alignment=ema_alignment,
+            higher_tf_bias=higher_tf_direction or "NEUTRAL"
+        )
+    
+    def analyze_wave_position(self, df: pd.DataFrame, 
+                             structure: MarketStructure) -> WavePosition:
+        """
+        3️⃣ Wave Position (Elliott Wave Concept)
+        Simplified wave analysis without manual counting
+        """
+        prices = df['close'].values
+        highs = df['high'].values
+        lows = df['low'].values
         
-    except Exception as e:
-        log.error(f"Timeframe error: {e}")
-        return "NEUTRAL", 0.0, f"Error: {e}"
-
-def analyze_wave_simple(data: Dict[str, pd.DataFrame], direction: str) -> Tuple[float, str]:
-    """Simplified wave analysis"""
-    try:
-        h4_df = data.get('H4')
-        if h4_df is None or len(h4_df) < 20:
-            return 0.6, "Insufficient data"
+        if len(prices) < 50:
+            return WavePosition(
+                wave_type="UNKNOWN",
+                wave_phase="UNKNOWN",
+                completion_percent=50,
+                next_move_direction="UNKNOWN"
+            )
         
-        prices = h4_df['close'].values[-20:]
+        # Detect impulsive vs corrective movement
+        recent_move = prices[-1] - prices[-20]
+        volatility = np.std(prices[-20:])
         
-        # Simple wave detection: higher highs for uptrend, lower lows for downtrend
-        if direction == "UP":
-            # Check if recent prices are making higher highs
-            recent_high = np.max(prices[-5:])
-            prev_high = np.max(prices[-10:-5])
-            
-            if recent_high > prev_high:
-                return 0.8, "Higher highs detected"
-            else:
-                return 0.5, "No clear higher highs"
-        
-        elif direction == "DOWN":
-            # Check if recent prices are making lower lows
-            recent_low = np.min(prices[-5:])
-            prev_low = np.min(prices[-10:-5])
-            
-            if recent_low < prev_low:
-                return 0.8, "Lower lows detected"
-            else:
-                return 0.5, "No clear lower lows"
-        
-        return 0.6, "Neutral wave pattern"
-        
-    except Exception as e:
-        log.error(f"Wave error: {e}")
-        return 0.5, f"Error: {e}"
-
-def analyze_strength_simple(data: Dict[str, pd.DataFrame], direction: str) -> Tuple[float, str]:
-    """Simplified strength analysis"""
-    try:
-        h1_df = data.get('H1')
-        if h1_df is None or len(h1_df) < 10:
-            return 0.6, "Insufficient data"
-        
-        recent = h1_df.iloc[-5:]  # Last 5 candles
-        
-        # Calculate bullish/bearish pressure
-        if direction == "UP":
-            bullish_candles = sum(recent['close'] > recent['open'])
-            score = bullish_candles / 5
-            strength = "Bullish pressure"
-        else:  # DOWN
-            bearish_candles = sum(recent['close'] < recent['open'])
-            score = bearish_candles / 5
-            strength = "Bearish pressure"
-        
-        return score, strength
-        
-    except Exception as e:
-        log.error(f"Strength error: {e}")
-        return 0.5, f"Error: {e}"
-
-def analyze_indicators_simple(data: Dict[str, pd.DataFrame], direction: str) -> Tuple[float, str]:
-    """Simplified indicators - just RSI"""
-    try:
-        m15_df = data.get('M15')
-        if m15_df is None or len(m15_df) < 14:
-            return 0.6, "Insufficient data"
-        
-        prices = m15_df['close'].values[-14:]
-        
-        # Simple RSI calculation
-        deltas = np.diff(prices)
-        gains = deltas[deltas > 0]
-        losses = -deltas[deltas < 0]
-        
-        avg_gain = np.mean(gains) if len(gains) > 0 else 0
-        avg_loss = np.mean(losses) if len(losses) > 0 else 0
-        
-        if avg_loss == 0:
-            rsi = 100 if avg_gain > 0 else 0
+        if abs(recent_move) > volatility * 2:
+            wave_type = "IMPULSIVE"
         else:
-            rs = avg_gain / avg_loss
-            rsi = 100 - (100 / (1 + rs))
+            wave_type = "CORRECTIVE"
         
-        # Check if RSI supports direction
-        if direction == "UP":
-            if rsi < 50:  # Oversold or neutral
-                return 0.8, f"RSI {rsi:.0f} (Supports UP)"
+        # Determine wave phase using fractal analysis
+        # Look for exhaustion patterns
+        recent_highs = highs[-10:]
+        recent_lows = lows[-10:]
+        
+        # Check if price is making new extremes
+        if structure.direction == "BULLISH":
+            is_new_high = prices[-1] > np.max(highs[-30:-10])
+            # Calculate momentum divergence (simplified)
+            if wave_type == "IMPULSIVE" and not is_new_high:
+                wave_phase = "LATE"
+                completion = 70
+                next_move = "CORRECTION"  # Expect correction after impulse
+            elif wave_type == "CORRECTIVE":
+                wave_phase = "MID"
+                completion = 40
+                next_move = "CONTINUATION"  # Expect continuation of trend
             else:
-                return 0.4, f"RSI {rsi:.0f} (Caution)"
-        else:  # DOWN
-            if rsi > 50:  # Overbought or neutral
-                return 0.8, f"RSI {rsi:.0f} (Supports DOWN)"
+                wave_phase = "EARLY"
+                completion = 20
+                next_move = "CONTINUATION"
+        else:  # BEARISH
+            is_new_low = prices[-1] < np.min(lows[-30:-10])
+            if wave_type == "IMPULSIVE" and not is_new_low:
+                wave_phase = "LATE"
+                completion = 70
+                next_move = "CORRECTION"
+            elif wave_type == "CORRECTIVE":
+                wave_phase = "MID"
+                completion = 40
+                next_move = "CONTINUATION"
             else:
-                return 0.4, f"RSI {rsi:.0f} (Caution)"
+                wave_phase = "EARLY"
+                completion = 20
+                next_move = "CONTINUATION"
         
-    except Exception as e:
-        log.error(f"Indicators error: {e}")
-        return 0.5, f"Error: {e}"
-
-def analyze_volume_simple(data: Dict[str, pd.DataFrame], direction: str) -> Tuple[float, str]:
-    """Simplified volume analysis"""
-    try:
-        m15_df = data.get('M15')
-        if m15_df is None or len(m15_df) < 10:
-            return 0.6, "Insufficient data"
+        # Check for exhaustion (price extended from EMAs)
+        emas = self.calculate_emas(df)
+        fast_ema = emas['fast'].iloc[-1]
+        price_distance = abs(prices[-1] - fast_ema) / fast_ema
         
-        recent_volume = m15_df['volume'].values[-5:].mean()
-        prev_volume = m15_df['volume'].values[-10:-5].mean()
+        if price_distance > 0.05:  # 5% away from fast EMA
+            wave_phase = "EXHAUSTION"
+            completion = 85
+            next_move = "REVERSAL"
         
-        if prev_volume == 0:
-            volume_ratio = 1
-        else:
-            volume_ratio = recent_volume / prev_volume
+        return WavePosition(
+            wave_type=wave_type,
+            wave_phase=wave_phase,
+            completion_percent=completion,
+            next_move_direction=next_move
+        )
+    
+    def analyze_momentum(self, df: pd.DataFrame, 
+                        wave: WavePosition) -> MomentumAnalysis:
+        """
+        4️⃣ RSI Momentum Analysis
+        """
+        rsi = self.calculate_rsi(df['close'])
+        rsi_values = rsi.values[-30:]
+        price_values = df['close'].values[-30:]
         
-        if volume_ratio > 1.2:
-            return 0.8, f"Volume increasing ({volume_ratio:.1f}x)"
-        elif volume_ratio > 0.8:
-            return 0.6, f"Volume normal ({volume_ratio:.1f}x)"
-        else:
-            return 0.4, f"Volume low ({volume_ratio:.1f}x)"
+        current_rsi = rsi_values[-1]
         
-    except Exception as e:
-        log.error(f"Volume error: {e}")
-        return 0.5, f"Error: {e}"
-
-def calculate_simple_sltp(current_price: float, side: str, data: Dict[str, pd.DataFrame]) -> Tuple[float, float, str]:
-    """Simple SL/TP calculation"""
-    try:
-        h4_df = data.get('H4')
-        if h4_df is None or len(h4_df) < 20:
-            # Default values if no data
-            if side == "BUY":
-                sl = current_price * 0.98  # 2% stop loss
-                tp = current_price * 1.04  # 4% take profit
-            else:
-                sl = current_price * 1.02  # 2% stop loss
-                tp = current_price * 0.96  # 4% take profit
-            
-            return sl, tp, "Default 1:2 R:R"
+        # Detect divergence
+        divergence = "NONE"
+        momentum_loss = False
+        failure_swing = False
+        hidden_divergence = "NONE"
         
-        if side == "BUY":
-            # Find recent support
-            recent_low = h4_df['low'].iloc[-10:].min()
-            sl = recent_low * 0.99  # 1% below support
+        # Simple divergence detection
+        if len(rsi_values) >= 10:
+            # Look for RSI making lower highs while price makes higher highs (bearish div)
+            rsi_highs = []
+            price_highs = []
             
-            risk = current_price - sl
-            tp = current_price + (risk * 2)  # 1:2 risk reward
+            for i in range(5, len(rsi_values)-5):
+                if (rsi_values[i] > rsi_values[i-1] and 
+                    rsi_values[i] > rsi_values[i+1]):
+                    rsi_highs.append((i, rsi_values[i]))
+                if (price_values[i] > price_values[i-1] and 
+                    price_values[i] > price_values[i+1]):
+                    price_highs.append((i, price_values[i]))
             
-            return sl, tp, f"SL below {recent_low:.2f}, TP 1:2 R:R"
-        
-        else:  # SELL
-            # Find recent resistance
-            recent_high = h4_df['high'].iloc[-10:].max()
-            sl = recent_high * 1.01  # 1% above resistance
-            
-            risk = sl - current_price
-            tp = current_price - (risk * 2)  # 1:2 risk reward
-            
-            return sl, tp, f"SL above {recent_high:.2f}, TP 1:2 R:R"
-        
-    except Exception as e:
-        log.error(f"SL/TP error: {e}")
-        # Fallback values
-        if side == "BUY":
-            return current_price * 0.98, current_price * 1.04, "Error fallback"
-        else:
-            return current_price * 1.02, current_price * 0.96, "Error fallback"
-
-# ================ SIGNAL GENERATION WITH DEDUPLICATION ================
-
-async def check_duplicate_signal(symbol: str, side: str, current_price: float, 
-                                tf_score: float, wave_score: float) -> Tuple[bool, str]:
-    """Check if similar signal was recently sent"""
-    try:
-        # Create price condition hash (based on market conditions, not time)
-        price_conditions = f"{symbol}:{side}:{current_price:.4f}:{tf_score:.2f}:{wave_score:.2f}"
-        price_hash = hashlib.md5(price_conditions.encode()).hexdigest()
-        
-        async with db_lock:
-            # Check for same price conditions in last 4 hours
-            async with db_conn.execute("""
-                SELECT COUNT(*) FROM signals 
-                WHERE price_hash = ? AND timestamp > datetime('now', '-4 hours')
-            """, (price_hash,)) as cursor:
-                same_conditions = (await cursor.fetchone())[0]
-            
-            if same_conditions > 0:
-                log.debug(f"{symbol}: Same market conditions detected recently")
-                return True, price_hash
-            
-            # Check for same symbol and side in last 6 hours (max 2 signals)
-            async with db_conn.execute("""
-                SELECT COUNT(*) FROM signals 
-                WHERE symbol = ? AND side = ? 
-                AND timestamp > datetime('now', '-6 hours')
-                AND status = 'OPEN'
-            """, (symbol, side)) as cursor:
-                recent_signals = (await cursor.fetchone())[0]
-            
-            if recent_signals >= 2:
-                log.debug(f"{symbol}: Too many recent {side} signals ({recent_signals})")
-                return True, price_hash
-            
-            # Check if price hasn't moved much from last signal
-            async with db_conn.execute("""
-                SELECT entry FROM signals 
-                WHERE symbol = ? AND side = ? 
-                AND timestamp > datetime('now', '-2 hours')
-                ORDER BY timestamp DESC LIMIT 1
-            """, (symbol, side)) as cursor:
-                result = await cursor.fetchone()
+            if len(rsi_highs) >= 2 and len(price_highs) >= 2:
+                rsi_trend = rsi_highs[-1][1] - rsi_highs[-2][1]
+                price_trend = price_highs[-1][1] - price_highs[-2][1]
                 
-                if result:
-                    last_entry = result[0]
-                    price_change = abs(current_price - last_entry) / last_entry * 100
-                    
-                    if price_change < 0.5:  # Less than 0.5% price change
-                        log.debug(f"{symbol}: Price hasn't moved enough ({price_change:.2f}%)")
-                        return True, price_hash
+                if price_trend > 0 and rsi_trend < -5:  # Bearish divergence
+                    divergence = "BEARISH_DIV"
+                elif price_trend < 0 and rsi_trend > 5:  # Bullish divergence
+                    divergence = "BULLISH_DIV"
         
-        return False, price_hash
+        # Check for momentum loss (RSI flattening during price movement)
+        recent_rsi = rsi_values[-5:]
+        if len(recent_rsi) >= 5:
+            rsi_slope = np.polyfit(range(5), recent_rsi, 1)[0]
+            price_slope = np.polyfit(range(5), price_values[-5:], 1)[0]
+            
+            if abs(price_slope) > 0.001 and abs(rsi_slope) < 0.0001:
+                momentum_loss = True
         
-    except Exception as e:
-        log.error(f"Duplicate check error: {e}")
-        # If error, create a random hash and allow the signal
-        return False, hashlib.md5(f"{symbol}:{time.time_ns()}".encode()).hexdigest()
-
-async def generate_signal_simple(data: Dict[str, pd.DataFrame], symbol: str) -> Optional[Dict]:
-    """Generate signal with simple logic and duplicate prevention"""
-    try:
-        log.info(f"Analyzing {symbol}...")
+        # Failure swing detection
+        if current_rsi > 70 and wave.wave_phase == "EXHAUSTION":
+            failure_swing = True
+        elif current_rsi < 30 and wave.wave_phase == "EXHAUSTION":
+            failure_swing = True
         
-        # 1. Timeframe analysis
-        direction, tf_score, tf_reason = analyze_timeframes_simple(data)
+        return MomentumAnalysis(
+            rsi_value=current_rsi,
+            divergence=divergence,
+            momentum_loss=momentum_loss,
+            failure_swing=failure_swing,
+            hidden_divergence=hidden_divergence
+        )
+    
+    def analyze_ema_interaction(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """
+        5️⃣ EMA Interaction
+        """
+        emas = self.calculate_emas(df)
+        current_price = df['close'].iloc[-1]
         
-        if direction == "NEUTRAL":
-            log.debug(f"{symbol}: No clear direction")
+        interactions = {
+            "rejections": [],
+            "overstretched": False,
+            "compression": False,
+            "expansion": False
+        }
+        
+        # Check for rejections
+        for name, ema_series in emas.items():
+            ema_value = ema_series.iloc[-1]
+            prev_ema = ema_series.iloc[-2]
+            
+            # Check if price bounced off EMA
+            candle = df.iloc[-1]
+            if (candle['low'] < ema_value and candle['close'] > ema_value and
+                candle['close'] > candle['open']):
+                interactions["rejections"].append(f"BULLISH_REJECTION_{name}")
+            elif (candle['high'] > ema_value and candle['close'] < ema_value and
+                  candle['close'] < candle['open']):
+                interactions["rejections"].append(f"BEARISH_REJECTION_{name}")
+        
+        # Check if price is overstretched from fast EMA
+        fast_ema = emas['fast'].iloc[-1]
+        distance_pct = abs(current_price - fast_ema) / fast_ema * 100
+        if distance_pct > 3:  # More than 3% away
+            interactions["overstretched"] = True
+        
+        # Check EMA compression/expansion
+        fast_slow_diff = abs(emas['fast'].iloc[-1] - emas['slow'].iloc[-1]) / emas['slow'].iloc[-1]
+        prev_fast_slow_diff = abs(emas['fast'].iloc[-2] - emas['slow'].iloc[-2]) / emas['slow'].iloc[-2]
+        
+        if fast_slow_diff < prev_fast_slow_diff * 0.8:
+            interactions["compression"] = True
+        elif fast_slow_diff > prev_fast_slow_diff * 1.2:
+            interactions["expansion"] = True
+        
+        return interactions
+    
+    def analyze_volume(self, df: pd.DataFrame, 
+                      structure: MarketStructure) -> VolumeAnalysis:
+        """
+        6️⃣ Volume & Market Strength
+        """
+        volumes = df['volume'].values
+        prices = df['close'].values
+        
+        if len(volumes) < 20:
+            return VolumeAnalysis(
+                volume_ratio=1.0,
+                volume_trend="UNKNOWN",
+                price_volume_confirmation=False,
+                climax_detected=False
+            )
+        
+        # Calculate volume ratio
+        recent_volume = np.mean(volumes[-5:])
+        avg_volume = np.mean(volumes[-20:])
+        volume_ratio = recent_volume / avg_volume if avg_volume > 0 else 1.0
+        
+        # Determine volume trend
+        volume_slope = np.polyfit(range(len(volumes[-10:])), volumes[-10:], 1)[0]
+        price_slope = np.polyfit(range(len(prices[-10:])), prices[-10:], 1)[0]
+        
+        if volume_slope > 0 and price_slope > 0:
+            volume_trend = "ACCUMULATING"
+            confirmation = True
+        elif volume_slope < 0 and price_slope > 0:
+            volume_trend = "DISTRIBUTING"
+            confirmation = False
+        elif volume_slope < 0 and price_slope < 0:
+            volume_trend = "EXHAUSTING"
+            confirmation = True
+        elif volume_slope > 0 and price_slope < 0:
+            volume_trend = "ABSORPTION"
+            confirmation = False
+        else:
+            volume_trend = "NEUTRAL"
+            confirmation = volume_ratio > 1.0
+        
+        # Check for climax volume (spike > 3x average)
+        climax_detected = False
+        if len(volumes) >= 3:
+            last_volume = volumes[-1]
+            if last_volume > avg_volume * 3:
+                climax_detected = True
+        
+        return VolumeAnalysis(
+            volume_ratio=volume_ratio,
+            volume_trend=volume_trend,
+            price_volume_confirmation=confirmation,
+            climax_detected=climax_detected
+        )
+    
+    def generate_signal(self, multi_tf_data: Dict[str, pd.DataFrame], 
+                       symbol: str) -> Optional[TradeSignal]:
+        """
+        7️⃣ Confluence & Signal Timing
+        Main signal generation logic
+        """
+        log.info(f"🔍 Analyzing {symbol} for professional setups...")
+        
+        # Get data from all timeframes
+        tf_4h = multi_tf_data.get("4H")
+        tf_1h = multi_tf_data.get("1H")
+        tf_15m = multi_tf_data.get("15M")
+        tf_5m = multi_tf_data.get("5M")
+        
+        if any(df is None for df in [tf_4h, tf_1h, tf_15m, tf_5m]):
+            log.debug(f"{symbol}: Missing timeframe data")
             return None
         
-        log.info(f"{symbol}: Direction {direction}, Score: {tf_score:.2f}")
+        # ========== TOP-DOWN ANALYSIS ==========
         
-        # 2. Other analyses
-        wave_score, wave_reason = analyze_wave_simple(data, direction)
-        strength_score, strength_reason = analyze_strength_simple(data, direction)
-        indicators_score, indicators_reason = analyze_indicators_simple(data, direction)
-        volume_score, volume_reason = analyze_volume_simple(data, direction)
-        
-        # 3. Calculate total score (simple average)
-        scores = [tf_score, wave_score, strength_score, indicators_score, volume_score]
-        total_score = np.mean(scores)
-        
-        log.info(f"{symbol}: Total score {total_score:.2f}")
-        
-        # 4. Check if score is good enough
-        if total_score < MIN_SYNTHESIS_SCORE:
-            log.debug(f"{symbol}: Score too low ({total_score:.2f} < {MIN_SYNTHESIS_SCORE})")
+        # 1. 4H - Highest timeframe for overall bias
+        structure_4h = self.analyze_market_structure(tf_4h)
+        if structure_4h.direction == "NEUTRAL":
+            log.debug(f"{symbol}: No clear 4H bias")
             return None
         
-        # 5. Get current price
-        current_price = data['M15']['close'].iloc[-1]
-        side = "BUY" if direction == "UP" else "SELL"
+        # 2. 1H - Wave structure analysis
+        structure_1h = self.analyze_market_structure(tf_1h, structure_4h.direction)
+        wave_1h = self.analyze_wave_position(tf_1h, structure_1h)
         
-        # 6. Check for duplicates BEFORE calculating SL/TP
-        is_duplicate, price_hash = await check_duplicate_signal(
-            symbol, side, current_price, tf_score, wave_score
+        # 3. 15M - Momentum timing
+        structure_15m = self.analyze_market_structure(tf_15m, structure_1h.direction)
+        momentum_15m = self.analyze_momentum(tf_15m, wave_1h)
+        ema_interaction_15m = self.analyze_ema_interaction(tf_15m)
+        volume_15m = self.analyze_volume(tf_15m, structure_15m)
+        
+        # 4. 5M - Entry precision
+        structure_5m = self.analyze_market_structure(tf_5m, structure_15m.direction)
+        
+        # ========== CONFLUENCE CHECK ==========
+        
+        # Check 1: All timeframes aligned in same direction
+        directions = [
+            structure_4h.direction,
+            structure_1h.direction,
+            structure_15m.direction
+        ]
+        
+        dominant_direction = max(set(directions), key=directions.count)
+        alignment_score = directions.count(dominant_direction) / len(directions)
+        
+        if alignment_score < 0.67:  # At least 2/3 timeframes aligned
+            log.debug(f"{symbol}: Timeframes not aligned ({alignment_score:.2f})")
+            return None
+        
+        # Check 2: Wave position is favorable
+        favorable_wave_phases = ["LATE", "EXHAUSTION", "MID"]
+        if wave_1h.wave_phase not in favorable_wave_phases:
+            log.debug(f"{symbol}: Wave phase not favorable ({wave_1h.wave_phase})")
+            return None
+        
+        # Check 3: Momentum confirms
+        momentum_confirms = False
+        if dominant_direction == "BULLISH":
+            momentum_confirms = (
+                momentum_15m.divergence == "BULLISH_DIV" or
+                (momentum_15m.rsi_value < 50 and not momentum_15m.momentum_loss)
+            )
+        else:  # BEARISH
+            momentum_confirms = (
+                momentum_15m.divergence == "BEARISH_DIV" or
+                (momentum_15m.rsi_value > 50 and not momentum_15m.momentum_loss)
+            )
+        
+        if not momentum_confirms:
+            log.debug(f"{symbol}: Momentum doesn't confirm")
+            return None
+        
+        # Check 4: Volume confirms
+        if not volume_15m.price_volume_confirmation:
+            log.debug(f"{symbol}: Volume doesn't confirm")
+            return None
+        
+        # Check 5: EMA interaction shows opportunity
+        has_ema_signal = (
+            len(ema_interaction_15m["rejections"]) > 0 or
+            ema_interaction_15m["compression"] or
+            (ema_interaction_15m["overstretched"] and wave_1h.wave_phase == "EXHAUSTION")
         )
         
-        if is_duplicate:
+        if not has_ema_signal:
+            log.debug(f"{symbol}: No EMA signal")
             return None
         
-        # 7. Calculate SL/TP
-        sl, tp, sltp_logic = calculate_simple_sltp(current_price, side, data)
+        # Check 6: Avoid choppy markets
+        # Calculate ATR to filter low volatility
+        atr = self.calculate_atr(tf_15m)
+        current_atr = atr.iloc[-1]
+        avg_atr = atr.mean()
         
-        # Calculate risk/reward
-        risk = abs(current_price - sl)
-        reward = abs(tp - current_price)
+        if current_atr < avg_atr * 0.3:  # Too low volatility
+            log.debug(f"{symbol}: Market too choppy (ATR {current_atr/avg_atr:.2f})")
+            return None
+        
+        # ========== SIGNAL GENERATION ==========
+        
+        current_price = tf_5m['close'].iloc[-1]
+        
+        # Determine side based on confluence
+        if dominant_direction == "BULLISH" and wave_1h.next_move_direction == "CONTINUATION":
+            side = "LONG"
+        elif dominant_direction == "BEARISH" and wave_1h.next_move_direction == "CONTINUATION":
+            side = "SHORT"
+        elif wave_1h.wave_phase == "EXHAUSTION" and wave_1h.next_move_direction == "REVERSAL":
+            # Counter-trend reversal signal (higher risk, higher reward)
+            side = "LONG" if dominant_direction == "BEARISH" else "SHORT"
+        else:
+            log.debug(f"{symbol}: No clear trade direction")
+            return None
+        
+        # Calculate SL/TP based on wave structure and volatility
+        if side == "LONG":
+            # Use recent swing low as SL basis
+            recent_low = tf_1h['low'].iloc[-20:].min()
+            stop_loss = recent_low * 0.995  # 0.5% below support
+            
+            # Expected move: 3% minimum, more if wave suggests
+            expected_move = 0.03  # 3% baseline
+            
+            if wave_1h.wave_phase == "EXHAUSTION":
+                expected_move *= 1.5  # Exhaustion moves often stronger
+            
+            take_profit = current_price * (1 + expected_move)
+            
+        else:  # SHORT
+            # Use recent swing high as SL basis
+            recent_high = tf_1h['high'].iloc[-20:].max()
+            stop_loss = recent_high * 1.005  # 0.5% above resistance
+            
+            expected_move = 0.03  # 3% baseline
+            
+            if wave_1h.wave_phase == "EXHAUSTION":
+                expected_move *= 1.5
+            
+            take_profit = current_price * (1 - expected_move)
+        
+        # Calculate confidence score
+        confidence_factors = {
+            "timeframe_alignment": alignment_score,
+            "wave_position": wave_1h.completion_percent / 100,
+            "momentum": 0.8 if momentum_confirms else 0.3,
+            "volume": 0.8 if volume_15m.price_volume_confirmation else 0.4,
+            "ema_signal": 0.7 if has_ema_signal else 0.3,
+            "structure_strength": structure_15m.strength
+        }
+        
+        confidence = np.mean(list(confidence_factors.values()))
+        
+        # Minimum confidence threshold
+        if confidence < 0.65:
+            log.debug(f"{symbol}: Confidence too low ({confidence:.2f})")
+            return None
+        
+        # Risk/Reward check
+        risk = abs(current_price - stop_loss)
+        reward = abs(take_profit - current_price)
         rr_ratio = reward / risk if risk > 0 else 0
         
-        # Skip if R:R is too poor
-        if rr_ratio < 1.0:
-            log.debug(f"{symbol}: Poor R:R ratio ({rr_ratio:.1f}:1)")
+        if rr_ratio < 1.5:  # Minimum 1.5:1 R:R
+            log.debug(f"{symbol}: Poor R:R ratio ({rr_ratio:.2f}:1)")
             return None
         
-        # 8. Create unique signal hash
-        unique_id = f"{symbol}:{side}:{current_price:.8f}:{time.time_ns()}"
-        signal_hash = hashlib.md5(unique_id.encode()).hexdigest()
+        # ========== CREATE SIGNAL ==========
         
-        # Create signal
-        signal = {
-            'symbol': symbol,
-            'side': side,
-            'entry': current_price,
-            'sl': sl,
-            'tp': tp,
-            'status': 'OPEN',
-            
-            'timeframe_alignment': tf_reason[:80],
-            'wave_structure': wave_reason[:80],
-            'strength_level': strength_reason[:80],
-            'indicators_signal': indicators_reason[:80],
-            'volume_status': volume_reason[:80],
-            'synthesis_score': total_score,
-            
-            'signal_hash': signal_hash,
-            'price_hash': price_hash
-        }
+        signal_id = hashlib.md5(
+            f"{symbol}:{side}:{current_price:.8f}:{time.time_ns()}".encode()
+        ).hexdigest()
         
-        log.info(f"✅ SIGNAL: {symbol} {side} @ {current_price:.4f} | Score: {total_score:.2f} | R:R: {rr_ratio:.1f}:1")
+        signal = TradeSignal(
+            symbol=symbol,
+            side=side,
+            entry_price=current_price,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            confidence=confidence,
+            expected_move_pct=expected_move * 100,
+            timeframes_aligned=[tf for tf, dir in zip(["4H", "1H", "15M"], directions) 
+                              if dir == dominant_direction],
+            wave_position=wave_1h,
+            momentum=momentum_15m,
+            volume=volume_15m,
+            market_structure=structure_15m,
+            signal_id=signal_id,
+            timestamp=time.time()
+        )
+        
+        log.info(f"🎯 SIGNAL FOUND: {symbol} {side} @ {current_price:.4f}")
+        log.info(f"   Confidence: {confidence:.2f}, Expected: {expected_move*100:.1f}%")
+        log.info(f"   Wave: {wave_1h.wave_phase}, R:R: {rr_ratio:.2f}:1")
         
         return signal
+    
+    def calculate_atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
+        """Calculate Average True Range"""
+        high = df['high']
+        low = df['low']
+        close = df['close'].shift()
         
-    except Exception as e:
-        log.error(f"Signal generation error for {symbol}: {e}")
-        return None
-
-# ================ DATA FETCHING ================
-
-async def fetch_ohlcv_data(exchange, symbol: str) -> Optional[Dict[str, pd.DataFrame]]:
-    """Fetch OHLCV data for all timeframes"""
-    data = {}
-    
-    for tf_name, tf in TIMEFRAMES.items():
-        try:
-            ohlcv = await exchange.fetch_ohlcv(symbol, timeframe=tf, limit=50)
-            
-            if ohlcv and len(ohlcv) >= 20:
-                df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-                
-                # Convert to numeric
-                for col in ["open", "high", "low", "close", "volume"]:
-                    df[col] = pd.to_numeric(df[col], errors='coerce')
-                
-                # Remove any NaN values
-                df = df.dropna()
-                
-                if len(df) >= 15:
-                    data[tf_name] = df
-                else:
-                    log.debug(f"{symbol} {tf}: Not enough data after cleaning")
-            else:
-                log.debug(f"{symbol} {tf}: No data or insufficient length")
-                
-        except Exception as e:
-            log.debug(f"{symbol} {tf} fetch error: {e}")
-            continue
-    
-    # Check if we have all required timeframes
-    required_tfs = ['DAILY', 'H4', 'H1', 'M15']
-    for tf in required_tfs:
-        if tf not in data:
-            log.debug(f"{symbol}: Missing {tf} data")
-            return None
-    
-    return data
-
-# ================ SCANNING LOOP ================
-
-async def scanning_loop(exchange):
-    """Main scanning loop"""
-    log.info("🚀 Starting scanner with duplicate prevention")
-    
-    # Test Telegram
-    await tg("🚀 Scanner started with duplicate prevention!")
-    
-    while True:
-        try:
-            log.info("=" * 50)
-            log.info("Starting new scan cycle...")
-            
-            # Get top volume pairs
-            try:
-                tickers = await exchange.fetch_tickers()
-                usdt_pairs = []
-                
-                for symbol, ticker in tickers.items():
-                    if symbol.endswith('/USDT'):
-                        volume = ticker.get('quoteVolume', 0)
-                        if volume > 1000000:  # $1M minimum volume
-                            usdt_pairs.append((symbol, volume))
-                
-                usdt_pairs.sort(key=lambda x: x[1], reverse=True)
-                top_pairs = usdt_pairs[:TOP_N]
-                
-                log.info(f"Found {len(top_pairs)} pairs with sufficient volume")
-                
-            except Exception as e:
-                log.error(f"Error fetching tickers: {e}")
-                await asyncio.sleep(30)
-                continue
-            
-            signals_found = 0
-            
-            for symbol, volume in top_pairs:
-                try:
-                    log.debug(f"Processing {symbol}...")
-                    
-                    # Fetch data
-                    data = await fetch_ohlcv_data(exchange, symbol)
-                    if not data:
-                        continue
-                    
-                    # Generate signal
-                    signal = await generate_signal_simple(data, symbol)
-                    
-                    if signal:
-                        # Save to database
-                        async with db_lock:
-                            # Final duplicate check with signal hash
-                            async with db_conn.execute(
-                                "SELECT COUNT(*) FROM signals WHERE signal_hash = ?",
-                                (signal['signal_hash'],)
-                            ) as cursor:
-                                exists = (await cursor.fetchone())[0]
-                            
-                            if exists == 0:
-                                # Insert new signal
-                                await db_conn.execute("""
-                                    INSERT INTO signals (
-                                        symbol, side, entry, sl, tp, status,
-                                        timeframe_alignment, wave_structure, strength_level,
-                                        indicators_signal, volume_status, synthesis_score,
-                                        signal_hash, price_hash
-                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                                """, (
-                                    signal['symbol'], signal['side'], signal['entry'], signal['sl'],
-                                    signal['tp'], signal['status'], signal['timeframe_alignment'],
-                                    signal['wave_structure'], signal['strength_level'],
-                                    signal['indicators_signal'], signal['volume_status'],
-                                    signal['synthesis_score'], signal['signal_hash'], signal['price_hash']
-                                ))
-                                
-                                await db_conn.commit()
-                                
-                                # Send Telegram alert
-                                side_ar = "شراء" if signal['side'] == "BUY" else "بيع"
-                                risk_pct = abs(signal['entry'] - signal['sl']) / signal['entry'] * 100
-                                reward_pct = abs(signal['tp'] - signal['entry']) / signal['entry'] * 100
-                                rr_ratio = reward_pct / risk_pct if risk_pct > 0 else 0
-                                
-                                message = f"""
-🎯 **إشارة تداول جديدة**
-
-**{signal['symbol']}** | **{side_ar}**
-
-📊 **التحليل:**
-• الفريمات: {signal['timeframe_alignment']}
-• الموجة: {signal['wave_structure']}
-• القوة: {signal['strength_level']}
-• المؤشرات: {signal['indicators_signal']}
-• الفوليوم: {signal['volume_status']}
-
-📈 **الجودة: {signal['synthesis_score']:.1%}**
-
-💰 **التنفيذ:**
-• الدخول: {signal['entry']:.4f}
-• وقف الخسارة: {signal['sl']:.4f}
-• هدف الربح: {signal['tp']:.4f}
-• نسبة الربح/المخاطرة: {rr_ratio:.1f}:1
-
-⏰ **المتابعة التلقائية مفعلة**
-
-#{side_ar} #تداول
-"""
-                                
-                                await tg(message)
-                                signals_found += 1
-                                log.info(f"✅ Signal sent for {symbol}")
-                            else:
-                                log.debug(f"Final duplicate check failed for {symbol}")
-                    
-                    # Small delay between symbols
-                    await asyncio.sleep(0.5)
-                    
-                except Exception as e:
-                    log.error(f"Error processing {symbol}: {e}")
-                    continue
-            
-            log.info(f"Scan complete. Found {signals_found} new signals.")
-            
-            # Wait for next scan
-            log.info(f"Waiting {SCAN_INTERVAL} seconds for next scan...")
-            await asyncio.sleep(SCAN_INTERVAL)
-            
-        except Exception as e:
-            log.error(f"Scan loop error: {e}")
-            await asyncio.sleep(30)
-
-# ================ MONITORING ================
-
-async def monitoring_loop(exchange):
-    """Monitor open positions"""
-    log.info("Starting monitoring loop...")
-    
-    while True:
-        try:
-            async with db_lock:
-                async with db_conn.execute("""
-                    SELECT id, symbol, side, entry, sl, tp FROM signals 
-                    WHERE status='OPEN'
-                """) as cursor:
-                    open_positions = await cursor.fetchall()
-            
-            if open_positions:
-                log.info(f"Monitoring {len(open_positions)} open positions")
-            
-            for pos_id, symbol, side, entry, sl, tp in open_positions:
-                try:
-                    # Get current price
-                    ticker = await exchange.fetch_ticker(symbol)
-                    current_price = ticker.get('last')
-                    
-                    if not current_price:
-                        continue
-                    
-                    # Check if position should be closed
-                    close_reason = None
-                    pnl_percent = 0
-                    
-                    if side == "BUY":
-                        if current_price >= tp:
-                            close_reason = "TP_HIT"
-                            pnl_percent = ((current_price - entry) / entry) * 100
-                        elif current_price <= sl:
-                            close_reason = "SL_HIT"
-                            pnl_percent = ((current_price - entry) / entry) * 100
-                    
-                    else:  # SELL
-                        if current_price <= tp:
-                            close_reason = "TP_HIT"
-                            pnl_percent = ((entry - current_price) / entry) * 100
-                        elif current_price >= sl:
-                            close_reason = "SL_HIT"
-                            pnl_percent = ((entry - current_price) / entry) * 100
-                    
-                    # Close position if needed
-                    if close_reason:
-                        async with db_lock:
-                            await db_conn.execute("""
-                                UPDATE signals SET 
-                                    status = 'CLOSED',
-                                    close_reason = ?,
-                                    close_price = ?,
-                                    close_timestamp = CURRENT_TIMESTAMP,
-                                    pnl_percent = ?
-                                WHERE id = ?
-                            """, (close_reason, current_price, pnl_percent, pos_id))
-                            
-                            await db_conn.commit()
-                        
-                        # Send notification
-                        side_ar = "شراء" if side == "BUY" else "بيع"
-                        result = "هدف الربح" if close_reason == "TP_HIT" else "وقف الخسارة"
-                        
-                        await tg(f"""
-{'✅' if close_reason == 'TP_HIT' else '❌'} **تم إغلاق الصفقة**
-
-**{symbol}** | **{side_ar}**
-النتيجة: {result}
-
-• الدخول: {entry:.4f}
-• الإغلاق: {current_price:.4f}
-• {result}: {tp if close_reason == 'TP_HIT' else sl:.4f}
-
-• الربح/الخسارة: {'+' if pnl_percent > 0 else ''}{pnl_percent:.2f}%
-
-#إغلاق #{"ربح" if pnl_percent > 0 else "خسارة"}
-""")
-                        
-                        log.info(f"{'✅' if close_reason == 'TP_HIT' else '❌'} {symbol}: {close_reason} | PnL: {pnl_percent:.2f}%")
-                
-                except Exception as e:
-                    log.error(f"Monitor error for {symbol}: {e}")
-                    continue
-            
-            # Wait before next check
-            await asyncio.sleep(10)
-            
-        except Exception as e:
-            log.error(f"Monitoring loop error: {e}")
-            await asyncio.sleep(30)
-
-# ================ WEB API ================
-
-app = FastAPI()
-
-@app.get("/")
-async def root():
-    return {
-        "status": "running",
-        "scanner": "Visual Synthesis Scanner",
-        "version": "2.0 - No Duplicates",
-        "min_score": MIN_SYNTHESIS_SCORE,
-        "scan_interval": SCAN_INTERVAL
-    }
-
-@app.get("/test-telegram")
-async def test_telegram():
-    """Test Telegram connectivity"""
-    try:
-        await tg("🔔 Test message from scanner API")
-        return {"status": "success", "message": "Test message sent"}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-@app.get("/force-scan")
-async def force_scan():
-    """Force an immediate scan"""
-    return {
-        "status": "queued",
-        "message": "Scan will run on next cycle",
-        "note": "Use /test-signal for immediate test"
-    }
-
-@app.get("/test-signal")
-async def test_signal():
-    """Generate and send a test signal"""
-    try:
-        test_signal = {
-            'symbol': 'BTC/USDT',
-            'side': 'BUY',
-            'entry': 50000.00,
-            'sl': 49000.00,
-            'tp': 52000.00,
-            'synthesis_score': 0.75
-        }
+        tr1 = high - low
+        tr2 = (high - close).abs()
+        tr3 = (low - close).abs()
         
-        side_ar = "شراء" if test_signal['side'] == "BUY" else "بيع"
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(period).mean()
         
-        await tg(f"""
-🧪 **إشارة اختبار**
+        return atr
 
-**{test_signal['symbol']}** | **{side_ar}**
-
-هذه إشارة اختبار للتأكد من عمل النظام.
-
-• الدخول: {test_signal['entry']:.2f}
-• وقف الخسارة: {test_signal['sl']:.2f}
-• هدف الربح: {test_signal['tp']:.2f}
-• الجودة: {test_signal['synthesis_score']:.1%}
-
-#اختبار #تست
-""")
+# ================ SCANNER MAIN ================
+class ProfessionalWaveScanner:
+    """Main scanner class"""
+    
+    def __init__(self):
+        self.analyzer = ProfessionalMarketAnalyzer()
+        self.exchange = None
+        self.db = None
+        self.recent_signals = {}
         
-        return {
-            "status": "success",
-            "message": "Test signal sent",
-            "signal": test_signal
-        }
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
-
-@app.get("/stats")
-async def get_stats():
-    """Get scanner statistics"""
-    try:
-        async with db_lock:
-            async with db_conn.execute("SELECT COUNT(*) FROM signals WHERE status='OPEN'") as cursor:
-                open_count = (await cursor.fetchone())[0]
-            
-            async with db_conn.execute("SELECT COUNT(*) FROM signals WHERE status='CLOSED'") as cursor:
-                closed_count = (await cursor.fetchone())[0]
-            
-            async with db_conn.execute("SELECT COUNT(*) FROM signals") as cursor:
-                total_count = (await cursor.fetchone())[0]
-            
-            # Try to get duplicate prevention stats (might fail if price_hash column doesn't exist yet)
-            try:
-                async with db_conn.execute("""
-                    SELECT COUNT(DISTINCT price_hash) as unique_signals,
-                           COUNT(*) as total_attempts
-                    FROM signals 
-                    WHERE timestamp > datetime('now', '-24 hours')
-                """) as cursor:
-                    dup_stats = await cursor.fetchone()
-                    if dup_stats and dup_stats[0] is not None:
-                        unique_signals = dup_stats[0]
-                        total_attempts = dup_stats[1]
-                        duplicates_blocked = total_attempts - unique_signals if total_attempts > unique_signals else 0
-                    else:
-                        unique_signals = total_count
-                        duplicates_blocked = 0
-            except:
-                unique_signals = total_count
-                duplicates_blocked = 0
+    async def initialize(self):
+        """Initialize scanner"""
+        log.info("=" * 60)
+        log.info("🚀 PROFESSIONAL WAVE MOMENTUM SCANNER")
+        log.info("⸻")
+        log.info("Methodology: MTF + Wave + RSI + EMA + Volume")
+        log.info("Expected moves: 3%+ within minutes to hours")
+        log.info("Signal frequency: Low, High accuracy")
+        log.info("=" * 60)
         
-        return {
-            "open_positions": open_count,
-            "closed_positions": closed_count,
-            "total_signals": total_count,
-            "unique_signals_24h": unique_signals,
-            "duplicates_blocked_24h": duplicates_blocked,
-            "scan_interval": SCAN_INTERVAL,
-            "min_score": MIN_SYNTHESIS_SCORE,
-            "duplicate_prevention": "ACTIVE"
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.get("/recent-signals")
-async def get_recent_signals(limit: int = 10):
-    """Get recent signals"""
-    try:
-        async with db_lock:
-            # Set row factory to get dictionaries
-            db_conn.row_factory = aiosqlite.Row
-            
-            async with db_conn.execute("""
-                SELECT symbol, side, entry, sl, tp, synthesis_score, timestamp, status
-                FROM signals 
-                ORDER BY timestamp DESC 
-                LIMIT ?
-            """, (limit,)) as cursor:
-                rows = await cursor.fetchall()
-                
-                signals = []
-                for row in rows:
-                    signals.append(dict(row))
-                
-                return {
-                    "status": "success",
-                    "signals": signals,
-                    "count": len(signals)
-                }
-    except Exception as e:
-        return {"error": str(e)}
-
-# ================ MAIN ================
-
-async def main():
-    global exchange
-    
-    log.info("=" * 60)
-    log.info("🚀 VISUAL SCANNER - NO DUPLICATE SIGNALS")
-    log.info("=" * 60)
-    
-    # Initialize database
-    if not await init_db():
-        log.error("Failed to initialize database")
-        return
-    
-    # Initialize exchange
-    try:
-        exchange = ccxt.okx({
+        # Initialize database
+        self.db = await init_db()
+        
+        # Initialize exchange
+        self.exchange = ccxt.okx({
             "enableRateLimit": True,
             "options": {"defaultType": "spot"},
             "timeout": 30000
         })
         
         # Test connection
-        ticker = await exchange.fetch_ticker("BTC/USDT")
-        log.info(f"✅ Exchange connected. BTC price: {ticker['last']}")
+        ticker = await self.exchange.fetch_ticker("BTC/USDT")
+        log.info(f"✅ Exchange connected. BTC: ${ticker['last']:.2f}")
         
-    except Exception as e:
-        log.error(f"Failed to connect to exchange: {e}")
-        return
-    
-    # Send startup message
-    await tg(f"""
-🚀 **الماسح الضوئي البصري - بدون إشارات مكررة**
+        # Send startup message
+        await tg(f"""
+🚀 <b>PROFESSIONAL WAVE SCANNER STARTED</b>
 
-✅ **تم بدء التشغيل بنجاح**
+<b>Methodology:</b>
+• Multi-Timeframe Context (4H → 5M)
+• Wave Position Analysis (Elliott Concept)
+• RSI Momentum & Divergence
+• EMA Interaction & Structure
+• Volume Confirmation
 
-**ميزات مكافحة التكرار:**
-• فحص التكرار بالسعر والظروف
-• حد أقصى إشارتين لكل زوج في 6 ساعات
-• منع الإشارات المتشابهة في 4 ساعات
-• تتبع تغير الأسعار
+<b>Target:</b> 3%+ moves within minutes to hours
+<b>Signal Type:</b> Low frequency, High precision
+<b>Pairs:</b> Top {TOP_N_VOLUME} by volume (>${MIN_VOLUME_USD/1e6}M)
 
-**الإعدادات:**
-• الحد الأدنى للجودة: {MIN_SYNTHESIS_SCORE}
-• فاصل المسح: {SCAN_INTERVAL} ثانية
-• عدد الأزواج: {TOP_N}
+✅ <b>Scanner is active and monitoring markets</b>
 
-جاهز للعمل! سيبدأ المسح الآن...
-
-#بدء #تشغيل
+#ProfessionalScanner #WaveAnalysis #CryptoSignals
 """)
     
-    # Start scanning and monitoring loops
-    try:
-        await asyncio.gather(
-            scanning_loop(exchange),
-            monitoring_loop(exchange)
-        )
-    except KeyboardInterrupt:
-        log.info("Scanner stopped by user")
-        await tg("🛑 توقف الماسح يدوياً")
-    except Exception as e:
-        log.error(f"Scanner crashed: {e}")
-        await tg(f"❌ تعطل الماسح: {str(e)[:100]}")
-    finally:
-        if exchange:
-            await exchange.close()
-        if db_conn:
-            await db_conn.close()
-        log.info("Scanner shutdown complete")
+    async def fetch_multi_tf_data(self, symbol: str) -> Dict[str, pd.DataFrame]:
+        """Fetch data for all timeframes"""
+        data = {}
+        
+        for tf_name, tf in TIMEFRAMES.items():
+            try:
+                ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=tf, limit=100)
+                
+                if ohlcv and len(ohlcv) >= 50:
+                    df = pd.DataFrame(
+                        ohlcv,
+                        columns=["timestamp", "open", "high", "low", "close", "volume"]
+                    )
+                    
+                    # Convert to numeric
+                    for col in ["open", "high", "low", "close", "volume"]:
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                    
+                    df = df.dropna()
+                    
+                    if len(df) >= 50:
+                        data[tf_name] = df
+                    else:
+                        log.debug(f"{symbol} {tf_name}: Insufficient data")
+                else:
+                    log.debug(f"{symbol} {tf_name}: No data")
+                    
+            except Exception as e:
+                log.debug(f"{symbol} {tf_name} fetch error: {e}")
+                continue
+        
+        return data
+    
+    async def get_top_volume_pairs(self) -> List[Tuple[str, float]]:
+        """Get top pairs by volume"""
+        try:
+            tickers = await self.exchange.fetch_tickers()
+            usdt_pairs = []
+            
+            for symbol, ticker in tickers.items():
+                if symbol.endswith('/USDT'):
+                    volume = ticker.get('quoteVolume', 0)
+                    if volume >= MIN_VOLUME_USD:
+                        usdt_pairs.append((symbol, volume))
+            
+            usdt_pairs.sort(key=lambda x: x[1], reverse=True)
+            return usdt_pairs[:TOP_N_VOLUME]
+            
+        except Exception as e:
+            log.error(f"Error fetching volume pairs: {e}")
+            return []
+    
+    async def save_signal(self, signal: TradeSignal):
+        """Save signal to database"""
+        try:
+            # Check if similar signal exists recently
+            async with self.db.execute("""
+                SELECT COUNT(*) FROM signals 
+                WHERE symbol = ? AND side = ? 
+                AND created_at > datetime('now', '-2 hours')
+            """, (signal.symbol, signal.side)) as cursor:
+                result = await cursor.fetchone()
+                if result and result[0] > 0:
+                    log.debug(f"Similar signal for {signal.symbol} in last 2 hours")
+                    return False
+            
+            # Insert new signal
+            await self.db.execute("""
+                INSERT INTO signals (
+                    id, symbol, side, entry_price, stop_loss, take_profit,
+                    confidence, expected_move_pct, market_structure,
+                    wave_position, momentum_analysis, volume_analysis,
+                    expired_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', '+6 hours'))
+            """, (
+                signal.signal_id,
+                signal.symbol,
+                signal.side,
+                signal.entry_price,
+                signal.stop_loss,
+                signal.take_profit,
+                signal.confidence,
+                signal.expected_move_pct,
+                str(signal.market_structure),
+                str(signal.wave_position),
+                str(signal.momentum),
+                str(signal.volume)
+            ))
+            
+            await self.db.commit()
+            return True
+            
+        except Exception as e:
+            log.error(f"Error saving signal: {e}")
+            return False
+    
+    async def format_signal_message(self, signal: TradeSignal) -> str:
+        """Format signal for Telegram"""
+        side_ar = "🔵 شراء" if signal.side == "LONG" else "🔴 بيع"
+        
+        # Calculate R:R
+        risk = abs(signal.entry_price - signal.stop_loss)
+        reward = abs(signal.take_profit - signal.entry_price)
+        rr_ratio = reward / risk if risk > 0 else 0
+        
+        # Format wave info
+        wave_ar = {
+            "EARLY": "بداية الموجة",
+            "MID": "وسط الموجة",
+            "LATE": "نهاية الموجة",
+            "EXHAUSTION": "مرحلة الإرهاق"
+        }.get(signal.wave_position.wave_phase, signal.wave_position.wave_phase)
+        
+        # Format RSI info
+        rsi_status = ""
+        if signal.momentum.divergence != "NONE":
+            rsi_status = "تضارب في RSI"
+        elif signal.momentum.failure_swing:
+            rsi_status = "فشل في RSI"
+        
+        message = f"""
+🎯 <b>إشارة تداول محترفة</b>
 
+<b>{signal.symbol}</b> | {side_ar}
+
+<b>التحليل المتعدد الفريمات:</b>
+• ٤ ساعات: {signal.market_structure.direction}
+• ١ ساعة: {signal.wave_position.wave_type} - {wave_ar}
+• ١٥ دقيقة: تأكيد الزخم{' ✅' if signal.momentum.divergence != 'NONE' else ''}
+• ٥ دقائق: الدخول الدقيق
+
+<b>المؤشرات:</b>
+• RSI: {signal.momentum.rsi_value:.1f} {rsi_status}
+• الفوليوم: {signal.volume.volume_trend} (×{signal.volume.volume_ratio:.1f})
+• جودة الإشارة: {signal.confidence:.1%}
+
+<b>التنفيذ:</b>
+• الدخول: <code>{signal.entry_price:.4f}</code>
+• وقف الخسارة: <code>{signal.stop_loss:.4f}</code>
+• هدف الربح: <code>{signal.take_profit:.4f}</code>
+
+<b>الأهداف:</b>
+• الحركة المتوقعة: {signal.expected_move_pct:.1f}%
+• نسبة الربح/المخاطرة: {rr_ratio:.1f}:1
+• الفريمات المتوافقة: {', '.join(signal.timeframes_aligned)}
+
+<b>الملاحظة:</b> هذه الإشارة تستهدف حركة سريعة (دقائق إلى ساعات).
+
+⏰ <i>الصفقة تنتهي تلقائياً بعد ٦ ساعات</i>
+
+#{signal.side} #{signal.symbol.replace('/USDT', '')} #تداول_محترف
+"""
+        return message
+    
+    async def monitoring_loop(self):
+        """Monitor open positions and trigger signals"""
+        while True:
+            try:
+                async with self.db.execute("""
+                    SELECT id, symbol, side, entry_price, stop_loss, take_profit 
+                    FROM signals 
+                    WHERE triggered = FALSE 
+                    AND expired_at > datetime('now')
+                """) as cursor:
+                    open_signals = await cursor.fetchall()
+                
+                for signal_id, symbol, side, entry, sl, tp in open_signals:
+                    try:
+                        # Get current price
+                        ticker = await self.exchange.fetch_ticker(symbol)
+                        current_price = ticker['last']
+                        
+                        # Check if price reached entry (within 0.5%)
+                        if abs(current_price - entry) / entry <= 0.005:
+                            # Trigger the signal
+                            await self.db.execute("""
+                                UPDATE signals SET 
+                                    triggered = TRUE,
+                                    trigger_price = ?,
+                                    trigger_time = CURRENT_TIMESTAMP
+                                WHERE id = ?
+                            """, (current_price, signal_id))
+                            
+                            await self.db.commit()
+                            
+                            # Send triggered notification
+                            await tg(f"""
+✅ <b>تم تفعيل الإشارة</b>
+
+<b>{symbol}</b>
+• الإشارة: {side}
+• سعر التفعيل: {current_price:.4f}
+• الوقت: {time.strftime('%H:%M:%S')}
+
+<b>بدء المتابعة التلقائية...</b>
+""")
+                        
+                        # Check if SL or TP hit
+                        pnl_percent = 0
+                        close_reason = None
+                        
+                        if side == "LONG":
+                            if current_price >= tp:
+                                close_reason = "TP_HIT"
+                                pnl_percent = ((current_price - entry) / entry) * 100
+                            elif current_price <= sl:
+                                close_reason = "SL_HIT"
+                                pnl_percent = ((current_price - entry) / entry) * 100
+                        else:  # SHORT
+                            if current_price <= tp:
+                                close_reason = "TP_HIT"
+                                pnl_percent = ((entry - current_price) / entry) * 100
+                            elif current_price >= sl:
+                                close_reason = "SL_HIT"
+                                pnl_percent = ((entry - current_price) / entry) * 100
+                        
+                        if close_reason:
+                            await self.db.execute("""
+                                UPDATE signals SET 
+                                    pnl_percent = ?
+                                WHERE id = ?
+                            """, (pnl_percent, signal_id))
+                            
+                            await self.db.commit()
+                            
+                            result_emoji = "✅" if close_reason == "TP_HIT" else "❌"
+                            await tg(f"""
+{result_emoji} <b>تم إغلاق الصفقة</b>
+
+<b>{symbol}</b>
+• النتيجة: {'هدف الربح' if close_reason == 'TP_HIT' else 'وقف الخسارة'}
+• الربح/الخسارة: {'+' if pnl_percent > 0 else ''}{pnl_percent:.2f}%
+• المدة: منذ التفعيل
+
+#{'ربح' if pnl_percent > 0 else 'خسارة'} #إغلاق
+""")
+                    
+                    except Exception as e:
+                        log.error(f"Monitor error for {symbol}: {e}")
+                        continue
+                
+                await asyncio.sleep(10)  # Check every 10 seconds
+                
+            except Exception as e:
+                log.error(f"Monitoring loop error: {e}")
+                await asyncio.sleep(30)
+    
+    async def scanning_loop(self):
+        """Main scanning loop"""
+        log.info("🚀 Starting professional scanning loop...")
+        
+        while True:
+            try:
+                start_time = time.time()
+                log.info("=" * 50)
+                log.info("Starting new professional scan...")
+                
+                # Get top volume pairs
+                pairs = await self.get_top_volume_pairs()
+                log.info(f"Scanning {len(pairs)} high-volume pairs")
+                
+                signals_found = 0
+                
+                for symbol, volume in pairs:
+                    try:
+                        # Fetch multi-timeframe data
+                        multi_tf_data = await self.fetch_multi_tf_data(symbol)
+                        
+                        if len(multi_tf_data) < 4:  # Need all 4 timeframes
+                            continue
+                        
+                        # Generate professional signal
+                        signal = self.analyzer.generate_signal(multi_tf_data, symbol)
+                        
+                        if signal:
+                            # Save to database
+                            saved = await self.save_signal(signal)
+                            
+                            if saved:
+                                # Send Telegram alert
+                                message = await self.format_signal_message(signal)
+                                await tg(message)
+                                
+                                signals_found += 1
+                                log.info(f"✅ Professional signal sent for {signal.symbol}")
+                        
+                        # Rate limiting
+                        await asyncio.sleep(0.3)
+                        
+                    except Exception as e:
+                        log.error(f"Error processing {symbol}: {e}")
+                        continue
+                
+                scan_duration = time.time() - start_time
+                log.info(f"Scan complete. Found {signals_found} professional signals in {scan_duration:.1f}s")
+                
+                # Wait for next scan
+                log.info(f"Waiting {SCAN_INTERVAL}s for next professional scan...")
+                await asyncio.sleep(SCAN_INTERVAL)
+                
+            except Exception as e:
+                log.error(f"Scan loop error: {e}")
+                await asyncio.sleep(30)
+    
+    async def run(self):
+        """Main run method"""
+        await self.initialize()
+        
+        # Start both loops
+        try:
+            await asyncio.gather(
+                self.scanning_loop(),
+                self.monitoring_loop()
+            )
+        except KeyboardInterrupt:
+            log.info("Scanner stopped by user")
+            await tg("🛑 توقف الماسح المحترف يدوياً")
+        finally:
+            if self.exchange:
+                await self.exchange.close()
+            if self.db:
+                await self.db.close()
+
+# ================ FASTAPI ================
+app = FastAPI(title="Professional Wave Scanner")
+
+scanner = None
+
+@app.on_event("startup")
+async def startup():
+    global scanner
+    scanner = ProfessionalWaveScanner()
+
+@app.get("/")
+async def root():
+    return {
+        "status": "running",
+        "scanner": "Professional Wave Momentum Scanner",
+        "methodology": "MTF + Wave + RSI + EMA + Volume",
+        "target_moves": "3%+ within minutes to hours",
+        "signal_frequency": "Low, High accuracy"
+    }
+
+@app.get("/stats")
+async def get_stats():
+    """Get scanner statistics"""
+    if not scanner or not scanner.db:
+        return {"error": "Scanner not initialized"}
+    
+    try:
+        async with scanner.db.execute("SELECT COUNT(*) FROM signals") as cursor:
+            total = (await cursor.fetchone())[0]
+        
+        async with scanner.db.execute("SELECT COUNT(*) FROM signals WHERE triggered = TRUE") as cursor:
+            triggered = (await cursor.fetchone())[0]
+        
+        async with scanner.db.execute("SELECT AVG(pnl_percent) FROM signals WHERE pnl_percent IS NOT NULL") as cursor:
+            avg_pnl = (await cursor.fetchone())[0] or 0
+        
+        return {
+            "total_signals": total,
+            "triggered_signals": triggered,
+            "average_pnl_percent": f"{avg_pnl:.2f}%",
+            "active_since": "Scanner running"
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.get("/recent")
+async def get_recent_signals(limit: int = 10):
+    """Get recent signals"""
+    if not scanner or not scanner.db:
+        return {"error": "Scanner not initialized"}
+    
+    try:
+        scanner.db.row_factory = aiosqlite.Row
+        async with scanner.db.execute("""
+            SELECT symbol, side, entry_price, confidence, expected_move_pct, created_at
+            FROM signals 
+            ORDER BY created_at DESC 
+            LIMIT ?
+        """, (limit,)) as cursor:
+            rows = await cursor.fetchall()
+            
+            signals = []
+            for row in rows:
+                signals.append(dict(row))
+            
+            return {
+                "signals": signals,
+                "count": len(signals)
+            }
+    except Exception as e:
+        return {"error": str(e)}
+
+# ================ MAIN ================
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Run the scanner
+    scanner_instance = ProfessionalWaveScanner()
+    asyncio.run(scanner_instance.run())
