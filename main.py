@@ -5,7 +5,7 @@
 🔥 ELLIOTT WAVE + INDICATORS HIGH-FREQUENCY SCANNER
 Professional-grade high-frequency signal generator
 Trend from Elliott Waves, Entries from Indicators
-FIXED VERSION - Complete notifications for entry/exit
+FIXED VERSION - Trade-based deduplication (no overlapping signals)
 """
 
 import os
@@ -39,13 +39,10 @@ MIN_TARGET_PCT = 3.0       # 3% minimum target
 MAX_TARGET_PCT = 8.0       # 8% maximum target
 MIN_RISK_REWARD = 2.0      # Minimum 1:2 risk/reward (high frequency)
 
-# Deduplication configuration
+# Deduplication configuration - TRADE-BASED
 DEDUPLICATION_CONFIG = {
-    "cooldown_same_side": 1800,      # 30 minutes for same side signals
-    "cooldown_opposite_side": 600,   # 10 minutes for opposite side
     "price_similarity_threshold": 0.5,  # 0.5% price difference
-    "max_signals_per_hour": 3,       # Max 3 signals per symbol per hour
-    "max_active_signals": 5,         # Max 5 active signals per symbol
+    "max_active_signals": 1,         # Only 1 active signal per symbol
 }
 
 # Timeframes for analysis
@@ -124,140 +121,89 @@ log = logging.getLogger("elliott_scanner")
 
 # ================ CORE ANALYSIS ENGINE ================
 class HighFrequencyScanner:
-    """High-frequency Elliott + Indicators scanner with deduplication"""
+    """High-frequency Elliott + Indicators scanner with TRADE-BASED deduplication"""
     
     class SignalDeduplicator:
-        """Prevents duplicate signal generation"""
+        """Prevents duplicate signal generation - TRADE-BASED"""
         
         def __init__(self):
-            self.signal_history = {}  # symbol: list of recent signals
-            self.active_signals = {}  # signal_id: signal_data
-            self.max_history_per_symbol = 10
-            self.cooldown_period = 900  # 15 minutes cooldown
-            
+            self.active_signals = {}  # symbol: signal_id (only one active per symbol)
+            self.signal_status = {}   # signal_id: {"symbol", "side", "price", "status"}
+        
         def should_generate_signal(self, symbol: str, side: str, price: float, 
                                   trend: ElliottTrend, indicators: IndicatorSignal) -> bool:
-            """Check if we should generate a new signal"""
-            current_time = time.time()
+            """Check if we should generate a new signal - TRADE-BASED"""
             
-            # Check cooldown first
-            if symbol in self.signal_history:
-                # Get most recent signal for this symbol
-                recent_signals = self.signal_history[symbol]
-                if recent_signals:
-                    last_signal_time = recent_signals[-1].get("timestamp", 0)
-                    if current_time - last_signal_time < self.cooldown_period:
-                        log.debug(f"{symbol}: In cooldown period ({int(current_time - last_signal_time)}s remaining)")
+            # Check if symbol already has an active signal
+            if symbol in self.active_signals:
+                signal_id = self.active_signals[symbol]
+                
+                # Check signal status
+                if signal_id in self.signal_status:
+                    status = self.signal_status[signal_id].get("status", "UNKNOWN")
+                    
+                    # Only allow new signal if previous is CLOSED
+                    if status != "CLOSED":
+                        log.debug(f"{symbol}: Active {side} signal exists (status: {status})")
                         return False
             
-            # Check for similar active signals
-            if symbol in self.active_signals:
-                for signal_id, signal in self.active_signals[symbol].items():
-                    # If same side and similar price, skip
-                    if signal["side"] == side:
-                        price_diff_pct = abs(price - signal["price"]) / price * 100
-                        if price_diff_pct < DEDUPLICATION_CONFIG["price_similarity_threshold"]:
-                            # Check if conditions are similar
-                            if self._are_conditions_similar(signal["conditions"], indicators):
-                                log.debug(f"{symbol}: Similar {side} signal active (price diff: {price_diff_pct:.2f}%)")
-                                return False
-            
             return True
-        
-        def _are_conditions_similar(self, old_conditions: Dict, new_indicators: IndicatorSignal) -> bool:
-            """Check if conditions are similar enough to be duplicates"""
-            # Compare key indicator states
-            similarity_score = 0
-            
-            if old_conditions.get("rsi_signal") == new_indicators.rsi_signal:
-                similarity_score += 1
-            
-            if old_conditions.get("ema_signal") == new_indicators.ema_signal:
-                similarity_score += 1
-            
-            if old_conditions.get("volume_signal") == new_indicators.volume_signal:
-                similarity_score += 1
-            
-            # If 2+ indicators match, consider it similar
-            return similarity_score >= 2
         
         def register_signal(self, signal: HighFreqSignal):
             """Register a new signal"""
             symbol = signal.symbol
             
-            # Add to history
-            if symbol not in self.signal_history:
-                self.signal_history[symbol] = []
+            # Remove any previous active signal for this symbol
+            if symbol in self.active_signals:
+                old_signal_id = self.active_signals[symbol]
+                if old_signal_id in self.signal_status:
+                    del self.signal_status[old_signal_id]
             
-            signal_data = {
-                "timestamp": signal.signal_timestamp,
+            # Register new signal as PENDING
+            self.active_signals[symbol] = signal.signal_id
+            self.signal_status[signal.signal_id] = {
+                "symbol": symbol,
                 "side": signal.side,
                 "price": signal.entry_price,
-                "conditions": {
-                    "rsi_signal": signal.indicators.rsi_signal,
-                    "ema_signal": signal.indicators.ema_signal,
-                    "volume_signal": signal.indicators.volume_signal
-                }
-            }
-            
-            self.signal_history[symbol].append(signal_data)
-            
-            # Keep only recent history
-            if len(self.signal_history[symbol]) > self.max_history_per_symbol:
-                self.signal_history[symbol] = self.signal_history[symbol][-self.max_history_per_symbol:]
-            
-            # Mark as active
-            if symbol not in self.active_signals:
-                self.active_signals[symbol] = {}
-            
-            # Check max active signals per symbol
-            if len(self.active_signals[symbol]) >= DEDUPLICATION_CONFIG["max_active_signals"]:
-                # Remove oldest signal
-                oldest_id = min(self.active_signals[symbol].keys(), 
-                              key=lambda k: self.active_signals[symbol][k]["timestamp"])
-                del self.active_signals[symbol][oldest_id]
-            
-            self.active_signals[symbol][signal.signal_id] = {
-                "side": signal.side,
-                "price": signal.entry_price,
-                "conditions": signal_data["conditions"],
+                "status": "PENDING",
                 "timestamp": signal.signal_timestamp
             }
             
-            log.debug(f"Registered signal {signal.signal_id[:8]} for {symbol}")
+            log.debug(f"Registered signal {signal.signal_id[:8]} for {symbol} (PENDING)")
         
-        def remove_signal(self, signal_id: str, symbol: str):
-            """Remove signal from active tracking"""
-            if symbol in self.active_signals and signal_id in self.active_signals[symbol]:
-                del self.active_signals[symbol][signal_id]
+        def update_signal_status(self, signal_id: str, status: str):
+            """Update signal status (PENDING → TRIGGERED → CLOSED)"""
+            if signal_id in self.signal_status:
+                self.signal_status[signal_id]["status"] = status
+                log.debug(f"Signal {signal_id[:8]} status updated to {status}")
                 
-                # Clean up if no active signals for symbol
-                if not self.active_signals[symbol]:
-                    del self.active_signals[symbol]
-                
-                log.debug(f"Removed signal {signal_id[:8]} from {symbol}")
+                # If CLOSED, mark as ready for new signals
+                if status == "CLOSED":
+                    symbol = self.signal_status[signal_id]["symbol"]
+                    log.info(f"✅ Signal {signal_id[:8]} for {symbol} CLOSED - Ready for new signals")
         
-        def cleanup_old_signals(self):
-            """Clean up signals older than cooldown period"""
+        def remove_closed_signals(self):
+            """Clean up closed signals to free memory"""
             current_time = time.time()
-            cleaned_count = 0
+            closed_signal_ids = []
             
-            for symbol in list(self.active_signals.keys()):
-                for signal_id in list(self.active_signals[symbol].keys()):
-                    signal_data = self.active_signals[symbol][signal_id]
-                    if current_time - signal_data["timestamp"] > self.cooldown_period:
-                        del self.active_signals[symbol][signal_id]
-                        cleaned_count += 1
+            for signal_id, data in list(self.signal_status.items()):
+                if data.get("status") == "CLOSED":
+                    # Remove if closed more than 1 hour ago
+                    if current_time - data.get("timestamp", 0) > 3600:
+                        closed_signal_ids.append(signal_id)
+            
+            for signal_id in closed_signal_ids:
+                symbol = self.signal_status[signal_id]["symbol"]
                 
-                # Clean up empty symbols
-                if not self.active_signals[symbol]:
+                # Only remove from active_signals if it's the current one
+                if self.active_signals.get(symbol) == signal_id:
                     del self.active_signals[symbol]
-            
-            if cleaned_count > 0:
-                log.debug(f"Cleaned up {cleaned_count} old signals")
+                
+                del self.signal_status[signal_id]
+                log.debug(f"Cleaned up closed signal {signal_id[:8]} for {symbol}")
     
     def __init__(self):
-        self.signals_today = {}
         self.daily_stats = {
             "signals_generated": 0,
             "long_signals": 0,
@@ -267,7 +213,6 @@ class HighFrequencyScanner:
         }
         self.deduplicator = self.SignalDeduplicator()
         self.active_signal_ids = set()
-        self.last_signal_per_symbol = {}  # Track last signal per symbol
     
     # ========== ELLIOTT WAVE TREND ANALYSIS ==========
     
@@ -577,39 +522,11 @@ class HighFrequencyScanner:
     
     # ========== HIGH-FREQUENCY SIGNAL GENERATION ==========
     
-    def _check_time_based_deduplication(self, symbol: str, side: str) -> bool:
-        """Time-based deduplication to prevent same-side signals too close"""
-        current_time = time.time()
-        
-        if symbol in self.last_signal_per_symbol:
-            last_signal = self.last_signal_per_symbol[symbol]
-            
-            # Same side signals need longer cooldown
-            if last_signal["side"] == side:
-                time_since_last = current_time - last_signal["timestamp"]
-                
-                if side == "LONG":
-                    if time_since_last < DEDUPLICATION_CONFIG["cooldown_same_side"]:
-                        log.debug(f"{symbol}: Same side ({side}) cooldown active ({int(time_since_last)}s)")
-                        return False
-                else:  # SHORT
-                    if time_since_last < DEDUPLICATION_CONFIG["cooldown_same_side"]:
-                        log.debug(f"{symbol}: Same side ({side}) cooldown active ({int(time_since_last)}s)")
-                        return False
-            
-            # Different side signals can come sooner
-            else:
-                if time_since_last < DEDUPLICATION_CONFIG["cooldown_opposite_side"]:
-                    log.debug(f"{symbol}: Opposite side cooldown active ({int(time_since_last)}s)")
-                    return False
-        
-        return True
-    
     def generate_high_freq_signal(self, multi_tf_data: Dict[str, pd.DataFrame], 
                                  symbol: str) -> Optional[HighFreqSignal]:
         """
         Generate high-frequency signal based on Elliott trend + Indicators
-        WITH DEDUPLICATION
+        WITH TRADE-BASED DEDUPLICATION
         """
         try:
             # Get timeframe data with proper None checks
@@ -676,22 +593,18 @@ class HighFrequencyScanner:
             else:  # BEARISH
                 side = "SHORT"
             
-            # 4. TIME-BASED DEDUPLICATION CHECK
-            if not self._check_time_based_deduplication(symbol, side):
-                return None
-            
-            # 5. Calculate entry price for deduplication
+            # 4. Calculate entry price for deduplication
             df_entry = best_signal["df"]
             current_price = df_entry['close'].iloc[-1]
             
-            # 6. DEDUPLICATION CHECK
+            # 5. TRADE-BASED DEDUPLICATION CHECK
             if not self.deduplicator.should_generate_signal(
                 symbol, side, current_price, trend, best_signal["indicators"]
             ):
                 self.daily_stats["signals_filtered"] += 1
                 return None
             
-            # 7. Calculate entry, SL, TP (HIGH FREQUENCY)
+            # 6. Calculate entry, SL, TP (HIGH FREQUENCY)
             stop_loss_pct = np.random.uniform(0.5, MAX_STOP_LOSS_PCT)
             target_pct = np.random.uniform(MIN_TARGET_PCT, MAX_TARGET_PCT)
             
@@ -716,15 +629,15 @@ class HighFrequencyScanner:
                 log.debug(f"{symbol}: R:R too low ({risk_reward:.1f}:1)")
                 return None
             
-            # 8. Determine conditions met
+            # 7. Determine conditions met
             conditions_met = self._get_conditions_met(trend, best_signal["indicators"])
             
-            # 9. Create signal ID
+            # 8. Create signal ID
             signal_id = hashlib.md5(
                 f"{symbol}:{side}:{current_price:.8f}:{time.time()}".encode()
             ).hexdigest()
             
-            # 10. Create final signal
+            # 9. Create final signal
             signal = HighFreqSignal(
                 signal_id=signal_id,
                 symbol=symbol,
@@ -745,15 +658,11 @@ class HighFrequencyScanner:
                 conditions_met=conditions_met
             )
             
-            # 11. Update tracking and deduplication
+            # 10. Update tracking and deduplication
             self.deduplicator.register_signal(signal)
             self.active_signal_ids.add(signal_id)
-            self.last_signal_per_symbol[symbol] = {
-                "side": side,
-                "timestamp": time.time()
-            }
             
-            # 12. Update statistics
+            # 11. Update statistics
             self.daily_stats["signals_generated"] += 1
             if side == "LONG":
                 self.daily_stats["long_signals"] += 1
@@ -843,7 +752,7 @@ class HighFrequencyScanner:
     
     def cleanup_old_signals(self):
         """Clean up old signals from deduplication"""
-        self.deduplicator.cleanup_old_signals()
+        self.deduplicator.remove_closed_signals()
 
 # ================ MAIN SCANNER SYSTEM ================
 class ElliottIndicatorsScanner:
@@ -864,7 +773,7 @@ class ElliottIndicatorsScanner:
         log.info("FREQUENCY: High (multiple signals per pair per day)")
         log.info("TARGET: 3-8% moves within minutes to hours")
         log.info(f"SCAN INTERVAL: {SCAN_INTERVAL} seconds")
-        log.info(f"DEDUPLICATION: Active with {DEDUPLICATION_CONFIG['cooldown_same_side']}s cooldown")
+        log.info(f"DEDUPLICATION: TRADE-BASED (one trade per symbol)")
         log.info("NOTIFICATIONS: Signal + Entry + TP/SL alerts enabled")
         log.info("=" * 70)
         
@@ -984,11 +893,11 @@ class ElliottIndicatorsScanner:
 • Target: 3-8%
 • Risk/Reward: Minimum 1:2
 
-<b>🛡️ DEDUPLICATION:</b>
-• Same-side cooldown: {DEDUPLICATION_CONFIG['cooldown_same_side']//60} min
-• Opposite-side cooldown: {DEDUPLICATION_CONFIG['cooldown_opposite_side']//60} min
-• Price similarity: {DEDUPLICATION_CONFIG['price_similarity_threshold']}%
-• Max signals per hour: {DEDUPLICATION_CONFIG['max_signals_per_hour']}
+<b>🛡️ DEDUPLICATION (TRADE-BASED):</b>
+• <b>ONE ACTIVE TRADE PER SYMBOL ONLY</b>
+• New signals only after previous trade closes (TP/SL)
+• No time-based cooldowns
+• Simple rule: One trade at a time per coin
 
 <b>🔔 NOTIFICATIONS:</b>
 • Signal alerts ✓
@@ -997,7 +906,7 @@ class ElliottIndicatorsScanner:
 
 <b>✅ STATUS: ACTIVE AND SCANNING</b>
 
-#ElliottScanner #HighFrequency #CompleteAlerts
+#ElliottScanner #HighFrequency #OneTradePerSymbol
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -1159,13 +1068,14 @@ class ElliottIndicatorsScanner:
 
 <b>🛡️ مكافحة التكرار:</b>
 • {dedupe_info}
-• مهلة بين الإشارات: {DEDUPLICATION_CONFIG['cooldown_same_side']//60} دقيقة لنفس الجانب
+• النظام: <b>صفقة واحدة لكل عملة</b>
+• لا إشارات جديدة لـ {signal.symbol} حتى إغلاق هذه الصفقة
 
 <b>⚠️ ملاحظة:</b>
-هذه إشارة عالية التردد مع نظام مكافحة التكرار.
+يتم منع الإشارات الجديدة لهذا الزوج حتى إغلاق هذه الصفقة.
 سيصلك إشعار عند الدخول وعند الإغلاق.
 
-#{side_text} #موجات_إليوت #مؤشرات #لا_تكرار
+#{side_text} #موجات_إليوت #مؤشرات #صفقة_واحدة
 """
         return message
     
@@ -1191,11 +1101,15 @@ class ElliottIndicatorsScanner:
 • السعر: <code>{entry_price:.6f}</code>
 • الحالة: <b>نشط</b>
 
+<b>🛡️ نظام التكرار:</b>
+❌ <b>ممنوع</b> إرسال إشارات جديدة لـ {symbol}
+✅ مسموح بإشارات جديدة بعد إغلاق هذه الصفقة
+
 <b>⚠️ المتابعة:</b>
 يتم متابعة الصفقة تلقائياً.
 ستصلك إشعار عند الوصول لوقف الخسارة أو هدف الربح.
 
-#{side_text} #تنفيذ #متابعة
+#{side_text} #تنفيذ #متابعة #لا_إشارات_جديدة
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -1249,11 +1163,15 @@ class ElliottIndicatorsScanner:
 • نسبة الربح/الخسارة: <b>{pnl_formatted}</b>
 • نسبة الربح/المخاطرة المحققة: {risk_reward:.1f}:1
 
+<b>🛡️ نظام التكرار:</b>
+✅ <b>مسموح الآن</b> بإرسال إشارات جديدة لـ {symbol}
+يمكن للماسح الضوئي توليد إشارات جديدة لهذه العملة
+
 <b>📈 الملخص:</b>
 {emoji} <b>{result_text}</b> - {symbol} {side_text}
 {color} النسبة: <b>{pnl_formatted}</b>
 
-#{side_text} #إغلاق #{"ربح" if close_reason == "TP_HIT" else "خسارة"}
+#{side_text} #إغلاق #{"ربح" if close_reason == "TP_HIT" else "خسارة"} #مسموح_إشارات_جديدة
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -1291,7 +1209,7 @@ class ElliottIndicatorsScanner:
             log.error(f"Telegram error: {e}")
     
     async def monitor_positions(self):
-        """Monitor and close positions with complete notifications"""
+        """Monitor and close positions with trade-based deduplication"""
         while True:
             try:
                 # Get open positions
@@ -1320,6 +1238,10 @@ class ElliottIndicatorsScanner:
                             """, (current_price, pos_id))
                             
                             await self.db.commit()
+                            
+                            # UPDATE DEDUPLICATION STATUS to TRIGGERED
+                            if hasattr(self.scanner, 'deduplicator'):
+                                self.scanner.deduplicator.update_signal_status(pos_id, "TRIGGERED")
                             
                             # SEND TRIGGER NOTIFICATION
                             await self.send_trade_trigger_notification(symbol, side, current_price)
@@ -1374,10 +1296,11 @@ class ElliottIndicatorsScanner:
                                 
                                 await self.db.commit()
                                 
-                                # Clean up from deduplication
+                                # UPDATE DEDUPLICATION STATUS to CLOSED
                                 if hasattr(self.scanner, 'deduplicator'):
-                                    self.scanner.deduplicator.remove_signal(pos_id, symbol)
+                                    self.scanner.deduplicator.update_signal_status(pos_id, "CLOSED")
                                 
+                                # Clean up from tracking
                                 if hasattr(self.scanner, 'active_signal_ids'):
                                     self.scanner.active_signal_ids.discard(pos_id)
                                 
@@ -1396,10 +1319,10 @@ class ElliottIndicatorsScanner:
                         log.error(f"Monitor error for {symbol}: {e}")
                         continue
                 
-                # Clean up old signals periodically
+                # Clean up old closed signals periodically
                 if int(time.time()) % 300 < 2:  # Every ~5 minutes
                     if hasattr(self.scanner, 'deduplicator'):
-                        self.scanner.deduplicator.cleanup_old_signals()
+                        self.scanner.deduplicator.remove_closed_signals()
                 
                 # Fast monitoring
                 await asyncio.sleep(2)
@@ -1410,7 +1333,7 @@ class ElliottIndicatorsScanner:
     
     async def high_freq_scanning(self):
         """Main high-frequency scanning loop"""
-        log.info("🚀 Starting high-frequency scanning with complete notifications...")
+        log.info("🚀 Starting high-frequency scanning with trade-based deduplication...")
         
         while True:
             try:
@@ -1470,8 +1393,8 @@ class ElliottIndicatorsScanner:
                 
                 # Log deduplication stats
                 if hasattr(self.scanner, 'deduplicator'):
-                    active_count = sum(len(sigs) for sigs in self.scanner.deduplicator.active_signals.values())
-                    log.info(f"📊 Active signals: {active_count}, Filtered: {self.scanner.daily_stats.get('signals_filtered', 0)}")
+                    active_count = len(self.scanner.deduplicator.active_signals)
+                    log.info(f"📊 Active trades: {active_count}, Filtered: {self.scanner.daily_stats.get('signals_filtered', 0)}")
                 
                 scan_duration = time.time() - start_time
                 log.info(f"Scan #{self.scan_cycle}: {signals_found} signals in {scan_duration:.1f}s")
@@ -1524,7 +1447,7 @@ class ElliottIndicatorsScanner:
             # Get active signals count
             active_count = 0
             if hasattr(self.scanner, 'deduplicator'):
-                active_count = sum(len(sigs) for sigs in self.scanner.deduplicator.active_signals.values())
+                active_count = len(self.scanner.deduplicator.active_signals)
             
             message = f"""
 🛑 <b>تم إيقاف الماسح الضوئي</b>
@@ -1536,18 +1459,18 @@ class ElliottIndicatorsScanner:
 • إشارات البيع: {stats['short_signals']}
 • الأزواج الممسوحة: {stats['pairs_scanned']}
 • دورات المسح: {self.scan_cycle}
-• الإشارات النشطة حالياً: {active_count}
+• الصفقات النشطة حالياً: {active_count}
 
-<b>🔔 نظام الإشعارات:</b>
-• إشعارات الإشارات ✓
-• إشعارات الدخول ✓
-• إشعارات الإغلاق (TP/SL) ✓
+<b>🛡️ نظام التكرار:</b>
+• نظام: <b>صفقة واحدة لكل عملة</b>
+• الإشارات المفلترة: {stats.get('signals_filtered', 0)}
+• نسبة التكرار: {stats.get('signals_filtered', 0) / max(1, stats['signals_generated'] + stats.get('signals_filtered', 0)):.1%}
 
 <b>🎯 الفلسفة المحققة:</b>
 الاتجاه من موجات إليوت، الدخول من المؤشرات.
-إشارات عالية التردد مع إشعارات كاملة من البداية للنهاية.
+صفقة واحدة لكل عملة - لا تداخل - إشعارات كاملة.
 
-#إحصائيات #موجات_إليوت #إشعارات_كاملة
+#إحصائيات #موجات_إليوت #صفقة_واحدة
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -1599,10 +1522,12 @@ async def start_http_server(scanner, port=8000):
                 # Get deduplication stats
                 dedupe_stats = {}
                 if hasattr(scanner.scanner, 'deduplicator'):
-                    active_count = sum(len(sigs) for sigs in scanner.scanner.deduplicator.active_signals.values())
+                    active_count = len(scanner.scanner.deduplicator.active_signals)
                     dedupe_stats = {
-                        "active_signals": active_count,
-                        "signals_filtered": scanner.scanner.daily_stats.get("signals_filtered", 0)
+                        "active_trades": active_count,
+                        "signals_filtered": scanner.scanner.daily_stats.get("signals_filtered", 0),
+                        "trade_based": True,
+                        "max_per_symbol": 1
                     }
                 
                 response = json.dumps({
@@ -1620,9 +1545,10 @@ async def start_http_server(scanner, port=8000):
                 dedupe_info = {}
                 if hasattr(scanner.scanner, 'deduplicator'):
                     dedupe_info = {
-                        "active_signals": scanner.scanner.deduplicator.active_signals,
-                        "signal_history": {k: len(v) for k, v in scanner.scanner.deduplicator.signal_history.items()},
-                        "filtered_count": scanner.scanner.daily_stats.get("signals_filtered", 0)
+                        "active_trades": scanner.scanner.deduplicator.active_signals,
+                        "signal_status": scanner.scanner.deduplicator.signal_status,
+                        "filtered_count": scanner.scanner.daily_stats.get("signals_filtered", 0),
+                        "strategy": "ONE_TRADE_PER_SYMBOL"
                     }
                 response = json.dumps(dedupe_info, indent=2)
             
