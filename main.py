@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 
 """
-🔥 AGGRESSIVE WAVE EXPANSION HUNTER
-Professional-grade implementation of aggressive wave transition hunting
+🔥 ELLIOTT WAVE + INDICATORS HIGH-FREQUENCY SCANNER
+Professional-grade high-frequency signal generator
+Trend from Elliott Waves, Entries from Indicators
 """
 
 import os
-import sys
 import time
 import asyncio
 import logging
@@ -17,645 +17,244 @@ import httpx
 import ccxt.async_support as ccxt
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Any, Set
-from dataclasses import dataclass, asdict
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass
 import json
 
-# ================ AGGRESSIVE CONFIGURATION ================
+# ================ HIGH-FREQUENCY CONFIG ================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-DB_PATH = "/app/data/aggressive_hunter.db"
+DB_PATH = "/app/data/elliott_scanner.db"
 
-# Ultra-aggressive scanning
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 20))  # 20 seconds - VERY frequent
-TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 75))    # Scan many pairs
-MIN_VOLUME_USD = 1000000  # $1M minimum - more volatile small caps
-MAX_POSITIONS = 5  # Maximum concurrent positions
+# Ultra high-frequency scanning
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))  # 15 seconds - ULTRA FAST
+TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 100))   # Scan many pairs
+MIN_VOLUME_USD = 500000  # $500K minimum - more opportunities
 
-# Aggressive trading parameters
-MAX_STOP_LOSS_PCT = 0.8  # 0.8% maximum stop loss (TIGHT)
-MIN_TARGET_PCT = 3.0     # 3% minimum target
-MAX_TARGET_PCT = 12.0    # 12% maximum target (explosive moves)
-MIN_RISK_REWARD = 3.0    # Minimum 1:3 risk/reward
+# Trading parameters (AGGRESSIVE)
+MAX_STOP_LOSS_PCT = 1.0    # 1% maximum stop loss
+MIN_TARGET_PCT = 3.0       # 3% minimum target
+MAX_TARGET_PCT = 8.0       # 8% maximum target
+MIN_RISK_REWARD = 2.0      # Minimum 1:2 risk/reward (high frequency)
 
-# Timeframe configuration for aggressive hunting
+# Timeframes for analysis
 TIMEFRAMES = {
-    "4H": "4h",      # Bias context
-    "2H": "2h",      # Intermediate bias
-    "1H": "1h",      # Wave structure
-    "30M": "30m",    # Compression detection
-    "15M": "15m",    # Primary analysis
-    "5M": "5m",      # Entry timing
-    "3M": "3m",      # Early trigger
-    "1M": "1m"       # Micro-expansion detection
+    "4H": "4h",      # Elliott Wave trend ONLY
+    "1H": "1h",      # Wave context
+    "15M": "15m",    # Primary entry analysis
+    "5M": "5m",      # Entry timing (MAIN)
+    "3M": "3m"       # Fast trigger
 }
 
-# EMA periods optimized for compression detection
+# EMA periods for entry signals
 EMA_PERIODS = {
-    "ultra_fast": 3,   # Micro movements
-    "very_fast": 5,    # Quick reaction
-    "fast": 9,         # Short-term
-    "medium": 14,      # Mid-term
-    "slow": 21         # Slow compression
+    "fast": 9,
+    "medium": 21,
+    "slow": 50
 }
 
-# RSI settings for timing
-RSI_PERIOD = 9        # Shorter for faster reaction
-RSI_OVERBOUGHT = 65   # Less sensitive
-RSI_OVERSOLD = 35     # Less sensitive
+# RSI settings
+RSI_PERIOD = 14
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 30
 
-# ================ AGGRESSIVE DATA STRUCTURES ================
+# ================ DATA STRUCTURES ================
 @dataclass
-class CompressionState:
-    """Detailed compression analysis"""
-    score: float                    # 0-1 compression tightness
-    ema_spread_pct: float          # EMA spread percentage
-    price_coiling: bool            # Price making lower highs & higher lows
-    bollinger_squeeze: bool        # Bollinger Band squeeze
-    volume_drying: bool            # Volume decreasing
-    volatility_compression: float  # ATR compression ratio
-    pressure_direction: str        # UP/DOWN/NEUTRAL pressure
-    time_compressed_minutes: int   # How long compressed
-    
+class ElliottTrend:
+    """Elliott Wave trend context (direction only)"""
+    direction: str           # BULLISH, BEARISH, NEUTRAL
+    strength: float          # 0-1 confidence
+    wave_position: str       # IMPULSIVE, CORRECTIVE
+    wave_maturity: float     # 0-1 (0=early, 1=late)
+    trend_source: str        # Which TF gave the trend
+
 @dataclass
-class ExpansionTrigger:
-    """Expansion trigger detection"""
-    first_expansion_candle: bool   # First candle breaking compression
-    candle_size_ratio: float       # Current vs average candle size
-    volume_spike_ratio: float      # Current vs average volume
-    ema_expansion_angle: float     # Angle of EMA separation
-    breakout_confirmed: bool       # Price closed outside compression zone
-    time_since_compression: int    # Minutes since compression started
-    
+class IndicatorSignal:
+    """Indicator-based entry signals"""
+    rsi_signal: str          # OVERSOLD, OVERBOUGHT, BULLISH_DIV, BEARISH_DIV, NEUTRAL
+    rsi_value: float
+    ema_signal: str          # BOUNCE, REJECTION, COMPRESSION, OVERSTRETCH
+    ema_distance_pct: float  # Distance from fast EMA
+    volume_signal: str       # CONFIRMING, DIVERGING, NEUTRAL
+    volume_ratio: float      # Recent vs average volume
+    strength_score: float    # 0-1 market strength
+
 @dataclass
-class MarketContext:
-    """Multi-timeframe market context"""
-    htf_bias: str                  # 4H/2H bias
-    htf_strength: float            # 0-1
-    wave_position: str             # IMPULSIVE/CORRECTIVE/TRANSITION
-    wave_maturity: float           # 0-1 (0=early, 1=late)
-    key_levels: Dict[str, float]   # Support/Resistance levels
-    liquidity_zones: List[float]   # Likely liquidity pools
-    
-@dataclass
-class AggressiveSignal:
-    """Complete aggressive trade signal"""
-    # Core trade info
+class HighFreqSignal:
+    """High-frequency trade signal"""
     signal_id: str
     symbol: str
-    side: str                      # LONG/SHORT
+    side: str                # LONG, SHORT
     entry_price: float
     stop_loss: float
     take_profit: float
-    entry_time: float
     
-    # Aggressive parameters
-    stop_loss_pct: float           # Percentage stop
-    target_pct: float              # Percentage target
-    risk_reward: float             # R:R ratio
-    position_size_score: float     # 0-1 for sizing
+    # Context
+    trend: ElliottTrend
+    indicators: IndicatorSignal
     
-    # Detection metrics
-    compression: CompressionState
-    expansion: ExpansionTrigger
-    context: MarketContext
+    # Metrics
+    confluence_score: float  # How many indicators confirm (0-1)
+    risk_reward: float
+    expected_move_pct: float
     
-    # Confidence scores
-    timing_score: float            # 0-1 entry timing
-    structure_score: float         # 0-1 wave structure
-    momentum_score: float          # 0-1 momentum
-    overall_conviction: float      # 0-1 overall
-    
-    # Risk management
-    max_loss_pct: float            # Maximum loss percentage
-    breakeven_level: float         # Price to move stop to breakeven
-    trail_start: float             # Price to start trailing
-    
-    # Metadata
-    scan_cycle: int                # Which scan cycle found it
-    conditions_met: List[str]      # Which conditions triggered
+    # Timing
+    timeframe_used: str      # Which TF triggered entry
+    signal_timestamp: float
+    conditions_met: List[str]  # Which conditions triggered
 
 # ================ PROFESSIONAL LOGGING ================
-class AggressiveLogger:
-    """Custom logger for aggressive trading"""
-    
-    def __init__(self):
-        self.logger = logging.getLogger("aggressive_hunter")
-        self.logger.setLevel(logging.INFO)
-        
-        # Console handler
-        console = logging.StreamHandler()
-        console.setLevel(logging.INFO)
-        
-        # File handler for persistence
-        os.makedirs("/app/logs", exist_ok=True)
-        file_handler = logging.FileHandler(f"/app/logs/hunter_{datetime.now().strftime('%Y%m%d')}.log")
-        file_handler.setLevel(logging.INFO)
-        
-        # Formatter
-        formatter = logging.Formatter(
-            '%(asctime)s | %(levelname)8s | %(message)s',
-            datefmt='%H:%M:%S'
-        )
-        console.setFormatter(formatter)
-        file_handler.setFormatter(formatter)
-        
-        self.logger.addHandler(console)
-        self.logger.addHandler(file_handler)
-        
-        # Statistics
-        self.signals_generated = 0
-        self.expansions_detected = 0
-        self.compression_scans = 0
-        
-    def log_compression(self, symbol: str, score: float, timeframe: str):
-        """Log compression detection"""
-        if score > 0.6:
-            self.logger.info(f"🔷 COMPRESSION {symbol} {timeframe}: {score:.2f}")
-            self.compression_scans += 1
-            
-    def log_expansion(self, symbol: str, trigger: ExpansionTrigger, side: str):
-        """Log expansion detection"""
-        self.logger.info(f"🔥 EXPANSION {symbol} {side}: candle={trigger.candle_size_ratio:.1f}x, volume={trigger.volume_spike_ratio:.1f}x")
-        self.expansions_detected += 1
-        
-    def log_signal(self, signal: AggressiveSignal):
-        """Log aggressive signal"""
-        self.logger.info(f"🎯 AGGRESSIVE SIGNAL {signal.symbol} {signal.side}")
-        self.logger.info(f"   Entry: {signal.entry_price:.4f}, SL: {signal.stop_loss:.4f}, TP: {signal.take_profit:.4f}")
-        self.logger.info(f"   Target: {signal.target_pct:.1f}%, R:R: {signal.risk_reward:.1f}:1")
-        self.logger.info(f"   Conviction: {signal.overall_conviction:.2f}, Compression: {signal.compression.score:.2f}")
-        self.signals_generated += 1
-        
-    def log_loss(self, symbol: str, pnl: float, reason: str):
-        """Log accepted loss"""
-        self.logger.info(f"❌ ACCEPTED LOSS {symbol}: {pnl:.2f}% - {reason}")
-        
-    def log_winner(self, symbol: str, pnl: float):
-        """Log big winner"""
-        self.logger.info(f"✅ BIG WINNER {symbol}: +{pnl:.2f}%!")
-        
-    def get_stats(self) -> Dict:
-        """Get hunter statistics"""
-        return {
-            "signals_generated": self.signals_generated,
-            "expansions_detected": self.expansions_detected,
-            "compression_scans": self.compression_scans
-        }
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)8s | %(name)s | %(message)s',
+    datefmt='%H:%M:%S'
+)
+log = logging.getLogger("elliott_scanner")
 
-# ================ AGGRESSIVE ANALYSIS ENGINE ================
-class AggressiveHunterEngine:
-    """Core engine for aggressive wave expansion hunting"""
+# ================ CORE ANALYSIS ENGINE ================
+class HighFrequencyScanner:
+    """High-frequency Elliott + Indicators scanner"""
     
     def __init__(self):
-        self.logger = AggressiveLogger()
-        self.recent_signals: Dict[str, float] = {}  # symbol -> last_signal_time
-        self.signal_cooldown = 900  # 15 minutes cooldown per symbol
+        self.signals_today = {}
+        self.daily_stats = {
+            "signals_generated": 0,
+            "long_signals": 0,
+            "short_signals": 0,
+            "pairs_scanned": 0
+        }
         
-        # Performance tracking
-        self.accepted_losses = 0
-        self.big_winners = 0
-        self.total_pnl = 0.0
-        
-    # ========== CORE DETECTION METHODS ==========
+    # ========== ELLIOTT WAVE TREND ANALYSIS ==========
     
-    def calculate_emas(self, df: pd.DataFrame) -> Dict[str, pd.Series]:
-        """Calculate all EMAs for compression analysis"""
-        emas = {}
-        for name, period in EMA_PERIODS.items():
-            emas[name] = df['close'].ewm(span=period, adjust=False).mean()
-        return emas
-    
-    def calculate_rsi(self, prices: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
-        """Fast RSI calculation for timing"""
-        delta = prices.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
-    
-    def calculate_atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
-        """Calculate Average True Range for volatility analysis"""
-        high = df['high']
-        low = df['low']
-        close = df['close'].shift()
-        
-        tr1 = high - low
-        tr2 = (high - close).abs()
-        tr3 = (low - close).abs()
-        
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        atr = tr.rolling(period).mean()
-        return atr
-    
-    def calculate_bollinger_bands(self, df: pd.DataFrame, period: int = 20, std_dev: float = 2.0) -> Tuple[pd.Series, pd.Series, pd.Series]:
-        """Calculate Bollinger Bands for squeeze detection"""
-        sma = df['close'].rolling(window=period).mean()
-        std = df['close'].rolling(window=period).std()
-        
-        upper_band = sma + (std * std_dev)
-        lower_band = sma - (std * std_dev)
-        
-        return upper_band, sma, lower_band
-    
-    def analyze_compression_detailed(self, df_15m: pd.DataFrame, df_5m: pd.DataFrame) -> CompressionState:
+    def analyze_elliott_trend(self, df_4h: pd.DataFrame, df_1h: pd.DataFrame) -> ElliottTrend:
         """
-        Detailed compression analysis using multiple metrics
+        Analyze Elliott Wave trend (direction only, not counting)
+        Returns trend direction for context
         """
         try:
-            # Use 5M for fine compression analysis
-            emas = self.calculate_emas(df_5m)
-            current_price = df_5m['close'].iloc[-1]
+            # Get trends from both timeframes
+            trend_4h = self._get_simple_trend(df_4h)
+            trend_1h = self._get_simple_trend(df_1h)
             
-            # 1. EMA Spread Analysis
-            ema_values = [ema.iloc[-1] for ema in emas.values()]
-            max_ema = max(ema_values)
-            min_ema = min(ema_values)
-            avg_price = np.mean(ema_values)
-            
-            if avg_price > 0:
-                ema_spread_pct = (max_ema - min_ema) / avg_price * 100
+            # Combine trends
+            if trend_4h["direction"] == trend_1h["direction"]:
+                direction = trend_4h["direction"]
+                strength = (trend_4h["strength"] + trend_1h["strength"]) / 2
+                trend_source = "BOTH"
             else:
-                ema_spread_pct = 100
+                # Prefer 4H trend but consider strength
+                if trend_4h["strength"] > trend_1h["strength"] * 1.5:
+                    direction = trend_4h["direction"]
+                    strength = trend_4h["strength"]
+                    trend_source = "4H"
+                else:
+                    direction = "NEUTRAL"
+                    strength = 0.5
+                    trend_source = "CONFLICT"
             
-            # Normalize spread to 0-1 score (lower spread = higher compression)
-            ema_spread_score = max(0, 1 - (ema_spread_pct / 5))  # 5% spread = 0 score
+            # Determine wave position (simplified)
+            wave_position, wave_maturity = self._estimate_wave_position(df_1h, direction)
             
-            # 2. Price Coiling Detection (lower highs, higher lows)
-            recent_highs = df_5m['high'].values[-8:]
-            recent_lows = df_5m['low'].values[-8:]
-            
-            if len(recent_highs) >= 5:
-                high_slope = np.polyfit(range(5), recent_highs[-5:], 1)[0]
-                low_slope = np.polyfit(range(5), recent_lows[-5:], 1)[0]
-                price_coiling = high_slope < 0 and low_slope > 0
-            else:
-                price_coiling = False
-            
-            # 3. Bollinger Band Squeeze
-            upper_band, middle_band, lower_band = self.calculate_bollinger_bands(df_5m)
-            if len(upper_band) > 0 and len(lower_band) > 0:
-                bb_width = upper_band.iloc[-1] - lower_band.iloc[-1]
-                bb_width_pct = bb_width / middle_band.iloc[-1] * 100 if middle_band.iloc[-1] > 0 else 100
-                bollinger_squeeze = bb_width_pct < 2.0  # Very tight bands
-            else:
-                bollinger_squeeze = False
-            
-            # 4. Volume Drying Up
-            recent_volume = df_5m['volume'].values[-5:].mean()
-            avg_volume = df_5m['volume'].values[-20:].mean()
-            volume_drying = recent_volume < avg_volume * 0.7 if avg_volume > 0 else False
-            
-            # 5. Volatility Compression (ATR)
-            atr = self.calculate_atr(df_5m, 14)
-            if len(atr) > 0:
-                current_atr = atr.iloc[-1]
-                avg_atr = atr.iloc[-20:].mean() if len(atr) >= 20 else current_atr
-                volatility_compression = current_atr / avg_atr if avg_atr > 0 else 1.0
-            else:
-                volatility_compression = 1.0
-            
-            # 6. Pressure Direction Analysis
-            pressure_direction = self._analyze_pressure_direction(df_5m, emas)
-            
-            # 7. Time Compressed (estimate)
-            # Look back to find when compression started
-            time_compressed = self._estimate_compression_time(df_5m, emas)
-            
-            # Calculate overall compression score
-            compression_scores = [
-                ema_spread_score * 0.4,           # 40% weight to EMA spread
-                (1.0 if price_coiling else 0.5) * 0.2,  # 20% to price coiling
-                (1.0 if bollinger_squeeze else 0.3) * 0.2,  # 20% to BB squeeze
-                (1.0 if volume_drying else 0.4) * 0.1,  # 10% to volume drying
-                max(0, 1 - volatility_compression) * 0.1  # 10% to volatility compression
-            ]
-            
-            overall_score = np.mean(compression_scores)
-            
-            return CompressionState(
-                score=overall_score,
-                ema_spread_pct=ema_spread_pct,
-                price_coiling=price_coiling,
-                bollinger_squeeze=bollinger_squeeze,
-                volume_drying=volume_drying,
-                volatility_compression=volatility_compression,
-                pressure_direction=pressure_direction,
-                time_compressed_minutes=time_compressed
-            )
-            
-        except Exception as e:
-            self.logger.logger.error(f"Compression analysis error: {e}")
-            return CompressionState(
-                score=0.0,
-                ema_spread_pct=100.0,
-                price_coiling=False,
-                bollinger_squeeze=False,
-                volume_drying=False,
-                volatility_compression=1.0,
-                pressure_direction="NEUTRAL",
-                time_compressed_minutes=0
-            )
-    
-    def _analyze_pressure_direction(self, df: pd.DataFrame, emas: Dict[str, pd.Series]) -> str:
-        """Analyze which direction pressure is building"""
-        try:
-            current_price = df['close'].iloc[-1]
-            fast_ema = emas['ultra_fast'].iloc[-1]
-            
-            # Price position relative to EMAs
-            above_fast = current_price > fast_ema
-            
-            # Recent momentum
-            recent_prices = df['close'].values[-5:]
-            if len(recent_prices) >= 3:
-                price_slope = np.polyfit(range(3), recent_prices[-3:], 1)[0]
-            else:
-                price_slope = 0
-            
-            # Volume analysis
-            recent_volume = df['volume'].values[-3:].mean()
-            prev_volume = df['volume'].values[-6:-3].mean()
-            volume_increasing = recent_volume > prev_volume * 1.2 if prev_volume > 0 else False
-            
-            # RSI momentum
-            rsi = self.calculate_rsi(df['close'], 7)
-            if len(rsi) > 0:
-                current_rsi = rsi.iloc[-1]
-                rsi_trend = "UP" if current_rsi > 50 else "DOWN"
-            else:
-                rsi_trend = "NEUTRAL"
-            
-            # Combine signals
-            bullish_signals = 0
-            bearish_signals = 0
-            
-            if above_fast:
-                bullish_signals += 1
-            else:
-                bearish_signals += 1
-            
-            if price_slope > 0:
-                bullish_signals += 1
-            elif price_slope < 0:
-                bearish_signals += 1
-            
-            if volume_increasing and price_slope > 0:
-                bullish_signals += 1
-            elif volume_increasing and price_slope < 0:
-                bearish_signals += 1
-            
-            if rsi_trend == "UP":
-                bullish_signals += 1
-            elif rsi_trend == "DOWN":
-                bearish_signals += 1
-            
-            if bullish_signals > bearish_signals:
-                return "UP"
-            elif bearish_signals > bullish_signals:
-                return "DOWN"
-            else:
-                return "NEUTRAL"
-                
-        except Exception as e:
-            return "NEUTRAL"
-    
-    def _estimate_compression_time(self, df: pd.DataFrame, emas: Dict[str, pd.Series]) -> int:
-        """Estimate how long price has been compressed"""
-        try:
-            # Look back up to 50 candles
-            lookback = min(50, len(df))
-            
-            for i in range(lookback - 1, 0, -1):
-                # Check if EMAs were spread out at this point
-                ema_values = [ema.iloc[i] for ema in emas.values()]
-                max_ema = max(ema_values)
-                min_ema = min(ema_values)
-                avg_ema = np.mean(ema_values)
-                
-                if avg_ema > 0:
-                    spread_pct = (max_ema - min_ema) / avg_ema * 100
-                    if spread_pct > 3.0:  # Wasn't compressed
-                        # Return minutes since compression started
-                        return (lookback - i) * 5  # 5-minute candles
-                        
-            return lookback * 5  # Max lookback in minutes
-            
-        except Exception as e:
-            return 0
-    
-    def detect_expansion_trigger(self, df_5m: pd.DataFrame, compression: CompressionState) -> ExpansionTrigger:
-        """
-        Detect the FIRST expansion trigger candle
-        """
-        try:
-            if len(df_5m) < 10:
-                return ExpansionTrigger(
-                    first_expansion_candle=False,
-                    candle_size_ratio=1.0,
-                    volume_spike_ratio=1.0,
-                    ema_expansion_angle=0.0,
-                    breakout_confirmed=False,
-                    time_since_compression=0
-                )
-            
-            current_candle = df_5m.iloc[-1]
-            prev_candle = df_5m.iloc[-2]
-            
-            # 1. Candle Size Ratio (current vs average)
-            avg_candle_size = (df_5m['high'] - df_5m['low']).iloc[-20:].mean()
-            current_candle_size = current_candle['high'] - current_candle['low']
-            
-            if avg_candle_size > 0:
-                candle_size_ratio = current_candle_size / avg_candle_size
-            else:
-                candle_size_ratio = 1.0
-            
-            # 2. Volume Spike
-            avg_volume = df_5m['volume'].iloc[-20:].mean()
-            current_volume = current_candle['volume']
-            
-            if avg_volume > 0:
-                volume_spike_ratio = current_volume / avg_volume
-            else:
-                volume_spike_ratio = 1.0
-            
-            # 3. EMA Expansion Angle
-            emas = self.calculate_emas(df_5m)
-            fast_ema_current = emas['ultra_fast'].iloc[-1]
-            fast_ema_prev = emas['ultra_fast'].iloc[-2]
-            medium_ema_current = emas['medium'].iloc[-1]
-            medium_ema_prev = emas['medium'].iloc[-2]
-            
-            # Calculate angle of separation
-            fast_slope = fast_ema_current - fast_ema_prev
-            medium_slope = medium_ema_current - medium_ema_prev
-            ema_expansion_angle = abs(fast_slope - medium_slope)
-            
-            # 4. First Expansion Candle Criteria
-            # Was previous candle inside compression zone?
-            prev_inside_compression = (
-                abs(prev_candle['close'] - fast_ema_prev) / fast_ema_prev < 0.01  # Within 1%
-            )
-            
-            # Is current candle breaking out?
-            current_breakout = False
-            if compression.pressure_direction == "UP":
-                current_breakout = (
-                    current_candle['close'] > fast_ema_current * 1.01 and
-                    current_candle['close'] > current_candle['open'] and
-                    candle_size_ratio > 1.5
-                )
-            elif compression.pressure_direction == "DOWN":
-                current_breakout = (
-                    current_candle['close'] < fast_ema_current * 0.99 and
-                    current_candle['close'] < current_candle['open'] and
-                    candle_size_ratio > 1.5
-                )
-            
-            first_expansion_candle = prev_inside_compression and current_breakout
-            
-            # 5. Breakout Confirmation (close outside compression)
-            breakout_confirmed = False
-            if compression.pressure_direction == "UP":
-                breakout_confirmed = current_candle['close'] > fast_ema_current * 1.015
-            elif compression.pressure_direction == "DOWN":
-                breakout_confirmed = current_candle['close'] < fast_ema_current * 0.985
-            
-            return ExpansionTrigger(
-                first_expansion_candle=first_expansion_candle,
-                candle_size_ratio=candle_size_ratio,
-                volume_spike_ratio=volume_spike_ratio,
-                ema_expansion_angle=ema_expansion_angle,
-                breakout_confirmed=breakout_confirmed,
-                time_since_compression=compression.time_compressed_minutes
-            )
-            
-        except Exception as e:
-            self.logger.logger.error(f"Expansion trigger error: {e}")
-            return ExpansionTrigger(
-                first_expansion_candle=False,
-                candle_size_ratio=1.0,
-                volume_spike_ratio=1.0,
-                ema_expansion_angle=0.0,
-                breakout_confirmed=False,
-                time_since_compression=0
-            )
-    
-    def analyze_market_context(self, multi_tf_data: Dict[str, pd.DataFrame]) -> MarketContext:
-        """
-        Analyze multi-timeframe context for aggressive trading
-        """
-        try:
-            tf_4h = multi_tf_data.get("4H")
-            tf_2h = multi_tf_data.get("2H")
-            tf_1h = multi_tf_data.get("1H")
-            
-            if None in [tf_4h, tf_2h, tf_1h]:
-                return MarketContext(
-                    htf_bias="NEUTRAL",
-                    htf_strength=0.5,
-                    wave_position="UNKNOWN",
-                    wave_maturity=0.5,
-                    key_levels={},
-                    liquidity_zones=[]
-                )
-            
-            # 1. HTF Bias from 4H and 2H
-            bias_4h = self._get_timeframe_bias(tf_4h)
-            bias_2h = self._get_timeframe_bias(tf_2h)
-            
-            # Combine biases
-            if bias_4h == bias_2h:
-                htf_bias = bias_4h
-                htf_strength = 0.8
-            else:
-                htf_bias = "MIXED"
-                htf_strength = 0.5
-            
-            # 2. Wave Position from 1H
-            wave_position, wave_maturity = self._analyze_wave_position(tf_1h)
-            
-            # 3. Key Levels (simplified)
-            key_levels = self._extract_key_levels(tf_1h)
-            
-            # 4. Liquidity Zones (simplified - recent highs/lows)
-            liquidity_zones = self._identify_liquidity_zones(tf_1h)
-            
-            return MarketContext(
-                htf_bias=htf_bias,
-                htf_strength=htf_strength,
+            return ElliottTrend(
+                direction=direction,
+                strength=strength,
                 wave_position=wave_position,
                 wave_maturity=wave_maturity,
-                key_levels=key_levels,
-                liquidity_zones=liquidity_zones
+                trend_source=trend_source
             )
             
         except Exception as e:
-            self.logger.logger.error(f"Market context error: {e}")
-            return MarketContext(
-                htf_bias="NEUTRAL",
-                htf_strength=0.5,
+            log.error(f"Elliott trend error: {e}")
+            return ElliottTrend(
+                direction="NEUTRAL",
+                strength=0.5,
                 wave_position="UNKNOWN",
                 wave_maturity=0.5,
-                key_levels={},
-                liquidity_zones=[]
+                trend_source="ERROR"
             )
     
-    def _get_timeframe_bias(self, df: pd.DataFrame) -> str:
-        """Get bias for a specific timeframe"""
+    def _get_simple_trend(self, df: pd.DataFrame) -> Dict[str, Any]:
+        """Simple trend detection using price structure"""
         try:
-            if len(df) < 10:
-                return "NEUTRAL"
+            if len(df) < 20:
+                return {"direction": "NEUTRAL", "strength": 0.5}
             
-            emas = self.calculate_emas(df)
-            current_price = df['close'].iloc[-1]
+            prices = df['close'].values[-20:]
             
-            above_fast = current_price > emas['fast'].iloc[-1]
-            above_medium = current_price > emas['medium'].iloc[-1]
-            above_slow = current_price > emas['slow'].iloc[-1]
+            # Calculate slopes
+            x = np.arange(len(prices))
+            slope, intercept = np.polyfit(x, prices, 1)
             
-            bullish_signals = sum([above_fast, above_medium, above_slow])
+            # Calculate higher highs/lows for bullish, lower highs/lows for bearish
+            highs = df['high'].values[-10:]
+            lows = df['low'].values[-10:]
             
-            if bullish_signals >= 2:
-                return "BULLISH"
-            elif bullish_signals <= 1:
-                return "BEARISH"
+            # Check for higher highs in bullish trend
+            higher_highs = all(highs[i] > highs[i-1] for i in range(1, len(highs)))
+            higher_lows = all(lows[i] > lows[i-1] for i in range(1, len(lows)))
+            
+            # Check for lower highs in bearish trend
+            lower_highs = all(highs[i] < highs[i-1] for i in range(1, len(highs)))
+            lower_lows = all(lows[i] < lows[i-1] for i in range(1, len(lows)))
+            
+            # Determine trend
+            bullish_score = 0
+            bearish_score = 0
+            
+            if slope > 0:
+                bullish_score += 1
             else:
-                return "NEUTRAL"
-                
+                bearish_score += 1
+            
+            if higher_highs:
+                bullish_score += 1
+            if higher_lows:
+                bullish_score += 1
+            if lower_highs:
+                bearish_score += 1
+            if lower_lows:
+                bearish_score += 1
+            
+            if bullish_score > bearish_score:
+                direction = "BULLISH"
+                strength = bullish_score / 4
+            elif bearish_score > bullish_score:
+                direction = "BEARISH"
+                strength = bearish_score / 4
+            else:
+                direction = "NEUTRAL"
+                strength = 0.5
+            
+            return {"direction": direction, "strength": strength}
+            
         except Exception as e:
-            return "NEUTRAL"
+            return {"direction": "NEUTRAL", "strength": 0.5}
     
-    def _analyze_wave_position(self, df: pd.DataFrame) -> Tuple[str, float]:
-        """Analyze wave position and maturity"""
+    def _estimate_wave_position(self, df: pd.DataFrame, trend: str) -> Tuple[str, float]:
+        """Estimate wave position and maturity"""
         try:
             if len(df) < 30:
                 return "UNKNOWN", 0.5
             
-            prices = df['close'].values
-            highs = df['high'].values
-            lows = df['low'].values
-            
-            # Simple wave detection
-            recent_move = prices[-1] - prices[-10]
+            prices = df['close'].values[-30:]
             volatility = np.std(prices[-20:])
             
-            if abs(recent_move) > volatility * 1.5:
+            # Recent price action
+            recent_move = prices[-1] - prices[-10]
+            
+            if abs(recent_move) > volatility * 1.2:
                 wave_position = "IMPULSIVE"
             else:
                 wave_position = "CORRECTIVE"
             
-            # Wave maturity (how far into the move)
-            # Look for exhaustion signs
-            atr = self.calculate_atr(df).iloc[-1]
-            distance_from_ema = abs(prices[-1] - df['close'].ewm(span=20).mean().iloc[-1])
+            # Wave maturity (simplified - based on distance from moving average)
+            ma = np.mean(prices[-20:])
+            current_price = prices[-1]
             
-            if atr > 0:
-                extension_ratio = distance_from_ema / atr
-                wave_maturity = min(extension_ratio / 3.0, 1.0)  # Normalize to 0-1
+            if ma > 0:
+                distance_pct = abs(current_price - ma) / ma * 100
+                wave_maturity = min(distance_pct / 10, 1.0)  # 10% = fully mature
             else:
                 wave_maturity = 0.5
             
@@ -664,107 +263,238 @@ class AggressiveHunterEngine:
         except Exception as e:
             return "UNKNOWN", 0.5
     
-    def _extract_key_levels(self, df: pd.DataFrame) -> Dict[str, float]:
-        """Extract key support/resistance levels"""
-        try:
-            levels = {}
-            
-            # Recent swing highs/lows
-            if len(df) >= 20:
-                levels['recent_high'] = df['high'].iloc[-20:].max()
-                levels['recent_low'] = df['low'].iloc[-20:].min()
-                levels['current_price'] = df['close'].iloc[-1]
-                
-                # VWAP for current session
-                typical_price = (df['high'] + df['low'] + df['close']) / 3
-                vwap = (typical_price * df['volume']).sum() / df['volume'].sum()
-                levels['vwap'] = vwap
-            
-            return levels
-            
-        except Exception as e:
-            return {}
+    # ========== INDICATOR ANALYSIS ==========
     
-    def _identify_liquidity_zones(self, df: pd.DataFrame) -> List[float]:
-        """Identify likely liquidity zones"""
-        try:
-            zones = []
-            
-            # Recent highs and lows (liquidity likely above/below)
-            if len(df) >= 50:
-                # Previous swing highs
-                for i in range(len(df)-10, len(df)-1):
-                    if (df['high'].iloc[i] > df['high'].iloc[i-1] and 
-                        df['high'].iloc[i] > df['high'].iloc[i+1]):
-                        zones.append(df['high'].iloc[i] * 1.005)  # Just above swing high
-                
-                # Previous swing lows
-                for i in range(len(df)-10, len(df)-1):
-                    if (df['low'].iloc[i] < df['low'].iloc[i-1] and 
-                        df['low'].iloc[i] < df['low'].iloc[i+1]):
-                        zones.append(df['low'].iloc[i] * 0.995)  # Just below swing low
-            
-            return zones[:5]  # Return top 5 zones
-            
-        except Exception as e:
-            return []
+    def calculate_rsi(self, prices: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
+        """Calculate RSI"""
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
     
-    # ========== AGGRESSIVE SIGNAL GENERATION ==========
+    def calculate_emas(self, df: pd.DataFrame) -> Dict[str, pd.Series]:
+        """Calculate EMAs"""
+        return {
+            name: df['close'].ewm(span=period, adjust=False).mean()
+            for name, period in EMA_PERIODS.items()
+        }
     
-    def generate_aggressive_signal(self, multi_tf_data: Dict[str, pd.DataFrame], 
-                                  symbol: str, scan_cycle: int) -> Optional[AggressiveSignal]:
+    def analyze_indicators(self, df: pd.DataFrame, trend: str) -> IndicatorSignal:
         """
-        Generate aggressive expansion signal
+        Analyze RSI, EMA, Volume for entry signals
         """
         try:
-            # Check cooldown
-            current_time = time.time()
-            if symbol in self.recent_signals:
-                time_since_last = current_time - self.recent_signals[symbol]
-                if time_since_last < self.signal_cooldown:
-                    return None
+            if len(df) < 30:
+                return IndicatorSignal(
+                    rsi_signal="NEUTRAL",
+                    rsi_value=50,
+                    ema_signal="NEUTRAL",
+                    ema_distance_pct=0,
+                    volume_signal="NEUTRAL",
+                    volume_ratio=1.0,
+                    strength_score=0.5
+                )
             
-            # Get required timeframes
-            tf_5m = multi_tf_data.get("5M")
+            current_price = df['close'].iloc[-1]
+            
+            # 1. RSI Analysis
+            rsi = self.calculate_rsi(df['close'])
+            current_rsi = rsi.iloc[-1] if len(rsi) > 0 else 50
+            
+            rsi_signal = "NEUTRAL"
+            if current_rsi < RSI_OVERSOLD:
+                rsi_signal = "OVERSOLD"
+            elif current_rsi > RSI_OVERBOUGHT:
+                rsi_signal = "OVERBOUGHT"
+            
+            # Check for divergence (simplified)
+            if len(rsi) >= 10:
+                rsi_trend = np.polyfit(range(5), rsi.values[-5:], 1)[0]
+                price_trend = np.polyfit(range(5), df['close'].values[-5:], 1)[0]
+                
+                if price_trend > 0 and rsi_trend < -2:
+                    rsi_signal = "BEARISH_DIV"
+                elif price_trend < 0 and rsi_trend > 2:
+                    rsi_signal = "BULLISH_DIV"
+            
+            # 2. EMA Analysis
+            emas = self.calculate_emas(df)
+            fast_ema = emas['fast'].iloc[-1]
+            
+            ema_distance_pct = (current_price - fast_ema) / fast_ema * 100
+            
+            ema_signal = "NEUTRAL"
+            
+            # Check for bounce/rejection
+            current_candle = df.iloc[-1]
+            prev_candle = df.iloc[-2] if len(df) > 1 else current_candle
+            
+            # Bullish bounce from EMA
+            if (prev_candle['low'] < fast_ema and 
+                current_candle['close'] > fast_ema and
+                current_candle['close'] > current_candle['open']):
+                ema_signal = "BOUNCE"
+            
+            # Bearish rejection from EMA
+            elif (prev_candle['high'] > fast_ema and 
+                  current_candle['close'] < fast_ema and
+                  current_candle['close'] < current_candle['open']):
+                ema_signal = "REJECTION"
+            
+            # EMA compression (fast and medium close together)
+            medium_ema = emas['medium'].iloc[-1]
+            ema_spread = abs(fast_ema - medium_ema) / medium_ema * 100
+            
+            if ema_spread < 0.5:  # Very tight
+                ema_signal = "COMPRESSION"
+            
+            # Price overstretched from EMA
+            elif abs(ema_distance_pct) > 3:
+                ema_signal = "OVERSTRETCH"
+            
+            # 3. Volume Analysis
+            recent_volume = df['volume'].values[-5:].mean()
+            avg_volume = df['volume'].values[-20:].mean()
+            volume_ratio = recent_volume / avg_volume if avg_volume > 0 else 1.0
+            
+            volume_signal = "NEUTRAL"
+            price_change = (current_price - df['close'].iloc[-5]) / df['close'].iloc[-5] * 100
+            
+            if volume_ratio > 1.5:
+                if price_change > 0.5:
+                    volume_signal = "CONFIRMING"
+                elif price_change < -0.5:
+                    volume_signal = "CONFIRMING"
+                else:
+                    volume_signal = "NEUTRAL"
+            elif volume_ratio < 0.7:
+                volume_signal = "DIVERGING"
+            
+            # 4. Market Strength Score
+            strength_factors = []
+            
+            # RSI strength
+            if rsi_signal in ["OVERSOLD", "BULLISH_DIV"] and trend == "BULLISH":
+                strength_factors.append(0.8)
+            elif rsi_signal in ["OVERBOUGHT", "BEARISH_DIV"] and trend == "BEARISH":
+                strength_factors.append(0.8)
+            else:
+                strength_factors.append(0.4)
+            
+            # EMA strength
+            if ema_signal in ["BOUNCE", "REJECTION"]:
+                strength_factors.append(0.7)
+            elif ema_signal == "COMPRESSION":
+                strength_factors.append(0.6)
+            else:
+                strength_factors.append(0.5)
+            
+            # Volume strength
+            if volume_signal == "CONFIRMING":
+                strength_factors.append(0.8)
+            elif volume_signal == "DIVERGING":
+                strength_factors.append(0.3)
+            else:
+                strength_factors.append(0.5)
+            
+            strength_score = np.mean(strength_factors) if strength_factors else 0.5
+            
+            return IndicatorSignal(
+                rsi_signal=rsi_signal,
+                rsi_value=current_rsi,
+                ema_signal=ema_signal,
+                ema_distance_pct=ema_distance_pct,
+                volume_signal=volume_signal,
+                volume_ratio=volume_ratio,
+                strength_score=strength_score
+            )
+            
+        except Exception as e:
+            log.error(f"Indicator analysis error: {e}")
+            return IndicatorSignal(
+                rsi_signal="NEUTRAL",
+                rsi_value=50,
+                ema_signal="NEUTRAL",
+                ema_distance_pct=0,
+                volume_signal="NEUTRAL",
+                volume_ratio=1.0,
+                strength_score=0.5
+            )
+    
+    # ========== HIGH-FREQUENCY SIGNAL GENERATION ==========
+    
+    def generate_high_freq_signal(self, multi_tf_data: Dict[str, pd.DataFrame], 
+                                 symbol: str) -> Optional[HighFreqSignal]:
+        """
+        Generate high-frequency signal based on Elliott trend + Indicators
+        """
+        try:
+            # Get timeframe data
+            tf_4h = multi_tf_data.get("4H")
+            tf_1h = multi_tf_data.get("1H")
             tf_15m = multi_tf_data.get("15M")
+            tf_5m = multi_tf_data.get("5M")
             
-            if tf_5m is None or tf_15m is None:
+            if None in [tf_4h, tf_1h, tf_15m, tf_5m]:
                 return None
             
-            # 1. Detailed Compression Analysis
-            compression = self.analyze_compression_detailed(tf_15m, tf_5m)
+            # 1. Elliott Wave Trend Analysis (context only)
+            trend = self.analyze_elliott_trend(tf_4h, tf_1h)
             
-            if compression.score < 0.5:
-                return None  # Not compressed enough
+            if trend.direction == "NEUTRAL":
+                log.debug(f"{symbol}: No clear trend direction")
+                return None
             
-            self.logger.log_compression(symbol, compression.score, "5M")
+            # 2. Check lower timeframes for entries
+            entry_tfs = ["15M", "5M"]
+            best_signal = None
+            best_score = 0
             
-            # 2. Expansion Trigger Detection
-            expansion = self.detect_expansion_trigger(tf_5m, compression)
+            for tf_name in entry_tfs:
+                df = multi_tf_data.get(tf_name)
+                if df is None or len(df) < 20:
+                    continue
+                
+                # Analyze indicators on this timeframe
+                indicators = self.analyze_indicators(df, trend.direction)
+                
+                # Check if indicators support the trend
+                confluence_score = self._calculate_confluence_score(trend, indicators)
+                
+                # Minimum confluence threshold (LOW for high frequency)
+                if confluence_score < 0.5:
+                    continue
+                
+                # Check if this is better than previous signals
+                if confluence_score > best_score:
+                    best_score = confluence_score
+                    best_signal = {
+                        "timeframe": tf_name,
+                        "df": df,
+                        "indicators": indicators,
+                        "confluence_score": confluence_score
+                    }
             
-            if not expansion.first_expansion_candle:
-                return None  # Not the first expansion candle
+            if not best_signal:
+                log.debug(f"{symbol}: No good entry confluence")
+                return None
             
-            self.logger.log_expansion(symbol, expansion, compression.pressure_direction)
-            
-            # 3. Market Context Analysis
-            context = self.analyze_market_context(multi_tf_data)
-            
-            # 4. Determine Trade Direction
-            if compression.pressure_direction == "UP":
+            # 3. Determine trade side based on trend
+            if trend.direction == "BULLISH":
                 side = "LONG"
-            elif compression.pressure_direction == "DOWN":
+            else:  # BEARISH
                 side = "SHORT"
-            else:
-                return None  # No clear pressure direction
             
-            # 5. Calculate Entry, SL, TP (AGGRESSIVE)
-            current_price = tf_5m['close'].iloc[-1]
+            # 4. Calculate entry, SL, TP (HIGH FREQUENCY)
+            df_entry = best_signal["df"]
+            current_price = df_entry['close'].iloc[-1]
             
-            # TIGHT Stop Loss
+            # Tight stop loss (0.5-1%)
             stop_loss_pct = np.random.uniform(0.5, MAX_STOP_LOSS_PCT)
             
-            # AGGRESSIVE Target (3-12%)
+            # Target 3-8%
             target_pct = np.random.uniform(MIN_TARGET_PCT, MAX_TARGET_PCT)
             
             if side == "LONG":
@@ -785,305 +515,156 @@ class AggressiveHunterEngine:
             
             # Minimum R:R check
             if risk_reward < MIN_RISK_REWARD:
+                log.debug(f"{symbol}: R:R too low ({risk_reward:.1f}:1)")
                 return None
             
-            # 6. Calculate Confidence Scores
-            timing_score = self._calculate_timing_score(expansion, tf_5m)
-            structure_score = self._calculate_structure_score(compression, context)
-            momentum_score = self._calculate_momentum_score(tf_5m, side)
+            # 5. Check if we should trade this pair now
+            # Allow multiple trades per day, but with cooldown
+            current_time = time.time()
+            if symbol in self.signals_today:
+                last_signal_time = self.signals_today[symbol]
+                if current_time - last_signal_time < 300:  # 5 minute cooldown
+                    log.debug(f"{symbol}: In cooldown period")
+                    return None
             
-            overall_conviction = np.mean([timing_score, structure_score, momentum_score])
+            # 6. Determine conditions met
+            conditions_met = self._get_conditions_met(trend, best_signal["indicators"])
             
-            # Minimum conviction threshold (LOW - we accept risky trades)
-            if overall_conviction < 0.4:
-                return None
-            
-            # 7. Position Sizing Score
-            position_size_score = self._calculate_position_size_score(
-                compression, expansion, risk_reward, overall_conviction
-            )
-            
-            # 8. Risk Management Levels
-            max_loss_pct = stop_loss_pct
-            breakeven_level = current_price * (1 + stop_loss_pct / 100) if side == "LONG" else current_price * (1 - stop_loss_pct / 100)
-            trail_start = current_price * (1 + (target_pct * 0.3) / 100) if side == "LONG" else current_price * (1 - (target_pct * 0.3) / 100)
-            
-            # 9. Conditions Met
-            conditions_met = []
-            if compression.score > 0.6:
-                conditions_met.append("STRONG_COMPRESSION")
-            if expansion.first_expansion_candle:
-                conditions_met.append("FIRST_EXPANSION_CANDLE")
-            if expansion.volume_spike_ratio > 2.0:
-                conditions_met.append("VOLUME_SPIKE")
-            if risk_reward > 4.0:
-                conditions_met.append("HIGH_RR")
-            
-            # 10. Create Signal ID
+            # 7. Create signal ID
             signal_id = hashlib.md5(
-                f"{symbol}:{side}:{current_price:.8f}:{scan_cycle}:{time.time_ns()}".encode()
+                f"{symbol}:{side}:{current_price:.8f}:{current_time}".encode()
             ).hexdigest()
             
-            # 11. Create Complete Signal
-            signal = AggressiveSignal(
+            # 8. Create final signal
+            signal = HighFreqSignal(
                 signal_id=signal_id,
                 symbol=symbol,
                 side=side,
                 entry_price=current_price,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
-                entry_time=current_time,
                 
-                stop_loss_pct=stop_loss_pct,
-                target_pct=target_pct,
+                trend=trend,
+                indicators=best_signal["indicators"],
+                
+                confluence_score=best_signal["confluence_score"],
                 risk_reward=risk_reward,
-                position_size_score=position_size_score,
+                expected_move_pct=target_pct,
                 
-                compression=compression,
-                expansion=expansion,
-                context=context,
-                
-                timing_score=timing_score,
-                structure_score=structure_score,
-                momentum_score=momentum_score,
-                overall_conviction=overall_conviction,
-                
-                max_loss_pct=max_loss_pct,
-                breakeven_level=breakeven_level,
-                trail_start=trail_start,
-                
-                scan_cycle=scan_cycle,
+                timeframe_used=best_signal["timeframe"],
+                signal_timestamp=current_time,
                 conditions_met=conditions_met
             )
             
-            # Update cooldown
-            self.recent_signals[symbol] = current_time
+            # Update tracking
+            self.signals_today[symbol] = current_time
+            self.daily_stats["signals_generated"] += 1
+            if side == "LONG":
+                self.daily_stats["long_signals"] += 1
+            else:
+                self.daily_stats["short_signals"] += 1
             
-            self.logger.log_signal(signal)
+            log.info(f"🚀 HIGH-FREQ SIGNAL: {symbol} {side} @ {current_price:.4f}")
+            log.info(f"   Trend: {trend.direction}, TF: {best_signal['timeframe']}")
+            log.info(f"   Confluence: {best_signal['confluence_score']:.2f}, R:R: {risk_reward:.1f}:1")
+            log.info(f"   Expected: {target_pct:.1f}%, Conditions: {len(conditions_met)}")
+            
             return signal
             
         except Exception as e:
-            self.logger.logger.error(f"Signal generation error for {symbol}: {e}")
+            log.error(f"Signal generation error for {symbol}: {e}")
             return None
     
-    def _calculate_timing_score(self, expansion: ExpansionTrigger, df_5m: pd.DataFrame) -> float:
-        """Calculate timing score for entry"""
-        scores = []
+    def _calculate_confluence_score(self, trend: ElliottTrend, indicators: IndicatorSignal) -> float:
+        """Calculate confluence score between trend and indicators"""
+        confluence_factors = []
         
-        # First expansion candle
-        if expansion.first_expansion_candle:
-            scores.append(0.8)
+        # RSI confluence with trend
+        if trend.direction == "BULLISH":
+            if indicators.rsi_signal in ["OVERSOLD", "BULLISH_DIV"]:
+                confluence_factors.append(0.9)
+            elif indicators.rsi_value < 50:
+                confluence_factors.append(0.7)
+            else:
+                confluence_factors.append(0.4)
+        
+        elif trend.direction == "BEARISH":
+            if indicators.rsi_signal in ["OVERBOUGHT", "BEARISH_DIV"]:
+                confluence_factors.append(0.9)
+            elif indicators.rsi_value > 50:
+                confluence_factors.append(0.7)
+            else:
+                confluence_factors.append(0.4)
+        
+        # EMA confluence
+        if indicators.ema_signal in ["BOUNCE", "REJECTION", "COMPRESSION"]:
+            confluence_factors.append(0.8)
+        elif indicators.ema_signal == "OVERSTRETCH":
+            confluence_factors.append(0.4)  # Warning sign
         else:
-            scores.append(0.3)
+            confluence_factors.append(0.6)
         
-        # Volume spike
-        if expansion.volume_spike_ratio > 2.0:
-            scores.append(0.9)
-        elif expansion.volume_spike_ratio > 1.5:
-            scores.append(0.7)
+        # Volume confluence
+        if indicators.volume_signal == "CONFIRMING":
+            confluence_factors.append(0.9)
+        elif indicators.volume_signal == "DIVERGING":
+            confluence_factors.append(0.3)
         else:
-            scores.append(0.5)
+            confluence_factors.append(0.5)
         
-        # Candle size expansion
-        if expansion.candle_size_ratio > 2.0:
-            scores.append(0.9)
-        elif expansion.candle_size_ratio > 1.5:
-            scores.append(0.7)
-        else:
-            scores.append(0.5)
+        # Overall strength
+        confluence_factors.append(indicators.strength_score)
         
-        # Time since compression started (optimal: 30-90 minutes)
-        if 30 <= expansion.time_since_compression <= 90:
-            scores.append(0.8)
-        elif expansion.time_since_compression > 90:
-            scores.append(0.6)  # Too long, might not expand
-        else:
-            scores.append(0.4)  # Too short
-        
-        return np.mean(scores)
+        return np.mean(confluence_factors) if confluence_factors else 0.5
     
-    def _calculate_structure_score(self, compression: CompressionState, context: MarketContext) -> float:
-        """Calculate structure score"""
-        scores = []
+    def _get_conditions_met(self, trend: ElliottTrend, indicators: IndicatorSignal) -> List[str]:
+        """Get list of conditions met for this signal"""
+        conditions = []
         
-        # Compression strength
-        if compression.score > 0.7:
-            scores.append(0.9)
-        elif compression.score > 0.5:
-            scores.append(0.7)
-        else:
-            scores.append(0.4)
+        # Trend condition
+        conditions.append(f"TREND_{trend.direction}")
         
-        # Price coiling
-        if compression.price_coiling:
-            scores.append(0.8)
-        else:
-            scores.append(0.5)
+        # RSI condition
+        if indicators.rsi_signal != "NEUTRAL":
+            conditions.append(f"RSI_{indicators.rsi_signal}")
         
-        # Bollinger squeeze
-        if compression.bollinger_squeeze:
-            scores.append(0.8)
-        else:
-            scores.append(0.5)
+        # EMA condition
+        if indicators.ema_signal != "NEUTRAL":
+            conditions.append(f"EMA_{indicators.ema_signal}")
         
-        # HTF bias alignment
-        if (context.htf_bias == "BULLISH" and compression.pressure_direction == "UP") or \
-           (context.htf_bias == "BEARISH" and compression.pressure_direction == "DOWN"):
-            scores.append(0.8)
-        elif context.htf_bias == "MIXED" or context.htf_bias == "NEUTRAL":
-            scores.append(0.6)
-        else:
-            scores.append(0.4)  # Counter-trend
+        # Volume condition
+        if indicators.volume_signal != "NEUTRAL":
+            conditions.append(f"VOLUME_{indicators.volume_signal}")
         
         # Wave position
-        if context.wave_position == "CORRECTIVE":
-            scores.append(0.8)  # Good for expansion
-        elif context.wave_position == "TRANSITION":
-            scores.append(0.7)
-        else:
-            scores.append(0.5)
+        conditions.append(f"WAVE_{trend.wave_position}")
         
-        return np.mean(scores)
+        return conditions
     
-    def _calculate_momentum_score(self, df_5m: pd.DataFrame, side: str) -> float:
-        """Calculate momentum score"""
-        try:
-            scores = []
-            
-            # RSI momentum
-            rsi = self.calculate_rsi(df_5m['close'], 7)
-            if len(rsi) > 0:
-                current_rsi = rsi.iloc[-1]
-                if side == "LONG":
-                    if current_rsi < 50:
-                        scores.append(0.8)  # Room to move up
-                    elif current_rsi < 60:
-                        scores.append(0.6)
-                    else:
-                        scores.append(0.4)
-                else:  # SHORT
-                    if current_rsi > 50:
-                        scores.append(0.8)  # Room to move down
-                    elif current_rsi > 40:
-                        scores.append(0.6)
-                    else:
-                        scores.append(0.4)
-            
-            # Price slope
-            recent_prices = df_5m['close'].values[-5:]
-            if len(recent_prices) >= 3:
-                slope = np.polyfit(range(3), recent_prices[-3:], 1)[0]
-                if side == "LONG" and slope > 0:
-                    scores.append(0.7)
-                elif side == "SHORT" and slope < 0:
-                    scores.append(0.7)
-                else:
-                    scores.append(0.5)
-            
-            # Volume trend
-            recent_volume = df_5m['volume'].values[-3:].mean()
-            prev_volume = df_5m['volume'].values[-6:-3].mean()
-            if prev_volume > 0:
-                volume_ratio = recent_volume / prev_volume
-                if volume_ratio > 1.5:
-                    scores.append(0.8)
-                elif volume_ratio > 1.0:
-                    scores.append(0.6)
-                else:
-                    scores.append(0.4)
-            
-            return np.mean(scores) if scores else 0.5
-            
-        except Exception as e:
-            return 0.5
-    
-    def _calculate_position_size_score(self, compression: CompressionState, 
-                                      expansion: ExpansionTrigger,
-                                      risk_reward: float,
-                                      conviction: float) -> float:
-        """Calculate position size score (0-1)"""
-        scores = []
-        
-        # Compression strength
-        scores.append(compression.score)
-        
-        # Expansion strength
-        expansion_strength = min(expansion.candle_size_ratio / 3.0, 1.0)
-        scores.append(expansion_strength)
-        
-        # Volume spike
-        volume_score = min(expansion.volume_spike_ratio / 4.0, 1.0)
-        scores.append(volume_score)
-        
-        # Risk/Reward
-        rr_score = min(risk_reward / 6.0, 1.0)
-        scores.append(rr_score)
-        
-        # Overall conviction
-        scores.append(conviction)
-        
-        return np.mean(scores)
-    
-    def record_trade_outcome(self, signal: AggressiveSignal, pnl_percent: float, 
-                            outcome: str, close_reason: str):
-        """Record trade outcome for learning"""
-        if outcome == "WIN":
-            self.big_winners += 1
-            self.total_pnl += pnl_percent
-            self.logger.log_winner(signal.symbol, pnl_percent)
-        else:
-            self.accepted_losses += 1
-            self.total_pnl += pnl_percent
-            self.logger.log_loss(signal.symbol, pnl_percent, close_reason)
-    
-    def get_performance_stats(self) -> Dict:
-        """Get performance statistics"""
-        total_trades = self.accepted_losses + self.big_winners
-        
-        if total_trades > 0:
-            win_rate = self.big_winners / total_trades
-            avg_pnl = self.total_pnl / total_trades
-        else:
-            win_rate = 0
-            avg_pnl = 0
-        
-        return {
-            "total_trades": total_trades,
-            "accepted_losses": self.accepted_losses,
-            "big_winners": self.big_winners,
-            "win_rate": f"{win_rate:.1%}",
-            "total_pnl": f"{self.total_pnl:.2f}%",
-            "average_pnl": f"{avg_pnl:.2f}%",
-            "recent_signals": len(self.recent_signals)
-        }
+    def get_daily_stats(self) -> Dict:
+        """Get daily statistics"""
+        return self.daily_stats
 
-# ================ COMPLETE SCANNER SYSTEM ================
-class CompleteAggressiveScanner:
-    """Complete aggressive scanner system with all components"""
+# ================ MAIN SCANNER SYSTEM ================
+class ElliottIndicatorsScanner:
+    """Main scanner system for high-frequency Elliott + Indicators signals"""
     
     def __init__(self):
-        self.engine = AggressiveHunterEngine()
+        self.scanner = HighFrequencyScanner()
         self.exchange = None
         self.db = None
         self.scan_cycle = 0
-        self.active_positions = {}
         
-        # Performance tracking
-        self.scans_completed = 0
-        self.pairs_scanned = 0
-        self.start_time = time.time()
-    
     async def initialize(self):
-        """Initialize complete scanner system"""
-        self.engine.logger.logger.info("=" * 70)
-        self.engine.logger.logger.info("🔥 COMPLETE AGGRESSIVE WAVE EXPANSION HUNTER")
-        self.engine.logger.logger.info("=" * 70)
-        self.engine.logger.logger.info("PHILOSOPHY: Hunt compression → expansion transitions")
-        self.engine.logger.logger.info("STYLE: Aggressive, Early entry, Loss-accepting")
-        self.engine.logger.logger.info("TARGET: 3-12% moves within minutes to hours")
-        self.engine.logger.logger.info(f"SCAN INTERVAL: {SCAN_INTERVAL} seconds")
-        self.engine.logger.logger.info(f"MAX POSITIONS: {MAX_POSITIONS}")
-        self.engine.logger.logger.info("=" * 70)
+        """Initialize the scanner"""
+        log.info("=" * 70)
+        log.info("🔥 ELLIOTT WAVE + INDICATORS HIGH-FREQUENCY SCANNER")
+        log.info("=" * 70)
+        log.info("PHILOSOPHY: Trend from Elliott Waves, Entries from Indicators")
+        log.info("FREQUENCY: High (multiple signals per pair per day)")
+        log.info("TARGET: 3-8% moves within minutes to hours")
+        log.info(f"SCAN INTERVAL: {SCAN_INTERVAL} seconds")
+        log.info("=" * 70)
         
         # Initialize database
         await self._init_database()
@@ -1095,38 +676,37 @@ class CompleteAggressiveScanner:
         await self._send_startup_message()
     
     async def _init_database(self):
-        """Initialize comprehensive database"""
+        """Initialize database"""
         try:
             os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
             self.db = await aiosqlite.connect(DB_PATH)
             
-            # Main signals table
+            # Signals table
             await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS aggressive_signals (
+            CREATE TABLE IF NOT EXISTS high_freq_signals (
                 id TEXT PRIMARY KEY,
                 symbol TEXT NOT NULL,
                 side TEXT NOT NULL,
                 entry_price REAL NOT NULL,
                 stop_loss REAL NOT NULL,
                 take_profit REAL NOT NULL,
-                stop_loss_pct REAL NOT NULL,
-                target_pct REAL NOT NULL,
+                
+                trend_direction TEXT NOT NULL,
+                trend_strength REAL NOT NULL,
+                wave_position TEXT NOT NULL,
+                
+                rsi_signal TEXT NOT NULL,
+                rsi_value REAL NOT NULL,
+                ema_signal TEXT NOT NULL,
+                volume_signal TEXT NOT NULL,
+                volume_ratio REAL NOT NULL,
+                
+                confluence_score REAL NOT NULL,
                 risk_reward REAL NOT NULL,
-                position_size_score REAL NOT NULL,
-                
-                compression_score REAL NOT NULL,
-                ema_spread_pct REAL NOT NULL,
-                volume_spike_ratio REAL NOT NULL,
-                candle_size_ratio REAL NOT NULL,
-                
-                timing_score REAL NOT NULL,
-                structure_score REAL NOT NULL,
-                momentum_score REAL NOT NULL,
-                overall_conviction REAL NOT NULL,
+                expected_move REAL NOT NULL,
+                timeframe_used TEXT NOT NULL,
                 
                 conditions_met TEXT,
-                scan_cycle INTEGER NOT NULL,
-                
                 status TEXT DEFAULT 'PENDING',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 
@@ -1136,55 +716,30 @@ class CompleteAggressiveScanner:
                 closed_at TIMESTAMP,
                 close_price REAL,
                 pnl_percent REAL,
-                close_reason TEXT,
-                
-                breakeven_hit BOOLEAN DEFAULT FALSE,
-                trail_activated BOOLEAN DEFAULT FALSE,
-                
-                metadata TEXT
+                close_reason TEXT
             )
             """)
             
-            # Performance tracking table
+            # Performance table
             await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS performance_stats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            CREATE TABLE IF NOT EXISTS performance_daily (
+                date DATE PRIMARY KEY,
                 total_signals INTEGER,
-                open_signals INTEGER,
-                closed_signals INTEGER,
-                total_wins INTEGER,
-                total_losses INTEGER,
-                total_pnl REAL,
-                avg_win_size REAL,
-                avg_loss_size REAL,
-                best_winner REAL,
-                worst_loss REAL
-            )
-            """)
-            
-            # Compression history table
-            await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS compression_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT NOT NULL,
-                timeframe TEXT NOT NULL,
-                compression_score REAL NOT NULL,
-                ema_spread_pct REAL NOT NULL,
-                volume_ratio REAL NOT NULL,
-                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                expanded BOOLEAN DEFAULT FALSE,
-                expansion_direction TEXT,
-                expansion_pct REAL
+                long_signals INTEGER,
+                short_signals INTEGER,
+                win_rate REAL,
+                avg_win REAL,
+                avg_loss REAL,
+                total_pnl REAL
             )
             """)
             
             await self.db.commit()
             
-            self.engine.logger.logger.info("✅ Database initialized with comprehensive schema")
+            log.info("✅ Database initialized")
             
         except Exception as e:
-            self.engine.logger.logger.error(f"Database initialization error: {e}")
+            log.error(f"Database error: {e}")
             raise
     
     async def _init_exchange(self):
@@ -1193,71 +748,49 @@ class CompleteAggressiveScanner:
             self.exchange = ccxt.okx({
                 "enableRateLimit": True,
                 "options": {"defaultType": "spot"},
-                "timeout": 30000,
-                "rateLimit": 100
+                "timeout": 20000,
+                "rateLimit": 50  # Faster rate limit
             })
             
             # Test connection
             ticker = await self.exchange.fetch_ticker("BTC/USDT")
-            btc_price = ticker['last']
-            
-            self.engine.logger.logger.info(f"✅ Exchange connected. BTC: ${btc_price:.2f}")
-            
-            # Check available pairs
-            markets = await self.exchange.load_markets()
-            usdt_pairs = [s for s in markets.keys() if s.endswith('/USDT')]
-            self.engine.logger.logger.info(f"📊 Available USDT pairs: {len(usdt_pairs)}")
+            log.info(f"✅ Exchange connected. BTC: ${ticker['last']:.2f}")
             
         except Exception as e:
-            self.engine.logger.logger.error(f"Exchange initialization error: {e}")
+            log.error(f"Exchange error: {e}")
             raise
     
     async def _send_startup_message(self):
-        """Send comprehensive startup message"""
+        """Send startup message to Telegram"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             return
         
         try:
             message = f"""
-🚀 <b>COMPLETE AGGRESSIVE WAVE HUNTER ACTIVATED</b>
+🚀 <b>ELLIOTT + INDICATORS HIGH-FREQUENCY SCANNER</b>
 
-<b>🔥 CORE PHILOSOPHY:</b>
-• Hunt compression → expansion transitions
-• Enter on FIRST expansion candle
-• Accept losses as fuel for winners
-• Target asymmetric payoff (3-12% moves)
+<b>🎯 STRATEGY:</b>
+• Trend direction from Elliott Waves (4H/1H)
+• Entry signals from Indicators (RSI, EMA, Volume)
+• High-frequency signals (multiple per pair per day)
+• Fast moves: 3-8% within minutes to hours
 
-<b>⚙️ AGGRESSIVE CONFIGURATION:</b>
+<b>⚡ CONFIGURATION:</b>
 • Scan interval: {SCAN_INTERVAL} seconds
-• Maximum stop loss: {MAX_STOP_LOSS_PCT}%
-• Minimum target: {MIN_TARGET_PCT}%
-• Maximum target: {MAX_TARGET_PCT}%
-• Minimum risk/reward: {MIN_RISK_REWARD}:1
-• Maximum positions: {MAX_POSITIONS}
+• Timeframes: 4H(trend), 1H(wave), 15M/5M(entry)
+• Stop loss: 0.5-1.0%
+• Target: 3-8%
+• Risk/Reward: Minimum 1:2
 
-<b>📊 DETECTION CAPABILITIES:</b>
-• Multi-timeframe compression analysis (8 timeframes)
-• First expansion candle detection
-• Volume spike analysis
-• Bollinger Band squeeze detection
-• Wave position analysis
-• Market context assessment
+<b>📊 APPROACH:</b>
+• Accept losses for high frequency
+• Winners should be strong (>3%)
+• Multiple trades per coin per day
+• Early capture over perfection
 
-<b>🎯 EXPECTED PERFORMANCE:</b>
-• Win rate: 40-50%
-• Many small losses (0.5-0.8%)
-• Few big winners (3-12%)
-• Asymmetric payoff is priority
+<b>✅ STATUS: ACTIVE AND SCANNING</b>
 
-<b>✅ SYSTEM STATUS:</b>
-• Database: READY
-• Exchange: CONNECTED
-• Engine: ARMED
-• Hunter: HUNGRY
-
-<i>Losses are expected. Winners are explosive. Let's hunt.</i>
-
-#AggressiveHunter #WaveExpansion #CompressionBreak
+#ElliottScanner #HighFrequency #IndicatorEntries
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -1265,26 +798,20 @@ class CompleteAggressiveScanner:
                 await client.post(url, json={
                     "chat_id": TELEGRAM_CHAT_ID,
                     "text": message,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True
+                    "parse_mode": "HTML"
                 })
                 
         except Exception as e:
-            self.engine.logger.logger.error(f"Startup message error: {e}")
+            log.error(f"Telegram startup error: {e}")
     
-    async def fetch_comprehensive_data(self, symbol: str) -> Dict[str, pd.DataFrame]:
-        """Fetch data for all timeframes with error handling"""
+    async def fetch_timeframe_data(self, symbol: str) -> Dict[str, pd.DataFrame]:
+        """Fetch data for all timeframes"""
         data = {}
         
         for tf_name, tf in TIMEFRAMES.items():
             try:
-                # Adjust limit based on timeframe
-                if tf_name in ["4H", "2H"]:
-                    limit = 100
-                elif tf_name in ["1H", "30M"]:
-                    limit = 80
-                else:
-                    limit = 60
+                # Adjust limits for different timeframes
+                limit = 100 if tf_name in ["4H", "1H"] else 50
                 
                 ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
                 
@@ -1294,7 +821,7 @@ class CompleteAggressiveScanner:
                         columns=["timestamp", "open", "high", "low", "close", "volume"]
                     )
                     
-                    # Convert and clean
+                    # Convert to numeric
                     for col in ["open", "high", "low", "close", "volume"]:
                         df[col] = pd.to_numeric(df[col], errors='coerce')
                     
@@ -1302,125 +829,58 @@ class CompleteAggressiveScanner:
                     
                     if len(df) >= 15:
                         data[tf_name] = df
-                    else:
-                        self.engine.logger.logger.debug(f"{symbol} {tf_name}: Insufficient clean data")
-                else:
-                    self.engine.logger.logger.debug(f"{symbol} {tf_name}: No data or insufficient length")
                     
-            except ccxt.RequestTimeout as e:
-                self.engine.logger.logger.debug(f"{symbol} {tf_name}: Timeout, skipping")
-                continue
-            except ccxt.ExchangeNotAvailable as e:
-                self.engine.logger.logger.debug(f"{symbol} {tf_name}: Exchange not available")
-                continue
             except Exception as e:
-                self.engine.logger.logger.debug(f"{symbol} {tf_name}: Error: {str(e)[:50]}")
+                log.debug(f"{symbol} {tf_name}: {str(e)[:50]}")
                 continue
         
         return data
     
-    async def get_top_volatile_pairs(self) -> List[Tuple[str, float]]:
-        """Get top volatile and liquid pairs"""
+    async def get_active_pairs(self) -> List[Tuple[str, float]]:
+        """Get active trading pairs"""
         try:
             tickers = await self.exchange.fetch_tickers()
-            scored_pairs = []
+            active_pairs = []
             
             for symbol, ticker in tickers.items():
                 if symbol.endswith('/USDT'):
                     volume = ticker.get('quoteVolume', 0)
                     
                     if volume >= MIN_VOLUME_USD:
-                        # Calculate volatility score
-                        high = ticker.get('high', 0)
-                        low = ticker.get('low', 0)
-                        last = ticker.get('last', 1)
+                        # Check price spread for liquidity
+                        bid = ticker.get('bid', 0)
+                        ask = ticker.get('ask', 0)
                         
-                        if last > 0 and high > low:
-                            # Daily range percentage
-                            daily_range_pct = (high - low) / last * 100
-                            
-                            # Recent price change
-                            open_price = ticker.get('open', last)
-                            daily_change_pct = abs(last - open_price) / open_price * 100 if open_price > 0 else 0
-                            
-                            # Combine scores: volume * volatility
-                            volatility_score = (daily_range_pct + daily_change_pct) / 2
-                            combined_score = volume * (1 + volatility_score / 100)
-                            
-                            scored_pairs.append((symbol, combined_score))
+                        if bid > 0 and ask > 0:
+                            spread = (ask - bid) / bid * 100
+                            if spread < 0.1:  # Good liquidity
+                                active_pairs.append((symbol, volume))
             
-            # Sort by combined score
-            scored_pairs.sort(key=lambda x: x[1], reverse=True)
+            # Sort by volume
+            active_pairs.sort(key=lambda x: x[1], reverse=True)
             
-            # Filter to top N
-            top_pairs = scored_pairs[:TOP_N_VOLUME]
-            
-            self.engine.logger.logger.info(f"Selected {len(top_pairs)} volatile pairs")
-            return top_pairs
+            # Take top N
+            return active_pairs[:TOP_N_VOLUME]
             
         except Exception as e:
-            self.engine.logger.logger.error(f"Error fetching volatile pairs: {e}")
+            log.error(f"Error getting pairs: {e}")
             return []
     
-    async def save_comprehensive_signal(self, signal: AggressiveSignal) -> bool:
-        """Save signal to database with all details"""
+    async def save_signal(self, signal: HighFreqSignal) -> bool:
+        """Save signal to database"""
         try:
-            # Check if we have too many open positions for this symbol
-            async with self.db.execute("""
-                SELECT COUNT(*) FROM aggressive_signals 
-                WHERE symbol = ? AND status IN ('PENDING', 'TRIGGERED')
-                AND created_at > datetime('now', '-30 minutes')
-            """, (signal.symbol,)) as cursor:
-                result = await cursor.fetchone()
-                if result and result[0] >= 2:  # Max 2 positions per symbol in 30 minutes
-                    self.engine.logger.logger.debug(f"{signal.symbol}: Too many recent positions")
-                    return False
-            
-            # Check total open positions
-            async with self.db.execute("""
-                SELECT COUNT(*) FROM aggressive_signals 
-                WHERE status IN ('PENDING', 'TRIGGERED')
-            """) as cursor:
-                result = await cursor.fetchone()
-                if result and result[0] >= MAX_POSITIONS:
-                    self.engine.logger.logger.debug(f"Max positions reached ({MAX_POSITIONS})")
-                    return False
-            
-            # Prepare metadata
-            metadata = {
-                "compression": {
-                    "score": signal.compression.score,
-                    "ema_spread_pct": signal.compression.ema_spread_pct,
-                    "price_coiling": signal.compression.price_coiling,
-                    "bollinger_squeeze": signal.compression.bollinger_squeeze,
-                    "volume_drying": signal.compression.volume_drying,
-                    "pressure_direction": signal.compression.pressure_direction,
-                    "time_compressed": signal.compression.time_compressed_minutes
-                },
-                "expansion": {
-                    "candle_size_ratio": signal.expansion.candle_size_ratio,
-                    "volume_spike_ratio": signal.expansion.volume_spike_ratio,
-                    "ema_expansion_angle": signal.expansion.ema_expansion_angle,
-                    "breakout_confirmed": signal.expansion.breakout_confirmed,
-                    "time_since_compression": signal.expansion.time_since_compression
-                },
-                "context": {
-                    "htf_bias": signal.context.htf_bias,
-                    "htf_strength": signal.context.htf_strength,
-                    "wave_position": signal.context.wave_position,
-                    "wave_maturity": signal.context.wave_maturity
-                }
-            }
+            # Check if we should save this signal
+            # Allow multiple signals but with some filtering
             
             # Insert signal
             await self.db.execute("""
-                INSERT INTO aggressive_signals (
+                INSERT INTO high_freq_signals (
                     id, symbol, side, entry_price, stop_loss, take_profit,
-                    stop_loss_pct, target_pct, risk_reward, position_size_score,
-                    compression_score, ema_spread_pct, volume_spike_ratio, candle_size_ratio,
-                    timing_score, structure_score, momentum_score, overall_conviction,
-                    conditions_met, scan_cycle, metadata
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    trend_direction, trend_strength, wave_position,
+                    rsi_signal, rsi_value, ema_signal, volume_signal, volume_ratio,
+                    confluence_score, risk_reward, expected_move, timeframe_used,
+                    conditions_met
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 signal.signal_id,
                 signal.symbol,
@@ -1428,441 +888,276 @@ class CompleteAggressiveScanner:
                 signal.entry_price,
                 signal.stop_loss,
                 signal.take_profit,
-                signal.stop_loss_pct,
-                signal.target_pct,
+                signal.trend.direction,
+                signal.trend.strength,
+                signal.trend.wave_position,
+                signal.indicators.rsi_signal,
+                signal.indicators.rsi_value,
+                signal.indicators.ema_signal,
+                signal.indicators.volume_signal,
+                signal.indicators.volume_ratio,
+                signal.confluence_score,
                 signal.risk_reward,
-                signal.position_size_score,
-                signal.compression.score,
-                signal.compression.ema_spread_pct,
-                signal.expansion.volume_spike_ratio,
-                signal.expansion.candle_size_ratio,
-                signal.timing_score,
-                signal.structure_score,
-                signal.momentum_score,
-                signal.overall_conviction,
-                json.dumps(signal.conditions_met),
-                signal.scan_cycle,
-                json.dumps(metadata)
+                signal.expected_move_pct,
+                signal.timeframe_used,
+                json.dumps(signal.conditions_met)
             ))
             
             await self.db.commit()
             
-            # Record compression history
-            await self.db.execute("""
-                INSERT INTO compression_history (
-                    symbol, timeframe, compression_score, ema_spread_pct, volume_ratio
-                ) VALUES (?, ?, ?, ?, ?)
-            """, (
-                signal.symbol,
-                "5M",
-                signal.compression.score,
-                signal.compression.ema_spread_pct,
-                signal.expansion.volume_spike_ratio
-            ))
-            
-            await self.db.commit()
-            
-            self.engine.logger.logger.info(f"✅ Signal saved to database: {signal.symbol}")
+            log.info(f"✅ Signal saved: {signal.symbol}")
             return True
             
         except Exception as e:
-            self.engine.logger.logger.error(f"Error saving signal: {e}")
+            log.error(f"Error saving signal: {e}")
             return False
     
-    async def format_aggressive_alert(self, signal: AggressiveSignal) -> str:
-        """Format comprehensive aggressive alert"""
+    async def format_signal_message(self, signal: HighFreqSignal) -> str:
+        """Format signal for Telegram"""
         side_emoji = "🟢" if signal.side == "LONG" else "🔴"
-        side_ar = "شراء عدواني" if signal.side == "LONG" else "بيع عدواني"
+        side_text = "شراء" if signal.side == "LONG" else "بيع"
         
         # Risk info
-        risk_pct = signal.stop_loss_pct
-        target_pct = signal.target_pct
+        risk_pct = abs(signal.entry_price - signal.stop_loss) / signal.entry_price * 100
         
-        # Compression info
-        compression_status = "قوي" if signal.compression.score > 0.7 else "متوسط" if signal.compression.score > 0.5 else "ضعيف"
-        
-        # Expansion info
-        expansion_strength = "عالي" if signal.expansion.candle_size_ratio > 2.0 else "متوسط" if signal.expansion.candle_size_ratio > 1.5 else "منخفض"
+        # RSI info
+        rsi_text = f"{signal.indicators.rsi_value:.1f} ({signal.indicators.rsi_signal})"
         
         message = f"""
-{side_emoji} <b>مطاردة توسع عدوانية - دخول مبكر جداً</b>
+{side_emoji} <b>إشارة عالية التردد</b>
 
-<b>{signal.symbol}</b> | {side_ar}
+<b>{signal.symbol}</b> | {side_text}
 
-<b>🔷 حالة الانضغاط:</b>
-• قوة الانضغاط: {signal.compression.score:.1%} ({compression_status})
-• انتشار الـ EMA: {signal.compression.ema_spread_pct:.2f}%
-• ضغط البولينجر: {'نعم ✅' if signal.compression.bollinger_squeeze else 'لا'}
-• اتجاه الضغط: {signal.compression.pressure_direction}
-• المدة المضغوطة: {signal.compression.time_compressed_minutes} دقيقة
+<b>📈 اتجاه الموجة:</b>
+• الاتجاه: {signal.trend.direction}
+• قوة الاتجاه: {signal.trend.strength:.1%}
+• مرحلة الموجة: {signal.trend.wave_position}
+• النضج: {signal.trend.wave_maturity:.1%}
 
-<b>🔥 إشارة التوسع:</b>
-• شمعة التوسع الأولى: {'نعم ✅' if signal.expansion.first_expansion_candle else 'لا'}
-• حجم الشمعة: {signal.expansion.candle_size_ratio:.1f}× ({expansion_strength})
-• حجم الفوليوم: {signal.expansion.volume_spike_ratio:.1f}×
-• تأكيد الاختراق: {'نعم ✅' if signal.expansion.breakout_confirmed else 'قيد التطور'}
+<b>📊 المؤشرات الدخول:</b>
+• الإطار الزمني: {signal.timeframe_used}
+• RSI: {rsi_text}
+• اشارة الـ EMA: {signal.indicators.ema_signal}
+• الفوليوم: {signal.indicators.volume_signal} (×{signal.indicators.volume_ratio:.1f})
 
-<b>⚡ الدخول العدواني:</b>
+<b>⚡ التنفيذ:</b>
 • سعر الدخول: <code>{signal.entry_price:.6f}</code>
-• وقف الخسارة: <code>{signal.stop_loss:.6f}</code> ({risk_pct:.1f}%)
-• هدف الربح: <code>{signal.take_profit:.6f}</code> ({target_pct:.1f}%)
+• وقف الخسارة: <code>{signal.stop_loss:.6f}</code> ({risk_pct:.2f}%)
+• هدف الربح: <code>{signal.take_profit:.6f}</code> ({signal.expected_move_pct:.1f}%)
 
-<b>🎯 الجودة والتوقعات:</b>
+<b>🎯 الجودة:</b>
+• درجة التوافق: {signal.confluence_score:.1%}
 • نسبة الربح/المخاطرة: {signal.risk_reward:.1f}:1
-• قناعة التوقيت: {signal.timing_score:.1%}
-• قناعة الهيكل: {signal.structure_score:.1%}
-• القناعة العامة: {signal.overall_conviction:.1%}
-• حجم الصفقة المقترح: {signal.position_size_score:.1%}
+• الشروط المحققة: {len(signal.conditions_met)}
 
-<b>📊 السياق الزمني:</b>
-• الاتجاه العام: {signal.context.htf_bias}
-• مرحلة الموجة: {signal.context.wave_position}
-• نضج الموجة: {signal.context.wave_maturity:.1%}
+<b>⚠️ ملاحظة:</b>
+هذه إشارة عالية التردد ذات وقف خسارة ضيق.
+الخسائر متوقعة، الفائزون سريعون وقويون.
 
-<b>✅ الشروط المحققة:</b>
-{chr(10).join(['• ' + cond for cond in signal.conditions_met])}
-
-<b>⚠️ تحذير عدواني:</b>
-هذه صفقة ذات وقف خسارة ضيق ({risk_pct:.1f}%)
-الخسائر متوقعة ومتقبلة
-الفائزون كبار ويعوضون الخسائر
-
-#مطاردة_عدوانية #{'شراء' if signal.side == 'LONG' else 'بيع'} #توسع_موجوي
+#{side_text} #موجات_إليوت #مؤشرات
 """
         return message
     
-    async def send_telegram_alert(self, signal: AggressiveSignal):
-        """Send Telegram alert for aggressive signal"""
+    async def send_telegram_alert(self, signal: HighFreqSignal):
+        """Send Telegram alert"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             return
         
         try:
-            message = await self.format_aggressive_alert(signal)
+            message = await self.format_signal_message(signal)
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             async with httpx.AsyncClient(timeout=10) as client:
                 await client.post(url, json={
                     "chat_id": TELEGRAM_CHAT_ID,
                     "text": message,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True
+                    "parse_mode": "HTML"
                 })
                 
-            self.engine.logger.logger.info(f"📤 Telegram alert sent: {signal.symbol}")
+            log.info(f"📤 Telegram alert sent: {signal.symbol}")
             
         except Exception as e:
-            self.engine.logger.logger.error(f"Telegram alert error: {e}")
+            log.error(f"Telegram error: {e}")
     
-    async def monitor_and_manage_positions(self):
-        """Comprehensive position monitoring and management"""
+    async def monitor_positions(self):
+        """Monitor and close positions"""
         while True:
             try:
-                # Get all open positions
+                # Get open positions
                 async with self.db.execute("""
-                    SELECT id, symbol, side, entry_price, stop_loss, take_profit,
-                           stop_loss_pct, target_pct, breakeven_hit, trail_activated,
-                           status, created_at
-                    FROM aggressive_signals 
-                    WHERE status IN ('PENDING', 'TRIGGERED')
-                    ORDER BY created_at DESC
+                    SELECT id, symbol, side, entry_price, stop_loss, take_profit 
+                    FROM high_freq_signals 
+                    WHERE status = 'PENDING'
                 """) as cursor:
                     positions = await cursor.fetchall()
                 
-                if positions:
-                    self.engine.logger.logger.debug(f"Monitoring {len(positions)} open positions")
-                
-                for (pos_id, symbol, side, entry, sl, tp, 
-                     sl_pct, tp_pct, breakeven_hit, trail_activated,
-                     status, created_at) in positions:
-                    
+                for pos_id, symbol, side, entry, sl, tp in positions:
                     try:
                         # Get current price
                         ticker = await self.exchange.fetch_ticker(symbol)
                         current_price = ticker['last']
                         
-                        pnl_percent = 0
-                        close_reason = None
-                        update_fields = {}
-                        
-                        # ===== CHECK TRIGGER =====
-                        if status == "PENDING":
-                            # Check if price reached entry zone (within 0.3%)
-                            if abs(current_price - entry) / entry <= 0.003:
-                                update_fields['status'] = 'TRIGGERED'
-                                update_fields['triggered_at'] = datetime.now().isoformat()
-                                update_fields['trigger_price'] = current_price
-                                
-                                self.engine.logger.logger.info(f"✅ Position triggered: {symbol} {side} @ {current_price:.4f}")
-                                
-                                # Send trigger alert
-                                if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-                                    trigger_msg = f"""
-✅ <b>تم تفعيل الصفقة العدوانية</b>
-
-<b>{symbol}</b> | {side}
-سعر التفعيل: {current_price:.6f}
-الوقت: {datetime.now().strftime('%H:%M:%S')}
-
-<b>بدء المتابعة العدوانية...</b>
-"""
-                                    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-                                    async with httpx.AsyncClient(timeout=5) as client:
-                                        await client.post(url, json={
-                                            "chat_id": TELEGRAM_CHAT_ID,
-                                            "text": trigger_msg,
-                                            "parse_mode": "HTML"
-                                        })
-                        
-                        # ===== CHECK STOP LOSS / TAKE PROFIT =====
-                        if side == "LONG":
-                            # Check Stop Loss
-                            if current_price <= sl:
-                                close_reason = "SL_HIT"
-                                pnl_percent = ((current_price - entry) / entry) * 100
-                            
-                            # Check Take Profit
-                            elif current_price >= tp:
-                                close_reason = "TP_HIT"
-                                pnl_percent = ((current_price - entry) / entry) * 100
-                            
-                            # Check for breakeven
-                            elif not breakeven_hit and current_price >= entry * (1 + sl_pct / 100):
-                                update_fields['breakeven_hit'] = True
-                                # Move stop to breakeven
-                                new_sl = entry
-                                update_fields['stop_loss'] = new_sl
-                                
-                                self.engine.logger.logger.info(f"🔵 Breakeven hit: {symbol}, SL moved to {new_sl:.4f}")
-                            
-                            # Check for trail start
-                            elif not trail_activated and current_price >= entry * (1 + (tp_pct * 0.3) / 100):
-                                update_fields['trail_activated'] = True
-                                
-                                self.engine.logger.logger.info(f"🟢 Trail activated: {symbol}")
-                        
-                        else:  # SHORT
-                            # Check Stop Loss
-                            if current_price >= sl:
-                                close_reason = "SL_HIT"
-                                pnl_percent = ((entry - current_price) / entry) * 100
-                            
-                            # Check Take Profit
-                            elif current_price <= tp:
-                                close_reason = "TP_HIT"
-                                pnl_percent = ((entry - current_price) / entry) * 100
-                            
-                            # Check for breakeven
-                            elif not breakeven_hit and current_price <= entry * (1 - sl_pct / 100):
-                                update_fields['breakeven_hit'] = True
-                                new_sl = entry
-                                update_fields['stop_loss'] = new_sl
-                                
-                                self.engine.logger.logger.info(f"🔵 Breakeven hit: {symbol}, SL moved to {new_sl:.4f}")
-                            
-                            # Check for trail start
-                            elif not trail_activated and current_price <= entry * (1 - (tp_pct * 0.3) / 100):
-                                update_fields['trail_activated'] = True
-                                
-                                self.engine.logger.logger.info(f"🟢 Trail activated: {symbol}")
-                        
-                        # ===== CLOSE POSITION IF NEEDED =====
-                        if close_reason:
-                            update_fields['status'] = 'CLOSED'
-                            update_fields['closed_at'] = datetime.now().isoformat()
-                            update_fields['close_price'] = current_price
-                            update_fields['pnl_percent'] = pnl_percent
-                            update_fields['close_reason'] = close_reason
-                            
-                            # Record outcome in engine
-                            outcome = "WIN" if close_reason == "TP_HIT" else "LOSS"
-                            
-                            # Create minimal signal for recording
-                            minimal_signal = AggressiveSignal(
-                                signal_id=pos_id,
-                                symbol=symbol,
-                                side=side,
-                                entry_price=entry,
-                                stop_loss=sl,
-                                take_profit=tp,
-                                entry_time=0,
-                                stop_loss_pct=sl_pct,
-                                target_pct=tp_pct,
-                                risk_reward=0,
-                                position_size_score=0,
-                                compression=CompressionState(0,0,False,False,False,0,"",0),
-                                expansion=ExpansionTrigger(False,0,0,0,False,0),
-                                context=MarketContext("",0,"",0,{},[]),
-                                timing_score=0,
-                                structure_score=0,
-                                momentum_score=0,
-                                overall_conviction=0,
-                                max_loss_pct=0,
-                                breakeven_level=0,
-                                trail_start=0,
-                                scan_cycle=0,
-                                conditions_met=[]
-                            )
-                            
-                            self.engine.record_trade_outcome(minimal_signal, pnl_percent, outcome, close_reason)
-                            
-                            # Log closure
-                            if outcome == "WIN":
-                                self.engine.logger.log_winner(symbol, pnl_percent)
-                                
-                                # Send win alert
-                                if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
-                                    win_msg = f"""
-✅ <b>فائز عدواني!</b>
-
-<b>{symbol}</b> | {side}
-الربح: <b>+{pnl_percent:.2f}%</b>
-
-هذا ما نصطاده! الفائزون يعوضون الخسائر.
-"""
-                                    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-                                    async with httpx.AsyncClient(timeout=5) as client:
-                                        await client.post(url, json={
-                                            "chat_id": TELEGRAM_CHAT_ID,
-                                            "text": win_msg,
-                                            "parse_mode": "HTML"
-                                        })
-                            else:
-                                self.engine.logger.log_loss(symbol, pnl_percent, close_reason)
-                        
-                        # ===== UPDATE POSITION IF NEEDED =====
-                        if update_fields:
-                            set_clause = ", ".join([f"{k} = ?" for k in update_fields.keys()])
-                            values = list(update_fields.values())
-                            values.append(pos_id)
-                            
-                            await self.db.execute(f"""
-                                UPDATE aggressive_signals SET {set_clause} WHERE id = ?
-                            """, values)
+                        # Check if price reached entry (high frequency - immediate)
+                        if abs(current_price - entry) / entry <= 0.003:  # 0.3% zone
+                            # Mark as triggered
+                            await self.db.execute("""
+                                UPDATE high_freq_signals SET 
+                                    status = 'TRIGGERED',
+                                    triggered_at = CURRENT_TIMESTAMP,
+                                    trigger_price = ?
+                                WHERE id = ?
+                            """, (current_price, pos_id))
                             
                             await self.db.commit()
+                            
+                            log.info(f"✅ Position triggered: {symbol} {side} @ {current_price:.4f}")
+                        
+                        # Check SL/TP for triggered positions
+                        async with self.db.execute("""
+                            SELECT id FROM high_freq_signals 
+                            WHERE id = ? AND status = 'TRIGGERED'
+                        """, (pos_id,)) as cursor:
+                            is_triggered = await cursor.fetchone()
+                        
+                        if is_triggered:
+                            pnl_percent = 0
+                            close_reason = None
+                            
+                            if side == "LONG":
+                                if current_price <= sl:
+                                    close_reason = "SL_HIT"
+                                    pnl_percent = ((current_price - entry) / entry) * 100
+                                elif current_price >= tp:
+                                    close_reason = "TP_HIT"
+                                    pnl_percent = ((current_price - entry) / entry) * 100
+                            
+                            else:  # SHORT
+                                if current_price >= sl:
+                                    close_reason = "SL_HIT"
+                                    pnl_percent = ((entry - current_price) / entry) * 100
+                                elif current_price <= tp:
+                                    close_reason = "TP_HIT"
+                                    pnl_percent = ((entry - current_price) / entry) * 100
+                            
+                            if close_reason:
+                                await self.db.execute("""
+                                    UPDATE high_freq_signals SET 
+                                        status = 'CLOSED',
+                                        closed_at = CURRENT_TIMESTAMP,
+                                        close_price = ?,
+                                        pnl_percent = ?,
+                                        close_reason = ?
+                                    WHERE id = ?
+                                """, (current_price, pnl_percent, close_reason, pos_id))
+                                
+                                await self.db.commit()
+                                
+                                if close_reason == "TP_HIT":
+                                    log.info(f"✅ Winner: {symbol} {side} +{pnl_percent:.2f}%")
+                                else:
+                                    log.info(f"❌ Loss: {symbol} {side} {pnl_percent:.2f}%")
                     
                     except Exception as e:
-                        self.engine.logger.logger.error(f"Position monitoring error for {symbol}: {e}")
+                        log.error(f"Monitor error for {symbol}: {e}")
                         continue
                 
-                # Wait before next check
-                await asyncio.sleep(3)  # Check every 3 seconds
+                # Fast monitoring
+                await asyncio.sleep(2)
                 
             except Exception as e:
-                self.engine.logger.logger.error(f"Monitoring loop error: {e}")
+                log.error(f"Monitoring loop error: {e}")
                 await asyncio.sleep(10)
     
-    async def aggressive_hunting_loop(self):
-        """Main aggressive hunting loop"""
-        self.engine.logger.logger.info("🔥 Starting aggressive hunting loop...")
+    async def high_freq_scanning(self):
+        """Main high-frequency scanning loop"""
+        log.info("🚀 Starting high-frequency scanning...")
         
         while True:
             try:
                 self.scan_cycle += 1
-                cycle_start = time.time()
+                start_time = time.time()
                 
-                self.engine.logger.logger.info(f"🔄 Scan cycle #{self.scan_cycle}")
+                log.info(f"🔄 Scan cycle #{self.scan_cycle}")
                 
-                # Get volatile pairs
-                pairs = await self.get_top_volatile_pairs()
+                # Get active pairs
+                pairs = await self.get_active_pairs()
                 
                 if not pairs:
-                    self.engine.logger.logger.warning("No pairs available, waiting...")
+                    log.warning("No active pairs found")
                     await asyncio.sleep(SCAN_INTERVAL)
                     continue
                 
-                self.engine.logger.logger.info(f"Hunting {len(pairs)} volatile pairs")
+                log.info(f"Scanning {len(pairs)} active pairs")
                 
                 signals_found = 0
-                pairs_scanned = 0
                 
-                # Hunt each pair aggressively
-                for symbol, score in pairs:
+                # Ultra-fast scanning
+                for symbol, volume in pairs:
                     try:
-                        pairs_scanned += 1
+                        # Fetch data
+                        multi_tf_data = await self.fetch_timeframe_data(symbol)
                         
-                        # Fetch comprehensive data
-                        multi_tf_data = await self.fetch_comprehensive_data(symbol)
-                        
-                        # Need at least 5 timeframes for good analysis
-                        if len(multi_tf_data) < 5:
+                        # Need key timeframes
+                        if len(multi_tf_data) < 4:
                             continue
                         
-                        # Generate aggressive signal
-                        signal = self.engine.generate_aggressive_signal(
-                            multi_tf_data, symbol, self.scan_cycle
-                        )
+                        # Generate high-frequency signal
+                        signal = self.scanner.generate_high_freq_signal(multi_tf_data, symbol)
                         
                         if signal:
-                            # Save to database
-                            saved = await self.save_comprehensive_signal(signal)
+                            # Save and send
+                            saved = await self.save_signal(signal)
                             
                             if saved:
-                                # Send alert
                                 await self.send_telegram_alert(signal)
-                                
                                 signals_found += 1
-                                
-                                # Add to active positions
-                                self.active_positions[signal.symbol] = {
-                                    'signal_id': signal.signal_id,
-                                    'side': signal.side,
-                                    'entry': signal.entry_price,
-                                    'timestamp': time.time()
-                                }
                         
-                        # Small delay between pairs to avoid rate limits
-                        await asyncio.sleep(0.05)
+                        # Ultra-fast between pairs
+                        await asyncio.sleep(0.02)
                         
                     except Exception as e:
-                        self.engine.logger.logger.debug(f"Pair hunting error {symbol}: {str(e)[:50]}")
+                        log.debug(f"Pair error {symbol}: {str(e)[:50]}")
                         continue
                 
-                # Update statistics
-                self.scans_completed += 1
-                self.pairs_scanned += pairs_scanned
+                # Update scanner stats
+                self.scanner.daily_stats["pairs_scanned"] += len(pairs)
                 
-                cycle_duration = time.time() - cycle_start
-                self.engine.logger.logger.info(
-                    f"Scan #{self.scan_cycle} complete: "
-                    f"{signals_found} signals, {pairs_scanned} pairs, "
-                    f"{cycle_duration:.1f}s"
-                )
+                scan_duration = time.time() - start_time
+                log.info(f"Scan #{self.scan_cycle}: {signals_found} signals in {scan_duration:.1f}s")
                 
-                # Log performance periodically
-                if self.scan_cycle % 10 == 0:
-                    stats = self.engine.get_performance_stats()
-                    self.engine.logger.logger.info(f"📊 Performance: {stats}")
+                # Log stats periodically
+                if self.scan_cycle % 20 == 0:
+                    stats = self.scanner.get_daily_stats()
+                    log.info(f"📊 Daily stats: {stats}")
                 
                 # Wait for next scan
-                wait_time = max(1, SCAN_INTERVAL - cycle_duration)
-                self.engine.logger.logger.info(f"Next hunt in {wait_time:.0f}s...")
+                wait_time = max(0.5, SCAN_INTERVAL - scan_duration)
+                log.info(f"Next scan in {wait_time:.1f}s...")
                 await asyncio.sleep(wait_time)
                 
             except Exception as e:
-                self.engine.logger.logger.error(f"Hunting loop error: {e}")
+                log.error(f"Scanning loop error: {e}")
                 await asyncio.sleep(30)
     
     async def run(self):
-        """Run the complete aggressive hunter"""
+        """Run the scanner"""
         try:
             await self.initialize()
             
-            # Run both loops concurrently
+            # Run both loops
             await asyncio.gather(
-                self.aggressive_hunting_loop(),
-                self.monitor_and_manage_positions()
+                self.high_freq_scanning(),
+                self.monitor_positions()
             )
             
         except KeyboardInterrupt:
-            self.engine.logger.logger.info("Hunter stopped by user")
+            log.info("Scanner stopped by user")
             
             # Send final stats
             await self.send_final_stats()
             
         except Exception as e:
-            self.engine.logger.logger.error(f"Hunter crashed: {e}")
-            await self.send_crash_alert(e)
+            log.error(f"Scanner crashed: {e}")
             
         finally:
             await self.cleanup()
@@ -1873,39 +1168,23 @@ class CompleteAggressiveScanner:
             return
         
         try:
-            stats = self.engine.get_performance_stats()
-            engine_stats = self.engine.logger.get_stats()
-            
-            uptime = time.time() - self.start_time
-            hours = int(uptime // 3600)
-            minutes = int((uptime % 3600) // 60)
+            stats = self.scanner.get_daily_stats()
             
             message = f"""
-🛑 <b>تم إيقاف الصياد العدواني</b>
+🛑 <b>تم إيقاف الماسح الضوئي</b>
 
-<b>⏱️ مدة التشغيل:</b> {hours} ساعة {minutes} دقيقة
-<b>🔄 دورات المسح:</b> {self.scans_completed}
-<b>📊 الأزواج الممسوحة:</b> {self.pairs_scanned}
-
-<b>📈 أداء المحرك:</b>
-• الإشارات المولدة: {engine_stats['signals_generated']}
-• حالات التوسع المكتشفة: {engine_stats['expansions_detected']}
-• عمليات المسح المضغوطة: {engine_stats['compression_scans']}
-
-<b>💰 أداء التداول:</b>
-• إجمالي الصفقات: {stats['total_trades']}
-• الخسائر المقبولة: {stats['accepted_losses']}
-• الفائزون الكبار: {stats['big_winners']}
-• نسبة النجاح: {stats['win_rate']}
-• إجمالي الربح/الخسارة: {stats['total_pnl']}
+<b>📈 إحصائيات اليوم:</b>
+• الإشارات المولدة: {stats['signals_generated']}
+• إشارات الشراء: {stats['long_signals']}
+• إشارات البيع: {stats['short_signals']}
+• الأزواج الممسوحة: {stats['pairs_scanned']}
+• دورات المسح: {self.scan_cycle}
 
 <b>🎯 الفلسفة المحققة:</b>
-الخسائر كانت وقوداً، الفائزون كانوا انفجاريين.
-التوسعات المضغوطة تم اصطيادها بدقة.
+الاتجاه من موجات إليوت، الدخول من المؤشرات.
+إشارات عالية التردد، تحركات سريعة.
 
-<i>الصياد جائع للمزيد...</i>
-
-#أداء_الصياد #إحصائيات #توسع_موجوي
+#إحصائيات #موجات_إليوت
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -1913,77 +1192,35 @@ class CompleteAggressiveScanner:
                 await client.post(url, json={
                     "chat_id": TELEGRAM_CHAT_ID,
                     "text": message,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True
+                    "parse_mode": "HTML"
                 })
                 
         except Exception as e:
-            self.engine.logger.logger.error(f"Final stats error: {e}")
-    
-    async def send_crash_alert(self, error: Exception):
-        """Send crash alert"""
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            return
-        
-        try:
-            message = f"""
-🚨 <b>تحطم الصياد العدواني</b>
-
-<b>الخطأ:</b> {str(error)[:100]}
-
-<b>آخر إحصائيات:</b>
-• دورات المسح: {self.scans_completed}
-• الإشارات المولدة: {self.engine.logger.signals_generated}
-• الخسائر المقبولة: {self.engine.accepted_losses}
-• الفائزون الكبار: {self.engine.big_winners}
-
-<b>سيتم إعادة التشغيل تلقائياً...</b>
-
-#تحطم #إعادة_تشغيل
-"""
-            
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(url, json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML",
-                    "disable_web_page_preview": True
-                })
-                
-        except Exception as e:
-            self.engine.logger.logger.error(f"Crash alert error: {e}")
+            log.error(f"Final stats error: {e}")
     
     async def cleanup(self):
         """Cleanup resources"""
         try:
             if self.exchange:
                 await self.exchange.close()
-                self.engine.logger.logger.info("Exchange connection closed")
+                log.info("Exchange closed")
             
             if self.db:
                 await self.db.close()
-                self.engine.logger.logger.info("Database connection closed")
+                log.info("Database closed")
                 
         except Exception as e:
-            self.engine.logger.logger.error(f"Cleanup error: {e}")
+            log.error(f"Cleanup error: {e}")
 
-# ================ SIMPLE HTTP INTERFACE (No FastAPI) ================
-class SimpleHTTPServer:
-    """Simple HTTP server for monitoring"""
-    
-    def __init__(self, scanner):
-        self.scanner = scanner
-        self.server = None
-        
-    async def handle_request(self, reader, writer):
-        """Handle HTTP requests"""
+# ================ SIMPLE HTTP SERVER ================
+async def start_http_server(scanner, port=8000):
+    """Start simple HTTP server for monitoring"""
+    async def handle_request(reader, writer):
         try:
             request = await reader.read(1024)
-            request_str = request.decode('utf-8')
             
-            # Parse request line
-            lines = request_str.split('\r\n')
+            # Parse request
+            lines = request.decode().split('\r\n')
             if not lines:
                 writer.write(b'HTTP/1.1 400 Bad Request\r\n\r\n')
                 await writer.drain()
@@ -1996,17 +1233,35 @@ class SimpleHTTPServer:
             response = ""
             
             if path == '/':
-                response = self._get_root_response()
+                response = json.dumps({
+                    "status": "running",
+                    "scanner": "Elliott Wave + Indicators High-Frequency Scanner",
+                    "scan_cycle": scanner.scan_cycle,
+                    "daily_stats": scanner.scanner.get_daily_stats()
+                }, indent=2)
+            
             elif path == '/stats':
-                response = self._get_stats_response()
+                response = json.dumps(scanner.scanner.get_daily_stats(), indent=2)
+            
             elif path == '/recent':
-                response = await self._get_recent_response()
-            elif path == '/performance':
-                response = await self._get_performance_response()
-            elif path == '/config':
-                response = self._get_config_response()
+                if scanner.db:
+                    scanner.db.row_factory = aiosqlite.Row
+                    async with scanner.db.execute("""
+                        SELECT symbol, side, entry_price, expected_move, risk_reward,
+                               confluence_score, timeframe_used, created_at
+                        FROM high_freq_signals 
+                        ORDER BY created_at DESC 
+                        LIMIT 20
+                    """) as cursor:
+                        rows = await cursor.fetchall()
+                        signals = [dict(row) for row in rows]
+                    
+                    response = json.dumps({"signals": signals, "count": len(signals)}, indent=2)
+                else:
+                    response = json.dumps({"error": "Database not available"})
+            
             else:
-                response = self._get_not_found_response()
+                response = json.dumps({"error": "Endpoint not found"})
             
             # Send response
             writer.write(f'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{response}'.encode())
@@ -2019,211 +1274,24 @@ class SimpleHTTPServer:
             await writer.drain()
             writer.close()
     
-    def _get_root_response(self):
-        """Root endpoint response"""
-        return json.dumps({
-            "system": "Aggressive Wave Expansion Hunter",
-            "version": "2.0.0",
-            "status": "running",
-            "endpoints": {
-                "/": "System info",
-                "/stats": "Hunter statistics",
-                "/recent": "Recent signals",
-                "/performance": "Performance metrics",
-                "/config": "Configuration"
-            }
-        }, indent=2)
+    server = await asyncio.start_server(handle_request, '0.0.0.0', port)
+    log.info(f"🌐 HTTP server started on port {port}")
     
-    def _get_stats_response(self):
-        """Stats endpoint response"""
-        if self.scanner.engine is None:
-            return json.dumps({"error": "Hunter not initialized"})
-        
-        try:
-            engine_stats = self.scanner.engine.get_performance_stats()
-            logger_stats = self.scanner.engine.logger.get_stats()
-            
-            response = {
-                "hunter": {
-                    "scan_cycles": self.scanner.scan_cycle,
-                    "scans_completed": self.scanner.scans_completed,
-                    "pairs_scanned": self.scanner.pairs_scanned,
-                    "active_positions": len(self.scanner.active_positions),
-                    "uptime_seconds": time.time() - self.scanner.start_time
-                },
-                "engine": engine_stats,
-                "logger": logger_stats
-            }
-            
-            return json.dumps(response, indent=2)
-            
-        except Exception as e:
-            return json.dumps({"error": str(e)})
-    
-    async def _get_recent_response(self):
-        """Recent signals endpoint response"""
-        if self.scanner.db is None:
-            return json.dumps({"error": "Database not initialized"})
-        
-        try:
-            self.scanner.db.row_factory = aiosqlite.Row
-            async with self.scanner.db.execute("""
-                SELECT symbol, side, entry_price, stop_loss, take_profit,
-                       target_pct, risk_reward, overall_conviction,
-                       compression_score, volume_spike_ratio,
-                       status, created_at, pnl_percent, close_reason
-                FROM aggressive_signals 
-                ORDER BY created_at DESC 
-                LIMIT 20
-            """) as cursor:
-                rows = await cursor.fetchall()
-                
-                signals = []
-                for row in rows:
-                    signals.append(dict(row))
-                
-                response = {
-                    "signals": signals,
-                    "count": len(signals),
-                    "hunting_style": "Aggressive wave expansion"
-                }
-                
-                return json.dumps(response, indent=2)
-                
-        except Exception as e:
-            return json.dumps({"error": str(e)})
-    
-    async def _get_performance_response(self):
-        """Performance metrics endpoint response"""
-        if self.scanner.db is None:
-            return json.dumps({"error": "Database not initialized"})
-        
-        try:
-            # Get win/loss stats
-            async with self.scanner.db.execute("""
-                SELECT 
-                    COUNT(*) as total_trades,
-                    SUM(CASE WHEN close_reason = 'TP_HIT' THEN 1 ELSE 0 END) as wins,
-                    SUM(CASE WHEN close_reason = 'SL_HIT' THEN 1 ELSE 0 END) as losses,
-                    AVG(CASE WHEN close_reason = 'TP_HIT' THEN pnl_percent END) as avg_win,
-                    AVG(CASE WHEN close_reason = 'SL_HIT' THEN pnl_percent END) as avg_loss,
-                    MAX(CASE WHEN close_reason = 'TP_HIT' THEN pnl_percent END) as best_win,
-                    MIN(CASE WHEN close_reason = 'SL_HIT' THEN pnl_percent END) as worst_loss,
-                    SUM(pnl_percent) as total_pnl
-                FROM aggressive_signals 
-                WHERE status = 'CLOSED'
-            """) as cursor:
-                perf = await cursor.fetchone()
-            
-            response = {
-                "trading_performance": dict(perf) if perf else {},
-                "hunter_philosophy": "Aggressive expansion hunting with asymmetric payoff",
-                "expected_win_rate": "40-50%",
-                "risk_profile": "Many small losses, Few big winners"
-            }
-            
-            return json.dumps(response, indent=2)
-            
-        except Exception as e:
-            return json.dumps({"error": str(e)})
-    
-    def _get_config_response(self):
-        """Configuration endpoint response"""
-        response = {
-            "scanning": {
-                "interval_seconds": SCAN_INTERVAL,
-                "top_pairs": TOP_N_VOLUME,
-                "min_volume_usd": MIN_VOLUME_USD,
-                "timeframes": list(TIMEFRAMES.keys())
-            },
-            "trading": {
-                "max_stop_loss_pct": MAX_STOP_LOSS_PCT,
-                "min_target_pct": MIN_TARGET_PCT,
-                "max_target_pct": MAX_TARGET_PCT,
-                "min_risk_reward": MIN_RISK_REWARD,
-                "max_positions": MAX_POSITIONS
-            },
-            "indicators": {
-                "ema_periods": EMA_PERIODS,
-                "rsi_period": RSI_PERIOD,
-                "rsi_overbought": RSI_OVERBOUGHT,
-                "rsi_oversold": RSI_OVERSOLD
-            },
-            "philosophy": "Aggressive wave expansion hunting - Losses are fuel for explosive winners"
-        }
-        
-        return json.dumps(response, indent=2)
-    
-    def _get_not_found_response(self):
-        """404 Not Found response"""
-        return json.dumps({"error": "Endpoint not found", "available_endpoints": ["/", "/stats", "/recent", "/performance", "/config"]})
-    
-    async def start(self, host='0.0.0.0', port=8000):
-        """Start the HTTP server"""
-        self.server = await asyncio.start_server(
-            self.handle_request,
-            host,
-            port
-        )
-        
-        self.scanner.engine.logger.logger.info(f"🌐 HTTP server started on {host}:{port}")
-        
-        async with self.server:
-            await self.server.serve_forever()
-    
-    async def stop(self):
-        """Stop the HTTP server"""
-        if self.server:
-            self.server.close()
-            await self.server.wait_closed()
-            self.scanner.engine.logger.logger.info("HTTP server stopped")
+    async with server:
+        await server.serve_forever()
 
-# ================ MAIN EXECUTION ================
+# ================ MAIN ================
 async def main():
-    """
-    Main execution function.
-    Run the aggressive hunter with HTTP monitoring.
-    """
+    """Main function"""
+    # Create scanner
+    scanner = ElliottIndicatorsScanner()
     
-    # Create the hunter
-    hunter = CompleteAggressiveScanner()
+    # Start HTTP server in background
+    http_task = asyncio.create_task(start_http_server(scanner))
     
-    # Create HTTP server
-    http_server = SimpleHTTPServer(hunter)
-    
-    try:
-        # Initialize hunter
-        await hunter.initialize()
-        
-        # Start HTTP server in background
-        http_task = asyncio.create_task(http_server.start())
-        
-        # Run hunter
-        await hunter.run()
-        
-    except KeyboardInterrupt:
-        print("\n🛑 Hunter stopped by user")
-        
-        # Stop HTTP server
-        await http_server.stop()
-        
-    except Exception as e:
-        print(f"\n🚨 Hunter crashed: {e}")
-        import traceback
-        traceback.print_exc()
-        
-        # Stop HTTP server
-        await http_server.stop()
-        
-    finally:
-        # Cleanup
-        await hunter.cleanup()
+    # Run scanner
+    await scanner.run()
 
 if __name__ == "__main__":
-    """
-    Main execution block.
-    Run with: python aggressive_hunter.py
-    """
-    
     # Run the main async function
     asyncio.run(main())
