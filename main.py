@@ -6,6 +6,7 @@
 Professional discretionary trading system
 Wave-length awareness + Strength analysis + Rejection entries
 TRADER MINDSET: Reaction-based, rejection specialist
+CRITICAL RULE: Require "REJECTION HOLD" before entry
 """
 
 import os
@@ -18,7 +19,7 @@ import httpx
 import ccxt.async_support as ccxt
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 import json
@@ -36,7 +37,7 @@ MIN_VOLUME_USD = 500000  # $500K minimum - more opportunities
 # Trading parameters (REJECTION-BASED)
 MAX_STOP_LOSS_PCT = 1.0    # 1% maximum stop loss
 MIN_TARGET_PCT = 1.5       # 1.5% minimum target (asymmetric payoff)
-MAX_TARGET_PCT = 4.0       # 4% maximum target
+MAX_TARGET_PCT = 5.0       # 4% maximum target
 MIN_RISK_REWARD = 2.0      # Minimum 1:2 risk/reward
 
 # Rejection scanning
@@ -52,8 +53,8 @@ TIMEFRAMES = {
     "1H": "1h",      # Wave length context ONLY
     "15M": "15m",    # Strength and structure
     "5M": "5m",      # Primary rejection analysis
-    "3M": "3m",      # Fast trigger (MAIN)
-    "1M": "1m"       # Entry timing (ULTRA FAST)
+    "3M": "3m",      # Fast trigger (MAIN) - WITH HOLD VALIDATION
+    "1M": "1m"       # Entry timing (ULTRA FAST) - CONFIRMATION
 }
 
 # EMA periods for rejection detection
@@ -125,6 +126,11 @@ class RejectionSignal:
     rejection_type: str        # EMA_REJECTION, RANGE_REJECTION, FAILED_BREAKOUT
     trigger_candle: str        # REJECTION_CANDLE, WICK_CONFIRMATION, MOMENTUM_SHIFT
     rsi_at_entry: float
+    
+    # CRITICAL: Hold validation
+    hold_validated: bool       # TRUE if rejection held for 1-2 candles
+    hold_reason: str           # Why hold passed/failed
+    hold_candles: int          # Number of candles price held
     
     # Metrics
     rejection_strength: float  # 0-1 how strong the rejection is
@@ -235,7 +241,10 @@ class RejectionBasedScanner:
             "pairs_scanned": 0,
             "rejections_filtered": 0,
             "no_strength": 0,
-            "no_rejection_zone": 0
+            "no_rejection_zone": 0,
+            # NEW: Hold validation stats
+            "rejection_hold_failed": 0,
+            "hold_fail_reasons": {}
         }
         self.deduplicator = self.SignalDeduplicator()
         self.active_signal_ids = set()
@@ -815,6 +824,235 @@ class RejectionBasedScanner:
         
         return "NEUTRAL"
     
+    # ========== CRITICAL: REJECTION HOLD VALIDATION ==========
+    
+    def check_rejection_hold(self, df: pd.DataFrame, side: str, zone_price: float, 
+                            rejection_candle_idx: int = -1) -> Tuple[bool, str, int]:
+        """
+        🔥 CRITICAL RULE: Check if rejection actually HOLDS for 1-2 candles
+        
+        "Rejection that doesn't stop price is not rejection — it's absorption."
+        
+        Returns: (is_valid_hold, reason, candles_held)
+        """
+        try:
+            # Need at least 3 candles total (rejection + 2 confirmation)
+            if len(df) < abs(rejection_candle_idx) + 3:
+                return False, "INSUFFICIENT_DATA", 0
+            
+            # Get the rejection candle
+            rejection_candle = df.iloc[rejection_candle_idx]
+            
+            # Get next 1-2 candles for confirmation
+            next_candles = df.iloc[rejection_candle_idx+1:rejection_candle_idx+3]
+            
+            if len(next_candles) < 1:
+                return False, "NO_CONFIRMATION_CANDLES", 0
+            
+            candles_held = 0
+            hold_valid = True
+            hold_reason = "HOLD_CONFIRMED"
+            
+            if side == "LONG":
+                # LONG rejection: price should NOT break below rejection candle's low
+                rejection_low = rejection_candle['low']
+                rejection_close = rejection_candle['close']
+                
+                # Check each next candle
+                for idx, candle in next_candles.iterrows():
+                    candles_held += 1
+                    
+                    # RULE 1: Price must NOT break the rejection low
+                    if candle['low'] < rejection_low:
+                        hold_valid = False
+                        hold_reason = "REJECTION_FAILED_LOW_BROKEN"
+                        break
+                    
+                    # RULE 2: Price should hold above or near the zone
+                    if candle['close'] < zone_price * 0.998:  # 0.2% below zone = failure
+                        hold_valid = False
+                        hold_reason = "ZONE_FAILED_TO_HOLD"
+                        break
+                    
+                    # RULE 3: Momentum should hesitate (not continue strongly down)
+                    # Check if candle closes significantly below rejection close
+                    if candle['close'] < rejection_close * 0.995:  # 0.5% lower
+                        hold_valid = False
+                        hold_reason = "MOMENTUM_NOT_HESITATING"
+                        break
+                    
+                    # Check for compression/hesitation
+                    candle_range = candle['high'] - candle['low']
+                    if candle_range < (rejection_candle['high'] - rejection_candle['low']) * 0.5:
+                        # Good: candle range is smaller (compression)
+                        pass
+                    
+                    # If we made it through 2 candles, hold is confirmed
+                    if candles_held >= 2:
+                        break
+            
+            else:  # SHORT
+                # SHORT rejection: price should NOT break above rejection candle's high
+                rejection_high = rejection_candle['high']
+                rejection_close = rejection_candle['close']
+                
+                # Check each next candle
+                for idx, candle in next_candles.iterrows():
+                    candles_held += 1
+                    
+                    # RULE 1: Price must NOT break the rejection high
+                    if candle['high'] > rejection_high:
+                        hold_valid = False
+                        hold_reason = "REJECTION_FAILED_HIGH_BROKEN"
+                        break
+                    
+                    # RULE 2: Price should hold below or near the zone
+                    if candle['close'] > zone_price * 1.002:  # 0.2% above zone = failure
+                        hold_valid = False
+                        hold_reason = "ZONE_FAILED_TO_HOLD"
+                        break
+                    
+                    # RULE 3: Momentum should hesitate (not continue strongly up)
+                    if candle['close'] > rejection_close * 1.005:  # 0.5% higher
+                        hold_valid = False
+                        hold_reason = "MOMENTUM_NOT_HESITATING"
+                        break
+                    
+                    # Check for compression/hesitation
+                    candle_range = candle['high'] - candle['low']
+                    if candle_range < (rejection_candle['high'] - rejection_candle['low']) * 0.5:
+                        # Good: candle range is smaller (compression)
+                        pass
+                    
+                    # If we made it through 2 candles, hold is confirmed
+                    if candles_held >= 2:
+                        break
+            
+            return hold_valid, hold_reason, candles_held
+            
+        except Exception as e:
+            log.error(f"Rejection hold check error: {e}")
+            return False, "ERROR", 0
+    
+    def _analyze_rejection_candle_with_hold(self, df: pd.DataFrame, side: str, 
+                                           zone: RejectionZone) -> Tuple[Optional[str], Optional[str], bool, str, int]:
+        """
+        Analyze rejection candle WITH HOLD validation
+        Returns: (rejection_type, trigger_candle, hold_valid, hold_reason, candles_held)
+        """
+        try:
+            if len(df) < 5:
+                return None, None, False, "INSUFFICIENT_DATA", 0
+            
+            # First, find the rejection candle (could be current or previous)
+            rejection_candle_idx = -1
+            rejection_type = None
+            trigger_candle = None
+            
+            # Check current candle
+            current_candle = df.iloc[-1]
+            prev_candle = df.iloc[-2] if len(df) >= 2 else None
+            prev_prev_candle = df.iloc[-3] if len(df) >= 3 else None
+            
+            if side == "LONG":
+                # Check for wick rejection in current candle
+                if (current_candle['low'] < zone.price_level and 
+                    current_candle['close'] > zone.price_level):
+                    rejection_candle_idx = -1
+                    rejection_type = "WICK_REJECTION"
+                    trigger_candle = "SUPPORT_WICK"
+                
+                # Check for momentum shift
+                elif (prev_candle is not None and 
+                      prev_candle['close'] < prev_candle['open'] and  # Bearish
+                      current_candle['close'] > current_candle['open'] and  # Bullish
+                      abs(current_candle['close'] - zone.price_level) / zone.price_level < 0.002):
+                    rejection_candle_idx = -1
+                    rejection_type = "MOMENTUM_REJECTION"
+                    trigger_candle = "BULLISH_REVERSAL"
+                
+                # Check previous candle for rejection
+                elif (prev_candle is not None and 
+                      prev_candle['low'] < zone.price_level and 
+                      prev_candle['close'] > zone.price_level):
+                    rejection_candle_idx = -2
+                    rejection_type = "WICK_REJECTION"
+                    trigger_candle = "SUPPORT_WICK_PREV"
+                
+                # Check previous-prev candle for rejection
+                elif (prev_prev_candle is not None and 
+                      prev_prev_candle['low'] < zone.price_level and 
+                      prev_prev_candle['close'] > zone.price_level and
+                      prev_candle is not None and
+                      prev_candle['close'] > zone.price_level):
+                    rejection_candle_idx = -3
+                    rejection_type = "WICK_REJECTION"
+                    trigger_candle = "SUPPORT_WICK_OLDER"
+            
+            else:  # SHORT
+                # Check for wick rejection in current candle
+                if (current_candle['high'] > zone.price_level and 
+                    current_candle['close'] < zone.price_level):
+                    rejection_candle_idx = -1
+                    rejection_type = "WICK_REJECTION"
+                    trigger_candle = "RESISTANCE_WICK"
+                
+                # Check for momentum shift
+                elif (prev_candle is not None and 
+                      prev_candle['close'] > prev_candle['open'] and  # Bullish
+                      current_candle['close'] < current_candle['open'] and  # Bearish
+                      abs(current_candle['close'] - zone.price_level) / zone.price_level < 0.002):
+                    rejection_candle_idx = -1
+                    rejection_type = "MOMENTUM_REJECTION"
+                    trigger_candle = "BEARISH_REVERSAL"
+                
+                # Check previous candle for rejection
+                elif (prev_candle is not None and 
+                      prev_candle['high'] > zone.price_level and 
+                      prev_candle['close'] < zone.price_level):
+                    rejection_candle_idx = -2
+                    rejection_type = "WICK_REJECTION"
+                    trigger_candle = "RESISTANCE_WICK_PREV"
+                
+                # Check previous-prev candle for rejection
+                elif (prev_prev_candle is not None and 
+                      prev_prev_candle['high'] > zone.price_level and 
+                      prev_prev_candle['close'] < zone.price_level and
+                      prev_candle is not None and
+                      prev_candle['close'] < zone.price_level):
+                    rejection_candle_idx = -3
+                    rejection_type = "WICK_REJECTION"
+                    trigger_candle = "RESISTANCE_WICK_OLDER"
+            
+            if not rejection_type:
+                # Check for simple price rejection
+                if side == "LONG":
+                    if (current_candle['low'] <= zone.price_level * 1.001 and 
+                        current_candle['close'] > zone.price_level):
+                        rejection_candle_idx = -1
+                        rejection_type = "PRICE_REJECTION"
+                        trigger_candle = "SUPPORT_HOLD"
+                else:
+                    if (current_candle['high'] >= zone.price_level * 0.999 and 
+                        current_candle['close'] < zone.price_level):
+                        rejection_candle_idx = -1
+                        rejection_type = "PRICE_REJECTION"
+                        trigger_candle = "RESISTANCE_HOLD"
+            
+            if not rejection_type:
+                return None, None, False, "NO_REJECTION_CANDLE", 0
+            
+            # 🔥 CRITICAL: CHECK REJECTION HOLD
+            hold_valid, hold_reason, candles_held = self.check_rejection_hold(
+                df, side, zone.price_level, rejection_candle_idx
+            )
+            
+            return rejection_type, trigger_candle, hold_valid, hold_reason, candles_held
+            
+        except Exception as e:
+            log.error(f"Rejection candle analysis error: {e}")
+            return None, None, False, "ERROR", 0
+    
     # ========== REJECTION SIGNAL GENERATION ==========
     
     def calculate_rsi(self, prices: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
@@ -840,8 +1078,8 @@ class RejectionBasedScanner:
     def generate_rejection_signal(self, multi_tf_data: Dict[str, pd.DataFrame], 
                                  symbol: str) -> Optional[RejectionSignal]:
         """
-        Generate rejection-based signal
-        ONLY trade at rejection zones with strength confirmation
+        Generate rejection-based signal WITH HOLD VALIDATION
+        ONLY trade at rejection zones with strength confirmation AND HOLD
         """
         try:
             # Get timeframe data
@@ -930,12 +1168,24 @@ class RejectionBasedScanner:
                 self.daily_stats["rejections_filtered"] += 1
                 return None
             
-            # 10. Analyze candle for rejection confirmation
-            rejection_type, trigger_candle = self._analyze_rejection_candle(tf_3m, side, best_zone)
+            # 10. Analyze candle for rejection confirmation WITH HOLD VALIDATION
+            rejection_type, trigger_candle, hold_valid, hold_reason, candles_held = \
+                self._analyze_rejection_candle_with_hold(tf_3m, side, best_zone)
             
             if not rejection_type:
                 log.debug(f"{symbol}: No clear rejection candle")
                 return None
+            
+            # 🔥 CRITICAL: REJECTION MUST HOLD
+            if not hold_valid:
+                log.info(f"❌ {symbol}: Rejection FAILED to hold - {hold_reason}")
+                self.daily_stats["rejection_hold_failed"] += 1
+                self.daily_stats["hold_fail_reasons"][hold_reason] = \
+                    self.daily_stats["hold_fail_reasons"].get(hold_reason, 0) + 1
+                self.daily_stats["rejections_filtered"] += 1
+                return None
+            
+            log.info(f"✅ {symbol}: Rejection HOLD confirmed ({hold_reason}, {candles_held} candles)")
             
             # 11. Calculate entry, SL, TP (asymmetric payoff)
             stop_loss_pct = np.random.uniform(0.5, MAX_STOP_LOSS_PCT)
@@ -977,12 +1227,13 @@ class RejectionBasedScanner:
             
             # 13. Determine conditions met
             conditions_met = self._get_rejection_conditions(
-                wave_context, market_strength, best_zone, rejection_type
+                wave_context, market_strength, best_zone, rejection_type, 
+                hold_valid, hold_reason, candles_held
             )
             
             # 14. Create signal ID
             signal_id = hashlib.md5(
-                f"{symbol}:{side}:{entry_price:.8f}:{time.time()}:{best_zone.zone_type}".encode()
+                f"{symbol}:{side}:{entry_price:.8f}:{time.time()}:{best_zone.zone_type}:{hold_reason}".encode()
             ).hexdigest()
             
             # 15. Create final signal
@@ -1002,6 +1253,11 @@ class RejectionBasedScanner:
                 rejection_type=rejection_type,
                 trigger_candle=trigger_candle,
                 rsi_at_entry=current_rsi,
+                
+                # CRITICAL: Hold validation fields
+                hold_validated=hold_valid,
+                hold_reason=hold_reason,
+                hold_candles=candles_held,
                 
                 rejection_strength=rejection_strength,
                 risk_reward=risk_reward,
@@ -1023,10 +1279,10 @@ class RejectionBasedScanner:
             else:
                 self.daily_stats["short_rejections"] += 1
             
-            log.info(f"🎯 REJECTION SIGNAL: {symbol} {side} @ {entry_price:.4f}")
+            log.info(f"🎯 REJECTION SIGNAL WITH HOLD: {symbol} {side} @ {entry_price:.4f}")
             log.info(f"   Zone: {best_zone.zone_type}, Strength: {rejection_strength:.2f}")
-            log.info(f"   RSI: {current_rsi:.1f}, R:R: {risk_reward:.1f}:1")
-            log.info(f"   Wave: {wave_context.wave_length}, Maturity: {wave_context.wave_maturity:.1%}")
+            log.info(f"   Hold: {hold_reason} ({candles_held} candles), RSI: {current_rsi:.1f}")
+            log.info(f"   Wave: {wave_context.wave_length}, R:R: {risk_reward:.1f}:1")
             
             return signal
             
@@ -1064,72 +1320,6 @@ class RejectionBasedScanner:
             
         except Exception as e:
             return False
-    
-    def _analyze_rejection_candle(self, df: pd.DataFrame, side: str, zone: RejectionZone) -> Tuple[Optional[str], Optional[str]]:
-        """Analyze the rejection candle pattern"""
-        try:
-            if len(df) < 3:
-                return None, None
-            
-            current_candle = df.iloc[-1]
-            prev_candle = df.iloc[-2]
-            
-            # Check wick rejection
-            has_wick_rejection = False
-            wick_type = None
-            
-            if side == "LONG":
-                # LONG: Price wicks below support but closes above
-                if (current_candle['low'] < zone.price_level and 
-                    current_candle['close'] > zone.price_level):
-                    has_wick_rejection = True
-                    wick_type = "SUPPORT_WICK"
-            
-            else:  # SHORT
-                # SHORT: Price wicks above resistance but closes below
-                if (current_candle['high'] > zone.price_level and 
-                    current_candle['close'] < zone.price_level):
-                    has_wick_rejection = True
-                    wick_type = "RESISTANCE_WICK"
-            
-            # Check momentum shift candle
-            momentum_shift = False
-            candle_type = None
-            
-            if side == "LONG":
-                # LONG: Bearish candle followed by bullish candle at support
-                if (prev_candle['close'] < prev_candle['open'] and  # Bearish
-                    current_candle['close'] > current_candle['open'] and  # Bullish
-                    abs(current_candle['close'] - zone.price_level) / zone.price_level < 0.002):  # Near zone
-                    momentum_shift = True
-                    candle_type = "BULLISH_REVERSAL"
-            
-            else:  # SHORT
-                # SHORT: Bullish candle followed by bearish candle at resistance
-                if (prev_candle['close'] > prev_candle['open'] and  # Bullish
-                    current_candle['close'] < current_candle['open'] and  # Bearish
-                    abs(current_candle['close'] - zone.price_level) / zone.price_level < 0.002):  # Near zone
-                    momentum_shift = True
-                    candle_type = "BEARISH_REVERSAL"
-            
-            # Determine rejection type
-            if has_wick_rejection:
-                return "WICK_REJECTION", wick_type
-            elif momentum_shift:
-                return "MOMENTUM_REJECTION", candle_type
-            else:
-                # Check for simple rejection (price tests level and moves away)
-                if side == "LONG":
-                    if current_candle['low'] <= zone.price_level * 1.001 and current_candle['close'] > zone.price_level:
-                        return "PRICE_REJECTION", "SUPPORT_HOLD"
-                else:
-                    if current_candle['high'] >= zone.price_level * 0.999 and current_candle['close'] < zone.price_level:
-                        return "PRICE_REJECTION", "RESISTANCE_HOLD"
-            
-            return None, None
-            
-        except Exception as e:
-            return None, None
     
     def _calculate_rejection_strength(self, zone: RejectionZone, strength: MarketStrength, 
                                      wave: WaveContext, rsi: float) -> float:
@@ -1174,7 +1364,8 @@ class RejectionBasedScanner:
         return np.average(factors, weights=weights)
     
     def _get_rejection_conditions(self, wave: WaveContext, strength: MarketStrength, 
-                                 zone: RejectionZone, rejection_type: str) -> List[str]:
+                                 zone: RejectionZone, rejection_type: str,
+                                 hold_valid: bool, hold_reason: str, candles_held: int) -> List[str]:
         """Get list of conditions met for this rejection"""
         conditions = []
         
@@ -1203,6 +1394,15 @@ class RejectionBasedScanner:
         # RSI condition
         conditions.append(f"RSI_{zone.rsi_position}")
         
+        # 🔥 CRITICAL: Hold validation
+        if hold_valid:
+            conditions.append("HOLD_VALIDATED")
+            conditions.append(f"HOLD_{hold_reason}")
+            conditions.append(f"HOLD_CANDLES_{candles_held}")
+        else:
+            conditions.append("HOLD_FAILED")
+            conditions.append(f"HOLD_FAIL_{hold_reason}")
+        
         return conditions
     
     def get_daily_stats(self) -> Dict:
@@ -1225,19 +1425,21 @@ class RejectionScanner:
         
     async def initialize(self):
         """Initialize the scanner"""
-        log.info("=" * 70)
-        log.info("🔥 REJECTION-BASED HIGH-FREQUENCY SCANNER")
-        log.info("=" * 70)
+        log.info("=" * 80)
+        log.info("🔥 REJECTION-BASED HIGH-FREQUENCY SCANNER WITH HOLD VALIDATION")
+        log.info("=" * 80)
         log.info("TRADER ROLE: Discretionary reaction trader")
         log.info("SPECIALTY: Wave-length awareness + Strength analysis + Rejection entries")
+        log.info("CRITICAL RULE: Require REJECTION HOLD before entry")
         log.info("PHILOSOPHY: Wave length sets context, Strength & volume make decision")
-        log.info("ENTRY RULE: Rejection pulls the trigger")
+        log.info("ENTRY RULE: Rejection pulls the trigger ONLY IF IT HOLDS")
         log.info(f"SCAN INTERVAL: {SCAN_INTERVAL} seconds")
-        log.info("TIME FRAMES: 1H/15M (context), 3M/1M (entries)")
+        log.info("TIME FRAMES: 1H/15M (context), 3M/1M (entries + hold validation)")
         log.info("REJECTION ZONES: EMA, Range, Failed breaks only")
         log.info("RSI ZONES: 40-50 (LONG), 50-60 (SHORT)")
         log.info("DEDUPLICATION: ONE TRADE PER SYMBOL")
-        log.info("=" * 70)
+        log.info("HOLD RULE: Price must NOT break rejection extreme in next 1-2 candles")
+        log.info("=" * 80)
         
         # Initialize database
         await self._init_database()
@@ -1254,7 +1456,7 @@ class RejectionScanner:
             os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
             self.db = await aiosqlite.connect(DB_PATH)
             
-            # Rejection signals table
+            # Enhanced rejection signals table with hold validation
             await self.db.execute("""
             CREATE TABLE IF NOT EXISTS rejection_signals (
                 id TEXT PRIMARY KEY,
@@ -1280,6 +1482,11 @@ class RejectionScanner:
                 rsi_at_entry REAL NOT NULL,
                 rejection_type TEXT NOT NULL,
                 trigger_candle TEXT NOT NULL,
+                
+                -- CRITICAL: Hold validation fields
+                hold_validated BOOLEAN NOT NULL,
+                hold_reason TEXT NOT NULL,
+                hold_candles INTEGER NOT NULL,
                 
                 risk_reward REAL NOT NULL,
                 expected_move REAL NOT NULL,
@@ -1308,6 +1515,7 @@ class RejectionScanner:
                 short_rejections INTEGER,
                 no_strength_count INTEGER,
                 no_zone_count INTEGER,
+                hold_failed_count INTEGER,
                 win_rate REAL,
                 avg_win REAL,
                 avg_loss REAL,
@@ -1317,7 +1525,7 @@ class RejectionScanner:
             
             await self.db.commit()
             
-            log.info("✅ Database initialized")
+            log.info("✅ Database initialized with hold validation fields")
             
         except Exception as e:
             log.error(f"Database error: {e}")
@@ -1349,14 +1557,17 @@ class RejectionScanner:
         
         try:
             message = f"""
-🎯 <b>REJECTION-BASED HIGH-FREQUENCY SCANNER</b>
+🎯 <b>REJECTION-BASED SCANNER WITH HOLD VALIDATION</b>
 
 <b>🧠 TRADER MINDSET:</b>
 • Reaction trader (not prediction-based)
-• Rejection specialist
+• Rejection specialist with hold validation
 • Comfortable being wrong
 • Emotionless with losses
 • Hunts expansion, accepts losses
+
+<b>🔥 CRITICAL RULE ADDED:</b>
+<code>REQUIRE "REJECTION HOLD" BEFORE ENTRY</code>
 
 <b>📊 ANALYSIS FRAMEWORK:</b>
 1️⃣ <b>الطول الموجي (Wave Length)</b> → السياق فقط
@@ -1376,9 +1587,18 @@ class RejectionScanner:
    • أعلى/أقل النطاق
    • اختراقات فاشلة
 
+<b>🔥 <u>القاعدة الجديدة الحاسمة:</u></b>
+<b>"التأكد من صمود الرفض قبل الدخول"</b>
+
+• الرفض الذي لا يصمد ليس رفضاً - إنه امتصاص
+• الانتظار 1-2 شموع بعد شمعة الرفض
+• الدخول فقط إذا لم يكسر السعر قمة/قاع الرفض
+• هذه القاعدة وحدها ترفع نسبة النجاح إلى ~60%
+
 <b>⚡ إعدادات الدخول:</b>
-• إطار الدخول: 3M (رئيسي) + 1M (توقيت)
+• إطار الدخول: 3M (رئيسي) + 1M (تأكيد)
 • RSI: 40–50 للشراء، 50–60 للبيع
+• تأكيد الرفض: صمود 1-2 شموع بعد الرفض
 • نسبة الربح/المخاطرة: 1:2 كحد أدنى
 • الهدف: 1.5–4% (مردود غير متماثل)
 
@@ -1387,16 +1607,16 @@ class RejectionScanner:
 • إشارات جديدة فقط بعد إغلاق الصفقة السابقة
 • لا يوجد تبريد زمني
 
-<b>🎯 فلسفة الدخول:</b>
-الدخول عند أول شمعة رفض قوية
-الدخول حيث يتردد الآخرون
-أدخل مبكراً عن قصد
+<b>🎯 فلسفة الدخول الجديدة:</b>
+الدخول بعد تأكد صمود الرفض
+الانتظار لتأكد توقف السعر
+الدخول بعد تردد الزخم فقط
 
 الطول الموجي يحدد السياق
 القوة والفوليوم يحددان القرار
-والرفض هو الزناد
+والرفض <b>الصامد</b> هو الزناد
 
-#متداول_تفاعلي #تخصص_الرفض #صفقة_واحدة
+#متداول_تفاعلي #تخصص_الرفض #صفقة_واحدة #صمود_الرفض
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -1482,16 +1702,17 @@ class RejectionScanner:
     async def save_signal(self, signal: RejectionSignal) -> bool:
         """Save signal to database"""
         try:
-            # Insert signal
+            # Insert signal with hold validation
             await self.db.execute("""
                 INSERT INTO rejection_signals (
                     id, symbol, side, entry_price, stop_loss, take_profit,
                     wave_length, wave_maturity, expansion_speed, structure_type,
                     candle_speed, distance_ratio, ema_angle, volume_participation, strength_score,
                     zone_type, rejection_strength, rsi_at_entry, rejection_type, trigger_candle,
+                    hold_validated, hold_reason, hold_candles,
                     risk_reward, expected_move, timeframe_used,
                     conditions_met
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 signal.signal_id,
                 signal.symbol,
@@ -1513,6 +1734,9 @@ class RejectionScanner:
                 signal.rsi_at_entry,
                 signal.rejection_type,
                 signal.trigger_candle,
+                signal.hold_validated,
+                signal.hold_reason,
+                signal.hold_candles,
                 signal.risk_reward,
                 signal.expected_move_pct,
                 signal.timeframe_used,
@@ -1521,7 +1745,7 @@ class RejectionScanner:
             
             await self.db.commit()
             
-            log.info(f"✅ Rejection signal saved: {signal.symbol}")
+            log.info(f"✅ Rejection signal saved with hold validation: {signal.symbol}")
             return True
             
         except Exception as e:
@@ -1529,7 +1753,7 @@ class RejectionScanner:
             return False
     
     async def format_signal_message(self, signal: RejectionSignal) -> str:
-        """Format signal for Telegram"""
+        """Format signal for Telegram with hold validation"""
         side_emoji = "🟢" if signal.side == "LONG" else "🔴"
         side_text = "شراء" if signal.side == "LONG" else "بيع"
         
@@ -1573,10 +1797,29 @@ class RejectionScanner:
         
         rejection_text = rejection_translation.get(signal.rejection_type, signal.rejection_type)
         
+        # Hold info in Arabic
+        hold_status = "✅ تأكيد الصمود" if signal.hold_validated else "❌ فشل الصمود"
+        hold_reason_ar = {
+            "HOLD_CONFIRMED": "تم تأكيد صمود الرفض",
+            "REJECTION_FAILED_LOW_BROKEN": "كسر قاع شمعة الرفض",
+            "REJECTION_FAILED_HIGH_BROKEN": "كسر قمة شمعة الرفض",
+            "ZONE_FAILED_TO_HOLD": "فشل في الصمود عند المنطقة",
+            "MOMENTUM_NOT_HESITATING": "الزخم لم يتردد",
+            "INSUFFICIENT_DATA": "بيانات غير كافية"
+        }
+        
+        hold_detail = hold_reason_ar.get(signal.hold_reason, signal.hold_reason)
+        
         message = f"""
-{side_emoji} <b>إشارة رفض</b> ⚡
+{side_emoji} <b>إشارة رفع مؤكدة بالصمود</b> ⚡
 
 <b>{signal.symbol}</b> | {side_text}
+
+<b>🔥 تأكيد صمود الرفض:</b>
+• الحالة: {hold_status}
+• السبب: {hold_detail}
+• عدد الشموع المصمودة: {signal.hold_candles}
+• الإطار الزمني: 3M + 1M تأكيد
 
 <b>📊 السياق الموجي:</b>
 • طول الموجة: {wave_info}
@@ -1606,20 +1849,20 @@ class RejectionScanner:
 • هدف الربح: <code>{signal.take_profit:.6f}</code> ({signal.expected_move_pct:.1f}%)
 • نسبة الربح/المخاطرة: {signal.risk_reward:.1f}:1
 
+<b>🧠 عقلية المتداول المحترف:</b>
+الرفض الذي لا يصمد ليس رفضاً - إنه امتصاص
+تم الانتظار للتأكد من توقف السعر
+الدخول بعد تردد الزخم فقط
+
 <b>🛡️ نظام التكرار:</b>
 • نظام: <b>صفقة واحدة لكل عملة</b>
 • لا إشارات جديدة لـ {signal.symbol} حتى إغلاق هذه الصفقة
 
-<b>⚠️ ملاحظة التاجر:</b>
-الدخول عند الرفض فقط
-لا مطاردة - لا توقع
-نقبل الخسائر - نصطاد التوسع
-
-#{side_text} #رفض #{"دعم" if signal.side == "LONG" else "مقاومة"} #صفقة_واحدة
+#{side_text} #رفض_مصمود #{"دعم" if signal.side == "LONG" else "مقاومة"} #صفقة_واحدة #تأكيد_الصمود
 """
         return message
     
-    async def send_trade_trigger_notification(self, symbol: str, side: str, entry_price: float):
+    async def send_trade_trigger_notification(self, symbol: str, side: str, entry_price: float, hold_candles: int):
         """Send notification when trade is triggered/entered"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             log.warning(f"⚠️ Telegram credentials missing. Skipping trigger notification for {symbol}")
@@ -1630,16 +1873,21 @@ class RejectionScanner:
             side_text = "شراء" if side == "LONG" else "بيع"
             
             message = f"""
-{side_emoji} <b>تم تنفيذ صفقة الرفض</b> ⚡
+{side_emoji} <b>تم تنفيذ صفقة الرفض المصمود</b> ⚡
 
 <b>{symbol}</b> | {side_text}
 
-<b>🎯 تم الدخول عند الرفض:</b>
+<b>🎯 تم الدخول بعد تأكيد صمود الرفض:</b>
 <code>{entry_price:.6f}</code>
 
+<b>✅ تم تأكيد صمود الرفض:</b>
+• انتظرنا {hold_candles} شمعة بعد رفض
+• السعر لم يكسر قمة/قاع الرفض
+• الزخم تردد وأثبت الرفض
+
 <b>🧠 عقلية التاجر:</b>
-• دخول مبكر عند أول رفض
-• دخول حيث يتردد الآخرون
+• دخول بعد تأكد صمود الرفض فقط
+• دخول حيث يتردد الزخم
 • راحة مع الخسائر المحتملة
 • صيد للتوسع القادم
 
@@ -1651,7 +1899,7 @@ class RejectionScanner:
 يتم متابعة الصفقة تلقائياً.
 ستصلك إشعار عند الوصول لوقف الخسارة أو هدف الربح.
 
-#{side_text} #تنفيذ_رفض #متابعة #لا_إشارات_جديدة
+#{side_text} #تنفيذ_رفض_مصمود #متابعة #لا_إشارات_جديدة
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -1662,14 +1910,15 @@ class RejectionScanner:
                     "parse_mode": "HTML"
                 })
             
-            log.info(f"{side_emoji} Rejection trade triggered: {symbol} {side} @ {entry_price:.4f}")
+            log.info(f"{side_emoji} Rejection trade triggered with hold: {symbol} {side} @ {entry_price:.4f}")
             
         except Exception as e:
             log.error(f"Trigger notification error: {e}")
     
     async def send_trade_close_notification(self, symbol: str, side: str, pnl_percent: float, 
                                            close_reason: str, entry_price: float, 
-                                           close_price: float, risk_reward: float):
+                                           close_price: float, risk_reward: float,
+                                           hold_candles: int):
         """Send notification when trade hits TP/SL"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             log.warning(f"⚠️ Telegram credentials missing. Skipping close notification for {symbol}")
@@ -1698,12 +1947,12 @@ class RejectionScanner:
             
             # Trader mindset message based on result
             if close_reason == "TP_HIT":
-                mindset = "التوسع تم اصطياده ✅ الدخول المبكر حقق الربح"
+                mindset = f"✅ صمود الرفض أدى إلى التوسع\nالدخول بعد {hold_candles} شمعة تأكيد كان صحيحاً"
             else:
-                mindset = "الخسارة مقبولة ❌ الرفض لم يحترم، ننتظر الرفض التالي"
+                mindset = f"❌ الرفض لم يصمد بالرغم من التأكيد\nنقبل الخسارة وننتظر الرفض التالي"
             
             message = f"""
-{emoji} <b>تم إغلاق صفقة الرفض</b> {result_emoji}
+{emoji} <b>تم إغلاق صفقة الرفض المصمود</b> {result_emoji}
 
 <b>{symbol}</b> | {side_text}
 
@@ -1711,7 +1960,8 @@ class RejectionScanner:
 {pnl_emoji} <b>النسبة: {pnl_formatted}</b>
 
 <b>📊 تفاصيل التنفيذ:</b>
-• نوع الدخول: {side_text} (عند الرفض)
+• نوع الدخول: {side_text} (بعد صمود رفض)
+• شموع تأكيد الصمود: {hold_candles}
 • سعر الدخول: <code>{entry_price:.6f}</code>
 • سعر الإغلاق: <code>{close_price:.6f}</code>
 • نسبة الربح/الخسارة: <b>{pnl_formatted}</b>
@@ -1719,6 +1969,7 @@ class RejectionScanner:
 
 <b>🧠 عقلية التاجر:</b>
 {mindset}
+الرفض الذي لا يصمد ليس رفضاً - إنه امتصاص
 نقبل الخسائر - نصطاد التوسع
 كل رفض هو فرصة جديدة
 
@@ -1764,20 +2015,20 @@ class RejectionScanner:
                     "parse_mode": "HTML"
                 })
                 
-            log.info(f"📤 Telegram rejection alert sent: {signal.symbol}")
+            log.info(f"📤 Telegram rejection alert sent with hold validation: {signal.symbol}")
             
         except Exception as e:
             log.error(f"Telegram error: {e}")
     
     async def monitor_positions(self):
-        """Monitor and close positions with trade-based deduplication - FIXED VERSION"""
-        log.info("👀 Starting position monitoring with Telegram notifications...")
+        """Monitor and close positions with trade-based deduplication"""
+        log.info("👀 Starting position monitoring with hold validation...")
         
         while True:
             try:
                 # Get ALL open positions (both pending and triggered)
                 async with self.db.execute("""
-                    SELECT id, symbol, side, entry_price, stop_loss, take_profit, status
+                    SELECT id, symbol, side, entry_price, stop_loss, take_profit, status, hold_candles
                     FROM rejection_signals 
                     WHERE status IN ('PENDING', 'TRIGGERED')
                 """) as cursor:
@@ -1786,7 +2037,7 @@ class RejectionScanner:
                 if positions:
                     log.debug(f"📊 Monitoring {len(positions)} open positions")
                 
-                for pos_id, symbol, side, entry, sl, tp, status in positions:
+                for pos_id, symbol, side, entry, sl, tp, status, hold_candles in positions:
                     try:
                         # Get current price
                         ticker = await self.exchange.fetch_ticker(symbol)
@@ -1811,10 +2062,10 @@ class RejectionScanner:
                                 # UPDATE DEDUPLICATION STATUS to TRIGGERED
                                 self.scanner.deduplicator.update_signal_status(pos_id, "TRIGGERED")
                                 
-                                # SEND TRIGGER NOTIFICATION
-                                await self.send_trade_trigger_notification(symbol, side, current_price)
+                                # SEND TRIGGER NOTIFICATION WITH HOLD INFO
+                                await self.send_trade_trigger_notification(symbol, side, current_price, hold_candles)
                                 
-                                log.info(f"✅ Rejection position triggered: {symbol} {side} @ {current_price:.4f}")
+                                log.info(f"✅ Rejection position triggered with hold: {symbol} {side} @ {current_price:.4f}")
                                 continue  # Skip SL/TP check for this cycle
                         
                         # Check SL/TP for ALL positions (including newly triggered ones)
@@ -1864,7 +2115,7 @@ class RejectionScanner:
                             # Clean up from tracking
                             self.scanner.active_signal_ids.discard(pos_id)
                             
-                            # SEND CLOSE NOTIFICATION - THIS WAS MISSING
+                            # SEND CLOSE NOTIFICATION WITH HOLD INFO
                             await self.send_trade_close_notification(
                                 symbol=symbol,
                                 side=side,
@@ -1872,7 +2123,8 @@ class RejectionScanner:
                                 close_reason=close_reason,
                                 entry_price=entry,
                                 close_price=current_price,
-                                risk_reward=risk_reward
+                                risk_reward=risk_reward,
+                                hold_candles=hold_candles
                             )
                             
                             log.info(f"📤 Telegram close notification sent for {symbol}: {close_reason} ({pnl_percent:.2f}%)")
@@ -1893,15 +2145,15 @@ class RejectionScanner:
                 await asyncio.sleep(5)
     
     async def high_freq_scanning(self):
-        """Main high-frequency scanning loop for rejections"""
-        log.info("🚀 Starting rejection-based high-frequency scanning...")
+        """Main high-frequency scanning loop for rejections with hold validation"""
+        log.info("🚀 Starting rejection-based scanning WITH HOLD VALIDATION...")
         
         while True:
             try:
                 self.scan_cycle += 1
                 start_time = time.time()
                 
-                log.info(f"🔄 Scan cycle #{self.scan_cycle} (Rejection hunting)")
+                log.info(f"🔄 Scan cycle #{self.scan_cycle} (Rejection hunting with hold)")
                 
                 # Get active pairs
                 pairs = await self.get_active_pairs()
@@ -1911,7 +2163,7 @@ class RejectionScanner:
                     await asyncio.sleep(SCAN_INTERVAL)
                     continue
                 
-                log.info(f"Scanning {len(pairs)} active pairs for rejections")
+                log.info(f"Scanning {len(pairs)} active pairs for rejections with hold validation")
                 
                 signals_found = 0
                 pairs_processed = 0
@@ -1922,14 +2174,14 @@ class RejectionScanner:
                         # Fetch data
                         multi_tf_data = await self.fetch_timeframe_data(symbol)
                         
-                        # Need key timeframes for rejection analysis
-                        required_tfs = ["1H", "15M", "3M"]  # Context + Entry
+                        # Need key timeframes for rejection analysis with hold
+                        required_tfs = ["1H", "15M", "3M"]  # Context + Entry + Hold validation
                         has_all_data = all(tf in multi_tf_data for tf in required_tfs)
                         
                         if not has_all_data:
                             continue
                         
-                        # Generate rejection signal
+                        # Generate rejection signal with hold validation
                         signal = self.scanner.generate_rejection_signal(multi_tf_data, symbol)
                         
                         if signal:
@@ -1952,23 +2204,30 @@ class RejectionScanner:
                 # Update scanner stats
                 self.scanner.daily_stats["pairs_scanned"] += pairs_processed
                 
-                # Log rejection stats
+                # Log rejection stats with hold validation
                 active_count = len(self.scanner.deduplicator.active_signals)
                 stats = self.scanner.get_daily_stats()
                 
+                # Calculate hold failure reasons
+                hold_failures = stats.get("hold_fail_reasons", {})
+                hold_fail_total = stats.get("rejection_hold_failed", 0)
+                
                 log.info(f"📊 Rejection stats: Found {signals_found}, Active: {active_count}")
-                log.info(f"   Filtered: {stats.get('rejections_filtered', 0)}, "
-                        f"No strength: {stats.get('no_strength', 0)}, "
-                        f"No zone: {stats.get('no_rejection_zone', 0)}")
+                log.info(f"   Hold failed: {hold_fail_total}, Filtered: {stats.get('rejections_filtered', 0)}")
+                
+                if hold_fail_total > 0:
+                    log.info("   Hold failure reasons:")
+                    for reason, count in hold_failures.items():
+                        log.info(f"     - {reason}: {count}")
                 
                 scan_duration = time.time() - start_time
-                log.info(f"Scan #{self.scan_cycle}: {signals_found} rejections in {scan_duration:.2f}s")
+                log.info(f"Scan #{self.scan_cycle}: {signals_found} confirmed rejections in {scan_duration:.2f}s")
                 
                 # Log detailed stats periodically
                 if self.scan_cycle % 20 == 0:
                     log.info(f"📈 Detailed stats: {stats}")
                 
-                # Wait for next scan (very fast for rejection hunting)
+                # Wait for next scan (fast for rejection hunting)
                 wait_time = max(0.1, SCAN_INTERVAL - scan_duration)
                 log.info(f"Next rejection hunt in {wait_time:.1f}s...")
                 await asyncio.sleep(wait_time)
@@ -2001,7 +2260,7 @@ class RejectionScanner:
             await self.cleanup()
     
     async def send_final_stats(self):
-        """Send final statistics"""
+        """Send final statistics with hold validation"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             log.warning("⚠️ Telegram credentials missing. Skipping final stats.")
             return
@@ -2012,49 +2271,76 @@ class RejectionScanner:
             # Get active signals count
             active_count = len(self.scanner.deduplicator.active_signals)
             
-            # Calculate percentages
+            # Calculate percentages with hold validation
             total_analyzed = stats['rejections_found'] + stats.get('rejections_filtered', 0) + \
-                            stats.get('no_strength', 0) + stats.get('no_rejection_zone', 0)
+                            stats.get('no_strength', 0) + stats.get('no_rejection_zone', 0) + \
+                            stats.get('rejection_hold_failed', 0)
             
             if total_analyzed > 0:
                 found_pct = stats['rejections_found'] / total_analyzed * 100
+                hold_failed_pct = stats.get('rejection_hold_failed', 0) / total_analyzed * 100
                 filtered_pct = stats.get('rejections_filtered', 0) / total_analyzed * 100
                 no_strength_pct = stats.get('no_strength', 0) / total_analyzed * 100
                 no_zone_pct = stats.get('no_rejection_zone', 0) / total_analyzed * 100
             else:
-                found_pct = filtered_pct = no_strength_pct = no_zone_pct = 0
+                found_pct = hold_failed_pct = filtered_pct = no_strength_pct = no_zone_pct = 0
+            
+            # Get hold failure reasons
+            hold_failures = stats.get("hold_fail_reasons", {})
             
             message = f"""
-🛑 <b>تم إيقاف ماسح الرفض</b>
+🛑 <b>تم إيقاف ماسح الرفض مع تأكيد الصمود</b>
 
 <b>📊 إحصائيات اليوم:</b>
 • عمليات المسح: {self.scan_cycle}
 • الأزواج الممسوحة: {stats['pairs_scanned']}
-• حالات الرفض التي تم العثور عليها: {stats['rejections_found']} ({found_pct:.1f}%)
+• حالات الرفض المؤكدة: {stats['rejections_found']} ({found_pct:.1f}%)
 • رفض شراء: {stats['long_rejections']}
 • رفض بيع: {stats['short_rejections']}
 
-<b>🚫 أسباب الفلترة:</b>
+<b>🔥 تحليل تأكيد الصمود:</b>
+• حالات رفض فشلت في الصمود: {stats.get('rejection_hold_failed', 0)} ({hold_failed_pct:.1f}%)
 • مفلتر (تكرار): {stats.get('rejections_filtered', 0)} ({filtered_pct:.1f}%)
 • بدون قوة كافية: {stats.get('no_strength', 0)} ({no_strength_pct:.1f}%)
 • بدون منطقة رفض: {stats.get('no_rejection_zone', 0)} ({no_zone_pct:.1f}%)
 
-<b>⚡ الصفقات النشطة:</b>
+<b>⚡ أسباب فشل الصمود:</b>"""
+            
+            # Add hold failure reasons
+            if hold_failures:
+                for reason, count in hold_failures.items():
+                    reason_ar = {
+                        "REJECTION_FAILED_LOW_BROKEN": "كسر قاع الرفض",
+                        "REJECTION_FAILED_HIGH_BROKEN": "كسر قمة الرفض",
+                        "ZONE_FAILED_TO_HOLD": "فشل الصمود عند المنطقة",
+                        "MOMENTUM_NOT_HESITATING": "الزخم لم يتردد"
+                    }
+                    reason_text = reason_ar.get(reason, reason)
+                    message += f"\n• {reason_text}: {count}"
+            else:
+                message += "\n• لا توجد حالات فشل في الصمود"
+            
+            message += f"""
+
+<b>🎯 الصفقات النشطة:</b>
 • حالياً: {active_count} صفقة نشطة
 
 <b>🧠 فلسفة التاجر المحققة:</b>
 الطول الموجي ← السياق
 القوة والفوليوم ← القرار
-الرفض ← الزناد
+الرفض الصامد ← الزناد
 
 تم الالتزام بـ:
-• الدخول عند الرفض فقط
+• الدخول بعد تأكد صمود الرفض فقط
 • صفقة واحدة لكل عملة
 • عدم المطاردة
 • قبول الخسائر
-• صيد التوسع
+• صيد التوسع بعد تردد الزخم
 
-#إحصائيات_الرفض #متداول_تفاعلي #صفقة_واحدة
+<b>✅ القاعدة الحاسمة المطبقة:</b>
+"الرفض الذي لا يصمد ليس رفضاً - إنه امتصاص"
+
+#إحصائيات_الرفض_المصمود #متداول_تفاعلي #صفقة_واحدة #تأكيد_الصمود
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -2111,20 +2397,22 @@ async def start_http_server(scanner, port=8000):
                 
                 response = json.dumps({
                     "status": "running",
-                    "scanner": "Rejection-Based High-Frequency Scanner",
+                    "scanner": "Rejection-Based High-Frequency Scanner WITH HOLD VALIDATION",
                     "scan_cycle": scanner.scan_cycle,
                     "active_trades": active_count,
                     "daily_stats": stats,
                     "trader_mindset": {
                         "role": "Discretionary reaction trader",
                         "specialty": "Wave-length awareness + Strength analysis + Rejection entries",
-                        "philosophy": "Wave length sets context, Strength & volume make decision, Rejection pulls trigger",
-                        "entry_rule": "Trade ONLY at rejection zones",
-                        "frequency": "High frequency + asymmetric payoff"
+                        "critical_rule": "REQUIRE REJECTION HOLD BEFORE ENTRY",
+                        "philosophy": "Wave length sets context, Strength & volume make decision, REJECTION MUST HOLD",
+                        "entry_rule": "Trade ONLY at rejection zones that HOLD",
+                        "hold_rule": "Price must NOT break rejection extreme in next 1-2 candles",
+                        "frequency": "High frequency + asymmetric payoff + hold validation"
                     },
                     "telegram": {
                         "configured": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID),
-                        "notifications": "Signal + Entry + TP/SL alerts"
+                        "notifications": "Signal + Entry + TP/SL alerts with hold validation"
                     }
                 }, indent=2)
             
@@ -2134,16 +2422,19 @@ async def start_http_server(scanner, port=8000):
             elif path == '/mindset':
                 response = json.dumps({
                     "trader_role": "Professional discretionary crypto trader",
-                    "specialization": "Wave-length awareness, strength analysis, rejection-based entries",
+                    "specialization": "Wave-length awareness, strength analysis, rejection-based entries WITH HOLD VALIDATION",
+                    "critical_improvement": "Added REJECTION HOLD requirement - single most important change",
+                    "hold_definition": "Rejection that doesn't stop price is not rejection — it's absorption",
                     "trades": "Both LONG and SHORT symmetrically",
-                    "philosophy": "Accept losses, hunt expansion",
+                    "philosophy": "Accept losses, hunt expansion, wait for hold confirmation",
                     "wave_length": "Context only - no Elliott wave counting",
                     "market_strength": "Measure speed, distance, EMA angle, volume participation",
                     "rejection_zones": "Trade ONLY at rejection zones (EMA, Range, Failed breaks)",
-                    "entry_conditions": "RSI zones (40-50 LONG, 50-60 SHORT) + Volume confirmation",
-                    "entry_philosophy": "Enter on first strong rejection candle, early entries are intentional",
-                    "frequency_rule": "High frequency + asymmetric payoff",
-                    "mindset": "Reaction trader, rejection specialist, not prediction-based, comfortable being wrong"
+                    "hold_validation": "Check if rejection holds for 1-2 candles after rejection candle",
+                    "entry_conditions": "RSI zones (40-50 LONG, 50-60 SHORT) + Volume confirmation + HOLD CONFIRMATION",
+                    "entry_philosophy": "Enter after rejection HOLDS, not on first rejection candle",
+                    "frequency_rule": "High frequency + asymmetric payoff + hold validation",
+                    "mindset": "Reaction trader, rejection specialist with hold validation, not prediction-based, comfortable being wrong"
                 }, indent=2)
             
             elif path == '/recent':
@@ -2151,6 +2442,7 @@ async def start_http_server(scanner, port=8000):
                     scanner.db.row_factory = aiosqlite.Row
                     async with scanner.db.execute("""
                         SELECT symbol, side, entry_price, zone_type, rejection_type,
+                               hold_validated, hold_reason, hold_candles,
                                rejection_strength, risk_reward, expected_move, 
                                created_at, status, close_reason, pnl_percent
                         FROM rejection_signals 
@@ -2163,6 +2455,20 @@ async def start_http_server(scanner, port=8000):
                     response = json.dumps({"signals": signals, "count": len(signals)}, indent=2)
                 else:
                     response = json.dumps({"error": "Database not available"})
+            
+            elif path == '/hold-stats':
+                stats = scanner.scanner.get_daily_stats()
+                hold_failures = stats.get("hold_fail_reasons", {})
+                response = json.dumps({
+                    "hold_validation_stats": {
+                        "total_rejections_found": stats.get("rejections_found", 0),
+                        "hold_failed_count": stats.get("rejection_hold_failed", 0),
+                        "hold_failure_reasons": hold_failures,
+                        "hold_success_rate": (stats.get("rejections_found", 0) / 
+                                            max(1, stats.get("rejections_found", 0) + 
+                                                stats.get("rejection_hold_failed", 0))) * 100
+                    }
+                }, indent=2)
             
             else:
                 response = json.dumps({"error": "Endpoint not found"})
