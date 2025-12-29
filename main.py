@@ -1344,6 +1344,7 @@ class RejectionScanner:
     async def _send_startup_message(self):
         """Send startup message to Telegram"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            log.warning("⚠️ Telegram credentials not set. Notifications will not be sent.")
             return
         
         try:
@@ -1405,6 +1406,8 @@ class RejectionScanner:
                     "text": message,
                     "parse_mode": "HTML"
                 })
+                
+            log.info("✅ Startup message sent to Telegram")
                 
         except Exception as e:
             log.error(f"Telegram startup error: {e}")
@@ -1619,6 +1622,7 @@ class RejectionScanner:
     async def send_trade_trigger_notification(self, symbol: str, side: str, entry_price: float):
         """Send notification when trade is triggered/entered"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            log.warning(f"⚠️ Telegram credentials missing. Skipping trigger notification for {symbol}")
             return
         
         try:
@@ -1668,9 +1672,12 @@ class RejectionScanner:
                                            close_price: float, risk_reward: float):
         """Send notification when trade hits TP/SL"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            log.warning(f"⚠️ Telegram credentials missing. Skipping close notification for {symbol}")
             return
         
         try:
+            log.info(f"📤 Sending close notification for {symbol}: {close_reason} ({pnl_percent:.2f}%)")
+            
             if close_reason == "TP_HIT":
                 emoji = "✅"
                 result_text = "هدف الربح"
@@ -1724,11 +1731,16 @@ class RejectionScanner:
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(url, json={
+                response = await client.post(url, json={
                     "chat_id": TELEGRAM_CHAT_ID,
                     "text": message,
                     "parse_mode": "HTML"
                 })
+                
+                if response.status_code == 200:
+                    log.info(f"✅ Telegram close notification sent for {symbol}: {close_reason}")
+                else:
+                    log.error(f"❌ Telegram API error: {response.status_code} - {response.text}")
             
             log.info(f"{emoji} Rejection trade closed: {symbol} {side} {pnl_formatted} ({close_reason})")
             
@@ -1738,6 +1750,7 @@ class RejectionScanner:
     async def send_telegram_alert(self, signal: RejectionSignal):
         """Send Telegram alert"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            log.warning(f"⚠️ Telegram credentials missing. Skipping alert for {signal.symbol}")
             return
         
         try:
@@ -1757,110 +1770,112 @@ class RejectionScanner:
             log.error(f"Telegram error: {e}")
     
     async def monitor_positions(self):
-        """Monitor and close positions with trade-based deduplication"""
+        """Monitor and close positions with trade-based deduplication - FIXED VERSION"""
+        log.info("👀 Starting position monitoring with Telegram notifications...")
+        
         while True:
             try:
-                # Get open positions
+                # Get ALL open positions (both pending and triggered)
                 async with self.db.execute("""
-                    SELECT id, symbol, side, entry_price, stop_loss, take_profit 
+                    SELECT id, symbol, side, entry_price, stop_loss, take_profit, status
                     FROM rejection_signals 
-                    WHERE status = 'PENDING'
+                    WHERE status IN ('PENDING', 'TRIGGERED')
                 """) as cursor:
                     positions = await cursor.fetchall()
                 
-                for pos_id, symbol, side, entry, sl, tp in positions:
+                if positions:
+                    log.debug(f"📊 Monitoring {len(positions)} open positions")
+                
+                for pos_id, symbol, side, entry, sl, tp, status in positions:
                     try:
                         # Get current price
                         ticker = await self.exchange.fetch_ticker(symbol)
                         current_price = ticker['last']
                         
-                        # Check if price reached entry (rejection entries are immediate)
-                        # For rejection trading, we enter immediately at signal price
-                        # Mark as triggered if price is within 0.5% of entry
-                        if abs(current_price - entry) / entry <= 0.005:  # 0.5% zone
-                            # Mark as triggered
-                            await self.db.execute("""
-                                UPDATE rejection_signals SET 
-                                    status = 'TRIGGERED',
-                                    triggered_at = CURRENT_TIMESTAMP,
-                                    trigger_price = ?
-                                WHERE id = ?
-                            """, (current_price, pos_id))
-                            
-                            await self.db.commit()
-                            
-                            # UPDATE DEDUPLICATION STATUS to TRIGGERED
-                            self.scanner.deduplicator.update_signal_status(pos_id, "TRIGGERED")
-                            
-                            # SEND TRIGGER NOTIFICATION
-                            await self.send_trade_trigger_notification(symbol, side, current_price)
-                            
-                            log.info(f"✅ Rejection position triggered: {symbol} {side} @ {current_price:.4f}")
-                        
-                        # Check SL/TP for triggered positions
-                        async with self.db.execute("""
-                            SELECT id FROM rejection_signals 
-                            WHERE id = ? AND status = 'TRIGGERED'
-                        """, (pos_id,)) as cursor:
-                            is_triggered = await cursor.fetchone()
-                        
-                        if is_triggered:
-                            pnl_percent = 0
-                            close_reason = None
-                            
-                            if side == "LONG":
-                                if current_price <= sl:
-                                    close_reason = "SL_HIT"
-                                    pnl_percent = ((current_price - entry) / entry) * 100
-                                elif current_price >= tp:
-                                    close_reason = "TP_HIT"
-                                    pnl_percent = ((current_price - entry) / entry) * 100
-                            
-                            else:  # SHORT
-                                if current_price >= sl:
-                                    close_reason = "SL_HIT"
-                                    pnl_percent = ((entry - current_price) / entry) * 100
-                                elif current_price <= tp:
-                                    close_reason = "TP_HIT"
-                                    pnl_percent = ((entry - current_price) / entry) * 100
-                            
-                            if close_reason:
-                                # Get risk_reward from database
-                                async with self.db.execute("""
-                                    SELECT risk_reward FROM rejection_signals WHERE id = ?
-                                """, (pos_id,)) as cursor:
-                                    row = await cursor.fetchone()
-                                    risk_reward = row[0] if row else 0
-                                
-                                # Update database
+                        # For PENDING positions: check if price reached entry
+                        if status == 'PENDING':
+                            # For rejection trading, we enter immediately at signal price
+                            # Mark as triggered if price is within reasonable range (0.5%)
+                            if abs(current_price - entry) / entry <= 0.005:  # 0.5% zone
+                                # Mark as triggered
                                 await self.db.execute("""
                                     UPDATE rejection_signals SET 
-                                        status = 'CLOSED',
-                                        closed_at = CURRENT_TIMESTAMP,
-                                        close_price = ?,
-                                        pnl_percent = ?,
-                                        close_reason = ?
+                                        status = 'TRIGGERED',
+                                        triggered_at = CURRENT_TIMESTAMP,
+                                        trigger_price = ?
                                     WHERE id = ?
-                                """, (current_price, pnl_percent, close_reason, pos_id))
+                                """, (current_price, pos_id))
                                 
                                 await self.db.commit()
                                 
-                                # UPDATE DEDUPLICATION STATUS to CLOSED
-                                self.scanner.deduplicator.update_signal_status(pos_id, "CLOSED")
+                                # UPDATE DEDUPLICATION STATUS to TRIGGERED
+                                self.scanner.deduplicator.update_signal_status(pos_id, "TRIGGERED")
                                 
-                                # Clean up from tracking
-                                self.scanner.active_signal_ids.discard(pos_id)
+                                # SEND TRIGGER NOTIFICATION
+                                await self.send_trade_trigger_notification(symbol, side, current_price)
                                 
-                                # SEND CLOSE NOTIFICATION
-                                await self.send_trade_close_notification(
-                                    symbol=symbol,
-                                    side=side,
-                                    pnl_percent=pnl_percent,
-                                    close_reason=close_reason,
-                                    entry_price=entry,
-                                    close_price=current_price,
-                                    risk_reward=risk_reward
-                                )
+                                log.info(f"✅ Rejection position triggered: {symbol} {side} @ {current_price:.4f}")
+                                continue  # Skip SL/TP check for this cycle
+                        
+                        # Check SL/TP for ALL positions (including newly triggered ones)
+                        pnl_percent = 0
+                        close_reason = None
+                        
+                        if side == "LONG":
+                            if current_price <= sl:
+                                close_reason = "SL_HIT"
+                                pnl_percent = ((current_price - entry) / entry) * 100
+                            elif current_price >= tp:
+                                close_reason = "TP_HIT"
+                                pnl_percent = ((current_price - entry) / entry) * 100
+                        
+                        else:  # SHORT
+                            if current_price >= sl:
+                                close_reason = "SL_HIT"
+                                pnl_percent = ((entry - current_price) / entry) * 100
+                            elif current_price <= tp:
+                                close_reason = "TP_HIT"
+                                pnl_percent = ((entry - current_price) / entry) * 100
+                        
+                        if close_reason:
+                            # Get risk_reward from database
+                            async with self.db.execute("""
+                                SELECT risk_reward FROM rejection_signals WHERE id = ?
+                            """, (pos_id,)) as cursor:
+                                row = await cursor.fetchone()
+                                risk_reward = row[0] if row else 0
+                            
+                            # Update database
+                            await self.db.execute("""
+                                UPDATE rejection_signals SET 
+                                    status = 'CLOSED',
+                                    closed_at = CURRENT_TIMESTAMP,
+                                    close_price = ?,
+                                    pnl_percent = ?,
+                                    close_reason = ?
+                                WHERE id = ?
+                            """, (current_price, pnl_percent, close_reason, pos_id))
+                            
+                            await self.db.commit()
+                            
+                            # UPDATE DEDUPLICATION STATUS to CLOSED
+                            self.scanner.deduplicator.update_signal_status(pos_id, "CLOSED")
+                            
+                            # Clean up from tracking
+                            self.scanner.active_signal_ids.discard(pos_id)
+                            
+                            # SEND CLOSE NOTIFICATION - THIS WAS MISSING
+                            await self.send_trade_close_notification(
+                                symbol=symbol,
+                                side=side,
+                                pnl_percent=pnl_percent,
+                                close_reason=close_reason,
+                                entry_price=entry,
+                                close_price=current_price,
+                                risk_reward=risk_reward
+                            )
+                            
+                            log.info(f"📤 Telegram close notification sent for {symbol}: {close_reason} ({pnl_percent:.2f}%)")
                     
                     except Exception as e:
                         log.error(f"Monitor error for {symbol}: {e}")
@@ -1871,7 +1886,7 @@ class RejectionScanner:
                     self.scanner.deduplicator.remove_closed_signals()
                 
                 # Fast monitoring for rejection trading
-                await asyncio.sleep(1)
+                await asyncio.sleep(2)  # Check every 2 seconds
                 
             except Exception as e:
                 log.error(f"Monitoring loop error: {e}")
@@ -1988,6 +2003,7 @@ class RejectionScanner:
     async def send_final_stats(self):
         """Send final statistics"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            log.warning("⚠️ Telegram credentials missing. Skipping final stats.")
             return
         
         try:
@@ -2049,6 +2065,8 @@ class RejectionScanner:
                     "parse_mode": "HTML"
                 })
                 
+            log.info("✅ Final stats sent to Telegram")
+                
         except Exception as e:
             log.error(f"Final stats error: {e}")
     
@@ -2103,6 +2121,10 @@ async def start_http_server(scanner, port=8000):
                         "philosophy": "Wave length sets context, Strength & volume make decision, Rejection pulls trigger",
                         "entry_rule": "Trade ONLY at rejection zones",
                         "frequency": "High frequency + asymmetric payoff"
+                    },
+                    "telegram": {
+                        "configured": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID),
+                        "notifications": "Signal + Entry + TP/SL alerts"
                     }
                 }, indent=2)
             
