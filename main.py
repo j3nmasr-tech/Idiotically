@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-🔥 REJECTION-BASED HIGH-FREQUENCY SCANNER
-Professional discretionary trading system
+🔥 REJECTION-BASED HIGH-FREQUENCY SCANNER (FUTURES)
+Professional discretionary trading system using MEXC Futures
 Wave-length awareness + Strength analysis + Rejection entries
 TRADER MINDSET: Reaction-based, rejection specialist
 """
@@ -26,12 +26,12 @@ import json
 # ================ HIGH-FREQUENCY CONFIG ================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-DB_PATH = "/app/data/rejection_scanner.db"
+DB_PATH = "/app/data/rejection_scanner_futures.db"
 
 # Ultra high-frequency scanning - REACTION TRADING
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 5))   # 5 seconds - ULTRA FAST FOR REJECTIONS
-TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 100))   # Scan many pairs
-MIN_VOLUME_USD = 500000  # $500K minimum - more opportunities
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 25))   # 5 seconds - ULTRA FAST FOR REJECTIONS
+TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 150))    # Reduced for futures (more liquid)
+MIN_VOLUME_USDT = 1000000  # $1M minimum for futures (more accurate)
 
 # Trading parameters (REJECTION-BASED)
 MAX_STOP_LOSS_PCT = 1.0    # 1% maximum stop loss
@@ -47,7 +47,7 @@ REJECTION_CONFIG = {
     "min_rejection_strength": 0.6,  # Minimum rejection strength score
 }
 
-# Timeframes for REACTION TRADING
+# Timeframes for REACTION TRADING - FUTURES
 TIMEFRAMES = {
     "1H": "1h",      # Wave length context ONLY
     "15M": "15m",    # Strength and structure
@@ -142,11 +142,11 @@ logging.basicConfig(
     format='%(asctime)s | %(levelname)8s | %(name)s | %(message)s',
     datefmt='%H:%M:%S'
 )
-log = logging.getLogger("rejection_scanner")
+log = logging.getLogger("rejection_scanner_futures")
 
 # ================ CORE REJECTION ENGINE ================
 class RejectionBasedScanner:
-    """High-frequency rejection scanner - REACTION TRADING"""
+    """High-frequency rejection scanner - REACTION TRADING with Futures"""
     
     class SignalDeduplicator:
         """Prevents duplicate signal generation - TRADE-BASED"""
@@ -443,7 +443,7 @@ class RejectionBasedScanner:
             # 3. EMA angle analysis
             ema_angle = self._calculate_ema_angle(df)
             
-            # 4. Volume participation
+            # 4. Volume participation (futures volume is more accurate)
             volume_participation = self._calculate_volume_participation(df)
             
             # 5. Strength score
@@ -544,17 +544,18 @@ class RejectionBasedScanner:
             return 0.0
     
     def _calculate_volume_participation(self, df: pd.DataFrame) -> float:
-        """Calculate volume participation ratio"""
+        """Calculate volume participation ratio (futures volume is more accurate)"""
         try:
             if len(df) < 20:
                 return 0.5
             
+            # Futures volume includes both long and short positions
             recent_volume = df['volume'].values[-5:].mean()
             avg_volume = df['volume'].values[-20:].mean()
             
             if avg_volume > 0:
                 ratio = recent_volume / avg_volume
-                # Normalize: 1.0 = average, 1.5 = 0.75, 2.0 = 1.0, 0.5 = 0.25
+                # Normalize for futures: 1.0 = average, 1.5 = 0.75, 2.0 = 1.0, 0.5 = 0.25
                 if ratio >= 1.0:
                     return min((ratio - 1.0) * 2, 1.0)  # 1.0→0, 1.5→1.0
                 else:
@@ -892,7 +893,7 @@ class RejectionBasedScanner:
             # 5. Check volume confirmation for each zone
             valid_zones = []
             for zone in rejection_zones:
-                # Check volume confirmation
+                # Check volume confirmation (futures volume is more accurate)
                 zone.volume_confirmation = self._check_volume_confirmation(tf_3m, zone.zone_type)
                 
                 # Only consider zones with volume confirmation
@@ -1035,7 +1036,7 @@ class RejectionBasedScanner:
             return None
     
     def _check_volume_confirmation(self, df: pd.DataFrame, zone_type: str) -> bool:
-        """Check volume confirmation at rejection zone"""
+        """Check volume confirmation at rejection zone (futures volume is more accurate)"""
         try:
             if len(df) < 5:
                 return False
@@ -1050,7 +1051,7 @@ class RejectionBasedScanner:
             if prev_volume > 0:
                 volume_ratio = recent_volume / prev_volume
                 
-                # Volume spike (1.5x or more) is confirmation
+                # Volume spike (1.5x or more) is confirmation - more reliable in futures
                 if volume_ratio >= 1.5:
                     return True
             
@@ -1214,8 +1215,8 @@ class RejectionBasedScanner:
         self.deduplicator.remove_closed_signals()
 
 # ================ MAIN SCANNER SYSTEM ================
-class RejectionScanner:
-    """Main scanner system for rejection-based trading"""
+class RejectionScannerFutures:
+    """Main scanner system for rejection-based trading with MEXC Futures"""
     
     def __init__(self):
         self.scanner = RejectionBasedScanner()
@@ -1226,8 +1227,10 @@ class RejectionScanner:
     async def initialize(self):
         """Initialize the scanner"""
         log.info("=" * 70)
-        log.info("🔥 REJECTION-BASED HIGH-FREQUENCY SCANNER")
+        log.info("🔥 REJECTION-BASED HIGH-FREQUENCY SCANNER (MEXC FUTURES)")
         log.info("=" * 70)
+        log.info("EXCHANGE: MEXC Futures - More accurate price discovery")
+        log.info("MARKET: Perpetual Futures - Institutional flow patterns")
         log.info("TRADER ROLE: Discretionary reaction trader")
         log.info("SPECIALTY: Wave-length awareness + Strength analysis + Rejection entries")
         log.info("PHILOSOPHY: Wave length sets context, Strength & volume make decision")
@@ -1242,7 +1245,7 @@ class RejectionScanner:
         # Initialize database
         await self._init_database()
         
-        # Initialize exchange
+        # Initialize exchange (MEXC Futures)
         await self._init_exchange()
         
         # Send startup message
@@ -1256,7 +1259,7 @@ class RejectionScanner:
             
             # Rejection signals table
             await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS rejection_signals (
+            CREATE TABLE IF NOT EXISTS rejection_signals_futures (
                 id TEXT PRIMARY KEY,
                 symbol TEXT NOT NULL,
                 side TEXT NOT NULL,
@@ -1301,7 +1304,7 @@ class RejectionScanner:
             
             # Performance table
             await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS performance_daily (
+            CREATE TABLE IF NOT EXISTS performance_daily_futures (
                 date DATE PRIMARY KEY,
                 total_rejections INTEGER,
                 long_rejections INTEGER,
@@ -1317,29 +1320,43 @@ class RejectionScanner:
             
             await self.db.commit()
             
-            log.info("✅ Database initialized")
+            log.info("✅ Database initialized for futures trading")
             
         except Exception as e:
             log.error(f"Database error: {e}")
             raise
     
     async def _init_exchange(self):
-        """Initialize exchange connection"""
+        """Initialize MEXC Futures exchange connection"""
         try:
-            self.exchange = ccxt.okx({
+            # MEXC Futures configuration
+            self.exchange = ccxt.mexc({
                 "enableRateLimit": True,
-                "options": {"defaultType": "spot"},
-                "timeout": 20000,
-                "rateLimit": 50
+                "options": {
+                    "defaultType": "swap",  # Futures/Swap market
+                    "defaultSubType": "linear",  # USDT-M futures
+                    "adjustForTimeDifference": True,
+                },
+                "timeout": 30000,
+                "rateLimit": 100,
             })
             
-            # Test connection
-            ticker = await self.exchange.fetch_ticker("BTC/USDT")
-            log.info(f"✅ Exchange connected. BTC: ${ticker['last']:.2f}")
+            # Test connection with futures ticker
+            futures_symbol = "BTC/USDT:USDT"  # USDT-M futures symbol
+            ticker = await self.exchange.fetch_ticker(futures_symbol)
+            
+            log.info(f"✅ MEXC Futures connected. BTC/USDT: ${ticker['last']:.2f}")
+            log.info(f"   Futures volume (24h): ${ticker['quoteVolume']:,.0f}")
+            log.info(f"   Bid/Ask: {ticker['bid']:.2f}/{ticker['ask']:.2f}")
             
         except Exception as e:
-            log.error(f"Exchange error: {e}")
-            raise
+            log.error(f"MEXC Futures error: {e}")
+            # Try alternative symbol format
+            try:
+                ticker = await self.exchange.fetch_ticker("BTC/USDT")
+                log.info(f"✅ Connected with alternative symbol. BTC: ${ticker['last']:.2f}")
+            except:
+                raise
     
     async def _send_startup_message(self):
         """Send startup message to Telegram"""
@@ -1350,27 +1367,34 @@ class RejectionScanner:
         try:
             message = f"""
 🎯 <b>REJECTION-BASED HIGH-FREQUENCY SCANNER</b>
+🔥 <b>MEXC FUTURES EDITION</b>
 
-<b>🧠 TRADER MINDSET:</b>
-• Reaction trader (not prediction-based)
-• Rejection specialist
-• Comfortable being wrong
-• Emotionless with losses
-• Hunts expansion, accepts losses
+<b>📊 بيانات العقود الآجلة:</b>
+• السوق: العقود الدائمة (Perpetual Futures)
+• المنصة: MEXC (اكتشاف سعر أكثر دقة)
+• السيولة: أعلى من السوق الفوري
+• الحجم: يمثل التدفق المؤسسي الحقيقي
 
-<b>📊 ANALYSIS FRAMEWORK:</b>
-1️⃣ <b>الطول الموجي (Wave Length)</b> → السياق فقط
+<b>🧠 عقلية التاجر:</b>
+• متداول تفاعلي (غير تنبؤي)
+• متخصص في الرفض
+• مرتاح مع الخسائر
+• بلا عواطف مع الصفقات
+• يصطاد التوسع، يقبل الخسائر
+
+<b>📊 إطار التحليل:</b>
+1️⃣ <b>الطول الموجي</b> → السياق فقط
    • طول الموجة ونضجها
    • سرعة التوسع
    • لا عد للموجات
 
-2️⃣ <b>القوة (Market Strength)</b> → قرار الدخول
+2️⃣ <b>القوة</b> → قرار الدخول
    • سرعة الشموع
    • المسافة المقطوعة
    • زاوية المتوسطات
-   • مشاركة الفوليوم
+   • مشاركة الفوليوم (دقيقة في العقود)
 
-3️⃣ <b>مناطق الرفض (Rejection Zones)</b> → الزناد الإجباري
+3️⃣ <b>مناطق الرفض</b> → الزناد الإجباري
    • الدخول عند الرفض فقط
    • دعم/مقاومة المتوسطات
    • أعلى/أقل النطاق
@@ -1396,7 +1420,7 @@ class RejectionScanner:
 القوة والفوليوم يحددان القرار
 والرفض هو الزناد
 
-#متداول_تفاعلي #تخصص_الرفض #صفقة_واحدة
+#متداول_تفاعلي #عقود_آجلة #تخصص_الرفض #صفقة_واحدة
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -1407,13 +1431,13 @@ class RejectionScanner:
                     "parse_mode": "HTML"
                 })
                 
-            log.info("✅ Startup message sent to Telegram")
+            log.info("✅ Startup message sent to Telegram (Futures Edition)")
                 
         except Exception as e:
             log.error(f"Telegram startup error: {e}")
     
     async def fetch_timeframe_data(self, symbol: str) -> Dict[str, pd.DataFrame]:
-        """Fetch data for all timeframes"""
+        """Fetch data for all timeframes from MEXC Futures"""
         data = {}
         
         for tf_name, tf in TIMEFRAMES.items():
@@ -1426,7 +1450,10 @@ class RejectionScanner:
                 else:  # 5M, 3M, 1M
                     limit = 50
                 
-                ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
+                # For futures, we need to use the proper symbol format
+                futures_symbol = self._get_futures_symbol(symbol)
+                
+                ohlcv = await self.exchange.fetch_ohlcv(futures_symbol, timeframe=tf, limit=limit)
                 
                 if ohlcv and len(ohlcv) >= 20:
                     df = pd.DataFrame(
@@ -1449,42 +1476,76 @@ class RejectionScanner:
         
         return data
     
+    def _get_futures_symbol(self, symbol: str) -> str:
+        """Convert spot symbol to futures symbol for MEXC"""
+        # MEXC futures symbols are typically like "BTC/USDT:USDT"
+        if symbol.endswith('/USDT'):
+            return f"{symbol}:USDT"
+        return symbol
+    
     async def get_active_pairs(self) -> List[Tuple[str, float]]:
-        """Get active trading pairs"""
+        """Get active futures trading pairs from MEXC"""
         try:
-            tickers = await self.exchange.fetch_tickers()
+            # Fetch futures markets
+            markets = await self.exchange.load_markets()
+            
             active_pairs = []
             
-            for symbol, ticker in tickers.items():
-                if symbol.endswith('/USDT'):
-                    volume = ticker.get('quoteVolume', 0)
+            for symbol, market in markets.items():
+                # Filter for USDT-M perpetual futures
+                if (market.get('type') == 'swap' and 
+                    market.get('settle') == 'USDT' and
+                    market.get('quote') == 'USDT' and
+                    '/USDT:' in symbol and
+                    market.get('active', False)):
                     
-                    if volume >= MIN_VOLUME_USD:
-                        # Check price spread for liquidity
-                        bid = ticker.get('bid', 0)
-                        ask = ticker.get('ask', 0)
+                    try:
+                        # Get ticker for volume
+                        ticker = await self.exchange.fetch_ticker(symbol)
+                        volume = ticker.get('quoteVolume', 0)
                         
-                        if bid > 0 and ask > 0:
-                            spread = (ask - bid) / bid * 100
-                            if spread < 0.1:  # Good liquidity
-                                active_pairs.append((symbol, volume))
+                        if volume >= MIN_VOLUME_USDT:
+                            # Check price spread for liquidity
+                            bid = ticker.get('bid', 0)
+                            ask = ticker.get('ask', 0)
+                            
+                            if bid > 0 and ask > 0:
+                                spread = (ask - bid) / bid * 100
+                                if spread < 0.1:  # Good liquidity
+                                    # Convert to simple symbol for display
+                                    simple_symbol = symbol.replace(':USDT', '')
+                                    active_pairs.append((simple_symbol, volume))
+                    
+                    except Exception as e:
+                        log.debug(f"Error getting ticker for {symbol}: {e}")
+                        continue
             
             # Sort by volume
             active_pairs.sort(key=lambda x: x[1], reverse=True)
             
             # Take top N
-            return active_pairs[:TOP_N_VOLUME]
+            top_pairs = active_pairs[:TOP_N_VOLUME]
+            log.info(f"Found {len(top_pairs)} active futures pairs (min volume: ${MIN_VOLUME_USDT:,.0f})")
+            
+            return top_pairs
             
         except Exception as e:
-            log.error(f"Error getting pairs: {e}")
-            return []
+            log.error(f"Error getting futures pairs: {e}")
+            # Fallback to major pairs
+            return [
+                ("BTC/USDT", 1000000000),
+                ("ETH/USDT", 500000000),
+                ("SOL/USDT", 300000000),
+                ("XRP/USDT", 200000000),
+                ("ADA/USDT", 150000000),
+            ]
     
     async def save_signal(self, signal: RejectionSignal) -> bool:
         """Save signal to database"""
         try:
             # Insert signal
             await self.db.execute("""
-                INSERT INTO rejection_signals (
+                INSERT INTO rejection_signals_futures (
                     id, symbol, side, entry_price, stop_loss, take_profit,
                     wave_length, wave_maturity, expansion_speed, structure_type,
                     candle_speed, distance_ratio, ema_angle, volume_participation, strength_score,
@@ -1521,11 +1582,11 @@ class RejectionScanner:
             
             await self.db.commit()
             
-            log.info(f"✅ Rejection signal saved: {signal.symbol}")
+            log.info(f"✅ Futures rejection signal saved: {signal.symbol}")
             return True
             
         except Exception as e:
-            log.error(f"Error saving signal: {e}")
+            log.error(f"Error saving futures signal: {e}")
             return False
     
     async def format_signal_message(self, signal: RejectionSignal) -> str:
@@ -1573,9 +1634,13 @@ class RejectionScanner:
         
         rejection_text = rejection_translation.get(signal.rejection_type, signal.rejection_type)
         
+        # Futures tag
+        futures_tag = "📈 <b>عقود آجلة - اكتشاف سعر دقيق</b>"
+        
         message = f"""
-{side_emoji} <b>إشارة رفض</b> ⚡
+{side_emoji} <b>إشارة رفض - عقود آجلة</b> ⚡
 
+{futures_tag}
 <b>{signal.symbol}</b> | {side_text}
 
 <b>📊 السياق الموجي:</b>
@@ -1583,7 +1648,7 @@ class RejectionScanner:
 • النضج: {signal.wave_context.wave_maturity:.1%}
 • سرعة التوسع: {signal.wave_context.expansion_speed:.1%}
 
-<b>💪 قوة السوق:</b>
+<b>💪 قوة السوق (عقود):</b>
 • درجة القوة: {signal.market_strength.strength_score:.1%}
 • النوع: {strength_text}
 • سرعة الشموع: {signal.market_strength.candle_speed:.1%}
@@ -1614,8 +1679,9 @@ class RejectionScanner:
 الدخول عند الرفض فقط
 لا مطاردة - لا توقع
 نقبل الخسائر - نصطاد التوسع
+<b>بيانات العقود الآجلة أكثر دقة</b>
 
-#{side_text} #رفض #{"دعم" if signal.side == "LONG" else "مقاومة"} #صفقة_واحدة
+#{side_text} #رفض #عقود_آجلة #{"دعم" if signal.side == "LONG" else "مقاومة"} #صفقة_واحدة
 """
         return message
     
@@ -1630,12 +1696,17 @@ class RejectionScanner:
             side_text = "شراء" if side == "LONG" else "بيع"
             
             message = f"""
-{side_emoji} <b>تم تنفيذ صفقة الرفض</b> ⚡
+{side_emoji} <b>تم تنفيذ صفقة الرفض - عقود آجلة</b> ⚡
 
 <b>{symbol}</b> | {side_text}
 
 <b>🎯 تم الدخول عند الرفض:</b>
 <code>{entry_price:.6f}</code>
+
+<b>📊 معلومات العقود:</b>
+• النوع: عقود دائمة (Perpetual)
+• البيانات: دقيقة (اكتشاف سعر مؤسسي)
+• الحجم: يمثل التدفق الحقيقي
 
 <b>🧠 عقلية التاجر:</b>
 • دخول مبكر عند أول رفض
@@ -1651,7 +1722,7 @@ class RejectionScanner:
 يتم متابعة الصفقة تلقائياً.
 ستصلك إشعار عند الوصول لوقف الخسارة أو هدف الربح.
 
-#{side_text} #تنفيذ_رفض #متابعة #لا_إشارات_جديدة
+#{side_text} #تنفيذ_رفض #عقود_آجلة #متابعة #لا_إشارات_جديدة
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -1662,7 +1733,7 @@ class RejectionScanner:
                     "parse_mode": "HTML"
                 })
             
-            log.info(f"{side_emoji} Rejection trade triggered: {symbol} {side} @ {entry_price:.4f}")
+            log.info(f"{side_emoji} Futures rejection trade triggered: {symbol} {side} @ {entry_price:.4f}")
             
         except Exception as e:
             log.error(f"Trigger notification error: {e}")
@@ -1676,7 +1747,7 @@ class RejectionScanner:
             return
         
         try:
-            log.info(f"📤 Sending close notification for {symbol}: {close_reason} ({pnl_percent:.2f}%)")
+            log.info(f"📤 Sending futures close notification for {symbol}: {close_reason} ({pnl_percent:.2f}%)")
             
             if close_reason == "TP_HIT":
                 emoji = "✅"
@@ -1703,14 +1774,14 @@ class RejectionScanner:
                 mindset = "الخسارة مقبولة ❌ الرفض لم يحترم، ننتظر الرفض التالي"
             
             message = f"""
-{emoji} <b>تم إغلاق صفقة الرفض</b> {result_emoji}
+{emoji} <b>تم إغلاق صفقة الرفض - عقود آجلة</b> {result_emoji}
 
 <b>{symbol}</b> | {side_text}
 
 {color} <b>النتيجة: {result_text}</b>
 {pnl_emoji} <b>النسبة: {pnl_formatted}</b>
 
-<b>📊 تفاصيل التنفيذ:</b>
+<b>📊 تفاصيل التنفيذ (عقود):</b>
 • نوع الدخول: {side_text} (عند الرفض)
 • سعر الدخول: <code>{entry_price:.6f}</code>
 • سعر الإغلاق: <code>{close_price:.6f}</code>
@@ -1721,12 +1792,13 @@ class RejectionScanner:
 {mindset}
 نقبل الخسائر - نصطاد التوسع
 كل رفض هو فرصة جديدة
+<b>بيانات العقود أكثر دقة للتحليل القادم</b>
 
 <b>🛡️ نظام التكرار:</b>
 ✅ <b>مسموح الآن</b> بإرسال إشارات جديدة لـ {symbol}
 يمكن للماسح الضوئي البحث عن رفض جديد لهذه العملة
 
-#{side_text} #إغلاق_رفض #{"ربح" if close_reason == "TP_HIT" else "خسارة"} #مسموح_إشارات_جديدة
+#{side_text} #إغلاق_رفض #عقود_آجلة #{"ربح" if close_reason == "TP_HIT" else "خسارة"} #مسموح_إشارات_جديدة
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -1738,11 +1810,11 @@ class RejectionScanner:
                 })
                 
                 if response.status_code == 200:
-                    log.info(f"✅ Telegram close notification sent for {symbol}: {close_reason}")
+                    log.info(f"✅ Futures Telegram close notification sent for {symbol}: {close_reason}")
                 else:
                     log.error(f"❌ Telegram API error: {response.status_code} - {response.text}")
             
-            log.info(f"{emoji} Rejection trade closed: {symbol} {side} {pnl_formatted} ({close_reason})")
+            log.info(f"{emoji} Futures rejection trade closed: {symbol} {side} {pnl_formatted} ({close_reason})")
             
         except Exception as e:
             log.error(f"Close notification error: {e}")
@@ -1764,32 +1836,33 @@ class RejectionScanner:
                     "parse_mode": "HTML"
                 })
                 
-            log.info(f"📤 Telegram rejection alert sent: {signal.symbol}")
+            log.info(f"📤 Futures Telegram rejection alert sent: {signal.symbol}")
             
         except Exception as e:
             log.error(f"Telegram error: {e}")
     
     async def monitor_positions(self):
         """Monitor and close positions with trade-based deduplication - FIXED VERSION"""
-        log.info("👀 Starting position monitoring with Telegram notifications...")
+        log.info("👀 Starting futures position monitoring with Telegram notifications...")
         
         while True:
             try:
                 # Get ALL open positions (both pending and triggered)
                 async with self.db.execute("""
                     SELECT id, symbol, side, entry_price, stop_loss, take_profit, status
-                    FROM rejection_signals 
+                    FROM rejection_signals_futures 
                     WHERE status IN ('PENDING', 'TRIGGERED')
                 """) as cursor:
                     positions = await cursor.fetchall()
                 
                 if positions:
-                    log.debug(f"📊 Monitoring {len(positions)} open positions")
+                    log.debug(f"📊 Monitoring {len(positions)} open futures positions")
                 
                 for pos_id, symbol, side, entry, sl, tp, status in positions:
                     try:
-                        # Get current price
-                        ticker = await self.exchange.fetch_ticker(symbol)
+                        # Get current price from futures market
+                        futures_symbol = self._get_futures_symbol(symbol)
+                        ticker = await self.exchange.fetch_ticker(futures_symbol)
                         current_price = ticker['last']
                         
                         # For PENDING positions: check if price reached entry
@@ -1799,7 +1872,7 @@ class RejectionScanner:
                             if abs(current_price - entry) / entry <= 0.005:  # 0.5% zone
                                 # Mark as triggered
                                 await self.db.execute("""
-                                    UPDATE rejection_signals SET 
+                                    UPDATE rejection_signals_futures SET 
                                         status = 'TRIGGERED',
                                         triggered_at = CURRENT_TIMESTAMP,
                                         trigger_price = ?
@@ -1814,7 +1887,7 @@ class RejectionScanner:
                                 # SEND TRIGGER NOTIFICATION
                                 await self.send_trade_trigger_notification(symbol, side, current_price)
                                 
-                                log.info(f"✅ Rejection position triggered: {symbol} {side} @ {current_price:.4f}")
+                                log.info(f"✅ Futures rejection position triggered: {symbol} {side} @ {current_price:.4f}")
                                 continue  # Skip SL/TP check for this cycle
                         
                         # Check SL/TP for ALL positions (including newly triggered ones)
@@ -1840,14 +1913,14 @@ class RejectionScanner:
                         if close_reason:
                             # Get risk_reward from database
                             async with self.db.execute("""
-                                SELECT risk_reward FROM rejection_signals WHERE id = ?
+                                SELECT risk_reward FROM rejection_signals_futures WHERE id = ?
                             """, (pos_id,)) as cursor:
                                 row = await cursor.fetchone()
                                 risk_reward = row[0] if row else 0
                             
                             # Update database
                             await self.db.execute("""
-                                UPDATE rejection_signals SET 
+                                UPDATE rejection_signals_futures SET 
                                     status = 'CLOSED',
                                     closed_at = CURRENT_TIMESTAMP,
                                     close_price = ?,
@@ -1864,7 +1937,7 @@ class RejectionScanner:
                             # Clean up from tracking
                             self.scanner.active_signal_ids.discard(pos_id)
                             
-                            # SEND CLOSE NOTIFICATION - THIS WAS MISSING
+                            # SEND CLOSE NOTIFICATION
                             await self.send_trade_close_notification(
                                 symbol=symbol,
                                 side=side,
@@ -1875,7 +1948,7 @@ class RejectionScanner:
                                 risk_reward=risk_reward
                             )
                             
-                            log.info(f"📤 Telegram close notification sent for {symbol}: {close_reason} ({pnl_percent:.2f}%)")
+                            log.info(f"📤 Futures Telegram close notification sent for {symbol}: {close_reason} ({pnl_percent:.2f}%)")
                     
                     except Exception as e:
                         log.error(f"Monitor error for {symbol}: {e}")
@@ -1893,25 +1966,25 @@ class RejectionScanner:
                 await asyncio.sleep(5)
     
     async def high_freq_scanning(self):
-        """Main high-frequency scanning loop for rejections"""
-        log.info("🚀 Starting rejection-based high-frequency scanning...")
+        """Main high-frequency scanning loop for futures rejections"""
+        log.info("🚀 Starting futures rejection-based high-frequency scanning...")
         
         while True:
             try:
                 self.scan_cycle += 1
                 start_time = time.time()
                 
-                log.info(f"🔄 Scan cycle #{self.scan_cycle} (Rejection hunting)")
+                log.info(f"🔄 Futures scan cycle #{self.scan_cycle} (Rejection hunting)")
                 
-                # Get active pairs
+                # Get active futures pairs
                 pairs = await self.get_active_pairs()
                 
                 if not pairs:
-                    log.warning("No active pairs found")
+                    log.warning("No active futures pairs found")
                     await asyncio.sleep(SCAN_INTERVAL)
                     continue
                 
-                log.info(f"Scanning {len(pairs)} active pairs for rejections")
+                log.info(f"Scanning {len(pairs)} active futures pairs for rejections")
                 
                 signals_found = 0
                 pairs_processed = 0
@@ -1919,7 +1992,7 @@ class RejectionScanner:
                 # Ultra-fast scanning for rejections
                 for symbol, volume in pairs:
                     try:
-                        # Fetch data
+                        # Fetch futures data
                         multi_tf_data = await self.fetch_timeframe_data(symbol)
                         
                         # Need key timeframes for rejection analysis
@@ -1946,7 +2019,7 @@ class RejectionScanner:
                         await asyncio.sleep(0.01)  # 10ms between pairs
                         
                     except Exception as e:
-                        log.debug(f"Pair error {symbol}: {str(e)[:50]}")
+                        log.debug(f"Futures pair error {symbol}: {str(e)[:50]}")
                         continue
                 
                 # Update scanner stats
@@ -1956,25 +2029,25 @@ class RejectionScanner:
                 active_count = len(self.scanner.deduplicator.active_signals)
                 stats = self.scanner.get_daily_stats()
                 
-                log.info(f"📊 Rejection stats: Found {signals_found}, Active: {active_count}")
+                log.info(f"📊 Futures rejection stats: Found {signals_found}, Active: {active_count}")
                 log.info(f"   Filtered: {stats.get('rejections_filtered', 0)}, "
                         f"No strength: {stats.get('no_strength', 0)}, "
                         f"No zone: {stats.get('no_rejection_zone', 0)}")
                 
                 scan_duration = time.time() - start_time
-                log.info(f"Scan #{self.scan_cycle}: {signals_found} rejections in {scan_duration:.2f}s")
+                log.info(f"Futures Scan #{self.scan_cycle}: {signals_found} rejections in {scan_duration:.2f}s")
                 
                 # Log detailed stats periodically
                 if self.scan_cycle % 20 == 0:
-                    log.info(f"📈 Detailed stats: {stats}")
+                    log.info(f"📈 Futures detailed stats: {stats}")
                 
                 # Wait for next scan (very fast for rejection hunting)
                 wait_time = max(0.1, SCAN_INTERVAL - scan_duration)
-                log.info(f"Next rejection hunt in {wait_time:.1f}s...")
+                log.info(f"Next futures rejection hunt in {wait_time:.1f}s...")
                 await asyncio.sleep(wait_time)
                 
             except Exception as e:
-                log.error(f"Scanning loop error: {e}")
+                log.error(f"Futures scanning loop error: {e}")
                 await asyncio.sleep(10)
     
     async def run(self):
@@ -1989,13 +2062,13 @@ class RejectionScanner:
             )
             
         except KeyboardInterrupt:
-            log.info("Rejection scanner stopped by user")
+            log.info("Futures rejection scanner stopped by user")
             
             # Send final stats
             await self.send_final_stats()
             
         except Exception as e:
-            log.error(f"Scanner crashed: {e}")
+            log.error(f"Futures scanner crashed: {e}")
             
         finally:
             await self.cleanup()
@@ -2025,9 +2098,9 @@ class RejectionScanner:
                 found_pct = filtered_pct = no_strength_pct = no_zone_pct = 0
             
             message = f"""
-🛑 <b>تم إيقاف ماسح الرفض</b>
+🛑 <b>تم إيقاف ماسح الرفض للعقود الآجلة</b>
 
-<b>📊 إحصائيات اليوم:</b>
+<b>📊 إحصائيات اليوم (عقود):</b>
 • عمليات المسح: {self.scan_cycle}
 • الأزواج الممسوحة: {stats['pairs_scanned']}
 • حالات الرفض التي تم العثور عليها: {stats['rejections_found']} ({found_pct:.1f}%)
@@ -2040,7 +2113,13 @@ class RejectionScanner:
 • بدون منطقة رفض: {stats.get('no_rejection_zone', 0)} ({no_zone_pct:.1f}%)
 
 <b>⚡ الصفقات النشطة:</b>
-• حالياً: {active_count} صفقة نشطة
+• حالياً: {active_count} صفقة عقود نشطة
+
+<b>🎯 مزايا العقود الآجلة:</b>
+• اكتشاف سعر أكثر دقة
+• حجم يمثل التدفق المؤسسي
+• سيولة أعلى للدخول والخروج
+• أنماط تداول الرافعة المالية واضحة
 
 <b>🧠 فلسفة التاجر المحققة:</b>
 الطول الموجي ← السياق
@@ -2054,7 +2133,7 @@ class RejectionScanner:
 • قبول الخسائر
 • صيد التوسع
 
-#إحصائيات_الرفض #متداول_تفاعلي #صفقة_واحدة
+#إحصائيات_الرفض #عقود_آجلة #متداول_تفاعلي #صفقة_واحدة
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -2065,7 +2144,7 @@ class RejectionScanner:
                     "parse_mode": "HTML"
                 })
                 
-            log.info("✅ Final stats sent to Telegram")
+            log.info("✅ Final futures stats sent to Telegram")
                 
         except Exception as e:
             log.error(f"Final stats error: {e}")
@@ -2075,11 +2154,11 @@ class RejectionScanner:
         try:
             if self.exchange:
                 await self.exchange.close()
-                log.info("Exchange closed")
+                log.info("MEXC Futures exchange closed")
             
             if self.db:
                 await self.db.close()
-                log.info("Database closed")
+                log.info("Futures database closed")
                 
         except Exception as e:
             log.error(f"Cleanup error: {e}")
@@ -2111,7 +2190,8 @@ async def start_http_server(scanner, port=8000):
                 
                 response = json.dumps({
                     "status": "running",
-                    "scanner": "Rejection-Based High-Frequency Scanner",
+                    "scanner": "Rejection-Based High-Frequency Scanner (MEXC Futures)",
+                    "market": "Perpetual Futures - More accurate price discovery",
                     "scan_cycle": scanner.scan_cycle,
                     "active_trades": active_count,
                     "daily_stats": stats,
@@ -2120,7 +2200,8 @@ async def start_http_server(scanner, port=8000):
                         "specialty": "Wave-length awareness + Strength analysis + Rejection entries",
                         "philosophy": "Wave length sets context, Strength & volume make decision, Rejection pulls trigger",
                         "entry_rule": "Trade ONLY at rejection zones",
-                        "frequency": "High frequency + asymmetric payoff"
+                        "frequency": "High frequency + asymmetric payoff",
+                        "data_source": "MEXC Futures - Institutional flow patterns"
                     },
                     "telegram": {
                         "configured": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID),
@@ -2131,19 +2212,19 @@ async def start_http_server(scanner, port=8000):
             elif path == '/stats':
                 response = json.dumps(scanner.scanner.get_daily_stats(), indent=2)
             
-            elif path == '/mindset':
+            elif path == '/futures':
                 response = json.dumps({
-                    "trader_role": "Professional discretionary crypto trader",
-                    "specialization": "Wave-length awareness, strength analysis, rejection-based entries",
-                    "trades": "Both LONG and SHORT symmetrically",
-                    "philosophy": "Accept losses, hunt expansion",
-                    "wave_length": "Context only - no Elliott wave counting",
-                    "market_strength": "Measure speed, distance, EMA angle, volume participation",
-                    "rejection_zones": "Trade ONLY at rejection zones (EMA, Range, Failed breaks)",
-                    "entry_conditions": "RSI zones (40-50 LONG, 50-60 SHORT) + Volume confirmation",
-                    "entry_philosophy": "Enter on first strong rejection candle, early entries are intentional",
-                    "frequency_rule": "High frequency + asymmetric payoff",
-                    "mindset": "Reaction trader, rejection specialist, not prediction-based, comfortable being wrong"
+                    "exchange": "MEXC Futures",
+                    "market_type": "Perpetual Swap (USDT-M)",
+                    "advantages": [
+                        "More accurate price discovery",
+                        "Higher liquidity",
+                        "Institutional flow patterns",
+                        "Better volume data",
+                        "Clear leverage trading patterns"
+                    ],
+                    "symbol_format": "BTC/USDT:USDT",
+                    "min_volume": f"${MIN_VOLUME_USDT:,.0f}"
                 }, indent=2)
             
             elif path == '/recent':
@@ -2153,7 +2234,7 @@ async def start_http_server(scanner, port=8000):
                         SELECT symbol, side, entry_price, zone_type, rejection_type,
                                rejection_strength, risk_reward, expected_move, 
                                created_at, status, close_reason, pnl_percent
-                        FROM rejection_signals 
+                        FROM rejection_signals_futures 
                         ORDER BY created_at DESC 
                         LIMIT 20
                     """) as cursor:
@@ -2188,7 +2269,7 @@ async def start_http_server(scanner, port=8000):
 async def main():
     """Main function"""
     # Create scanner
-    scanner = RejectionScanner()
+    scanner = RejectionScannerFutures()
     
     # Start HTTP server in background
     http_task = asyncio.create_task(start_http_server(scanner))
