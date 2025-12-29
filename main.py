@@ -1163,12 +1163,7 @@ class RejectionBasedScanner:
                 log.debug(f"{symbol}: RSI not in SHORT zone ({current_rsi:.1f})")
                 return None
             
-            # 9. TRADE-BASED DEDUPLICATION CHECK
-            if not self.deduplicator.should_generate_signal(symbol, side, current_price):
-                self.daily_stats["rejections_filtered"] += 1
-                return None
-            
-            # 10. Analyze candle for rejection confirmation WITH HOLD VALIDATION
+            # 9. Analyze candle for rejection confirmation WITH HOLD VALIDATION
             rejection_type, trigger_candle, hold_valid, hold_reason, candles_held = \
                 self._analyze_rejection_candle_with_hold(tf_3m, side, best_zone)
             
@@ -1186,6 +1181,11 @@ class RejectionBasedScanner:
                 return None
             
             log.info(f"✅ {symbol}: Rejection HOLD confirmed ({hold_reason}, {candles_held} candles)")
+            
+            # 10. TRADE-BASED DEDUPLICATION CHECK (AFTER HOLD VALIDATION)
+            if not self.deduplicator.should_generate_signal(symbol, side, current_price):
+                log.debug(f"{symbol}: Active signal exists - skipping")
+                return None
             
             # 11. Calculate entry, SL, TP (asymmetric payoff)
             stop_loss_pct = np.random.uniform(0.5, MAX_STOP_LOSS_PCT)
@@ -1505,6 +1505,20 @@ class RejectionScanner:
                 close_reason TEXT
             )
             """)
+            
+            # Check and add missing columns if needed
+            try:
+                # Try to select from the table to see if it exists with all columns
+                await self.db.execute("SELECT hold_candles FROM rejection_signals LIMIT 1")
+            except aiosqlite.OperationalError as e:
+                if "no such column: hold_candles" in str(e):
+                    log.info("⚠️ Database missing hold validation columns, adding them...")
+                    # Add missing columns
+                    await self.db.execute("ALTER TABLE rejection_signals ADD COLUMN hold_candles INTEGER DEFAULT 0")
+                    await self.db.execute("ALTER TABLE rejection_signals ADD COLUMN hold_validated BOOLEAN DEFAULT FALSE")
+                    await self.db.execute("ALTER TABLE rejection_signals ADD COLUMN hold_reason TEXT DEFAULT 'UNKNOWN'")
+                    await self.db.commit()
+                    log.info("✅ Added hold validation columns to database")
             
             # Performance table
             await self.db.execute("""
