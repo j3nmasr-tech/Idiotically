@@ -30,7 +30,7 @@ DB_PATH = "/app/data/rejection_scanner_futures.db"
 
 # Ultra high-frequency scanning - REACTION TRADING
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 25))   # 5 seconds - ULTRA FAST FOR REJECTIONS
-TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 150))    # Reduced for futures (more liquid)
+TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 100))    # Reduced for futures (more liquid)
 MIN_VOLUME_USDT = 1000000  # $1M minimum for futures (more accurate)
 
 # Trading parameters (REJECTION-BASED)
