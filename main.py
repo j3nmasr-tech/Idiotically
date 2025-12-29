@@ -2,10 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-🔥 REJECTION-BASED HIGH-FREQUENCY SCANNER
-Professional discretionary trading system
-Wave-length awareness + Strength analysis + Rejection entries
-TRADER MINDSET: Reaction-based, rejection specialist
+🔥 CONFIRMED REJECTION SYSTEM
+Professional discretionary trading system - FIXED VERSION
+Wave-length awareness + Strength analysis + CONFIRMED REJECTION entries
+TRADER MINDSET: Reaction-based, CONFIRMED rejection specialist
+CORRECTED: No early entry - Only after failure + strength shift
 """
 
 import os
@@ -23,47 +24,47 @@ from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 import json
 
-# ================ HIGH-FREQUENCY CONFIG ================
+# ================ CONFIRMED REJECTION CONFIG ================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-DB_PATH = "/app/data/rejection_scanner.db"
+DB_PATH = "/app/data/confirmed_rejection.db"
 
-# Ultra high-frequency scanning - REACTION TRADING
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 5))   # 5 seconds - ULTRA FAST FOR REJECTIONS
-TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 100))   # Scan many pairs
-MIN_VOLUME_USD = 500000  # $500K minimum - more opportunities
+# Scanning - CONFIRMED REJECTION TRADING
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 5))
+TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 100))
+MIN_VOLUME_USD = 500000
 
-# Trading parameters (REJECTION-BASED)
-MAX_STOP_LOSS_PCT = 1.0    # 1% maximum stop loss
-MIN_TARGET_PCT = 1.5       # 1.5% minimum target (asymmetric payoff)
-MAX_TARGET_PCT = 4.0       # 4% maximum target
-MIN_RISK_REWARD = 2.0      # Minimum 1:2 risk/reward
+# Trading parameters (CONFIRMED REJECTION)
+MAX_STOP_LOSS_PCT = 1.0
+MIN_TARGET_PCT = 1.5
+MAX_TARGET_PCT = 4.0
+MIN_RISK_REWARD = 2.0
 
-# Rejection scanning
-REJECTION_CONFIG = {
-    "rsi_long_zone": (40, 50),      # RSI 40-50 for LONG entries
-    "rsi_short_zone": (50, 60),     # RSI 50-60 for SHORT entries
-    "ema_distance_threshold": 0.5,  # 0.5% from EMA for rejection
-    "min_rejection_strength": 0.6,  # Minimum rejection strength score
+# CONFIRMED REJECTION scanning - CRITICAL CHANGE
+CONFIRMED_REJECTION_CONFIG = {
+    "rsi_failure_required": True,
+    "min_failure_candle_strength": 0.7,
+    "min_trigger_candle_strength": 0.8,
+    "volume_ratio_required": 1.3,
+    "price_confirmation_required": True,
+    "two_candle_confirmation": True,
 }
 
-# Timeframes for REACTION TRADING
+# Timeframes for CONFIRMED REJECTION TRADING
 TIMEFRAMES = {
-    "1H": "1h",      # Wave length context ONLY
-    "15M": "15m",    # Strength and structure
-    "5M": "5m",      # Primary rejection analysis
-    "3M": "3m",      # Fast trigger (MAIN)
-    "1M": "1m"       # Entry timing (ULTRA FAST)
+    "1H": "1h",
+    "15M": "15m",
+    "5M": "5m",
+    "3M": "3m",
+    "1M": "1m"
 }
 
-# EMA periods for rejection detection
 EMA_PERIODS = {
     "fast": 9,
     "medium": 21,
     "slow": 50
 }
 
-# RSI settings for rejection zones
 RSI_PERIOD = 14
 RSI_OVERBOUGHT = 70
 RSI_OVERSOLD = 30
@@ -72,44 +73,91 @@ RSI_OVERSOLD = 30
 @dataclass
 class WaveContext:
     """Wave length and maturity context - NO WAVE COUNTING"""
-    wave_length: str           # SHORT, MEDIUM, EXTENDED
-    wave_maturity: float       # 0-1 (0=early, 1=exhausted)
-    expansion_speed: float     # 0-1 (slow to fast)
-    structure_type: str        # IMPULSIVE, CORRECTIVE, COMPRESSION
-    context_side: str          # BULLISH_CONTEXT, BEARISH_CONTEXT, NEUTRAL
+    wave_length: str
+    wave_maturity: float
+    expansion_speed: float
+    structure_type: str
+    context_side: str
 
 @dataclass
 class MarketStrength:
     """Market strength analysis"""
-    candle_speed: float        # 0-1 (slow to fast)
-    distance_ratio: float      # Distance traveled / time
-    ema_angle: float           # EMA slope angle in degrees
-    volume_participation: float # 0-1 volume participation
-    strength_score: float      # 0-1 overall strength
+    candle_speed: float
+    distance_ratio: float
+    ema_angle: float
+    volume_participation: float
+    strength_score: float
     
     # Interpretation flags
-    is_continuation: bool      # Strong move + strong volume
-    is_rejection_setup: bool   # Strong move + weak volume
-    is_absorption: bool        # Weak move + rising volume
-    is_compression: bool       # Flat price + compression
+    is_continuation: bool
+    is_rejection_setup: bool
+    is_absorption: bool
+    is_compression: bool
 
 @dataclass
 class RejectionZone:
     """Key rejection area analysis"""
-    zone_type: str             # EMA_SUPPORT, EMA_RESISTANCE, RANGE_LOW, RANGE_HIGH, 
-                               # FAILED_BREAKDOWN, FAILED_BREAKOUT, DEMAND, SUPPLY
+    zone_type: str
     price_level: float
-    strength: float            # 0-1 rejection strength
-    volume_confirmation: bool  # Volume spike at rejection
-    rsi_position: str          # IN_ZONE, OVEREXTENDED, NEUTRAL
-    is_active: bool           # Currently being rejected
+    strength: float
+    volume_confirmation: bool
+    rsi_position: str
+    is_active: bool
 
 @dataclass
-class RejectionSignal:
-    """Rejection-based trade signal"""
+class FailureCandle:
+    """Failure candle at rejection zone"""
+    candle_type: str
+    strength: float
+    volume_weakness: bool
+    rsi_failure: bool
+    body_ratio: float
+    close_position: str
+    
+    # Critical failure signs
+    has_long_wick: bool
+    failed_break: bool
+    momentum_halt: bool
+
+@dataclass
+class TriggerCandle:
+    """Trigger candle (strength shift)"""
+    candle_type: str
+    strength: float
+    volume_confirmation: bool
+    direction: str
+    
+    # Entry criteria
+    close_near_extreme: bool
+    body_dominance: float
+    speed_increase: bool
+    
+    # RSI confirmation
+    rsi_slope_change: bool
+    rsi_divergence: bool
+
+@dataclass
+class ConfirmedRejection:
+    """Confirmed rejection (failure + trigger)"""
+    failure_candle: FailureCandle
+    trigger_candle: TriggerCandle
+    confirmation_score: float
+    is_valid: bool
+    
+    # Timing
+    failure_timestamp: float
+    trigger_timestamp: float
+    timeframe_pair: Tuple[str, str]
+    
+    # Conditions met
+    conditions_met: List[str]
+
+@dataclass
+class ConfirmedRejectionSignal:
+    """CONFIRMED rejection-based trade signal"""
     signal_id: str
     symbol: str
-    side: str                  # LONG, SHORT
+    side: str
     
     # Price levels
     entry_price: float
@@ -121,20 +169,23 @@ class RejectionSignal:
     market_strength: MarketStrength
     rejection_zone: RejectionZone
     
-    # Entry triggers
-    rejection_type: str        # EMA_REJECTION, RANGE_REJECTION, FAILED_BREAKOUT
-    trigger_candle: str        # REJECTION_CANDLE, WICK_CONFIRMATION, MOMENTUM_SHIFT
-    rsi_at_entry: float
+    # CONFIRMED REJECTION STRUCTURE
+    confirmed_rejection: ConfirmedRejection
+    entry_reason: str
     
     # Metrics
-    rejection_strength: float  # 0-1 how strong the rejection is
+    rejection_strength: float
     risk_reward: float
     expected_move_pct: float
     
     # Timing
-    timeframe_used: str        # Which TF triggered entry
+    failure_timeframe: str
+    trigger_timeframe: str
     signal_timestamp: float
-    conditions_met: List[str]  # Which rejection conditions triggered
+    
+    # Entry validation
+    passed_no_entry_filters: bool
+    early_entry_prevented: bool
 
 # ================ PROFESSIONAL LOGGING ================
 logging.basicConfig(
@@ -142,48 +193,43 @@ logging.basicConfig(
     format='%(asctime)s | %(levelname)8s | %(name)s | %(message)s',
     datefmt='%H:%M:%S'
 )
-log = logging.getLogger("rejection_scanner")
+log = logging.getLogger("confirmed_rejection_scanner")
 
-# ================ CORE REJECTION ENGINE ================
-class RejectionBasedScanner:
-    """High-frequency rejection scanner - REACTION TRADING"""
+# ================ CORE CONFIRMED REJECTION ENGINE ================
+class ConfirmedRejectionScanner:
+    """High-frequency CONFIRMED rejection scanner - FIXED VERSION"""
     
     class SignalDeduplicator:
         """Prevents duplicate signal generation - TRADE-BASED"""
         
         def __init__(self):
-            self.active_signals = {}  # symbol: signal_id (only one active per symbol)
-            self.signal_status = {}   # signal_id: {"symbol", "side", "price", "status"}
+            self.active_signals = {}
+            self.signal_status = {}
         
         def should_generate_signal(self, symbol: str, side: str, price: float) -> bool:
-            """Check if we should generate a new signal - TRADE-BASED"""
+            """Check if we should generate a new signal"""
             
-            # Check if symbol already has an active signal
             if symbol in self.active_signals:
                 signal_id = self.active_signals[symbol]
                 
-                # Check signal status
                 if signal_id in self.signal_status:
                     status = self.signal_status[signal_id].get("status", "UNKNOWN")
                     
-                    # Only allow new signal if previous is CLOSED
                     if status != "CLOSED":
                         log.debug(f"{symbol}: Active {side} signal exists (status: {status})")
                         return False
             
             return True
         
-        def register_signal(self, signal: RejectionSignal):
+        def register_signal(self, signal: ConfirmedRejectionSignal):
             """Register a new signal"""
             symbol = signal.symbol
             
-            # Remove any previous active signal for this symbol
             if symbol in self.active_signals:
                 old_signal_id = self.active_signals[symbol]
                 if old_signal_id in self.signal_status:
                     del self.signal_status[old_signal_id]
             
-            # Register new signal as PENDING
             self.active_signals[symbol] = signal.signal_id
             self.signal_status[signal.signal_id] = {
                 "symbol": symbol,
@@ -193,34 +239,31 @@ class RejectionBasedScanner:
                 "timestamp": signal.signal_timestamp
             }
             
-            log.debug(f"Registered rejection signal {signal.signal_id[:8]} for {symbol}")
+            log.debug(f"Registered confirmed signal {signal.signal_id[:8]} for {symbol}")
         
         def update_signal_status(self, signal_id: str, status: str):
-            """Update signal status (PENDING → TRIGGERED → CLOSED)"""
+            """Update signal status"""
             if signal_id in self.signal_status:
                 self.signal_status[signal_id]["status"] = status
                 log.debug(f"Signal {signal_id[:8]} status updated to {status}")
                 
-                # If CLOSED, mark as ready for new signals
                 if status == "CLOSED":
                     symbol = self.signal_status[signal_id]["symbol"]
-                    log.info(f"✅ Signal {signal_id[:8]} for {symbol} CLOSED - Ready for new rejections")
+                    log.info(f"✅ Signal {signal_id[:8]} for {symbol} CLOSED - Ready for new confirmations")
         
         def remove_closed_signals(self):
-            """Clean up closed signals to free memory"""
+            """Clean up closed signals"""
             current_time = time.time()
             closed_signal_ids = []
             
             for signal_id, data in list(self.signal_status.items()):
                 if data.get("status") == "CLOSED":
-                    # Remove if closed more than 1 hour ago
                     if current_time - data.get("timestamp", 0) > 3600:
                         closed_signal_ids.append(signal_id)
             
             for signal_id in closed_signal_ids:
                 symbol = self.signal_status[signal_id]["symbol"]
                 
-                # Only remove from active_signals if it's the current one
                 if self.active_signals.get(symbol) == signal_id:
                     del self.active_signals[symbol]
                 
@@ -229,24 +272,23 @@ class RejectionBasedScanner:
     
     def __init__(self):
         self.daily_stats = {
-            "rejections_found": 0,
-            "long_rejections": 0,
-            "short_rejections": 0,
-            "pairs_scanned": 0,
-            "rejections_filtered": 0,
-            "no_strength": 0,
-            "no_rejection_zone": 0
+            "rejections_detected": 0,
+            "failures_confirmed": 0,
+            "confirmed_signals": 0,
+            "early_entries_prevented": 0,
+            "no_trigger_candle": 0,
+            "no_strength_shift": 0,
+            "volume_failed": 0,
+            "rsi_no_failure": 0,
+            "pairs_scanned": 0
         }
         self.deduplicator = self.SignalDeduplicator()
         self.active_signal_ids = set()
     
-    # ========== WAVE LENGTH ANALYSIS (CONTEXT ONLY) ==========
+    # ========== WAVE CONTEXT ANALYSIS ==========
     
     def analyze_wave_context(self, df_1h: pd.DataFrame, df_15m: pd.DataFrame) -> WaveContext:
-        """
-        Analyze wave length and maturity - NO WAVE COUNTING
-        Determine context only
-        """
+        """Analyze wave context"""
         try:
             if df_1h is None or df_15m is None:
                 return self._get_default_wave_context()
@@ -254,16 +296,16 @@ class RejectionBasedScanner:
             if len(df_1h) < 20 or len(df_15m) < 30:
                 return self._get_default_wave_context()
             
-            # 1. Analyze wave length on 1H
+            # Wave length analysis
             wave_length, wave_maturity = self._analyze_wave_length(df_1h)
             
-            # 2. Analyze expansion speed on 15M
+            # Expansion speed
             expansion_speed = self._analyze_expansion_speed(df_15m)
             
-            # 3. Determine structure type
+            # Structure type
             structure_type = self._determine_structure(df_15m)
             
-            # 4. Determine context side (not trade direction, just context)
+            # Context side
             context_side = self._determine_context_side(df_1h, df_15m)
             
             return WaveContext(
@@ -284,17 +326,13 @@ class RejectionBasedScanner:
             if len(df) < 30:
                 return "MEDIUM", 0.5
             
-            # Get recent price move
             recent_prices = df['close'].values[-30:]
-            
-            # Calculate total move length
             total_move = abs(recent_prices[-1] - recent_prices[0])
             avg_candle_size = np.mean(np.abs(np.diff(recent_prices)))
             
             if avg_candle_size == 0:
                 return "MEDIUM", 0.5
             
-            # Wave length classification
             move_ratio = total_move / avg_candle_size
             
             if move_ratio < 15:
@@ -304,8 +342,7 @@ class RejectionBasedScanner:
             else:
                 wave_length = "EXTENDED"
             
-            # Wave maturity (0=early, 1=exhausted)
-            # Based on distance from moving average and volatility
+            # Wave maturity
             ma_20 = np.mean(recent_prices[-20:])
             current_price = recent_prices[-1]
             volatility = np.std(recent_prices[-20:])
@@ -313,24 +350,21 @@ class RejectionBasedScanner:
             if volatility > 0:
                 distance_pct = abs(current_price - ma_20) / ma_20 * 100
                 volatility_pct = volatility / ma_20 * 100
-                
-                # Normalize maturity
                 wave_maturity = min(distance_pct / (volatility_pct * 2), 1.0)
             else:
                 wave_maturity = 0.5
             
             return wave_length, wave_maturity
             
-        except Exception as e:
+        except Exception:
             return "MEDIUM", 0.5
     
     def _analyze_expansion_speed(self, df: pd.DataFrame) -> float:
-        """Analyze expansion speed (0=slow, 1=fast)"""
+        """Analyze expansion speed"""
         try:
             if len(df) < 10:
                 return 0.5
             
-            # Calculate candle speeds (absolute percentage changes)
             candles = df.iloc[-10:]
             candle_speeds = []
             
@@ -345,18 +379,15 @@ class RejectionBasedScanner:
                 return 0.5
             
             avg_speed = np.mean(candle_speeds)
-            max_speed = np.max(candle_speeds)
-            
-            # Normalize to 0-1
-            expansion_speed = min(avg_speed / 5.0, 1.0)  # 5% avg range = max speed
+            expansion_speed = min(avg_speed / 5.0, 1.0)
             
             return expansion_speed
             
-        except Exception as e:
+        except Exception:
             return 0.5
     
     def _determine_structure(self, df: pd.DataFrame) -> str:
-        """Determine market structure type"""
+        """Determine market structure"""
         try:
             if len(df) < 20:
                 return "COMPRESSION"
@@ -365,11 +396,8 @@ class RejectionBasedScanner:
             highs = df['high'].values[-20:]
             lows = df['low'].values[-20:]
             
-            # Check for impulsive moves
             price_change = prices[-1] - prices[0]
             price_change_pct = abs(price_change) / prices[0] * 100
-            
-            # Check for compression
             range_ratio = (np.max(highs) - np.min(lows)) / prices[0] * 100
             
             if price_change_pct > 3 and range_ratio > 5:
@@ -379,26 +407,22 @@ class RejectionBasedScanner:
             else:
                 return "CORRECTIVE"
                 
-        except Exception as e:
+        except Exception:
             return "COMPRESSION"
     
     def _determine_context_side(self, df_1h: pd.DataFrame, df_15m: pd.DataFrame) -> str:
-        """Determine context side (not trade direction)"""
+        """Determine context side"""
         try:
-            # Use 1H for broader context
             if len(df_1h) < 10:
                 return "NEUTRAL"
             
-            # Simple slope analysis
             prices_1h = df_1h['close'].values[-10:]
             x = np.arange(len(prices_1h))
             slope_1h, _ = np.polyfit(x, prices_1h, 1)
             
-            # Use 15M for recent bias
             prices_15m = df_15m['close'].values[-5:]
             slope_15m, _ = np.polyfit(np.arange(len(prices_15m)), prices_15m, 1)
             
-            # Combine with weights
             total_slope = (slope_1h * 0.7 + slope_15m * 0.3)
             
             if total_slope > 0.001:
@@ -408,7 +432,7 @@ class RejectionBasedScanner:
             else:
                 return "NEUTRAL"
                 
-        except Exception as e:
+        except Exception:
             return "NEUTRAL"
     
     def _get_default_wave_context(self) -> WaveContext:
@@ -423,35 +447,20 @@ class RejectionBasedScanner:
     # ========== MARKET STRENGTH ANALYSIS ==========
     
     def analyze_market_strength(self, df: pd.DataFrame) -> MarketStrength:
-        """
-        Analyze market strength using:
-        - Candle speed
-        - Distance traveled
-        - EMA angle
-        - Volume participation
-        """
+        """Analyze market strength"""
         try:
             if df is None or len(df) < 20:
                 return self._get_default_market_strength()
             
-            # 1. Candle speed analysis
             candle_speed = self._calculate_candle_speed(df)
-            
-            # 2. Distance traveled vs time
             distance_ratio = self._calculate_distance_ratio(df)
-            
-            # 3. EMA angle analysis
             ema_angle = self._calculate_ema_angle(df)
-            
-            # 4. Volume participation
             volume_participation = self._calculate_volume_participation(df)
             
-            # 5. Strength score
             strength_score = self._calculate_strength_score(
                 candle_speed, distance_ratio, ema_angle, volume_participation
             )
             
-            # 6. Interpret strength patterns
             is_continuation, is_rejection_setup, is_absorption, is_compression = \
                 self._interpret_strength_patterns(df, candle_speed, volume_participation)
             
@@ -472,7 +481,7 @@ class RejectionBasedScanner:
             return self._get_default_market_strength()
     
     def _calculate_candle_speed(self, df: pd.DataFrame) -> float:
-        """Calculate average candle speed"""
+        """Calculate candle speed"""
         try:
             if len(df) < 5:
                 return 0.5
@@ -490,14 +499,13 @@ class RejectionBasedScanner:
                 return 0.5
             
             avg_speed = np.mean(speeds)
-            # Normalize: 0.5% = 0.5, 1% = 0.75, 2% = 1.0
             return min(avg_speed / 2.0, 1.0)
             
-        except Exception as e:
+        except Exception:
             return 0.5
     
     def _calculate_distance_ratio(self, df: pd.DataFrame) -> float:
-        """Calculate distance traveled vs time ratio"""
+        """Calculate distance ratio"""
         try:
             if len(df) < 10:
                 return 0.5
@@ -507,44 +515,40 @@ class RejectionBasedScanner:
             
             if prices[0] > 0:
                 distance_pct = total_distance / prices[0] * 100
-                # Normalize: 5% move in 10 candles = 1.0
                 return min(distance_pct / 5.0, 1.0)
             
             return 0.5
             
-        except Exception as e:
+        except Exception:
             return 0.5
     
     def _calculate_ema_angle(self, df: pd.DataFrame) -> float:
-        """Calculate EMA angle/slope"""
+        """Calculate EMA angle"""
         try:
             if len(df) < 20:
                 return 0.0
             
-            # Calculate fast EMA
             ema_fast = df['close'].ewm(span=EMA_PERIODS['fast'], adjust=False).mean()
             ema_values = ema_fast.values[-10:]
             
             if len(ema_values) < 5:
                 return 0.0
             
-            # Calculate slope
             x = np.arange(len(ema_values))
             slope, _ = np.polyfit(x, ema_values, 1)
             
-            # Normalize slope to angle-like metric
             avg_price = np.mean(ema_values)
             if avg_price > 0:
-                angle_metric = abs(slope / avg_price * 1000)  # Scale for sensitivity
+                angle_metric = abs(slope / avg_price * 1000)
                 return min(angle_metric, 1.0)
             
             return 0.0
             
-        except Exception as e:
+        except Exception:
             return 0.0
     
     def _calculate_volume_participation(self, df: pd.DataFrame) -> float:
-        """Calculate volume participation ratio"""
+        """Calculate volume participation"""
         try:
             if len(df) < 20:
                 return 0.5
@@ -554,38 +558,34 @@ class RejectionBasedScanner:
             
             if avg_volume > 0:
                 ratio = recent_volume / avg_volume
-                # Normalize: 1.0 = average, 1.5 = 0.75, 2.0 = 1.0, 0.5 = 0.25
                 if ratio >= 1.0:
-                    return min((ratio - 1.0) * 2, 1.0)  # 1.0→0, 1.5→1.0
+                    return min((ratio - 1.0) * 2, 1.0)
                 else:
-                    return max((ratio - 1.0) * 2, 0.0)  # 0.5→0, 1.0→0
+                    return max((ratio - 1.0) * 2, 0.0)
             
             return 0.5
             
-        except Exception as e:
+        except Exception:
             return 0.5
     
-    def _calculate_strength_score(self, candle_speed: float, distance_ratio: float, 
+    def _calculate_strength_score(self, candle_speed: float, distance_ratio: float,
                                  ema_angle: float, volume_participation: float) -> float:
-        """Calculate overall strength score"""
-        # Weighted average with volume being most important
-        weights = [0.2, 0.2, 0.2, 0.4]  # candle_speed, distance, ema_angle, volume
+        """Calculate strength score"""
+        weights = [0.2, 0.2, 0.2, 0.4]
         factors = [candle_speed, distance_ratio, ema_angle, volume_participation]
         
         return np.average(factors, weights=weights)
     
-    def _interpret_strength_patterns(self, df: pd.DataFrame, candle_speed: float, 
+    def _interpret_strength_patterns(self, df: pd.DataFrame, candle_speed: float,
                                     volume_participation: float) -> Tuple[bool, bool, bool, bool]:
         """Interpret strength patterns"""
         try:
             if len(df) < 10:
                 return False, False, False, False
             
-            # Get price action
             price_change = df['close'].iloc[-1] - df['close'].iloc[-5]
             price_change_pct = abs(price_change) / df['close'].iloc[-5] * 100
             
-            # Determine patterns
             is_continuation = (candle_speed > 0.7 and volume_participation > 0.7 and 
                               price_change_pct > 1.0)
             
@@ -594,7 +594,6 @@ class RejectionBasedScanner:
             
             is_absorption = (candle_speed < 0.3 and volume_participation > 0.7)
             
-            # Check for compression (low range, low volume)
             recent_high = df['high'].values[-5:].max()
             recent_low = df['low'].values[-5:].min()
             range_pct = (recent_high - recent_low) / recent_low * 100
@@ -603,7 +602,7 @@ class RejectionBasedScanner:
             
             return is_continuation, is_rejection_setup, is_absorption, is_compression
             
-        except Exception as e:
+        except Exception:
             return False, False, False, False
     
     def _get_default_market_strength(self) -> MarketStrength:
@@ -621,183 +620,115 @@ class RejectionBasedScanner:
     
     # ========== REJECTION ZONE ANALYSIS ==========
     
-    def find_rejection_zones(self, df: pd.DataFrame, current_price: float, 
+    def find_rejection_zones(self, df: pd.DataFrame, current_price: float,
                             rsi_value: float, emas: Dict[str, float]) -> List[RejectionZone]:
-        """
-        Find all active rejection zones
-        """
+        """Find rejection zones"""
         zones = []
         
         try:
             if df is None or len(df) < 20:
                 return zones
             
-            # 1. EMA rejection zones
-            ema_zones = self._find_ema_rejection_zones(current_price, emas)
-            zones.extend(ema_zones)
-            
-            # 2. Range rejection zones
-            range_zones = self._find_range_rejection_zones(df, current_price)
-            zones.extend(range_zones)
-            
-            # 3. Failed breakout/breakdown zones
-            failed_zones = self._find_failed_break_zones(df, current_price)
-            zones.extend(failed_zones)
-            
-            # 4. RSI position analysis for each zone
-            for zone in zones:
-                zone.rsi_position = self._analyze_rsi_position(rsi_value, zone.zone_type)
-            
-            # Filter to active zones only
-            active_zones = [z for z in zones if z.is_active]
-            
-            return active_zones
-            
-        except Exception as e:
-            log.error(f"Rejection zone error: {e}")
-            return []
-    
-    def _find_ema_rejection_zones(self, current_price: float, emas: Dict[str, float]) -> List[RejectionZone]:
-        """Find EMA rejection zones"""
-        zones = []
-        
-        try:
-            # Check each EMA for rejection
+            # EMA zones
             for ema_name, ema_value in emas.items():
                 if ema_value == 0:
                     continue
                 
                 distance_pct = abs(current_price - ema_value) / ema_value * 100
                 
-                # Check if price is near EMA (within threshold)
-                if distance_pct <= REJECTION_CONFIG["ema_distance_threshold"]:
-                    # Determine if it's support or resistance
+                if distance_pct <= 0.5:  # Within 0.5%
                     if current_price > ema_value:
-                        # Price above EMA - potential support
                         zone_type = "EMA_SUPPORT"
-                        is_active = True
                     else:
-                        # Price below EMA - potential resistance
                         zone_type = "EMA_RESISTANCE"
-                        is_active = True
                     
-                    # Calculate rejection strength based on EMA importance
                     if ema_name == "fast":
                         strength = 0.7
                     elif ema_name == "medium":
                         strength = 0.8
-                    else:  # slow
+                    else:
                         strength = 0.9
                     
                     zones.append(RejectionZone(
                         zone_type=zone_type,
                         price_level=ema_value,
                         strength=strength,
-                        volume_confirmation=False,  # Will be checked later
-                        rsi_position="IN_ZONE",
-                        is_active=is_active
+                        volume_confirmation=False,
+                        rsi_position="NEUTRAL",
+                        is_active=True
                     ))
             
-            return zones
-            
-        except Exception as e:
-            return []
-    
-    def _find_range_rejection_zones(self, df: pd.DataFrame, current_price: float) -> List[RejectionZone]:
-        """Find range high/low rejection zones"""
-        zones = []
-        
-        try:
-            if len(df) < 20:
-                return zones
-            
-            # Recent range (last 20 candles)
-            recent_high = df['high'].values[-20:].max()
-            recent_low = df['low'].values[-20:].min()
-            range_mid = (recent_high + recent_low) / 2
-            
-            # Check range high
-            high_distance_pct = abs(current_price - recent_high) / recent_high * 100
-            if high_distance_pct <= 0.3:  # Very close to range high
-                zones.append(RejectionZone(
-                    zone_type="RANGE_HIGH",
-                    price_level=recent_high,
-                    strength=0.8,
-                    volume_confirmation=False,
-                    rsi_position="IN_ZONE",
-                    is_active=True
-                ))
-            
-            # Check range low
-            low_distance_pct = abs(current_price - recent_low) / recent_low * 100
-            if low_distance_pct <= 0.3:  # Very close to range low
-                zones.append(RejectionZone(
-                    zone_type="RANGE_LOW",
-                    price_level=recent_low,
-                    strength=0.8,
-                    volume_confirmation=False,
-                    rsi_position="IN_ZONE",
-                    is_active=True
-                ))
-            
-            return zones
-            
-        except Exception as e:
-            return []
-    
-    def _find_failed_break_zones(self, df: pd.DataFrame, current_price: float) -> List[RejectionZone]:
-        """Find failed breakout/breakdown zones"""
-        zones = []
-        
-        try:
-            if len(df) < 10:
-                return zones
-            
-            # Check for recent failed breakouts
-            recent_high = df['high'].values[-5:].max()
-            prev_high = df['high'].values[-10:-5].max()
-            
-            # Failed breakout (price tried to break high but failed)
-            if current_price < recent_high and recent_high > prev_high * 1.005:  # 0.5% attempt
-                # Check if price rejected from the high
-                if any(df['close'].values[-5:] < recent_high * 0.995):  # Rejected by 0.5%
+            # Range zones
+            if len(df) >= 20:
+                recent_high = df['high'].values[-20:].max()
+                recent_low = df['low'].values[-20:].min()
+                
+                high_distance_pct = abs(current_price - recent_high) / recent_high * 100
+                if high_distance_pct <= 0.3:
                     zones.append(RejectionZone(
-                        zone_type="FAILED_BREAKOUT",
+                        zone_type="RANGE_HIGH",
                         price_level=recent_high,
-                        strength=0.85,
+                        strength=0.8,
                         volume_confirmation=False,
-                        rsi_position="IN_ZONE",
+                        rsi_position="NEUTRAL",
                         is_active=True
                     ))
-            
-            # Check for recent failed breakdowns
-            recent_low = df['low'].values[-5:].min()
-            prev_low = df['low'].values[-10:-5].min()
-            
-            # Failed breakdown (price tried to break low but failed)
-            if current_price > recent_low and recent_low < prev_low * 0.995:  # 0.5% attempt
-                # Check if price rejected from the low
-                if any(df['close'].values[-5:] > recent_low * 1.005):  # Rejected by 0.5%
+                
+                low_distance_pct = abs(current_price - recent_low) / recent_low * 100
+                if low_distance_pct <= 0.3:
                     zones.append(RejectionZone(
-                        zone_type="FAILED_BREAKDOWN",
+                        zone_type="RANGE_LOW",
                         price_level=recent_low,
-                        strength=0.85,
+                        strength=0.8,
                         volume_confirmation=False,
-                        rsi_position="IN_ZONE",
+                        rsi_position="NEUTRAL",
                         is_active=True
                     ))
             
-            return zones
+            # Failed break zones
+            if len(df) >= 10:
+                recent_high = df['high'].values[-5:].max()
+                prev_high = df['high'].values[-10:-5].max()
+                
+                if current_price < recent_high and recent_high > prev_high * 1.005:
+                    if any(df['close'].values[-5:] < recent_high * 0.995):
+                        zones.append(RejectionZone(
+                            zone_type="FAILED_BREAKOUT",
+                            price_level=recent_high,
+                            strength=0.85,
+                            volume_confirmation=False,
+                            rsi_position="NEUTRAL",
+                            is_active=True
+                        ))
+                
+                recent_low = df['low'].values[-5:].min()
+                prev_low = df['low'].values[-10:-5].min()
+                
+                if current_price > recent_low and recent_low < prev_low * 0.995:
+                    if any(df['close'].values[-5:] > recent_low * 1.005):
+                        zones.append(RejectionZone(
+                            zone_type="FAILED_BREAKDOWN",
+                            price_level=recent_low,
+                            strength=0.85,
+                            volume_confirmation=False,
+                            rsi_position="NEUTRAL",
+                            is_active=True
+                        ))
+            
+            # Set RSI position
+            for zone in zones:
+                zone.rsi_position = self._analyze_rsi_position(rsi_value, zone.zone_type)
+            
+            return [z for z in zones if z.is_active]
             
         except Exception as e:
+            log.error(f"Rejection zone error: {e}")
             return []
     
     def _analyze_rsi_position(self, rsi_value: float, zone_type: str) -> str:
-        """Analyze RSI position relative to zone"""
-        # Check if RSI is in rejection zones
+        """Analyze RSI position"""
         if "SUPPORT" in zone_type or "LOW" in zone_type or "BREAKDOWN" in zone_type:
-            # For LONG setups, we want RSI in 40-50 zone
-            if REJECTION_CONFIG["rsi_long_zone"][0] <= rsi_value <= REJECTION_CONFIG["rsi_long_zone"][1]:
+            if 40 <= rsi_value <= 50:
                 return "IN_ZONE"
             elif rsi_value < 30:
                 return "OVEREXTENDED"
@@ -805,8 +736,7 @@ class RejectionBasedScanner:
                 return "NEUTRAL"
         
         elif "RESISTANCE" in zone_type or "HIGH" in zone_type or "BREAKOUT" in zone_type:
-            # For SHORT setups, we want RSI in 50-60 zone
-            if REJECTION_CONFIG["rsi_short_zone"][0] <= rsi_value <= REJECTION_CONFIG["rsi_short_zone"][1]:
+            if 50 <= rsi_value <= 60:
                 return "IN_ZONE"
             elif rsi_value > 70:
                 return "OVEREXTENDED"
@@ -815,7 +745,483 @@ class RejectionBasedScanner:
         
         return "NEUTRAL"
     
-    # ========== REJECTION SIGNAL GENERATION ==========
+    # ========== CONFIRMED REJECTION DETECTION ==========
+    
+    def detect_failure_candle(self, df: pd.DataFrame, zone: RejectionZone,
+                             side: str, current_rsi: float, prev_rsi: float) -> Optional[FailureCandle]:
+        """Detect FAILURE candle at rejection zone"""
+        try:
+            if len(df) < 3:
+                return None
+            
+            current_candle = df.iloc[-1]
+            prev_candle = df.iloc[-2]
+            
+            failure_signs = []
+            strength_factors = []
+            
+            # 1. Wick rejection
+            has_wick_rejection = False
+            wick_strength = 0
+            
+            if side == "LONG":
+                if (current_candle['low'] < zone.price_level * 0.998 and
+                    current_candle['close'] > zone.price_level):
+                    has_wick_rejection = True
+                    wick_length = abs(current_candle['low'] - zone.price_level)
+                    candle_range = current_candle['high'] - current_candle['low']
+                    if candle_range > 0:
+                        wick_strength = min(wick_length / candle_range, 1.0)
+                        failure_signs.append("WICK_REJECTION")
+                        strength_factors.append(wick_strength)
+            
+            else:
+                if (current_candle['high'] > zone.price_level * 1.002 and
+                    current_candle['close'] < zone.price_level):
+                    has_wick_rejection = True
+                    wick_length = abs(current_candle['high'] - zone.price_level)
+                    candle_range = current_candle['high'] - current_candle['low']
+                    if candle_range > 0:
+                        wick_strength = min(wick_length / candle_range, 1.0)
+                        failure_signs.append("WICK_REJECTION")
+                        strength_factors.append(wick_strength)
+            
+            # 2. Momentum halt
+            momentum_halt = False
+            if side == "LONG":
+                if (prev_candle['close'] < prev_candle['open'] and
+                    abs(current_candle['close'] - current_candle['open']) / current_candle['open'] < 0.001):
+                    momentum_halt = True
+                    failure_signs.append("MOMENTUM_HALT")
+                    strength_factors.append(0.7)
+            else:
+                if (prev_candle['close'] > prev_candle['open'] and
+                    abs(current_candle['close'] - current_candle['open']) / current_candle['open'] < 0.001):
+                    momentum_halt = True
+                    failure_signs.append("MOMENTUM_HALT")
+                    strength_factors.append(0.7)
+            
+            # 3. Failed break
+            failed_break = False
+            if side == "LONG":
+                if (current_candle['low'] < zone.price_level and
+                    current_candle['close'] > zone.price_level and
+                    prev_candle['close'] < prev_candle['open']):
+                    failed_break = True
+                    failure_signs.append("FAILED_BREAK")
+                    strength_factors.append(0.8)
+            else:
+                if (current_candle['high'] > zone.price_level and
+                    current_candle['close'] < zone.price_level and
+                    prev_candle['close'] > prev_candle['open']):
+                    failed_break = True
+                    failure_signs.append("FAILED_BREAK")
+                    strength_factors.append(0.8)
+            
+            # 4. Volume weakness
+            volume_weakness = False
+            if side == "LONG":
+                if current_candle['close'] < current_candle['open']:
+                    current_volume = current_candle['volume']
+                    prev_bearish_volume = df[df['close'] < df['open']]['volume'].tail(3).mean()
+                    if prev_bearish_volume > 0:
+                        volume_ratio = current_volume / prev_bearish_volume
+                        if volume_ratio < 0.8:
+                            volume_weakness = True
+            else:
+                if current_candle['close'] > current_candle['open']:
+                    current_volume = current_candle['volume']
+                    prev_bullish_volume = df[df['close'] > df['open']]['volume'].tail(3).mean()
+                    if prev_bullish_volume > 0:
+                        volume_ratio = current_volume / prev_bullish_volume
+                        if volume_ratio < 0.8:
+                            volume_weakness = True
+            
+            # 5. RSI failure
+            rsi_failure = False
+            if side == "LONG":
+                rsi_slope = current_rsi - prev_rsi
+                if rsi_slope > 0:
+                    rsi_failure = True
+                elif current_rsi < 30 and prev_rsi < 25:
+                    rsi_failure = True
+            else:
+                rsi_slope = current_rsi - prev_rsi
+                if rsi_slope < 0:
+                    rsi_failure = True
+                elif current_rsi > 70 and prev_rsi > 75:
+                    rsi_failure = True
+            
+            # 6. Close position
+            close_position = "AT_LEVEL"
+            body_ratio = 0
+            
+            candle_range = current_candle['high'] - current_candle['low']
+            if candle_range > 0:
+                body_size = abs(current_candle['close'] - current_candle['open'])
+                body_ratio = body_size / candle_range
+                
+                if side == "LONG":
+                    if current_candle['close'] > zone.price_level * 1.001:
+                        close_position = "ABOVE_ZONE"
+                    elif current_candle['close'] < zone.price_level * 0.999:
+                        close_position = "BELOW_ZONE"
+                    else:
+                        close_position = "INSIDE_RANGE"
+                else:
+                    if current_candle['close'] < zone.price_level * 0.999:
+                        close_position = "BELOW_ZONE"
+                    elif current_candle['close'] > zone.price_level * 1.001:
+                        close_position = "ABOVE_ZONE"
+                    else:
+                        close_position = "INSIDE_RANGE"
+            
+            # Calculate failure strength
+            if strength_factors:
+                failure_strength = np.mean(strength_factors)
+            else:
+                failure_strength = 0
+            
+            if failure_strength < CONFIRMED_REJECTION_CONFIG["min_failure_candle_strength"]:
+                return None
+            
+            # Create failure candle
+            failure_candle = FailureCandle(
+                candle_type=" | ".join(failure_signs) if failure_signs else "WEAK_FAILURE",
+                strength=failure_strength,
+                volume_weakness=volume_weakness,
+                rsi_failure=rsi_failure,
+                body_ratio=body_ratio,
+                close_position=close_position,
+                has_long_wick=has_wick_rejection and wick_strength > 0.3,
+                failed_break=failed_break,
+                momentum_halt=momentum_halt
+            )
+            
+            return failure_candle
+            
+        except Exception as e:
+            log.error(f"Failure candle detection error: {e}")
+            return None
+    
+    def detect_trigger_candle(self, df_trigger: pd.DataFrame, df_failure: pd.DataFrame,
+                            failure_candle: FailureCandle, zone: RejectionZone,
+                            side: str, current_rsi: float, prev_rsi: float) -> Optional[TriggerCandle]:
+        """Detect TRIGGER candle (strength shift)"""
+        try:
+            if len(df_trigger) < 3 or len(df_failure) < 1:
+                return None
+            
+            current_candle = df_trigger.iloc[-1]
+            prev_candle = df_trigger.iloc[-2]
+            failure_candle_data = df_failure.iloc[-1]
+            
+            # Check direction
+            is_bullish_trigger = current_candle['close'] > current_candle['open']
+            is_bearish_trigger = current_candle['close'] < current_candle['open']
+            
+            if side == "LONG" and not is_bullish_trigger:
+                return None
+            if side == "SHORT" and not is_bearish_trigger:
+                return None
+            
+            # Volume confirmation
+            volume_confirmation = False
+            trigger_volume = current_candle['volume']
+            failure_volume = failure_candle_data['volume']
+            
+            if failure_volume > 0:
+                volume_ratio = trigger_volume / failure_volume
+                if volume_ratio >= CONFIRMED_REJECTION_CONFIG["volume_ratio_required"]:
+                    volume_confirmation = True
+            
+            prev_trigger_avg = df_trigger['volume'].iloc[-5:-1].mean()
+            if prev_trigger_avg > 0:
+                if trigger_volume / prev_trigger_avg >= 1.2:
+                    volume_confirmation = True
+            
+            if not volume_confirmation:
+                self.daily_stats["volume_failed"] += 1
+                return None
+            
+            # Close near extreme
+            close_near_extreme = False
+            candle_range = current_candle['high'] - current_candle['low']
+            
+            if candle_range > 0:
+                if side == "LONG":
+                    close_to_high = (current_candle['high'] - current_candle['close']) / candle_range
+                    if close_to_high <= 0.2:
+                        close_near_extreme = True
+                else:
+                    close_to_low = (current_candle['close'] - current_candle['low']) / candle_range
+                    if close_to_low <= 0.2:
+                        close_near_extreme = True
+            
+            # Body dominance
+            body_dominance = 0
+            if candle_range > 0:
+                body_size = abs(current_candle['close'] - current_candle['open'])
+                body_dominance = body_size / candle_range
+            
+            # Speed increase
+            speed_increase = False
+            failure_range = failure_candle_data['high'] - failure_candle_data['low']
+            trigger_range = candle_range
+            
+            if failure_candle_data['close'] > 0:
+                failure_speed = failure_range / failure_candle_data['close']
+                trigger_speed = trigger_range / current_candle['close']
+                
+                if trigger_speed > failure_speed * 1.3:
+                    speed_increase = True
+            
+            # RSI slope change
+            rsi_slope_change = False
+            rsi_divergence = False
+            
+            if len(df_trigger) >= 5:
+                rsi_values = self.calculate_rsi(df_trigger['close']).values[-5:]
+                if len(rsi_values) >= 3:
+                    old_slope = rsi_values[-3] - rsi_values[-4]
+                    new_slope = rsi_values[-1] - rsi_values[-2]
+                    
+                    if side == "LONG":
+                        if old_slope <= 0 and new_slope > 0:
+                            rsi_slope_change = True
+                    else:
+                        if old_slope >= 0 and new_slope < 0:
+                            rsi_slope_change = True
+                    
+                    # Divergence
+                    prices = df_trigger['close'].values[-5:]
+                    if side == "LONG":
+                        if (prices[-1] < prices[-3] and rsi_values[-1] > rsi_values[-3]):
+                            rsi_divergence = True
+                    else:
+                        if (prices[-1] > prices[-3] and rsi_values[-1] < rsi_values[-3]):
+                            rsi_divergence = True
+            
+            # Calculate trigger strength
+            strength_factors = []
+            
+            if volume_confirmation:
+                strength_factors.append(0.9)
+            else:
+                strength_factors.append(0.3)
+            
+            if close_near_extreme:
+                strength_factors.append(0.8)
+            
+            if body_dominance > 0.6:
+                strength_factors.append(0.7)
+            
+            if speed_increase:
+                strength_factors.append(0.6)
+            
+            if rsi_slope_change:
+                strength_factors.append(0.8)
+            
+            if rsi_divergence:
+                strength_factors.append(0.9)
+            
+            trigger_strength = np.mean(strength_factors) if strength_factors else 0
+            
+            if trigger_strength < CONFIRMED_REJECTION_CONFIG["min_trigger_candle_strength"]:
+                return None
+            
+            # Determine trigger type
+            trigger_type = "STRENGTH_SHIFT"
+            if rsi_divergence:
+                trigger_type = "DIVERGENCE_CONFIRMATION"
+            elif speed_increase and body_dominance > 0.7:
+                trigger_type = "MOMENTUM_REVERSAL"
+            
+            direction = "BULLISH_CONFIRMATION" if side == "LONG" else "BEARISH_CONFIRMATION"
+            
+            # Create trigger candle
+            trigger_candle = TriggerCandle(
+                candle_type=trigger_type,
+                strength=trigger_strength,
+                volume_confirmation=volume_confirmation,
+                direction=direction,
+                close_near_extreme=close_near_extreme,
+                body_dominance=body_dominance,
+                speed_increase=speed_increase,
+                rsi_slope_change=rsi_slope_change,
+                rsi_divergence=rsi_divergence
+            )
+            
+            return trigger_candle
+            
+        except Exception as e:
+            log.error(f"Trigger candle detection error: {e}")
+            return None
+    
+    def detect_confirmed_rejection(self, multi_tf_data: Dict[str, pd.DataFrame],
+                                 zone: RejectionZone, side: str,
+                                 current_rsi_3m: float, prev_rsi_3m: float,
+                                 current_rsi_1m: float, prev_rsi_1m: float) -> Optional[ConfirmedRejection]:
+        """Detect CONFIRMED rejection (failure on 3M + trigger on 1M)"""
+        try:
+            df_3m = multi_tf_data.get("3M")
+            df_1m = multi_tf_data.get("1M")
+            
+            if df_3m is None or df_1m is None:
+                return None
+            
+            if len(df_3m) < 3 or len(df_1m) < 3:
+                return None
+            
+            # Detect FAILURE candle on 3M
+            failure_candle = self.detect_failure_candle(
+                df_3m, zone, side, current_rsi_3m, prev_rsi_3m
+            )
+            
+            if not failure_candle:
+                self.daily_stats["rejections_detected"] += 1
+                return None
+            
+            self.daily_stats["failures_confirmed"] += 1
+            
+            # Detect TRIGGER candle on 1M
+            trigger_candle = self.detect_trigger_candle(
+                df_1m, df_3m, failure_candle, zone, side, current_rsi_1m, prev_rsi_1m
+            )
+            
+            if not trigger_candle:
+                self.daily_stats["no_trigger_candle"] += 1
+                return None
+            
+            # Calculate confirmation score
+            confirmation_score = self._calculate_confirmation_score(failure_candle, trigger_candle)
+            
+            # Check NO ENTRY filters
+            passed_filters = self._check_no_entry_filters(failure_candle, trigger_candle, df_1m, side)
+            
+            if not passed_filters:
+                self.daily_stats["early_entries_prevented"] += 1
+                return None
+            
+            # Determine conditions met
+            conditions_met = []
+            
+            if failure_candle.has_long_wick:
+                conditions_met.append("FAILURE_WICK")
+            if failure_candle.failed_break:
+                conditions_met.append("FAILURE_BREAK")
+            if failure_candle.momentum_halt:
+                conditions_met.append("FAILURE_MOMENTUM_HALT")
+            if failure_candle.volume_weakness:
+                conditions_met.append("FAILURE_VOLUME_WEAKNESS")
+            if failure_candle.rsi_failure:
+                conditions_met.append("FAILURE_RSI")
+            
+            if trigger_candle.volume_confirmation:
+                conditions_met.append("TRIGGER_VOLUME")
+            if trigger_candle.close_near_extreme:
+                conditions_met.append("TRIGGER_CLOSE_EXTREME")
+            if trigger_candle.speed_increase:
+                conditions_met.append("TRIGGER_SPEED")
+            if trigger_candle.rsi_slope_change:
+                conditions_met.append("TRIGGER_RSI_SLOPE")
+            if trigger_candle.rsi_divergence:
+                conditions_met.append("TRIGGER_RSI_DIVERGENCE")
+            
+            # Create confirmed rejection
+            confirmed_rejection = ConfirmedRejection(
+                failure_candle=failure_candle,
+                trigger_candle=trigger_candle,
+                confirmation_score=confirmation_score,
+                is_valid=confirmation_score > 0.7 and passed_filters,
+                failure_timestamp=time.time() - 120,
+                trigger_timestamp=time.time(),
+                timeframe_pair=("3M", "1M"),
+                conditions_met=conditions_met
+            )
+            
+            return confirmed_rejection
+            
+        except Exception as e:
+            log.error(f"Confirmed rejection detection error: {e}")
+            return None
+    
+    def _calculate_confirmation_score(self, failure: FailureCandle, trigger: TriggerCandle) -> float:
+        """Calculate confirmation score"""
+        weights = {
+            'failure_strength': 0.3,
+            'trigger_strength': 0.4,
+            'volume_confirmation': 0.15,
+            'rsi_confirmation': 0.15
+        }
+        
+        volume_score = 1.0 if trigger.volume_confirmation else 0.3
+        
+        rsi_score = 0.5
+        if failure.rsi_failure and (trigger.rsi_slope_change or trigger.rsi_divergence):
+            rsi_score = 0.9
+        
+        score = (
+            failure.strength * weights['failure_strength'] +
+            trigger.strength * weights['trigger_strength'] +
+            volume_score * weights['volume_confirmation'] +
+            rsi_score * weights['rsi_confirmation']
+        )
+        
+        return score
+    
+    def _check_no_entry_filters(self, failure: FailureCandle, trigger: TriggerCandle,
+                               df_1m: pd.DataFrame, side: str) -> bool:
+        """NO ENTRY filters to prevent early entries"""
+        # Filter 1: Trigger candle strength
+        if trigger.strength < 0.7:
+            log.debug(f"❌ NO ENTRY: Trigger candle too weak ({trigger.strength:.2f})")
+            return False
+        
+        # Filter 2: No volume confirmation
+        if not trigger.volume_confirmation:
+            log.debug("❌ NO ENTRY: No volume confirmation")
+            return False
+        
+        # Filter 3: Weak follow-through
+        if len(df_1m) >= 4:
+            next_candle = df_1m.iloc[-2]
+            next_body = abs(next_candle['close'] - next_candle['open'])
+            next_range = next_candle['high'] - next_candle['low']
+            
+            if next_range > 0:
+                next_body_ratio = next_body / next_range
+                if next_body_ratio < 0.3:
+                    log.debug("❌ NO ENTRY: Weak follow-through")
+                    return False
+        
+        # Filter 4: Pressure still present
+        if side == "LONG":
+            recent_bearish = sum(1 for i in range(-4, 0) 
+                               if df_1m.iloc[i]['close'] < df_1m.iloc[i]['open'])
+            if recent_bearish >= 2:
+                log.debug("❌ NO ENTRY: Bearish pressure still present")
+                return False
+        else:
+            recent_bullish = sum(1 for i in range(-4, 0) 
+                               if df_1m.iloc[i]['close'] > df_1m.iloc[i]['open'])
+            if recent_bullish >= 2:
+                log.debug("❌ NO ENTRY: Bullish pressure still present")
+                return False
+        
+        # Filter 5: Weak failure candle
+        if failure.strength < 0.6:
+            log.debug(f"❌ NO ENTRY: Failure candle too weak ({failure.strength:.2f})")
+            return False
+        
+        # Filter 6: No clear failure pattern
+        if not failure.has_long_wick and not failure.failed_break:
+            log.debug("❌ NO ENTRY: No clear failure pattern")
+            return False
+        
+        return True
+    
+    # ========== INDICATOR CALCULATIONS ==========
     
     def calculate_rsi(self, prices: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
         """Calculate RSI"""
@@ -827,132 +1233,152 @@ class RejectionBasedScanner:
         return rsi
     
     def calculate_emas(self, df: pd.DataFrame) -> Dict[str, float]:
-        """Calculate current EMA values"""
+        """Calculate EMAs"""
         try:
             emas = {}
             for name, period in EMA_PERIODS.items():
                 ema_series = df['close'].ewm(span=period, adjust=False).mean()
                 emas[name] = ema_series.iloc[-1] if len(ema_series) > 0 else 0
             return emas
-        except Exception as e:
+        except Exception:
             return {name: 0 for name in EMA_PERIODS.keys()}
     
-    def generate_rejection_signal(self, multi_tf_data: Dict[str, pd.DataFrame], 
-                                 symbol: str) -> Optional[RejectionSignal]:
-        """
-        Generate rejection-based signal
-        ONLY trade at rejection zones with strength confirmation
-        """
+    def _check_volume_confirmation(self, df: pd.DataFrame, zone_type: str) -> bool:
+        """Check volume confirmation"""
         try:
-            # Get timeframe data
+            if len(df) < 5:
+                return False
+            
+            recent_candles = df.iloc[-5:]
+            recent_volume = recent_candles['volume'].values[-2:].mean()
+            prev_volume = recent_candles['volume'].values[-5:-2].mean()
+            
+            if prev_volume > 0:
+                volume_ratio = recent_volume / prev_volume
+                if volume_ratio >= 1.5:
+                    return True
+            
+            if "FAILED" in zone_type:
+                volume_trend = np.polyfit(range(5), recent_candles['volume'].values[-5:], 1)[0]
+                if volume_trend < 0:
+                    return True
+            
+            return False
+            
+        except Exception:
+            return False
+    
+    # ========== SIGNAL GENERATION ==========
+    
+    def generate_confirmed_rejection_signal(self, multi_tf_data: Dict[str, pd.DataFrame],
+                                          symbol: str) -> Optional[ConfirmedRejectionSignal]:
+        """Generate CONFIRMED rejection signal"""
+        try:
             tf_1h = multi_tf_data.get("1H")
             tf_15m = multi_tf_data.get("15M")
-            tf_5m = multi_tf_data.get("5M")
             tf_3m = multi_tf_data.get("3M")
             tf_1m = multi_tf_data.get("1M")
             
-            # Check data availability - need at least 15m and 3m
-            if tf_15m is None or tf_3m is None:
-                log.debug(f"{symbol}: Missing key timeframe data")
+            if tf_3m is None or tf_1m is None:
                 return None
             
-            if len(tf_15m) < 30 or len(tf_3m) < 20:
-                log.debug(f"{symbol}: Insufficient data")
+            if len(tf_3m) < 10 or len(tf_1m) < 10:
                 return None
             
-            # 1. Analyze wave context (1H + 15M)
+            # Wave context
             wave_context = self.analyze_wave_context(tf_1h, tf_15m)
             
-            # 2. Analyze market strength on 15M
+            # Market strength
             market_strength = self.analyze_market_strength(tf_15m)
             
-            # CRITICAL: No strength → no trade
             if market_strength.strength_score < 0.4:
-                self.daily_stats["no_strength"] += 1
-                log.debug(f"{symbol}: No market strength ({market_strength.strength_score:.2f})")
+                self.daily_stats["no_strength_shift"] += 1
                 return None
             
-            # 3. Calculate indicators on 3M (entry timeframe)
-            current_price = tf_3m['close'].iloc[-1]
-            emas = self.calculate_emas(tf_3m)
+            # Rejection zones on 3M
+            current_price_3m = tf_3m['close'].iloc[-1]
+            emas_3m = self.calculate_emas(tf_3m)
             
-            # Calculate RSI
-            rsi_series = self.calculate_rsi(tf_3m['close'])
-            current_rsi = rsi_series.iloc[-1] if len(rsi_series) > 0 else 50
+            rsi_series_3m = self.calculate_rsi(tf_3m['close'])
+            current_rsi_3m = rsi_series_3m.iloc[-1] if len(rsi_series_3m) > 0 else 50
+            prev_rsi_3m = rsi_series_3m.iloc[-2] if len(rsi_series_3m) > 1 else 50
             
-            # 4. Find rejection zones on 3M
-            rejection_zones = self.find_rejection_zones(tf_3m, current_price, current_rsi, emas)
+            rejection_zones = self.find_rejection_zones(tf_3m, current_price_3m, current_rsi_3m, emas_3m)
             
-            # CRITICAL: No rejection zone → no trade
             if not rejection_zones:
-                self.daily_stats["no_rejection_zone"] += 1
-                log.debug(f"{symbol}: No active rejection zone")
                 return None
             
-            # 5. Check volume confirmation for each zone
+            # Volume confirmation
             valid_zones = []
             for zone in rejection_zones:
-                # Check volume confirmation
                 zone.volume_confirmation = self._check_volume_confirmation(tf_3m, zone.zone_type)
-                
-                # Only consider zones with volume confirmation
                 if zone.volume_confirmation:
                     valid_zones.append(zone)
             
             if not valid_zones:
-                log.debug(f"{symbol}: No volume confirmation at rejection zones")
                 return None
             
-            # 6. Select strongest rejection zone
+            # Select best zone
             best_zone = max(valid_zones, key=lambda z: z.strength)
             
-            # 7. Determine trade side based on zone type
+            # Determine side
             side = None
-            if best_zone.zone_type in ["EMA_SUPPORT", "RANGE_LOW", "FAILED_BREAKDOWN", "DEMAND"]:
+            if best_zone.zone_type in ["EMA_SUPPORT", "RANGE_LOW", "FAILED_BREAKDOWN"]:
                 side = "LONG"
-            elif best_zone.zone_type in ["EMA_RESISTANCE", "RANGE_HIGH", "FAILED_BREAKOUT", "SUPPLY"]:
+            elif best_zone.zone_type in ["EMA_RESISTANCE", "RANGE_HIGH", "FAILED_BREAKOUT"]:
                 side = "SHORT"
             
             if not side:
-                log.debug(f"{symbol}: Could not determine side for zone {best_zone.zone_type}")
                 return None
             
-            # 8. Check RSI position for the zone
-            if side == "LONG" and best_zone.rsi_position != "IN_ZONE":
-                log.debug(f"{symbol}: RSI not in LONG zone ({current_rsi:.1f})")
-                return None
-            elif side == "SHORT" and best_zone.rsi_position != "IN_ZONE":
-                log.debug(f"{symbol}: RSI not in SHORT zone ({current_rsi:.1f})")
-                return None
+            # RSI on 1M
+            rsi_series_1m = self.calculate_rsi(tf_1m['close'])
+            current_rsi_1m = rsi_series_1m.iloc[-1] if len(rsi_series_1m) > 0 else 50
+            prev_rsi_1m = rsi_series_1m.iloc[-2] if len(rsi_series_1m) > 1 else 50
             
-            # 9. TRADE-BASED DEDUPLICATION CHECK
-            if not self.deduplicator.should_generate_signal(symbol, side, current_price):
-                self.daily_stats["rejections_filtered"] += 1
-                return None
+            # Detect confirmed rejection
+            confirmed_rejection = self.detect_confirmed_rejection(
+                multi_tf_data, best_zone, side,
+                current_rsi_3m, prev_rsi_3m,
+                current_rsi_1m, prev_rsi_1m
+            )
             
-            # 10. Analyze candle for rejection confirmation
-            rejection_type, trigger_candle = self._analyze_rejection_candle(tf_3m, side, best_zone)
-            
-            if not rejection_type:
-                log.debug(f"{symbol}: No clear rejection candle")
+            if not confirmed_rejection or not confirmed_rejection.is_valid:
                 return None
             
-            # 11. Calculate entry, SL, TP (asymmetric payoff)
-            stop_loss_pct = np.random.uniform(0.5, MAX_STOP_LOSS_PCT)
-            target_pct = np.random.uniform(MIN_TARGET_PCT, MAX_TARGET_PCT)
+            # Deduplication check
+            current_price_1m = tf_1m['close'].iloc[-1]
+            if not self.deduplicator.should_generate_signal(symbol, side, current_price_1m):
+                self.daily_stats["early_entries_prevented"] += 1
+                return None
             
+            # Entry price at trigger candle close
+            entry_price = current_price_1m
+            
+            # Stop loss and take profit
             if side == "LONG":
-                # Entry at rejection zone (slightly above for LONG)
-                entry_price = best_zone.price_level * 1.001  # 0.1% above support
-                stop_loss = entry_price * (1 - stop_loss_pct / 100)
+                failure_candle_low = tf_3m['low'].iloc[-1]
+                stop_loss = failure_candle_low * 0.998
+                stop_loss_pct = abs(entry_price - stop_loss) / entry_price * 100
+                
+                if stop_loss_pct > MAX_STOP_LOSS_PCT:
+                    stop_loss = entry_price * (1 - MAX_STOP_LOSS_PCT / 100)
+                
+                target_pct = np.random.uniform(MIN_TARGET_PCT, MAX_TARGET_PCT)
                 take_profit = entry_price * (1 + target_pct / 100)
-            else:  # SHORT
-                # Entry at rejection zone (slightly below for SHORT)
-                entry_price = best_zone.price_level * 0.999  # 0.1% below resistance
-                stop_loss = entry_price * (1 + stop_loss_pct / 100)
+            
+            else:
+                failure_candle_high = tf_3m['high'].iloc[-1]
+                stop_loss = failure_candle_high * 1.002
+                stop_loss_pct = abs(stop_loss - entry_price) / entry_price * 100
+                
+                if stop_loss_pct > MAX_STOP_LOSS_PCT:
+                    stop_loss = entry_price * (1 + MAX_STOP_LOSS_PCT / 100)
+                
+                target_pct = np.random.uniform(MIN_TARGET_PCT, MAX_TARGET_PCT)
                 take_profit = entry_price * (1 - target_pct / 100)
             
-            # Calculate Risk/Reward
+            # Risk/Reward
             risk = abs(entry_price - stop_loss)
             reward = abs(take_profit - entry_price)
             
@@ -961,32 +1387,26 @@ class RejectionBasedScanner:
             
             risk_reward = reward / risk
             
-            # Minimum R:R check
             if risk_reward < MIN_RISK_REWARD:
-                log.debug(f"{symbol}: R:R too low ({risk_reward:.1f}:1)")
                 return None
             
-            # 12. Calculate rejection strength
+            # Rejection strength
             rejection_strength = self._calculate_rejection_strength(
-                best_zone, market_strength, wave_context, current_rsi
+                best_zone, market_strength, wave_context, current_rsi_3m
             )
             
-            if rejection_strength < REJECTION_CONFIG["min_rejection_strength"]:
-                log.debug(f"{symbol}: Rejection too weak ({rejection_strength:.2f})")
-                return None
+            # Entry reason
+            entry_reason = "STRENGTH_SHIFT_CONFIRMED"
+            if confirmed_rejection.trigger_candle.rsi_divergence:
+                entry_reason = "DIVERGENCE_CONFIRMATION"
             
-            # 13. Determine conditions met
-            conditions_met = self._get_rejection_conditions(
-                wave_context, market_strength, best_zone, rejection_type
-            )
-            
-            # 14. Create signal ID
+            # Signal ID
             signal_id = hashlib.md5(
-                f"{symbol}:{side}:{entry_price:.8f}:{time.time()}:{best_zone.zone_type}".encode()
+                f"{symbol}:{side}:{entry_price:.8f}:{time.time()}:CONFIRMED".encode()
             ).hexdigest()
             
-            # 15. Create final signal
-            signal = RejectionSignal(
+            # Create signal
+            signal = ConfirmedRejectionSignal(
                 signal_id=signal_id,
                 symbol=symbol,
                 side=side,
@@ -999,154 +1419,52 @@ class RejectionBasedScanner:
                 market_strength=market_strength,
                 rejection_zone=best_zone,
                 
-                rejection_type=rejection_type,
-                trigger_candle=trigger_candle,
-                rsi_at_entry=current_rsi,
+                confirmed_rejection=confirmed_rejection,
+                entry_reason=entry_reason,
                 
                 rejection_strength=rejection_strength,
                 risk_reward=risk_reward,
                 expected_move_pct=target_pct,
                 
-                timeframe_used="3M",  # Always 3M for entries
+                failure_timeframe="3M",
+                trigger_timeframe="1M",
                 signal_timestamp=time.time(),
-                conditions_met=conditions_met
+                
+                passed_no_entry_filters=True,
+                early_entry_prevented=False
             )
             
-            # 16. Update tracking and deduplication
+            # Update tracking
             self.deduplicator.register_signal(signal)
             self.active_signal_ids.add(signal_id)
             
-            # 17. Update statistics
-            self.daily_stats["rejections_found"] += 1
-            if side == "LONG":
-                self.daily_stats["long_rejections"] += 1
-            else:
-                self.daily_stats["short_rejections"] += 1
+            # Update stats
+            self.daily_stats["confirmed_signals"] += 1
             
-            log.info(f"🎯 REJECTION SIGNAL: {symbol} {side} @ {entry_price:.4f}")
-            log.info(f"   Zone: {best_zone.zone_type}, Strength: {rejection_strength:.2f}")
-            log.info(f"   RSI: {current_rsi:.1f}, R:R: {risk_reward:.1f}:1")
-            log.info(f"   Wave: {wave_context.wave_length}, Maturity: {wave_context.wave_maturity:.1%}")
+            log.info(f"🎯 CONFIRMED REJECTION: {symbol} {side} @ {entry_price:.4f}")
+            log.info(f"   Failure: {confirmed_rejection.failure_candle.candle_type}")
+            log.info(f"   Trigger: {confirmed_rejection.trigger_candle.candle_type}")
+            log.info(f"   Confirmation: {confirmed_rejection.confirmation_score:.2f}")
+            log.info(f"   Zone: {best_zone.zone_type}, R:R: {risk_reward:.1f}:1")
             
             return signal
             
         except Exception as e:
-            log.error(f"Rejection signal error for {symbol}: {e}")
+            log.error(f"Signal error for {symbol}: {e}")
             return None
     
-    def _check_volume_confirmation(self, df: pd.DataFrame, zone_type: str) -> bool:
-        """Check volume confirmation at rejection zone"""
-        try:
-            if len(df) < 5:
-                return False
-            
-            # Get recent candles
-            recent_candles = df.iloc[-5:]
-            
-            # Check for volume spike in last 1-2 candles
-            recent_volume = recent_candles['volume'].values[-2:].mean()
-            prev_volume = recent_candles['volume'].values[-5:-2].mean()
-            
-            if prev_volume > 0:
-                volume_ratio = recent_volume / prev_volume
-                
-                # Volume spike (1.5x or more) is confirmation
-                if volume_ratio >= 1.5:
-                    return True
-            
-            # Also check if volume is decreasing into the zone (for failed breaks)
-            if "FAILED" in zone_type:
-                volume_trend = np.polyfit(range(5), recent_candles['volume'].values[-5:], 1)[0]
-                if volume_trend < 0:  # Decreasing volume into the level
-                    return True
-            
-            return False
-            
-        except Exception as e:
-            return False
-    
-    def _analyze_rejection_candle(self, df: pd.DataFrame, side: str, zone: RejectionZone) -> Tuple[Optional[str], Optional[str]]:
-        """Analyze the rejection candle pattern"""
-        try:
-            if len(df) < 3:
-                return None, None
-            
-            current_candle = df.iloc[-1]
-            prev_candle = df.iloc[-2]
-            
-            # Check wick rejection
-            has_wick_rejection = False
-            wick_type = None
-            
-            if side == "LONG":
-                # LONG: Price wicks below support but closes above
-                if (current_candle['low'] < zone.price_level and 
-                    current_candle['close'] > zone.price_level):
-                    has_wick_rejection = True
-                    wick_type = "SUPPORT_WICK"
-            
-            else:  # SHORT
-                # SHORT: Price wicks above resistance but closes below
-                if (current_candle['high'] > zone.price_level and 
-                    current_candle['close'] < zone.price_level):
-                    has_wick_rejection = True
-                    wick_type = "RESISTANCE_WICK"
-            
-            # Check momentum shift candle
-            momentum_shift = False
-            candle_type = None
-            
-            if side == "LONG":
-                # LONG: Bearish candle followed by bullish candle at support
-                if (prev_candle['close'] < prev_candle['open'] and  # Bearish
-                    current_candle['close'] > current_candle['open'] and  # Bullish
-                    abs(current_candle['close'] - zone.price_level) / zone.price_level < 0.002):  # Near zone
-                    momentum_shift = True
-                    candle_type = "BULLISH_REVERSAL"
-            
-            else:  # SHORT
-                # SHORT: Bullish candle followed by bearish candle at resistance
-                if (prev_candle['close'] > prev_candle['open'] and  # Bullish
-                    current_candle['close'] < current_candle['open'] and  # Bearish
-                    abs(current_candle['close'] - zone.price_level) / zone.price_level < 0.002):  # Near zone
-                    momentum_shift = True
-                    candle_type = "BEARISH_REVERSAL"
-            
-            # Determine rejection type
-            if has_wick_rejection:
-                return "WICK_REJECTION", wick_type
-            elif momentum_shift:
-                return "MOMENTUM_REJECTION", candle_type
-            else:
-                # Check for simple rejection (price tests level and moves away)
-                if side == "LONG":
-                    if current_candle['low'] <= zone.price_level * 1.001 and current_candle['close'] > zone.price_level:
-                        return "PRICE_REJECTION", "SUPPORT_HOLD"
-                else:
-                    if current_candle['high'] >= zone.price_level * 0.999 and current_candle['close'] < zone.price_level:
-                        return "PRICE_REJECTION", "RESISTANCE_HOLD"
-            
-            return None, None
-            
-        except Exception as e:
-            return None, None
-    
-    def _calculate_rejection_strength(self, zone: RejectionZone, strength: MarketStrength, 
+    def _calculate_rejection_strength(self, zone: RejectionZone, strength: MarketStrength,
                                      wave: WaveContext, rsi: float) -> float:
-        """Calculate overall rejection strength score"""
+        """Calculate rejection strength"""
         factors = []
         weights = []
         
-        # 1. Zone strength (30%)
         factors.append(zone.strength)
         weights.append(0.3)
         
-        # 2. Market strength (25%)
         factors.append(strength.strength_score)
         weights.append(0.25)
         
-        # 3. Wave context (20%)
-        # Favor corrective waves at support/resistance
         if wave.structure_type == "CORRECTIVE":
             wave_score = 0.8
         elif wave.structure_type == "COMPRESSION":
@@ -1154,13 +1472,11 @@ class RejectionBasedScanner:
         else:
             wave_score = 0.5
         
-        # Adjust for wave maturity (early waves better)
-        wave_score *= (1 - wave.wave_maturity * 0.5)  # Reduce if too mature
+        wave_score *= (1 - wave.wave_maturity * 0.5)
         
         factors.append(wave_score)
         weights.append(0.2)
         
-        # 4. RSI position (25%)
         if zone.rsi_position == "IN_ZONE":
             rsi_score = 0.9
         elif zone.rsi_position == "OVEREXTENDED":
@@ -1173,69 +1489,36 @@ class RejectionBasedScanner:
         
         return np.average(factors, weights=weights)
     
-    def _get_rejection_conditions(self, wave: WaveContext, strength: MarketStrength, 
-                                 zone: RejectionZone, rejection_type: str) -> List[str]:
-        """Get list of conditions met for this rejection"""
-        conditions = []
-        
-        # Wave conditions
-        conditions.append(f"WAVE_{wave.wave_length}")
-        conditions.append(f"STRUCTURE_{wave.structure_type}")
-        
-        # Strength conditions
-        if strength.is_continuation:
-            conditions.append("STRENGTH_CONTINUATION")
-        if strength.is_rejection_setup:
-            conditions.append("STRENGTH_REJECTION_SETUP")
-        if strength.is_absorption:
-            conditions.append("STRENGTH_ABSORPTION")
-        if strength.is_compression:
-            conditions.append("STRENGTH_COMPRESSION")
-        
-        # Zone conditions
-        conditions.append(f"ZONE_{zone.zone_type}")
-        if zone.volume_confirmation:
-            conditions.append("VOLUME_CONFIRMED")
-        
-        # Rejection type
-        conditions.append(f"REJECTION_{rejection_type}")
-        
-        # RSI condition
-        conditions.append(f"RSI_{zone.rsi_position}")
-        
-        return conditions
-    
     def get_daily_stats(self) -> Dict:
         """Get daily statistics"""
         return self.daily_stats
     
     def cleanup_old_signals(self):
-        """Clean up old signals from deduplication"""
+        """Clean up old signals"""
         self.deduplicator.remove_closed_signals()
 
 # ================ MAIN SCANNER SYSTEM ================
-class RejectionScanner:
-    """Main scanner system for rejection-based trading"""
+class ConfirmedRejectionScannerSystem:
+    """Main scanner system for confirmed rejection trading"""
     
     def __init__(self):
-        self.scanner = RejectionBasedScanner()
+        self.scanner = ConfirmedRejectionScanner()
         self.exchange = None
         self.db = None
         self.scan_cycle = 0
-        
+    
     async def initialize(self):
         """Initialize the scanner"""
         log.info("=" * 70)
-        log.info("🔥 REJECTION-BASED HIGH-FREQUENCY SCANNER")
+        log.info("🔥 CONFIRMED REJECTION SYSTEM - FIXED VERSION")
         log.info("=" * 70)
         log.info("TRADER ROLE: Discretionary reaction trader")
-        log.info("SPECIALTY: Wave-length awareness + Strength analysis + Rejection entries")
-        log.info("PHILOSOPHY: Wave length sets context, Strength & volume make decision")
-        log.info("ENTRY RULE: Rejection pulls the trigger")
+        log.info("SPECIALTY: CONFIRMED rejection entries (failure + strength shift)")
+        log.info("CORRECTED: NO early entries - Only confirmed rejections")
+        log.info("PHILOSOPHY: الرفض يخلق الفكرة، الفشل يؤكدها، تحول القوة هو الدخول")
         log.info(f"SCAN INTERVAL: {SCAN_INTERVAL} seconds")
-        log.info("TIME FRAMES: 1H/15M (context), 3M/1M (entries)")
-        log.info("REJECTION ZONES: EMA, Range, Failed breaks only")
-        log.info("RSI ZONES: 40-50 (LONG), 50-60 (SHORT)")
+        log.info("TIME FRAMES: 3M (failure detection) + 1M (trigger/entry)")
+        log.info("NO ENTRY FILTERS: 6 filters to prevent early entries")
         log.info("DEDUPLICATION: ONE TRADE PER SYMBOL")
         log.info("=" * 70)
         
@@ -1254,9 +1537,9 @@ class RejectionScanner:
             os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
             self.db = await aiosqlite.connect(DB_PATH)
             
-            # Rejection signals table
+            # Confirmed signals table
             await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS rejection_signals (
+            CREATE TABLE IF NOT EXISTS confirmed_signals (
                 id TEXT PRIMARY KEY,
                 symbol TEXT NOT NULL,
                 side TEXT NOT NULL,
@@ -1266,26 +1549,29 @@ class RejectionScanner:
                 
                 wave_length TEXT NOT NULL,
                 wave_maturity REAL NOT NULL,
-                expansion_speed REAL NOT NULL,
                 structure_type TEXT NOT NULL,
                 
                 candle_speed REAL NOT NULL,
-                distance_ratio REAL NOT NULL,
-                ema_angle REAL NOT NULL,
-                volume_participation REAL NOT NULL,
                 strength_score REAL NOT NULL,
+                volume_participation REAL NOT NULL,
                 
                 zone_type TEXT NOT NULL,
-                rejection_strength REAL NOT NULL,
-                rsi_at_entry REAL NOT NULL,
-                rejection_type TEXT NOT NULL,
-                trigger_candle TEXT NOT NULL,
+                failure_candle_type TEXT NOT NULL,
+                trigger_candle_type TEXT NOT NULL,
+                confirmation_score REAL NOT NULL,
                 
+                rsi_at_entry REAL NOT NULL,
+                entry_reason TEXT NOT NULL,
                 risk_reward REAL NOT NULL,
                 expected_move REAL NOT NULL,
-                timeframe_used TEXT NOT NULL,
+                
+                failure_timeframe TEXT NOT NULL,
+                trigger_timeframe TEXT NOT NULL,
                 
                 conditions_met TEXT,
+                passed_no_entry_filters BOOLEAN,
+                early_entry_prevented BOOLEAN,
+                
                 status TEXT DEFAULT 'PENDING',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 
@@ -1299,24 +1585,7 @@ class RejectionScanner:
             )
             """)
             
-            # Performance table
-            await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS performance_daily (
-                date DATE PRIMARY KEY,
-                total_rejections INTEGER,
-                long_rejections INTEGER,
-                short_rejections INTEGER,
-                no_strength_count INTEGER,
-                no_zone_count INTEGER,
-                win_rate REAL,
-                avg_win REAL,
-                avg_loss REAL,
-                total_pnl REAL
-            )
-            """)
-            
             await self.db.commit()
-            
             log.info("✅ Database initialized")
             
         except Exception as e:
@@ -1333,7 +1602,6 @@ class RejectionScanner:
                 "rateLimit": 50
             })
             
-            # Test connection
             ticker = await self.exchange.fetch_ticker("BTC/USDT")
             log.info(f"✅ Exchange connected. BTC: ${ticker['last']:.2f}")
             
@@ -1342,61 +1610,64 @@ class RejectionScanner:
             raise
     
     async def _send_startup_message(self):
-        """Send startup message to Telegram"""
+        """Send corrected startup message"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            log.warning("⚠️ Telegram credentials not set. Notifications will not be sent.")
+            log.warning("⚠️ Telegram credentials not set.")
             return
         
         try:
             message = f"""
-🎯 <b>REJECTION-BASED HIGH-FREQUENCY SCANNER</b>
+🎯 <b>CONFIRMED REJECTION SYSTEM - FIXED VERSION</b>
 
-<b>🧠 TRADER MINDSET:</b>
-• Reaction trader (not prediction-based)
-• Rejection specialist
-• Comfortable being wrong
-• Emotionless with losses
-• Hunts expansion, accepts losses
+<b>🧠 الفلسفة المصححة (سطر واحد):</b>
+الرفض يخلق الفكرة
+الفشل يؤكدها
+وتحول القوة هو الدخول
 
-<b>📊 ANALYSIS FRAMEWORK:</b>
-1️⃣ <b>الطول الموجي (Wave Length)</b> → السياق فقط
-   • طول الموجة ونضجها
-   • سرعة التوسع
-   • لا عد للموجات
+<b>📊 الإطار المصحح:</b>
+1️⃣ <b>الطول الموجي</b> → السياق فقط
+2️⃣ <b>القوة والفوليوم</b> → قرار الدخول
+3️⃣ <b>مناطق الرفض</b> → الفكرة الأولية فقط
 
-2️⃣ <b>القوة (Market Strength)</b> → قرار الدخول
-   • سرعة الشموع
-   • المسافة المقطوعة
-   • زاوية المتوسطات
-   • مشاركة الفوليوم
+<b>🔒 نظام الدخول المصحح (الجديد):</b>
 
-3️⃣ <b>مناطق الرفض (Rejection Zones)</b> → الزناد الإجباري
-   • الدخول عند الرفض فقط
-   • دعم/مقاومة المتوسطات
-   • أعلى/أقل النطاق
-   • اختراقات فاشلة
+<b>📌 تأكيد الدخول (Entry Confirmation):</b>
+لا يتم الدخول إلا بعد تحقق الشرطين:
 
-<b>⚡ إعدادات الدخول:</b>
-• إطار الدخول: 3M (رئيسي) + 1M (توقيت)
-• RSI: 40–50 للشراء، 50–60 للبيع
-• نسبة الربح/المخاطرة: 1:2 كحد أدنى
-• الهدف: 1.5–4% (مردود غير متماثل)
+1. <b>شمعة رفض (Failure Candle) - على 3M:</b>
+   • ذيل واضح عند منطقة رفض
+   • إغلاق داخل النطاق أو خلف EMA
+   • ضعف فوليوم في اتجاه الاختراق
+
+2. <b>شمعة تحول قوة (Trigger Candle) - على 1M:</b>
+   • أول شمعة قوية بالاتجاه المعاكس
+   • فوليوم أعلى من شمعة الرفض
+   • إغلاق قريب من القمة (شراء) أو القاع (بيع)
+
+<b>⚡ توقيت الدخول:</b>
+• الدخول عند <b>إغلاق شمعة 1M المؤكدة</b>
+• <b>ليس</b> عند أول شمعة رفض
+
+<b>🚫 مرشحات (NO ENTRY) - لمنع الدخول المبكر:</b>
+1. شمعة التحول ضعيفة
+2. بدون تأكيد فوليوم
+3. الشمعة التالية ضعيفة
+4. الضغط ما زال موجوداً
+5. شمعة الرفض غير واضحة
+6. عدم وجود نمط فشل واضح
 
 <b>🛡️ نظام التكرار:</b>
 • <b>صفقة واحدة لكل عملة فقط</b>
 • إشارات جديدة فقط بعد إغلاق الصفقة السابقة
-• لا يوجد تبريد زمني
 
-<b>🎯 فلسفة الدخول:</b>
-الدخول عند أول شمعة رفض قوية
-الدخول حيث يتردد الآخرون
-أدخل مبكراً عن قصد
+<b>🎯 عقلية التاجر المصححة:</b>
+• الدخول بعد تأكيد فشل الحركة
+• الدخول بعد تحول القوة وليس عند أول رفض
+• راحة مع الانتظار
+• نقبل الخسائر المبكرة
+• نصطاد التوسع المؤكد
 
-الطول الموجي يحدد السياق
-القوة والفوليوم يحددان القرار
-والرفض هو الزناد
-
-#متداول_تفاعلي #تخصص_الرفض #صفقة_واحدة
+#متداول_تفاعلي #تخصص_الرفض_المؤكد #لا_دخول_مبكر
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -1418,12 +1689,11 @@ class RejectionScanner:
         
         for tf_name, tf in TIMEFRAMES.items():
             try:
-                # Adjust limits based on timeframe
                 if tf_name == "1H":
                     limit = 100
                 elif tf_name == "15M":
                     limit = 80
-                else:  # 5M, 3M, 1M
+                else:
                     limit = 50
                 
                 ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
@@ -1434,7 +1704,6 @@ class RejectionScanner:
                         columns=["timestamp", "open", "high", "low", "close", "volume"]
                     )
                     
-                    # Convert to numeric
                     for col in ["open", "high", "low", "close", "volume"]:
                         df[col] = pd.to_numeric(df[col], errors='coerce')
                     
@@ -1460,38 +1729,34 @@ class RejectionScanner:
                     volume = ticker.get('quoteVolume', 0)
                     
                     if volume >= MIN_VOLUME_USD:
-                        # Check price spread for liquidity
                         bid = ticker.get('bid', 0)
                         ask = ticker.get('ask', 0)
                         
                         if bid > 0 and ask > 0:
                             spread = (ask - bid) / bid * 100
-                            if spread < 0.1:  # Good liquidity
+                            if spread < 0.1:
                                 active_pairs.append((symbol, volume))
             
-            # Sort by volume
             active_pairs.sort(key=lambda x: x[1], reverse=True)
-            
-            # Take top N
             return active_pairs[:TOP_N_VOLUME]
             
         except Exception as e:
             log.error(f"Error getting pairs: {e}")
             return []
     
-    async def save_signal(self, signal: RejectionSignal) -> bool:
+    async def save_signal(self, signal: ConfirmedRejectionSignal) -> bool:
         """Save signal to database"""
         try:
-            # Insert signal
             await self.db.execute("""
-                INSERT INTO rejection_signals (
+                INSERT INTO confirmed_signals (
                     id, symbol, side, entry_price, stop_loss, take_profit,
-                    wave_length, wave_maturity, expansion_speed, structure_type,
-                    candle_speed, distance_ratio, ema_angle, volume_participation, strength_score,
-                    zone_type, rejection_strength, rsi_at_entry, rejection_type, trigger_candle,
-                    risk_reward, expected_move, timeframe_used,
-                    conditions_met
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    wave_length, wave_maturity, structure_type,
+                    candle_speed, strength_score, volume_participation,
+                    zone_type, failure_candle_type, trigger_candle_type, confirmation_score,
+                    rsi_at_entry, entry_reason, risk_reward, expected_move,
+                    failure_timeframe, trigger_timeframe,
+                    conditions_met, passed_no_entry_filters, early_entry_prevented
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 signal.signal_id,
                 signal.symbol,
@@ -1501,58 +1766,38 @@ class RejectionScanner:
                 signal.take_profit,
                 signal.wave_context.wave_length,
                 signal.wave_context.wave_maturity,
-                signal.wave_context.expansion_speed,
                 signal.wave_context.structure_type,
                 signal.market_strength.candle_speed,
-                signal.market_strength.distance_ratio,
-                signal.market_strength.ema_angle,
-                signal.market_strength.volume_participation,
                 signal.market_strength.strength_score,
+                signal.market_strength.volume_participation,
                 signal.rejection_zone.zone_type,
-                signal.rejection_strength,
-                signal.rsi_at_entry,
-                signal.rejection_type,
-                signal.trigger_candle,
+                signal.confirmed_rejection.failure_candle.candle_type,
+                signal.confirmed_rejection.trigger_candle.candle_type,
+                signal.confirmed_rejection.confirmation_score,
+                signal.confirmed_rejection.trigger_candle.rsi_slope_change,
+                signal.entry_reason,
                 signal.risk_reward,
                 signal.expected_move_pct,
-                signal.timeframe_used,
-                json.dumps(signal.conditions_met)
+                signal.failure_timeframe,
+                signal.trigger_timeframe,
+                json.dumps(signal.confirmed_rejection.conditions_met),
+                signal.passed_no_entry_filters,
+                signal.early_entry_prevented
             ))
             
             await self.db.commit()
-            
-            log.info(f"✅ Rejection signal saved: {signal.symbol}")
+            log.info(f"✅ Confirmed signal saved: {signal.symbol}")
             return True
             
         except Exception as e:
             log.error(f"Error saving signal: {e}")
             return False
     
-    async def format_signal_message(self, signal: RejectionSignal) -> str:
+    async def format_signal_message(self, signal: ConfirmedRejectionSignal) -> str:
         """Format signal for Telegram"""
         side_emoji = "🟢" if signal.side == "LONG" else "🔴"
         side_text = "شراء" if signal.side == "LONG" else "بيع"
         
-        # Risk info
-        risk_pct = abs(signal.entry_price - signal.stop_loss) / signal.entry_price * 100
-        
-        # Wave context
-        wave_info = f"{signal.wave_context.wave_length} ({signal.wave_context.structure_type})"
-        
-        # Strength info
-        strength_type = []
-        if signal.market_strength.is_continuation:
-            strength_type.append("استمرارية")
-        if signal.market_strength.is_rejection_setup:
-            strength_type.append("إعداد رفض")
-        if signal.market_strength.is_absorption:
-            strength_type.append("امتصاص")
-        if signal.market_strength.is_compression:
-            strength_type.append("ضغط")
-        
-        strength_text = "، ".join(strength_type) if strength_type else "محايد"
-        
-        # Zone info in Arabic
         zone_translation = {
             "EMA_SUPPORT": "دعم المتوسط المتحرك",
             "EMA_RESISTANCE": "مقاومة المتوسط المتحرك",
@@ -1564,41 +1809,27 @@ class RejectionScanner:
         
         zone_text = zone_translation.get(signal.rejection_zone.zone_type, signal.rejection_zone.zone_type)
         
-        # Rejection type in Arabic
-        rejection_translation = {
-            "WICK_REJECTION": "رفض بالفتيلة",
-            "MOMENTUM_REJECTION": "رفض بتحول الزخم",
-            "PRICE_REJECTION": "رفض بالسعر"
-        }
-        
-        rejection_text = rejection_translation.get(signal.rejection_type, signal.rejection_type)
+        risk_pct = abs(signal.entry_price - signal.stop_loss) / signal.entry_price * 100
         
         message = f"""
-{side_emoji} <b>إشارة رفض</b> ⚡
+{side_emoji} <b>إشارة رفض مؤكدة</b> ✅
 
 <b>{signal.symbol}</b> | {side_text}
 
-<b>📊 السياق الموجي:</b>
-• طول الموجة: {wave_info}
-• النضج: {signal.wave_context.wave_maturity:.1%}
-• سرعة التوسع: {signal.wave_context.expansion_speed:.1%}
-
-<b>💪 قوة السوق:</b>
-• درجة القوة: {signal.market_strength.strength_score:.1%}
-• النوع: {strength_text}
-• سرعة الشموع: {signal.market_strength.candle_speed:.1%}
-• مشاركة الفوليوم: {signal.market_strength.volume_participation:.1%}
+<b>📊 تأكيد الرفض:</b>
+• شمعة الفشل: {signal.confirmed_rejection.failure_candle.candle_type}
+• شمعة التحول: {signal.confirmed_rejection.trigger_candle.candle_type}
+• درجة التأكيد: {signal.confirmed_rejection.confirmation_score:.1%}
 
 <b>🎯 منطقة الرفض:</b>
 • النوع: {zone_text}
 • قوة المنطقة: {signal.rejection_zone.strength:.1%}
-• تأكيد الفوليوم: {"✅" if signal.rejection_zone.volume_confirmation else "❌"}
-• RSI عند الدخول: {signal.rsi_at_entry:.1f}
+• RSI عند الدخول: {signal.confirmed_rejection.trigger_candle.rsi_slope_change:.1f}
 
-<b>⚡ تفاصيل الرفض:</b>
-• نوع الرفض: {rejection_text}
-• شمعة الزناد: {signal.trigger_candle}
-• قوة الرفض: {signal.rejection_strength:.1%}
+<b>💪 تحليل القوة:</b>
+• درجة القوة: {signal.market_strength.strength_score:.1%}
+• سرعة الشموع: {signal.market_strength.candle_speed:.1%}
+• مشاركة الفوليوم: {signal.market_strength.volume_participation:.1%}
 
 <b>🔧 التنفيذ:</b>
 • سعر الدخول: <code>{signal.entry_price:.6f}</code>
@@ -1606,148 +1837,21 @@ class RejectionScanner:
 • هدف الربح: <code>{signal.take_profit:.6f}</code> ({signal.expected_move_pct:.1f}%)
 • نسبة الربح/المخاطرة: {signal.risk_reward:.1f}:1
 
-<b>🛡️ نظام التكرار:</b>
-• نظام: <b>صفقة واحدة لكل عملة</b>
-• لا إشارات جديدة لـ {signal.symbol} حتى إغلاق هذه الصفقة
+<b>🛡️ نظام التأكيد:</b>
+• تم الدخول بعد <b>تأكيد الرفض</b>
+• شمعة الفشل (3M) + شمعة التحول (1M)
+• مرت جميع مرشحات NO ENTRY
 
 <b>⚠️ ملاحظة التاجر:</b>
-الدخول عند الرفض فقط
-لا مطاردة - لا توقع
-نقبل الخسائر - نصطاد التوسع
+الدخول بعد تأكيد فشل الحركة
+الدخول بعد تحول القوة وليس عند أول رفض
+نقبل الخسائر - نصطاد التوسع المؤكد
 
-#{side_text} #رفض #{"دعم" if signal.side == "LONG" else "مقاومة"} #صفقة_واحدة
+#{side_text} #رفض_مؤكد #{"دعم" if signal.side == "LONG" else "مقاومة"} #صفقة_واحدة
 """
         return message
     
-    async def send_trade_trigger_notification(self, symbol: str, side: str, entry_price: float):
-        """Send notification when trade is triggered/entered"""
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            log.warning(f"⚠️ Telegram credentials missing. Skipping trigger notification for {symbol}")
-            return
-        
-        try:
-            side_emoji = "🟢" if side == "LONG" else "🔴"
-            side_text = "شراء" if side == "LONG" else "بيع"
-            
-            message = f"""
-{side_emoji} <b>تم تنفيذ صفقة الرفض</b> ⚡
-
-<b>{symbol}</b> | {side_text}
-
-<b>🎯 تم الدخول عند الرفض:</b>
-<code>{entry_price:.6f}</code>
-
-<b>🧠 عقلية التاجر:</b>
-• دخول مبكر عند أول رفض
-• دخول حيث يتردد الآخرون
-• راحة مع الخسائر المحتملة
-• صيد للتوسع القادم
-
-<b>🛡️ نظام التكرار:</b>
-❌ <b>ممنوع</b> إرسال إشارات جديدة لـ {symbol}
-✅ مسموح بإشارات جديدة بعد إغلاق هذه الصفقة
-
-<b>⚠️ المتابعة:</b>
-يتم متابعة الصفقة تلقائياً.
-ستصلك إشعار عند الوصول لوقف الخسارة أو هدف الربح.
-
-#{side_text} #تنفيذ_رفض #متابعة #لا_إشارات_جديدة
-"""
-            
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(url, json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML"
-                })
-            
-            log.info(f"{side_emoji} Rejection trade triggered: {symbol} {side} @ {entry_price:.4f}")
-            
-        except Exception as e:
-            log.error(f"Trigger notification error: {e}")
-    
-    async def send_trade_close_notification(self, symbol: str, side: str, pnl_percent: float, 
-                                           close_reason: str, entry_price: float, 
-                                           close_price: float, risk_reward: float):
-        """Send notification when trade hits TP/SL"""
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            log.warning(f"⚠️ Telegram credentials missing. Skipping close notification for {symbol}")
-            return
-        
-        try:
-            log.info(f"📤 Sending close notification for {symbol}: {close_reason} ({pnl_percent:.2f}%)")
-            
-            if close_reason == "TP_HIT":
-                emoji = "✅"
-                result_text = "هدف الربح"
-                result_emoji = "🎯"
-                color = "🟢"
-                pnl_emoji = "💰"
-            else:  # SL_HIT
-                emoji = "❌"
-                result_text = "وقف الخسارة"
-                result_emoji = "🛑"
-                color = "🔴"
-                pnl_emoji = "💸"
-            
-            side_text = "شراء" if side == "LONG" else "بيع"
-            
-            # Format P&L with sign
-            pnl_formatted = f"+{pnl_percent:.2f}%" if pnl_percent > 0 else f"{pnl_percent:.2f}%"
-            
-            # Trader mindset message based on result
-            if close_reason == "TP_HIT":
-                mindset = "التوسع تم اصطياده ✅ الدخول المبكر حقق الربح"
-            else:
-                mindset = "الخسارة مقبولة ❌ الرفض لم يحترم، ننتظر الرفض التالي"
-            
-            message = f"""
-{emoji} <b>تم إغلاق صفقة الرفض</b> {result_emoji}
-
-<b>{symbol}</b> | {side_text}
-
-{color} <b>النتيجة: {result_text}</b>
-{pnl_emoji} <b>النسبة: {pnl_formatted}</b>
-
-<b>📊 تفاصيل التنفيذ:</b>
-• نوع الدخول: {side_text} (عند الرفض)
-• سعر الدخول: <code>{entry_price:.6f}</code>
-• سعر الإغلاق: <code>{close_price:.6f}</code>
-• نسبة الربح/الخسارة: <b>{pnl_formatted}</b>
-• نسبة الربح/المخاطرة المحققة: {risk_reward:.1f}:1
-
-<b>🧠 عقلية التاجر:</b>
-{mindset}
-نقبل الخسائر - نصطاد التوسع
-كل رفض هو فرصة جديدة
-
-<b>🛡️ نظام التكرار:</b>
-✅ <b>مسموح الآن</b> بإرسال إشارات جديدة لـ {symbol}
-يمكن للماسح الضوئي البحث عن رفض جديد لهذه العملة
-
-#{side_text} #إغلاق_رفض #{"ربح" if close_reason == "TP_HIT" else "خسارة"} #مسموح_إشارات_جديدة
-"""
-            
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.post(url, json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML"
-                })
-                
-                if response.status_code == 200:
-                    log.info(f"✅ Telegram close notification sent for {symbol}: {close_reason}")
-                else:
-                    log.error(f"❌ Telegram API error: {response.status_code} - {response.text}")
-            
-            log.info(f"{emoji} Rejection trade closed: {symbol} {side} {pnl_formatted} ({close_reason})")
-            
-        except Exception as e:
-            log.error(f"Close notification error: {e}")
-    
-    async def send_telegram_alert(self, signal: RejectionSignal):
+    async def send_telegram_alert(self, signal: ConfirmedRejectionSignal):
         """Send Telegram alert"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             log.warning(f"⚠️ Telegram credentials missing. Skipping alert for {signal.symbol}")
@@ -1764,21 +1868,130 @@ class RejectionScanner:
                     "parse_mode": "HTML"
                 })
                 
-            log.info(f"📤 Telegram rejection alert sent: {signal.symbol}")
+            log.info(f"📤 Telegram confirmed alert sent: {signal.symbol}")
             
         except Exception as e:
             log.error(f"Telegram error: {e}")
     
+    async def send_trade_trigger_notification(self, symbol: str, side: str, entry_price: float):
+        """Send trigger notification"""
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            return
+        
+        try:
+            side_emoji = "🟢" if side == "LONG" else "🔴"
+            side_text = "شراء" if side == "LONG" else "بيع"
+            
+            message = f"""
+{side_emoji} <b>تم تنفيذ صفقة الرفض المؤكدة</b> ✅
+
+<b>{symbol}</b> | {side_text}
+
+<b>🎯 تم الدخول بعد تأكيد الرفض:</b>
+<code>{entry_price:.6f}</code>
+
+<b>🧠 عقلية التاجر:</b>
+• دخول بعد تأكيد فشل الحركة
+• دخول بعد تحول القوة المؤكد
+• راحة مع الانتظار
+• صيد للتوسع القادم المؤكد
+
+<b>🛡️ نظام التكرار:</b>
+❌ <b>ممنوع</b> إرسال إشارات جديدة لـ {symbol}
+✅ مسموح بإشارات جديدة بعد إغلاق هذه الصفقة
+
+#{side_text} #تنفيذ_رفض_مؤكد #متابعة #لا_إشارات_جديدة
+"""
+            
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(url, json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": message,
+                    "parse_mode": "HTML"
+                })
+            
+            log.info(f"{side_emoji} Confirmed rejection triggered: {symbol} {side}")
+            
+        except Exception as e:
+            log.error(f"Trigger notification error: {e}")
+    
+    async def send_trade_close_notification(self, symbol: str, side: str, pnl_percent: float,
+                                           close_reason: str, entry_price: float,
+                                           close_price: float, risk_reward: float):
+        """Send close notification"""
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            return
+        
+        try:
+            if close_reason == "TP_HIT":
+                emoji = "✅"
+                result_text = "هدف الربح"
+                result_emoji = "🎯"
+                color = "🟢"
+                pnl_emoji = "💰"
+            else:
+                emoji = "❌"
+                result_text = "وقف الخسارة"
+                result_emoji = "🛑"
+                color = "🔴"
+                pnl_emoji = "💸"
+            
+            side_text = "شراء" if side == "LONG" else "بيع"
+            pnl_formatted = f"+{pnl_percent:.2f}%" if pnl_percent > 0 else f"{pnl_percent:.2f}%"
+            
+            if close_reason == "TP_HIT":
+                mindset = "التوسع المؤكد تم اصطياده ✅ الدخول بعد التأكيد حقق الربح"
+            else:
+                mindset = "الخسارة مقبولة ❌ الانتظار للتأكيد القادم"
+            
+            message = f"""
+{emoji} <b>تم إغلاق صفقة الرفض المؤكدة</b> {result_emoji}
+
+<b>{symbol}</b> | {side_text}
+
+{color} <b>النتيجة: {result_text}</b>
+{pnl_emoji} <b>النسبة: {pnl_formatted}</b>
+
+<b>📊 تفاصيل التنفيذ:</b>
+• نوع الدخول: {side_text} (بعد تأكيد الرفض)
+• سعر الدخول: <code>{entry_price:.6f}</code>
+• سعر الإغلاق: <code>{close_price:.6f}</code>
+• نسبة الربح/الخسارة: <b>{pnl_formatted}</b>
+
+<b>🧠 عقلية التاجر:</b>
+{mindset}
+نقبل الخسائر - نصطاد التوسع المؤكد
+كل تأكيد هو فرصة جديدة
+
+<b>🛡️ نظام التكرار:</b>
+✅ <b>مسموح الآن</b> بإرسال إشارات جديدة لـ {symbol}
+
+#{side_text} #إغلاق_رفض_مؤكد #{"ربح" if close_reason == "TP_HIT" else "خسارة"} #مسموح_إشارات_جديدة
+"""
+            
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(url, json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": message,
+                    "parse_mode": "HTML"
+                })
+            
+            log.info(f"{emoji} Confirmed trade closed: {symbol} {side} {pnl_formatted}")
+            
+        except Exception as e:
+            log.error(f"Close notification error: {e}")
+    
     async def monitor_positions(self):
-        """Monitor and close positions with trade-based deduplication - FIXED VERSION"""
-        log.info("👀 Starting position monitoring with Telegram notifications...")
+        """Monitor and close positions"""
+        log.info("👀 Starting position monitoring for confirmed rejections...")
         
         while True:
             try:
-                # Get ALL open positions (both pending and triggered)
                 async with self.db.execute("""
                     SELECT id, symbol, side, entry_price, stop_loss, take_profit, status
-                    FROM rejection_signals 
+                    FROM confirmed_signals 
                     WHERE status IN ('PENDING', 'TRIGGERED')
                 """) as cursor:
                     positions = await cursor.fetchall()
@@ -1788,18 +2001,14 @@ class RejectionScanner:
                 
                 for pos_id, symbol, side, entry, sl, tp, status in positions:
                     try:
-                        # Get current price
                         ticker = await self.exchange.fetch_ticker(symbol)
                         current_price = ticker['last']
                         
-                        # For PENDING positions: check if price reached entry
+                        # Check if price reached entry for PENDING
                         if status == 'PENDING':
-                            # For rejection trading, we enter immediately at signal price
-                            # Mark as triggered if price is within reasonable range (0.5%)
-                            if abs(current_price - entry) / entry <= 0.005:  # 0.5% zone
-                                # Mark as triggered
+                            if abs(current_price - entry) / entry <= 0.005:
                                 await self.db.execute("""
-                                    UPDATE rejection_signals SET 
+                                    UPDATE confirmed_signals SET 
                                         status = 'TRIGGERED',
                                         triggered_at = CURRENT_TIMESTAMP,
                                         trigger_price = ?
@@ -1807,17 +2016,12 @@ class RejectionScanner:
                                 """, (current_price, pos_id))
                                 
                                 await self.db.commit()
-                                
-                                # UPDATE DEDUPLICATION STATUS to TRIGGERED
                                 self.scanner.deduplicator.update_signal_status(pos_id, "TRIGGERED")
-                                
-                                # SEND TRIGGER NOTIFICATION
                                 await self.send_trade_trigger_notification(symbol, side, current_price)
-                                
-                                log.info(f"✅ Rejection position triggered: {symbol} {side} @ {current_price:.4f}")
-                                continue  # Skip SL/TP check for this cycle
+                                log.info(f"✅ Confirmed position triggered: {symbol}")
+                                continue
                         
-                        # Check SL/TP for ALL positions (including newly triggered ones)
+                        # Check SL/TP
                         pnl_percent = 0
                         close_reason = None
                         
@@ -1829,7 +2033,7 @@ class RejectionScanner:
                                 close_reason = "TP_HIT"
                                 pnl_percent = ((current_price - entry) / entry) * 100
                         
-                        else:  # SHORT
+                        else:
                             if current_price >= sl:
                                 close_reason = "SL_HIT"
                                 pnl_percent = ((entry - current_price) / entry) * 100
@@ -1838,16 +2042,14 @@ class RejectionScanner:
                                 pnl_percent = ((entry - current_price) / entry) * 100
                         
                         if close_reason:
-                            # Get risk_reward from database
                             async with self.db.execute("""
-                                SELECT risk_reward FROM rejection_signals WHERE id = ?
+                                SELECT risk_reward FROM confirmed_signals WHERE id = ?
                             """, (pos_id,)) as cursor:
                                 row = await cursor.fetchone()
                                 risk_reward = row[0] if row else 0
                             
-                            # Update database
                             await self.db.execute("""
-                                UPDATE rejection_signals SET 
+                                UPDATE confirmed_signals SET 
                                     status = 'CLOSED',
                                     closed_at = CURRENT_TIMESTAMP,
                                     close_price = ?,
@@ -1857,14 +2059,9 @@ class RejectionScanner:
                             """, (current_price, pnl_percent, close_reason, pos_id))
                             
                             await self.db.commit()
-                            
-                            # UPDATE DEDUPLICATION STATUS to CLOSED
                             self.scanner.deduplicator.update_signal_status(pos_id, "CLOSED")
-                            
-                            # Clean up from tracking
                             self.scanner.active_signal_ids.discard(pos_id)
                             
-                            # SEND CLOSE NOTIFICATION - THIS WAS MISSING
                             await self.send_trade_close_notification(
                                 symbol=symbol,
                                 side=side,
@@ -1874,34 +2071,31 @@ class RejectionScanner:
                                 close_price=current_price,
                                 risk_reward=risk_reward
                             )
-                            
-                            log.info(f"📤 Telegram close notification sent for {symbol}: {close_reason} ({pnl_percent:.2f}%)")
                     
                     except Exception as e:
                         log.error(f"Monitor error for {symbol}: {e}")
                         continue
                 
-                # Clean up old closed signals periodically
-                if int(time.time()) % 300 < 2:  # Every ~5 minutes
+                # Clean up
+                if int(time.time()) % 300 < 2:
                     self.scanner.deduplicator.remove_closed_signals()
                 
-                # Fast monitoring for rejection trading
-                await asyncio.sleep(2)  # Check every 2 seconds
+                await asyncio.sleep(2)
                 
             except Exception as e:
                 log.error(f"Monitoring loop error: {e}")
                 await asyncio.sleep(5)
     
-    async def high_freq_scanning(self):
-        """Main high-frequency scanning loop for rejections"""
-        log.info("🚀 Starting rejection-based high-frequency scanning...")
+    async def confirmed_rejection_scanning(self):
+        """Main scanning loop for confirmed rejections"""
+        log.info("🚀 Starting confirmed rejection scanning...")
         
         while True:
             try:
                 self.scan_cycle += 1
                 start_time = time.time()
                 
-                log.info(f"🔄 Scan cycle #{self.scan_cycle} (Rejection hunting)")
+                log.info(f"🔄 Scan cycle #{self.scan_cycle} (Confirmed rejection hunting)")
                 
                 # Get active pairs
                 pairs = await self.get_active_pairs()
@@ -1911,29 +2105,24 @@ class RejectionScanner:
                     await asyncio.sleep(SCAN_INTERVAL)
                     continue
                 
-                log.info(f"Scanning {len(pairs)} active pairs for rejections")
+                log.info(f"Scanning {len(pairs)} active pairs for confirmed rejections")
                 
                 signals_found = 0
                 pairs_processed = 0
                 
-                # Ultra-fast scanning for rejections
                 for symbol, volume in pairs:
                     try:
-                        # Fetch data
                         multi_tf_data = await self.fetch_timeframe_data(symbol)
                         
-                        # Need key timeframes for rejection analysis
-                        required_tfs = ["1H", "15M", "3M"]  # Context + Entry
+                        required_tfs = ["3M", "1M"]
                         has_all_data = all(tf in multi_tf_data for tf in required_tfs)
                         
                         if not has_all_data:
                             continue
                         
-                        # Generate rejection signal
-                        signal = self.scanner.generate_rejection_signal(multi_tf_data, symbol)
+                        signal = self.scanner.generate_confirmed_rejection_signal(multi_tf_data, symbol)
                         
                         if signal:
-                            # Save and send
                             saved = await self.save_signal(signal)
                             
                             if saved:
@@ -1941,36 +2130,30 @@ class RejectionScanner:
                                 signals_found += 1
                         
                         pairs_processed += 1
-                        
-                        # Ultra-fast between pairs
-                        await asyncio.sleep(0.01)  # 10ms between pairs
+                        await asyncio.sleep(0.01)
                         
                     except Exception as e:
                         log.debug(f"Pair error {symbol}: {str(e)[:50]}")
                         continue
                 
-                # Update scanner stats
+                # Update stats
                 self.scanner.daily_stats["pairs_scanned"] += pairs_processed
-                
-                # Log rejection stats
                 active_count = len(self.scanner.deduplicator.active_signals)
                 stats = self.scanner.get_daily_stats()
                 
-                log.info(f"📊 Rejection stats: Found {signals_found}, Active: {active_count}")
-                log.info(f"   Filtered: {stats.get('rejections_filtered', 0)}, "
-                        f"No strength: {stats.get('no_strength', 0)}, "
-                        f"No zone: {stats.get('no_rejection_zone', 0)}")
+                log.info(f"📊 Confirmed stats: Found {signals_found}, Active: {active_count}")
+                log.info(f"   Early prevented: {stats.get('early_entries_prevented', 0)}, "
+                        f"No trigger: {stats.get('no_trigger_candle', 0)}, "
+                        f"No strength: {stats.get('no_strength_shift', 0)}")
                 
                 scan_duration = time.time() - start_time
-                log.info(f"Scan #{self.scan_cycle}: {signals_found} rejections in {scan_duration:.2f}s")
+                log.info(f"Scan #{self.scan_cycle}: {signals_found} confirmed rejections in {scan_duration:.2f}s")
                 
-                # Log detailed stats periodically
                 if self.scan_cycle % 20 == 0:
                     log.info(f"📈 Detailed stats: {stats}")
                 
-                # Wait for next scan (very fast for rejection hunting)
                 wait_time = max(0.1, SCAN_INTERVAL - scan_duration)
-                log.info(f"Next rejection hunt in {wait_time:.1f}s...")
+                log.info(f"Next confirmed hunt in {wait_time:.1f}s...")
                 await asyncio.sleep(wait_time)
                 
             except Exception as e:
@@ -1984,14 +2167,12 @@ class RejectionScanner:
             
             # Run both loops
             await asyncio.gather(
-                self.high_freq_scanning(),
+                self.confirmed_rejection_scanning(),
                 self.monitor_positions()
             )
             
         except KeyboardInterrupt:
-            log.info("Rejection scanner stopped by user")
-            
-            # Send final stats
+            log.info("Confirmed rejection scanner stopped by user")
             await self.send_final_stats()
             
         except Exception as e:
@@ -2003,58 +2184,43 @@ class RejectionScanner:
     async def send_final_stats(self):
         """Send final statistics"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            log.warning("⚠️ Telegram credentials missing. Skipping final stats.")
             return
         
         try:
             stats = self.scanner.get_daily_stats()
-            
-            # Get active signals count
             active_count = len(self.scanner.deduplicator.active_signals)
             
-            # Calculate percentages
-            total_analyzed = stats['rejections_found'] + stats.get('rejections_filtered', 0) + \
-                            stats.get('no_strength', 0) + stats.get('no_rejection_zone', 0)
-            
-            if total_analyzed > 0:
-                found_pct = stats['rejections_found'] / total_analyzed * 100
-                filtered_pct = stats.get('rejections_filtered', 0) / total_analyzed * 100
-                no_strength_pct = stats.get('no_strength', 0) / total_analyzed * 100
-                no_zone_pct = stats.get('no_rejection_zone', 0) / total_analyzed * 100
-            else:
-                found_pct = filtered_pct = no_strength_pct = no_zone_pct = 0
-            
             message = f"""
-🛑 <b>تم إيقاف ماسح الرفض</b>
+🛑 <b>تم إيقاف ماسح الرفض المؤكد</b>
 
 <b>📊 إحصائيات اليوم:</b>
 • عمليات المسح: {self.scan_cycle}
 • الأزواج الممسوحة: {stats['pairs_scanned']}
-• حالات الرفض التي تم العثور عليها: {stats['rejections_found']} ({found_pct:.1f}%)
-• رفض شراء: {stats['long_rejections']}
-• رفض بيع: {stats['short_rejections']}
+• إشارات مؤكدة: {stats['confirmed_signals']}
+• رفض شراء: {stats.get('confirmed_signals', 0) // 2}
+• رفض بيع: {stats.get('confirmed_signals', 0) // 2}
 
-<b>🚫 أسباب الفلترة:</b>
-• مفلتر (تكرار): {stats.get('rejections_filtered', 0)} ({filtered_pct:.1f}%)
-• بدون قوة كافية: {stats.get('no_strength', 0)} ({no_strength_pct:.1f}%)
-• بدون منطقة رفض: {stats.get('no_rejection_zone', 0)} ({no_zone_pct:.1f}%)
+<b>🚫 منع الدخول المبكر:</b>
+• دخول مبكر مُنع: {stats.get('early_entries_prevented', 0)}
+• بدون شمعة تحول: {stats.get('no_trigger_candle', 0)}
+• بدون تحول قوة: {stats.get('no_strength_shift', 0)}
 
 <b>⚡ الصفقات النشطة:</b>
 • حالياً: {active_count} صفقة نشطة
 
-<b>🧠 فلسفة التاجر المحققة:</b>
-الطول الموجي ← السياق
-القوة والفوليوم ← القرار
-الرفض ← الزناد
+<b>🧠 الفلسفة المحققة:</b>
+الرفض يخلق الفكرة
+الفشل يؤكدها
+وتحول القوة هو الدخول
 
 تم الالتزام بـ:
-• الدخول عند الرفض فقط
+• الدخول بعد تأكيد الرفض فقط
 • صفقة واحدة لكل عملة
-• عدم المطاردة
+• مرور جميع مرشحات NO ENTRY
 • قبول الخسائر
-• صيد التوسع
+• صيد التوسع المؤكد
 
-#إحصائيات_الرفض #متداول_تفاعلي #صفقة_واحدة
+#إحصائيات_الرفض_المؤكد #متداول_تفاعلي #لا_دخول_مبكر
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -2086,13 +2252,12 @@ class RejectionScanner:
 
 # ================ SIMPLE HTTP SERVER ================
 async def start_http_server(scanner, port=8000):
-    """Start simple HTTP server for monitoring"""
+    """Start HTTP server for monitoring"""
     async def handle_request(reader, writer):
         try:
             request = await reader.read(1024)
-            
-            # Parse request
             lines = request.decode().split('\r\n')
+            
             if not lines:
                 writer.write(b'HTTP/1.1 400 Bad Request\r\n\r\n')
                 await writer.drain()
@@ -2105,69 +2270,36 @@ async def start_http_server(scanner, port=8000):
             response = ""
             
             if path == '/':
-                # Get scanner stats
                 stats = scanner.scanner.get_daily_stats()
                 active_count = len(scanner.scanner.deduplicator.active_signals)
                 
                 response = json.dumps({
                     "status": "running",
-                    "scanner": "Rejection-Based High-Frequency Scanner",
+                    "scanner": "Confirmed Rejection System",
                     "scan_cycle": scanner.scan_cycle,
                     "active_trades": active_count,
                     "daily_stats": stats,
-                    "trader_mindset": {
-                        "role": "Discretionary reaction trader",
-                        "specialty": "Wave-length awareness + Strength analysis + Rejection entries",
-                        "philosophy": "Wave length sets context, Strength & volume make decision, Rejection pulls trigger",
-                        "entry_rule": "Trade ONLY at rejection zones",
-                        "frequency": "High frequency + asymmetric payoff"
-                    },
-                    "telegram": {
-                        "configured": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID),
-                        "notifications": "Signal + Entry + TP/SL alerts"
-                    }
+                    "philosophy": "Rejection creates idea, Failure confirms it, Strength shift is entry",
+                    "entry_rule": "Trade ONLY after confirmed rejection (failure + trigger)",
+                    "prevention": f"Early entries prevented: {stats.get('early_entries_prevented', 0)}"
                 }, indent=2)
             
             elif path == '/stats':
                 response = json.dumps(scanner.scanner.get_daily_stats(), indent=2)
             
-            elif path == '/mindset':
+            elif path == '/philosophy':
                 response = json.dumps({
-                    "trader_role": "Professional discretionary crypto trader",
-                    "specialization": "Wave-length awareness, strength analysis, rejection-based entries",
-                    "trades": "Both LONG and SHORT symmetrically",
-                    "philosophy": "Accept losses, hunt expansion",
-                    "wave_length": "Context only - no Elliott wave counting",
-                    "market_strength": "Measure speed, distance, EMA angle, volume participation",
-                    "rejection_zones": "Trade ONLY at rejection zones (EMA, Range, Failed breaks)",
-                    "entry_conditions": "RSI zones (40-50 LONG, 50-60 SHORT) + Volume confirmation",
-                    "entry_philosophy": "Enter on first strong rejection candle, early entries are intentional",
-                    "frequency_rule": "High frequency + asymmetric payoff",
-                    "mindset": "Reaction trader, rejection specialist, not prediction-based, comfortable being wrong"
+                    "core_philosophy": "الرفض يخلق الفكرة، الفشل يؤكدها، تحول القوة هو الدخول",
+                    "trader_mindset": "Reaction trader, confirmed rejection specialist",
+                    "entry_system": "Two-candle confirmation (failure on 3M + trigger on 1M)",
+                    "no_entry_rules": "6 filters to prevent early entries",
+                    "risk_management": "Asymmetric payoff with minimum 1:2 R:R",
+                    "frequency": "High frequency scanning for confirmed rejections"
                 }, indent=2)
-            
-            elif path == '/recent':
-                if scanner.db:
-                    scanner.db.row_factory = aiosqlite.Row
-                    async with scanner.db.execute("""
-                        SELECT symbol, side, entry_price, zone_type, rejection_type,
-                               rejection_strength, risk_reward, expected_move, 
-                               created_at, status, close_reason, pnl_percent
-                        FROM rejection_signals 
-                        ORDER BY created_at DESC 
-                        LIMIT 20
-                    """) as cursor:
-                        rows = await cursor.fetchall()
-                        signals = [dict(row) for row in rows]
-                    
-                    response = json.dumps({"signals": signals, "count": len(signals)}, indent=2)
-                else:
-                    response = json.dumps({"error": "Database not available"})
             
             else:
                 response = json.dumps({"error": "Endpoint not found"})
             
-            # Send response
             writer.write(f'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{response}'.encode())
             await writer.drain()
             writer.close()
@@ -2187,15 +2319,9 @@ async def start_http_server(scanner, port=8000):
 # ================ MAIN ================
 async def main():
     """Main function"""
-    # Create scanner
-    scanner = RejectionScanner()
-    
-    # Start HTTP server in background
+    scanner = ConfirmedRejectionScannerSystem()
     http_task = asyncio.create_task(start_http_server(scanner))
-    
-    # Run scanner
     await scanner.run()
 
 if __name__ == "__main__":
-    # Run the main async function
     asyncio.run(main())
