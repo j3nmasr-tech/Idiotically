@@ -39,6 +39,10 @@ MIN_TARGET_PCT = 1.5       # 1.5% minimum target (asymmetric payoff)
 MAX_TARGET_PCT = 4.0       # 4% maximum target
 MIN_RISK_REWARD = 2.0      # Minimum 1:2 risk/reward
 
+# BTC Trend Filter
+BTC_TREND_FILTER = True  # Enable BTC trend filter
+TREND_CHECK_INTERVAL = 300  # 5 minutes
+
 # Rejection scanning
 REJECTION_CONFIG = {
     "rsi_long_zone": (40, 50),      # RSI 40-50 for LONG entries
@@ -144,6 +148,84 @@ logging.basicConfig(
 )
 log = logging.getLogger("rejection_scanner")
 
+# ================ BTC TREND DETECTION ================
+class BitcoinTrendAnalyzer:
+    """Bitcoin trend detection for market direction filtering"""
+    
+    @staticmethod
+    async def fetch_btc_data(exchange, timeframe="4h"):
+        """Fetch Bitcoin data"""
+        try:
+            btc_ohlcv = await exchange.fetch_ohlcv("BTC/USDT", timeframe=timeframe, limit=100)
+            if btc_ohlcv and len(btc_ohlcv) >= 20:
+                df = pd.DataFrame(
+                    btc_ohlcv,
+                    columns=["timestamp", "open", "high", "low", "close", "volume"]
+                )
+                for col in ["open", "high", "low", "close", "volume"]:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                return df.dropna()
+        except Exception as e:
+            log.debug(f"BTC data fetch error: {e}")
+        return None
+    
+    @staticmethod
+    def analyze_trend(df_4h):
+        """Analyze Bitcoin trend on 4h timeframe"""
+        try:
+            if df_4h is None or len(df_4h) < 20:
+                return "NEUTRAL"
+            
+            # Calculate EMAs
+            df_4h['ema50'] = df_4h['close'].ewm(span=50, adjust=False).mean()
+            df_4h['ema21'] = df_4h['close'].ewm(span=21, adjust=False).mean()
+            
+            # RSI
+            delta = df_4h['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss
+            rsi = 100 - (100 / (1 + rs))
+            
+            current_price = df_4h['close'].iloc[-1]
+            ema50 = df_4h['ema50'].iloc[-1]
+            ema21 = df_4h['ema21'].iloc[-1]
+            current_rsi = rsi.iloc[-1] if len(rsi) > 0 else 50
+            
+            # Bullish conditions
+            bullish_conditions = 0
+            if current_price > ema50:
+                bullish_conditions += 1
+            if current_price > ema21:
+                bullish_conditions += 1
+            if ema21 > ema50:
+                bullish_conditions += 1
+            if current_rsi > 50:
+                bullish_conditions += 1
+            
+            # Bearish conditions
+            bearish_conditions = 0
+            if current_price < ema50:
+                bearish_conditions += 1
+            if current_price < ema21:
+                bearish_conditions += 1
+            if ema21 < ema50:
+                bearish_conditions += 1
+            if current_rsi < 50:
+                bearish_conditions += 1
+            
+            # Determine trend
+            if bullish_conditions >= 3:
+                return "BULLISH"
+            elif bearish_conditions >= 3:
+                return "BEARISH"
+            else:
+                return "NEUTRAL"
+                
+        except Exception as e:
+            log.debug(f"Trend analysis error: {e}")
+            return "NEUTRAL"
+
 # ================ CORE REJECTION ENGINE ================
 class RejectionBasedScanner:
     """High-frequency rejection scanner - REACTION TRADING"""
@@ -227,7 +309,7 @@ class RejectionBasedScanner:
                 del self.signal_status[signal_id]
                 log.debug(f"Cleaned up closed signal {signal_id[:8]} for {symbol}")
     
-    def __init__(self):
+    def __init__(self, exchange):
         self.daily_stats = {
             "rejections_found": 0,
             "long_rejections": 0,
@@ -235,10 +317,55 @@ class RejectionBasedScanner:
             "pairs_scanned": 0,
             "rejections_filtered": 0,
             "no_strength": 0,
-            "no_rejection_zone": 0
+            "no_rejection_zone": 0,
+            "skipped_wrong_trend": 0  # New stat for trend filtering
         }
         self.deduplicator = self.SignalDeduplicator()
         self.active_signal_ids = set()
+        self.exchange = exchange
+        self.btc_trend = "NEUTRAL"
+        self.last_trend_check = 0
+    
+    async def update_btc_trend(self):
+        """Update Bitcoin trend periodically"""
+        current_time = time.time()
+        
+        if current_time - self.last_trend_check < TREND_CHECK_INTERVAL:
+            return
+        
+        try:
+            btc_data = await BitcoinTrendAnalyzer.fetch_btc_data(self.exchange, "4h")
+            if btc_data is not None:
+                new_trend = BitcoinTrendAnalyzer.analyze_trend(btc_data)
+                
+                if new_trend != self.btc_trend:
+                    log.info(f"📊 BTC trend changed: {self.btc_trend} → {new_trend}")
+                    self.btc_trend = new_trend
+                
+                self.last_trend_check = current_time
+                    
+        except Exception as e:
+            log.debug(f"Failed to update BTC trend: {e}")
+    
+    def apply_btc_trend_filter(self, symbol: str, side: str) -> bool:
+        """Apply BTC trend filter to trading signals"""
+        if not BTC_TREND_FILTER:
+            return True  # Filter disabled, allow all
+        
+        if "BTC" in symbol:
+            return True  # Always allow BTC trades
+        
+        # Apply trend filter
+        if self.btc_trend == "BULLISH" and side == "SHORT":
+            log.debug(f"📊 {symbol}: Skipping SHORT in BULLISH BTC trend")
+            self.daily_stats["skipped_wrong_trend"] += 1
+            return False
+        elif self.btc_trend == "BEARISH" and side == "LONG":
+            log.debug(f"📊 {symbol}: Skipping LONG in BEARISH BTC trend")
+            self.daily_stats["skipped_wrong_trend"] += 1
+            return False
+        
+        return True
     
     # ========== WAVE LENGTH ANALYSIS (CONTEXT ONLY) ==========
     
@@ -837,13 +964,16 @@ class RejectionBasedScanner:
         except Exception as e:
             return {name: 0 for name in EMA_PERIODS.keys()}
     
-    def generate_rejection_signal(self, multi_tf_data: Dict[str, pd.DataFrame], 
+    async def generate_rejection_signal(self, multi_tf_data: Dict[str, pd.DataFrame], 
                                  symbol: str) -> Optional[RejectionSignal]:
         """
         Generate rejection-based signal
         ONLY trade at rejection zones with strength confirmation
         """
         try:
+            # Update Bitcoin trend first
+            await self.update_btc_trend()
+            
             # Get timeframe data
             tf_1h = multi_tf_data.get("1H")
             tf_15m = multi_tf_data.get("15M")
@@ -915,6 +1045,10 @@ class RejectionBasedScanner:
             
             if not side:
                 log.debug(f"{symbol}: Could not determine side for zone {best_zone.zone_type}")
+                return None
+            
+            # BTC TREND FILTER - Applied here
+            if not self.apply_btc_trend_filter(symbol, side):
                 return None
             
             # 8. Check RSI position for the zone
@@ -1023,7 +1157,7 @@ class RejectionBasedScanner:
             else:
                 self.daily_stats["short_rejections"] += 1
             
-            log.info(f"🎯 REJECTION SIGNAL: {symbol} {side} @ {entry_price:.4f}")
+            log.info(f"🎯 REJECTION SIGNAL (BTC: {self.btc_trend}): {symbol} {side} @ {entry_price:.4f}")
             log.info(f"   Zone: {best_zone.zone_type}, Strength: {rejection_strength:.2f}")
             log.info(f"   RSI: {current_rsi:.1f}, R:R: {risk_reward:.1f}:1")
             log.info(f"   Wave: {wave_context.wave_length}, Maturity: {wave_context.wave_maturity:.1%}")
@@ -1203,6 +1337,9 @@ class RejectionBasedScanner:
         # RSI condition
         conditions.append(f"RSI_{zone.rsi_position}")
         
+        # BTC Trend condition
+        conditions.append(f"BTC_TREND_{self.btc_trend}")
+        
         return conditions
     
     def get_daily_stats(self) -> Dict:
@@ -1218,7 +1355,7 @@ class RejectionScanner:
     """Main scanner system for rejection-based trading"""
     
     def __init__(self):
-        self.scanner = RejectionBasedScanner()
+        self.scanner = None
         self.exchange = None
         self.db = None
         self.scan_cycle = 0
@@ -1233,17 +1370,21 @@ class RejectionScanner:
         log.info("PHILOSOPHY: Wave length sets context, Strength & volume make decision")
         log.info("ENTRY RULE: Rejection pulls the trigger")
         log.info(f"SCAN INTERVAL: {SCAN_INTERVAL} seconds")
+        log.info(f"BTC TREND FILTER: {'ENABLED' if BTC_TREND_FILTER else 'DISABLED'}")
         log.info("TIME FRAMES: 1H/15M (context), 3M/1M (entries)")
         log.info("REJECTION ZONES: EMA, Range, Failed breaks only")
         log.info("RSI ZONES: 40-50 (LONG), 50-60 (SHORT)")
         log.info("DEDUPLICATION: ONE TRADE PER SYMBOL")
         log.info("=" * 70)
         
-        # Initialize database
-        await self._init_database()
-        
         # Initialize exchange
         await self._init_exchange()
+        
+        # Initialize scanner with exchange
+        self.scanner = RejectionBasedScanner(self.exchange)
+        
+        # Initialize database
+        await self._init_database()
         
         # Send startup message
         await self._send_startup_message()
@@ -1348,6 +1489,10 @@ class RejectionScanner:
             return
         
         try:
+            # Get initial BTC trend
+            btc_data = await BitcoinTrendAnalyzer.fetch_btc_data(self.exchange, "4h")
+            initial_trend = BitcoinTrendAnalyzer.analyze_trend(btc_data) if btc_data else "NEUTRAL"
+            
             message = f"""
 🎯 <b>REJECTION-BASED HIGH-FREQUENCY SCANNER</b>
 
@@ -1358,45 +1503,29 @@ class RejectionScanner:
 • Emotionless with losses
 • Hunts expansion, accepts losses
 
+<b>🎯 BTC TREND FILTER:</b>
+• Status: {'ENABLED ✅' if BTC_TREND_FILTER else 'DISABLED ❌'}
+• Current BTC Trend: {initial_trend}
+• Rule: LONG only in BULLISH, SHORT only in BEARISH
+• Update: Every {TREND_CHECK_INTERVAL//60} minutes
+
 <b>📊 ANALYSIS FRAMEWORK:</b>
-1️⃣ <b>الطول الموجي (Wave Length)</b> → السياق فقط
-   • طول الموجة ونضجها
-   • سرعة التوسع
-   • لا عد للموجات
+1️⃣ <b>Wave Length</b> → Context only
+2️⃣ <b>Market Strength</b> → Entry decision  
+3️⃣ <b>Rejection Zones</b> → Mandatory trigger
 
-2️⃣ <b>القوة (Market Strength)</b> → قرار الدخول
-   • سرعة الشموع
-   • المسافة المقطوعة
-   • زاوية المتوسطات
-   • مشاركة الفوليوم
+<b>⚡ Entry Settings:</b>
+• Entry TF: 3M (main) + 1M (timing)
+• RSI: 40–50 LONG, 50–60 SHORT
+• Risk/Reward: 1:2 minimum
+• Target: 1.5–4% (asymmetric payoff)
 
-3️⃣ <b>مناطق الرفض (Rejection Zones)</b> → الزناد الإجباري
-   • الدخول عند الرفض فقط
-   • دعم/مقاومة المتوسطات
-   • أعلى/أقل النطاق
-   • اختراقات فاشلة
+<b>🛡️ Deduplication System:</b>
+• <b>ONE TRADE PER SYMBOL ONLY</b>
+• New signals only after previous trade closed
+• No time-based cooldown
 
-<b>⚡ إعدادات الدخول:</b>
-• إطار الدخول: 3M (رئيسي) + 1M (توقيت)
-• RSI: 40–50 للشراء، 50–60 للبيع
-• نسبة الربح/المخاطرة: 1:2 كحد أدنى
-• الهدف: 1.5–4% (مردود غير متماثل)
-
-<b>🛡️ نظام التكرار:</b>
-• <b>صفقة واحدة لكل عملة فقط</b>
-• إشارات جديدة فقط بعد إغلاق الصفقة السابقة
-• لا يوجد تبريد زمني
-
-<b>🎯 فلسفة الدخول:</b>
-الدخول عند أول شمعة رفض قوية
-الدخول حيث يتردد الآخرون
-أدخل مبكراً عن قصد
-
-الطول الموجي يحدد السياق
-القوة والفوليوم يحددان القرار
-والرفض هو الزناد
-
-#متداول_تفاعلي #تخصص_الرفض #صفقة_واحدة
+#RejectionTrading #BTC_Filter #TrendFollowing
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -1407,7 +1536,7 @@ class RejectionScanner:
                     "parse_mode": "HTML"
                 })
                 
-            log.info("✅ Startup message sent to Telegram")
+            log.info(f"✅ Startup message sent. BTC trend: {initial_trend}")
                 
         except Exception as e:
             log.error(f"Telegram startup error: {e}")
@@ -1573,7 +1702,13 @@ class RejectionScanner:
         
         rejection_text = rejection_translation.get(signal.rejection_type, signal.rejection_type)
         
+        # BTC Trend info
+        btc_trend = self.scanner.btc_trend if self.scanner else "NEUTRAL"
+        trend_emoji = "📈" if btc_trend == "BULLISH" else "📉" if btc_trend == "BEARISH" else "➡️"
+        trend_text = "صاعد" if btc_trend == "BULLISH" else "هابط" if btc_trend == "BEARISH" else "محايد"
+        
         message = f"""
+{trend_emoji} <b>اتجاه البتكوين: {trend_text}</b>
 {side_emoji} <b>إشارة رفض</b> ⚡
 
 <b>{signal.symbol}</b> | {side_text}
@@ -1605,6 +1740,11 @@ class RejectionScanner:
 • وقف الخسارة: <code>{signal.stop_loss:.6f}</code> ({risk_pct:.2f}%)
 • هدف الربح: <code>{signal.take_profit:.6f}</code> ({signal.expected_move_pct:.1f}%)
 • نسبة الربح/المخاطرة: {signal.risk_reward:.1f}:1
+
+<b>📈 اتجاه السوق:</b>
+• اتجاه البتكوين: {trend_text} {trend_emoji}
+• فلترة الاتجاه: { "مفعّل ✅" if BTC_TREND_FILTER else "معطّل ❌" }
+• {"✅ هذه الصفقة مع اتجاه السوق" if (btc_trend == "BULLISH" and signal.side == "LONG") or (btc_trend == "BEARISH" and signal.side == "SHORT") else "⚠️ هذه الصفقة ضد اتجاه السوق" if btc_trend != "NEUTRAL" else "⚪ اتجاه السوق محايد"}
 
 <b>🛡️ نظام التكرار:</b>
 • نظام: <b>صفقة واحدة لكل عملة</b>
@@ -1912,6 +2052,9 @@ class RejectionScanner:
                     continue
                 
                 log.info(f"Scanning {len(pairs)} active pairs for rejections")
+                log.info(f"BTC Trend: {self.scanner.btc_trend if self.scanner else 'UNKNOWN'}")
+                if BTC_TREND_FILTER:
+                    log.info(f"Trend Filter: {'LONG only' if self.scanner.btc_trend == 'BULLISH' else 'SHORT only' if self.scanner.btc_trend == 'BEARISH' else 'BOTH LONG/SHORT'}")
                 
                 signals_found = 0
                 pairs_processed = 0
@@ -1930,7 +2073,7 @@ class RejectionScanner:
                             continue
                         
                         # Generate rejection signal
-                        signal = self.scanner.generate_rejection_signal(multi_tf_data, symbol)
+                        signal = await self.scanner.generate_rejection_signal(multi_tf_data, symbol)
                         
                         if signal:
                             # Save and send
@@ -1960,6 +2103,7 @@ class RejectionScanner:
                 log.info(f"   Filtered: {stats.get('rejections_filtered', 0)}, "
                         f"No strength: {stats.get('no_strength', 0)}, "
                         f"No zone: {stats.get('no_rejection_zone', 0)}")
+                log.info(f"   Skipped wrong trend: {stats.get('skipped_wrong_trend', 0)}")
                 
                 scan_duration = time.time() - start_time
                 log.info(f"Scan #{self.scan_cycle}: {signals_found} rejections in {scan_duration:.2f}s")
@@ -2014,15 +2158,17 @@ class RejectionScanner:
             
             # Calculate percentages
             total_analyzed = stats['rejections_found'] + stats.get('rejections_filtered', 0) + \
-                            stats.get('no_strength', 0) + stats.get('no_rejection_zone', 0)
+                            stats.get('no_strength', 0) + stats.get('no_rejection_zone', 0) + \
+                            stats.get('skipped_wrong_trend', 0)
             
             if total_analyzed > 0:
                 found_pct = stats['rejections_found'] / total_analyzed * 100
                 filtered_pct = stats.get('rejections_filtered', 0) / total_analyzed * 100
                 no_strength_pct = stats.get('no_strength', 0) / total_analyzed * 100
                 no_zone_pct = stats.get('no_rejection_zone', 0) / total_analyzed * 100
+                skipped_trend_pct = stats.get('skipped_wrong_trend', 0) / total_analyzed * 100
             else:
-                found_pct = filtered_pct = no_strength_pct = no_zone_pct = 0
+                found_pct = filtered_pct = no_strength_pct = no_zone_pct = skipped_trend_pct = 0
             
             message = f"""
 🛑 <b>تم إيقاف ماسح الرفض</b>
@@ -2033,6 +2179,11 @@ class RejectionScanner:
 • حالات الرفض التي تم العثور عليها: {stats['rejections_found']} ({found_pct:.1f}%)
 • رفض شراء: {stats['long_rejections']}
 • رفض بيع: {stats['short_rejections']}
+
+<b>🎯 فعالية فلترة البتكوين:</b>
+• صفقات تم تخطيها بسبب اتجاه خاطئ: {stats.get('skipped_wrong_trend', 0)} ({skipped_trend_pct:.1f}%)
+• اتجاه البتكوين النهائي: {self.scanner.btc_trend}
+• فلترة الاتجاه: { "مفعّل ✅" if BTC_TREND_FILTER else "معطّل ❌" }
 
 <b>🚫 أسباب الفلترة:</b>
 • مفلتر (تكرار): {stats.get('rejections_filtered', 0)} ({filtered_pct:.1f}%)
@@ -2046,8 +2197,10 @@ class RejectionScanner:
 الطول الموجي ← السياق
 القوة والفوليوم ← القرار
 الرفض ← الزناد
+اتجاه البتكوين ← تحديد جانب التداول
 
 تم الالتزام بـ:
+• {"شراء فقط في السوق الصاعد" if self.scanner.btc_trend == "BULLISH" and BTC_TREND_FILTER else "بيع فقط في السوق الهابط" if self.scanner.btc_trend == "BEARISH" and BTC_TREND_FILTER else "شراء وبيع"}
 • الدخول عند الرفض فقط
 • صفقة واحدة لكل عملة
 • عدم المطاردة
@@ -2106,21 +2259,24 @@ async def start_http_server(scanner, port=8000):
             
             if path == '/':
                 # Get scanner stats
-                stats = scanner.scanner.get_daily_stats()
-                active_count = len(scanner.scanner.deduplicator.active_signals)
+                stats = scanner.scanner.get_daily_stats() if scanner.scanner else {}
+                active_count = len(scanner.scanner.deduplicator.active_signals) if scanner.scanner else 0
                 
                 response = json.dumps({
                     "status": "running",
                     "scanner": "Rejection-Based High-Frequency Scanner",
                     "scan_cycle": scanner.scan_cycle,
                     "active_trades": active_count,
+                    "btc_trend": scanner.scanner.btc_trend if scanner.scanner else "UNKNOWN",
+                    "btc_trend_filter": BTC_TREND_FILTER,
                     "daily_stats": stats,
                     "trader_mindset": {
                         "role": "Discretionary reaction trader",
                         "specialty": "Wave-length awareness + Strength analysis + Rejection entries",
                         "philosophy": "Wave length sets context, Strength & volume make decision, Rejection pulls trigger",
                         "entry_rule": "Trade ONLY at rejection zones",
-                        "frequency": "High frequency + asymmetric payoff"
+                        "frequency": "High frequency + asymmetric payoff",
+                        "btc_filter": "LONG only in BULLISH, SHORT only in BEARISH" if BTC_TREND_FILTER else "Disabled"
                     },
                     "telegram": {
                         "configured": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID),
@@ -2129,7 +2285,7 @@ async def start_http_server(scanner, port=8000):
                 }, indent=2)
             
             elif path == '/stats':
-                response = json.dumps(scanner.scanner.get_daily_stats(), indent=2)
+                response = json.dumps(scanner.scanner.get_daily_stats() if scanner.scanner else {}, indent=2)
             
             elif path == '/mindset':
                 response = json.dumps({
@@ -2137,6 +2293,12 @@ async def start_http_server(scanner, port=8000):
                     "specialization": "Wave-length awareness, strength analysis, rejection-based entries",
                     "trades": "Both LONG and SHORT symmetrically",
                     "philosophy": "Accept losses, hunt expansion",
+                    "btc_trend_filter": {
+                        "enabled": BTC_TREND_FILTER,
+                        "rule": "LONG only in BULLISH, SHORT only in BEARISH, BOTH in NEUTRAL",
+                        "timeframe": "4H",
+                        "update_interval": f"{TREND_CHECK_INTERVAL//60} minutes"
+                    },
                     "wave_length": "Context only - no Elliott wave counting",
                     "market_strength": "Measure speed, distance, EMA angle, volume participation",
                     "rejection_zones": "Trade ONLY at rejection zones (EMA, Range, Failed breaks)",
