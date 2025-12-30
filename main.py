@@ -25,8 +25,8 @@ import json
 from collections import defaultdict
 
 # ================ HIGH-FREQUENCY CONFIG ================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 DB_PATH = "/app/data/enhanced_rejection_scanner.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "5"))
@@ -198,6 +198,183 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 log = logging.getLogger("enhanced_scanner")
+
+# ================ FIXED TELEGRAM BOT WITH PROPER ALERT SENDING ================
+class EnhancedTelegramBot:
+    def __init__(self, token: str, chat_id: str):
+        self.token = token
+        self.chat_id = chat_id
+        self.enabled = bool(token and chat_id)
+        
+        if self.enabled:
+            log.info(f"✅ Telegram bot enabled")
+            log.info(f"   Token: {self.token[:10]}...")
+            log.info(f"   Chat ID: {self.chat_id}")
+        else:
+            log.warning("⚠️ Telegram bot disabled - missing token or chat_id")
+            if not self.token:
+                log.warning("   Missing TELEGRAM_BOT_TOKEN environment variable")
+            if not self.chat_id:
+                log.warning("   Missing TELEGRAM_CHAT_ID environment variable")
+    
+    async def send_message(self, text: str, parse_mode: str = "HTML") -> bool:
+        """Send message with detailed error handling"""
+        if not self.enabled:
+            log.warning("⚠️ Telegram bot disabled, message not sent")
+            return False
+        
+        # Trim message if too long
+        if len(text) > 4000:
+            log.warning("📝 Message too long, trimming...")
+            text = text[:3900] + "\n\n... [Message trimmed]"
+        
+        max_retries = 3
+        retry_delay = 1.0
+        
+        for attempt in range(max_retries):
+            try:
+                url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+                
+                payload = {
+                    "chat_id": self.chat_id,
+                    "text": text,
+                    "parse_mode": parse_mode,
+                    "disable_web_page_preview": True
+                }
+                
+                log.debug(f"📤 Sending Telegram message (attempt {attempt + 1}/{max_retries})")
+                
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.post(url, json=payload, timeout=10.0)
+                    
+                    if response.status_code == 200:
+                        log.info("✅ Telegram message sent successfully")
+                        return True
+                    else:
+                        # Try to get error details
+                        try:
+                            error_json = response.json()
+                            error_desc = error_json.get('description', 'No description')
+                            log.error(f"❌ Telegram API error {response.status_code}: {error_desc}")
+                        except:
+                            log.error(f"❌ Telegram error {response.status_code}: {response.text[:100]}")
+                        
+                        # Don't retry on 400 errors (bad request)
+                        if response.status_code == 400:
+                            return False
+                        
+                        # Retry on server errors
+                        if response.status_code >= 500:
+                            log.warning(f"   Server error, retrying in {retry_delay}s...")
+                            await asyncio.sleep(retry_delay)
+                            retry_delay *= 2
+                            continue
+                        
+                        return False
+                        
+            except httpx.TimeoutException:
+                log.warning(f"⏱️ Telegram timeout (attempt {attempt + 1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+                continue
+                
+            except httpx.ConnectError:
+                log.warning(f"🌐 Telegram connection error (attempt {attempt + 1}/{max_retries})")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+                continue
+                
+            except Exception as e:
+                log.error(f"❌ Telegram unexpected error: {type(e).__name__}: {str(e)}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+                continue
+        
+        log.error("❌ Failed to send Telegram message after all retries")
+        return False
+    
+    def format_rejection_signal_message(self, signal: RejectionSignal) -> str:
+        """Format rejection signal message for Telegram"""
+        side_emoji = "🟢" if signal.side == "LONG" else "🔴"
+        side_text = "شراء" if signal.side == "LONG" else "بيع"
+        
+        # Calculate percentages
+        risk_pct = abs(signal.entry_price - signal.stop_loss) / signal.entry_price * 100
+        reward_pct = abs(signal.take_profit - signal.entry_price) / signal.entry_price * 100
+        
+        message = f"""
+{side_emoji} <b>إشارة رفض مكتشفة</b> ⚡
+
+<b>{signal.symbol}</b> | {side_emoji} {side_text}
+
+<b>• السعر:</b> <code>${signal.entry_price:.4f}</code>
+<b>• وقف الخسارة:</b> <code>${signal.stop_loss:.4f}</code> ({risk_pct:.2f}%)
+<b>• أخذ الربح:</b> <code>${signal.take_profit:.4f}</code> ({reward_pct:.2f}%)
+
+<b>• RSI:</b> {signal.rsi_at_entry:.1f}
+<b>• نسبة الربح/المخاطرة:</b> {signal.risk_reward:.1f}:1
+<b>• القوة:</b> {signal.rejection_strength:.0%}
+<b>• النوع:</b> {signal.rejection_type}
+<b>• الشمعة:</b> {signal.trigger_candle}
+
+<b>🏆 التوقعات:</b>
+• الحركة المتوقعة: {signal.expected_move_pct:.1f}%
+• نوع الموجة: {signal.wave_context.wave_length}
+• الهيكل: {signal.wave_context.structure_type}
+
+#إشارة_رفض #{side_text} #{signal.symbol.replace('/', '').replace('-', '')}
+"""
+        return message
+    
+    async def send_rejection_signal(self, signal: RejectionSignal) -> bool:
+        """Send rejection signal to Telegram"""
+        if not self.enabled:
+            return False
+        
+        message = self.format_rejection_signal_message(signal)
+        return await self.send_message(message)
+    
+    async def send_startup_message(self):
+        """Send startup message"""
+        if not self.enabled:
+            return
+        
+        message = f"""
+🚀 <b>بدء النظام المحسن للتداول بالرفض</b>
+
+✅ النظام قيد التشغيل
+🎯 البحث عن إشارات الرفض
+📊 تحليل متعدد الأطر
+📈 نظام محسّن لإشارات الرفض
+
+⏰ وقت البدء: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+#نظام_محسن
+"""
+        await self.send_message(message)
+    
+    async def send_scan_summary(self, scan_cycle: int, pairs_scanned: int, 
+                               analyses: int, signals: int, duration: float):
+        """Send scan summary"""
+        if not self.enabled:
+            return
+        
+        message = f"""
+📊 <b>ملخص المسح #{scan_cycle}</b>
+
+• الأزواج المفحوصة: {pairs_scanned}
+• التحليلات المحسنة: {analyses}
+• إشارات الرفض: {signals}
+• المدة: {duration:.1f} ثانية
+
+{'🎯 تم اكتشاف إشارات جديدة' if signals > 0 else '📭 لم يتم اكتشاف إشارات جديدة'}
+
+#ملخص_المسح
+"""
+        await self.send_message(message)
 
 # ================ ENHANCED ANALYZER ================
 class EnhancedAnalyzer:
@@ -1028,6 +1205,8 @@ class EnhancedRejectionBasedScanner:
     
     async def perform_enhanced_analysis(self, symbol: str, all_timeframe_data: Dict[str, pd.DataFrame]) -> EnhancedAnalysis:
         try:
+            log.info(f"🔍 Starting enhanced analysis for {symbol}")
+            
             current_price = 0
             indicator_analysis = {}
             strength_analysis = {}
@@ -1043,32 +1222,25 @@ class EnhancedRejectionBasedScanner:
                     strength = self.enhanced_analyzer.analyze_strength_enhanced(df, timeframe)
                     strength_analysis[timeframe] = strength
             
+            log.info(f"📊 Analysis indicators calculated for {symbol}")
+            
             consensus = self.enhanced_analyzer.calculate_timeframe_consensus(symbol, strength_analysis)
             alerts, strong_signals = self.enhanced_analyzer.collect_alerts_signals(strength_analysis)
+            
+            log.info(f"🎯 {symbol}: Consensus: {consensus.overall_trend}, Alerts: {len(alerts)}, Signals: {len(strong_signals)}")
             
             wave_context = None
             rejection_zones = []
             rejection_signal = None
             has_rejection_signal = False
             
-            if "1H" in all_timeframe_data and "15M" in all_timeframe_data:
-                wave_context = self.analyze_wave_context(
-                    all_timeframe_data.get("1H"), 
-                    all_timeframe_data.get("15M")
-                )
-            
+            # Generate rejection signal
             if "3M" in all_timeframe_data:
                 tf_3m = all_timeframe_data["3M"]
                 if len(tf_3m) >= 20:
-                    current_price_tf = tf_3m['close'].iloc[-1]
-                    rsi_series = self.calculate_rsi(tf_3m['close'])
-                    current_rsi = rsi_series.iloc[-1] if len(rsi_series) > 0 else 50
-                    emas = self.calculate_emas(tf_3m)
+                    log.info(f"📈 Checking for rejection signals in {symbol}...")
                     
-                    rejection_zones = self.find_rejection_zones(
-                        tf_3m, current_price_tf, current_rsi, emas
-                    )
-                    
+                    # Generate original rejection signal
                     key_timeframes = {
                         "1H": all_timeframe_data.get("1H"),
                         "15M": all_timeframe_data.get("15M"),
@@ -1078,9 +1250,15 @@ class EnhancedRejectionBasedScanner:
                     }
                     
                     rejection_signal = self.generate_rejection_signal(key_timeframes, symbol)
-                    has_rejection_signal = rejection_signal is not None
+                    
+                    if rejection_signal:
+                        log.info(f"🎯 REJECTION SIGNAL GENERATED: {symbol} {rejection_signal.side} @ {rejection_signal.entry_price:.4f}")
+                        log.info(f"   RSI: {rejection_signal.rsi_at_entry:.1f}, Risk/Reward: {rejection_signal.risk_reward:.1f}")
+                        has_rejection_signal = True
+                    else:
+                        log.info(f"   No rejection signal for {symbol}")
             
-            return EnhancedAnalysis(
+            analysis = EnhancedAnalysis(
                 symbol=symbol,
                 current_price=current_price,
                 analysis_time=datetime.now(),
@@ -1095,6 +1273,8 @@ class EnhancedRejectionBasedScanner:
                 rejection_signal=rejection_signal
             )
             
+            return analysis
+                
         except Exception as e:
             log.error(f"Enhanced analysis error for {symbol}: {e}")
             return None
@@ -1606,6 +1786,8 @@ class EnhancedRejectionBasedScanner:
                 self.daily_stats["short_rejections"] += 1
             
             log.info(f"🎯 REJECTION SIGNAL: {symbol} {side} @ {entry_price:.4f}")
+            log.info(f"   Stop Loss: ${stop_loss:.4f}, Take Profit: ${take_profit:.4f}")
+            log.info(f"   Risk/Reward: {risk_reward:.1f}:1, Strength: {rejection_strength:.2%}")
             
             return signal
             
@@ -1766,153 +1948,6 @@ class EnhancedRejectionBasedScanner:
     
     def cleanup_old_signals(self):
         self.deduplicator.remove_closed_signals()
-
-# ================ FIXED TELEGRAM BOT WITH TIMEOUT HANDLING ================
-class EnhancedTelegramBot:
-    def __init__(self, token: str, chat_id: str):
-        self.token = token
-        self.chat_id = chat_id
-        self.enabled = bool(token and chat_id)
-        
-        if self.enabled:
-            log.info(f"✅ Telegram bot enabled")
-        else:
-            log.warning("⚠️ Telegram bot disabled - missing token or chat_id")
-    
-    async def send_message(self, text: str, parse_mode: str = "HTML") -> bool:
-        """Send message with timeout handling"""
-        if not self.enabled:
-            log.debug("⚠️ Telegram bot disabled, message not sent")
-            return False
-        
-        # Trim message if too long
-        if len(text) > 4000:
-            log.warning("📝 Message too long, trimming...")
-            text = text[:3900] + "\n\n... [Message trimmed]"
-        
-        try:
-            url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-            
-            # Use shorter timeout and retry logic
-            async with httpx.AsyncClient(timeout=5.0) as client:  # Reduced from 10 to 5 seconds
-                response = await client.post(url, json={
-                    "chat_id": self.chat_id,
-                    "text": text,
-                    "parse_mode": parse_mode,
-                    "disable_web_page_preview": True
-                })
-                
-                if response.status_code == 200:
-                    return True
-                else:
-                    log.warning(f"⚠️ Telegram API error: {response.status_code}")
-                    return False
-                    
-        except httpx.TimeoutException:
-            log.warning("⏱️ Telegram timeout (5s)")
-            return False
-        except httpx.ConnectError:
-            log.warning("🌐 Telegram connection error")
-            return False
-        except Exception as e:
-            # Don't log full traceback to prevent log spam
-            log.warning(f"⚠️ Telegram error: {type(e).__name__}")
-            return False
-    
-    def format_enhanced_analysis_message(self, analysis: EnhancedAnalysis) -> str:
-        """Format enhanced analysis message - SHORTENED VERSION"""
-        
-        symbol = analysis.symbol
-        price = analysis.current_price
-        consensus = analysis.consensus
-        
-        trend_map = {
-            "STRONG_BULL": "📈 <b>صاعد قوي</b>",
-            "BULL": "📈 <b>صاعد</b>",
-            "NEUTRAL": "⚪ <b>محايد</b>",
-            "BEAR": "📉 <b>هابط</b>",
-            "STRONG_BEAR": "📉 <b>هابط قوي</b>"
-        }
-        
-        risk_map = {
-            "LOW": "🟢 منخفضة",
-            "MEDIUM": "🟡 متوسطة",
-            "HIGH": "🔴 عالية"
-        }
-        
-        message = f"""
-🎯 <b>تحليل محسن</b>
-
-<b>{symbol}</b> | ${price:,.4f}
-
-<b>📊 الإجماع:</b>
-{trend_map.get(consensus.overall_trend, consensus.overall_trend)}
-• الثقة: {consensus.trend_confidence:.1f}%
-• المخاطرة: {risk_map.get(consensus.risk_level, consensus.risk_level)}
-
-<b>🔄 الأطر:</b>
-• 🟢 صاعد: {len(consensus.bullish_timeframes)}
-• 🔴 هابط: {len(consensus.bearish_timeframes)}
-
-<b>💪 القوة:</b> {consensus.avg_strength:.1f}/100
-"""
-        
-        if analysis.has_rejection_signal and analysis.rejection_signal:
-            rs = analysis.rejection_signal
-            side_emoji = "🟢" if rs.side == "LONG" else "🔴"
-            side_text = "شراء" if rs.side == "LONG" else "بيع"
-            
-            message += f"\n<b>🎯 إشارة رفح:</b>\n"
-            message += f"{side_emoji} {side_text} @ ${rs.entry_price:.4f}"
-            message += f"\nنسبة الربح/المخاطرة: {rs.risk_reward:.1f}:1"
-        
-        if analysis.alerts and len(analysis.alerts) > 0:
-            message += f"\n<b>⚠️ تنبيهات:</b>"
-            for alert in analysis.alerts[:2]:  # فقط تنبيهين
-                message += f"\n• {alert}"
-        
-        message += f"\n\n🕐 {analysis.analysis_time.strftime('%H:%M:%S')}"
-        
-        return message
-    
-    async def send_rejection_signal_message(self, signal: RejectionSignal):
-        """Send rejection signal message - VERY SIMPLE"""
-        if not self.enabled:
-            return
-        
-        side_emoji = "🟢" if signal.side == "LONG" else "🔴"
-        side_text = "شراء" if signal.side == "LONG" else "بيع"
-        
-        message = f"""
-{side_emoji} <b>إشارة رفض</b> ⚡
-
-<b>{signal.symbol}</b> | {side_text}
-
-• السعر: ${signal.entry_price:.4f}
-• RSI: {signal.rsi_at_entry:.1f}
-• الربح/المخاطرة: {signal.risk_reward:.1f}:1
-
-#{side_text} #رفض
-"""
-        
-        await self.send_message(message)
-    
-    async def send_startup_message(self):
-        """Send startup message - VERY SIMPLE"""
-        if not self.enabled:
-            return
-        
-        message = """
-🚀 <b>بدء النظام المحسن للتداول بالرفض</b>
-
-✅ النظام قيد التشغيل
-🎯 البحث عن إشارات الرفض
-📊 تحليل متعدد الأطر
-
-#نظام_محسن
-"""
-        
-        await self.send_message(message)
 
 # ================ ENHANCED DATABASE ================
 class EnhancedDatabase:
@@ -2110,14 +2145,28 @@ class EnhancedRejectionScanner:
     
     async def initialize(self):
         log.info("=" * 70)
-        log.info("🔥 ENHANCED REJECTION-BASED SCANNER (FIXED)")
+        log.info("🔥 ENHANCED REJECTION-BASED SCANNER (TELEGRAM FIXED)")
         log.info("=" * 70)
         
-        await self.db.connect()
-        await self._init_exchange()
+        # Initialize database first
+        db_success = await self.db.connect()
+        if not db_success:
+            log.error("❌ Failed to connect to database")
+            return False
         
-        # Send startup message
-        await self.telegram.send_startup_message()
+        # Initialize exchange
+        exchange_success = await self._init_exchange()
+        if not exchange_success:
+            log.error("❌ Failed to connect to exchange")
+            return False
+        
+        # Test Telegram connection
+        if self.telegram.enabled:
+            await self.telegram.send_startup_message()
+            log.info("✅ Telegram connection tested and working")
+        else:
+            log.warning("⚠️ Telegram bot is not enabled")
+            log.warning("   Signals will be logged but not sent to Telegram")
         
         return True
     
@@ -2198,35 +2247,6 @@ class EnhancedRejectionScanner:
             log.error(f"Error getting pairs: {e}")
             return []
     
-    async def send_enhanced_analysis_alert(self, analysis: EnhancedAnalysis):
-        """Send enhanced analysis alert with better error handling"""
-        if not self.telegram.enabled:
-            return
-        
-        try:
-            message = self.telegram.format_enhanced_analysis_message(analysis)
-            success = await self.telegram.send_message(message)
-            
-            if success:
-                log.info(f"✅ Enhanced analysis sent for {analysis.symbol}")
-            else:
-                log.debug(f"⚠️ Failed to send enhanced analysis for {analysis.symbol}")
-                
-        except Exception as e:
-            log.debug(f"⚠️ Enhanced analysis alert error: {e}")
-    
-    async def send_rejection_signal_alert(self, signal: RejectionSignal):
-        """Send rejection signal alert with better error handling"""
-        if not self.telegram.enabled:
-            return
-        
-        try:
-            await self.telegram.send_rejection_signal_message(signal)
-            log.info(f"✅ Rejection signal sent for {signal.symbol}")
-                
-        except Exception as e:
-            log.debug(f"⚠️ Rejection signal alert error: {e}")
-    
     async def perform_enhanced_scan(self):
         self.scan_cycle += 1
         start_time = time.time()
@@ -2243,11 +2263,14 @@ class EnhancedRejectionScanner:
         
         signals_found = 0
         enhanced_analyses = 0
+        telegram_alerts_sent = 0
         
         for symbol, volume in pairs:
             try:
+                log.debug(f"🔍 Processing {symbol} (vol: ${volume:,.0f})")
+                
                 # Skip stablecoins
-                if symbol in ["USDC/USDT", "USDT/USDC", "DAI/USDT", "BUSD/USDT"]:
+                if symbol in ["USDC/USDT", "USDT/USDC", "DAI/USDT", "BUSD/USDT", "TUSD/USDT"]:
                     continue
                     
                 all_data = await self.fetch_all_timeframe_data(symbol)
@@ -2256,35 +2279,65 @@ class EnhancedRejectionScanner:
                 has_min_data = all(tf in all_data for tf in required_tfs)
                 
                 if not has_min_data:
+                    log.debug(f"   {symbol}: Missing timeframe data")
                     continue
                 
+                log.debug(f"   {symbol}: Running enhanced analysis...")
                 enhanced_analysis = await self.scanner.perform_enhanced_analysis(symbol, all_data)
                 
                 if enhanced_analysis:
-                    await self.db.save_enhanced_analysis(enhanced_analysis)
+                    log.debug(f"   {symbol}: Analysis complete, saving...")
                     
-                    # Only send Telegram for important signals
-                    if enhanced_analysis.has_rejection_signal:
-                        await self.send_rejection_signal_alert(enhanced_analysis.rejection_signal)
-                        signals_found += 1
+                    # Save to database
+                    save_success = await self.db.save_enhanced_analysis(enhanced_analysis)
                     
-                    enhanced_analyses += 1
-                
-                await asyncio.sleep(0.05)
-                
+                    if save_success:
+                        enhanced_analyses += 1
+                        
+                        # Check for rejection signal and send alert
+                        if enhanced_analysis.has_rejection_signal and enhanced_analysis.rejection_signal:
+                            signal = enhanced_analysis.rejection_signal
+                            log.info(f"🎯 REJECTION SIGNAL FOUND: {signal.symbol} {signal.side}")
+                            
+                            # Send to Telegram
+                            if self.telegram.enabled:
+                                try:
+                                    success = await self.telegram.send_rejection_signal(signal)
+                                    if success:
+                                        telegram_alerts_sent += 1
+                                        log.info(f"   ✅ Telegram alert sent for {signal.symbol}")
+                                    else:
+                                        log.warning(f"   ⚠️ Failed to send Telegram alert for {signal.symbol}")
+                                except Exception as e:
+                                    log.error(f"   ❌ Error sending Telegram alert: {e}")
+                            
+                            signals_found += 1
+                        else:
+                            log.debug(f"   {symbol}: No rejection signal")
+                        
+                    await asyncio.sleep(0.1)  # Small delay
+                    
             except Exception as e:
-                log.debug(f"Pair error {symbol}: {str(e)[:50]}")
+                log.error(f"❌ Error processing {symbol}: {e}")
                 continue
         
         self.scanner.daily_stats["pairs_scanned"] += len(pairs)
         
         scan_duration = time.time() - start_time
-        active_signals = len(self.scanner.deduplicator.active_signals)
         
-        log.info(f"📊 Enhanced scan results:")
-        log.info(f"   Analyses: {enhanced_analyses}, Rejection signals: {signals_found}")
-        log.info(f"   Active signals: {active_signals}")
+        log.info(f"📊 Scan #{self.scan_cycle} Results:")
+        log.info(f"   Pairs checked: {len(pairs)}")
+        log.info(f"   Analyses saved: {enhanced_analyses}")
+        log.info(f"   Signals found: {signals_found}")
+        log.info(f"   Telegram alerts sent: {telegram_alerts_sent}")
         log.info(f"   Duration: {scan_duration:.2f}s")
+        
+        # Send summary to Telegram if enabled
+        if self.telegram.enabled and (signals_found > 0 or self.scan_cycle % 10 == 0):
+            await self.telegram.send_scan_summary(
+                self.scan_cycle, len(pairs), enhanced_analyses, 
+                signals_found, scan_duration
+            )
         
         self.scanner.cleanup_old_signals()
     
@@ -2368,9 +2421,14 @@ class EnhancedRejectionScanner:
     
     async def run(self):
         try:
-            await self.initialize()
+            success = await self.initialize()
+            if not success:
+                log.error("❌ Failed to initialize scanner")
+                return
+            
             self.monitoring = True
             
+            # Run scanning and monitoring concurrently
             await asyncio.gather(
                 self._scanning_loop(),
                 self.monitor_positions()
@@ -2389,7 +2447,8 @@ class EnhancedRejectionScanner:
             try:
                 await self.perform_enhanced_scan()
                 
-                wait_time = max(0.1, SCAN_INTERVAL)
+                wait_time = max(SCAN_INTERVAL, 1)  # Minimum 1 second
+                log.debug(f"Sleeping for {wait_time} seconds before next scan...")
                 await asyncio.sleep(wait_time)
                 
             except Exception as e:
