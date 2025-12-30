@@ -29,8 +29,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_PATH = "/app/data/enhanced_rejection_scanner.db"
 
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 5))
-TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 100))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "5"))
+TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", "100"))
 MIN_VOLUME_USD = 500000
 
 # Trading parameters
@@ -1057,7 +1057,7 @@ class EnhancedRejectionBasedScanner:
         
         # Enhanced components
         self.enhanced_analyzer = EnhancedAnalyzer()
-        self.enhanced_analyses = {}  symbol: EnhancedAnalysis
+        self.enhanced_analyses = {}  # تخزين التحليلات المحسنة لكل رمز
     
     # ========== ORIGINAL METHODS (KEPT) ==========
     
