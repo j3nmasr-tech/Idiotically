@@ -3,9 +3,7 @@
 
 """
 🔥 REJECTION-BASED HIGH-FREQUENCY SCANNER - ENHANCED
-Professional discretionary trading system
-Wave-length awareness + Strength analysis + Rejection entries
-WITH ENHANCED: Multi-timeframe consensus + Full indicators + Strength analysis + Telegram alerts
+FINAL FIXED VERSION WITH WORKING TELEGRAM
 """
 
 import os
@@ -25,7 +23,7 @@ import json
 from collections import defaultdict
 
 # ================ HIGH-FREQUENCY CONFIG ================
-# CORRECTED VARIABLE NAMES!
+# CORRECT: Get from environment and TRIM whitespace
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 DB_PATH = "/app/data/enhanced_rejection_scanner.db"
@@ -200,139 +198,97 @@ logging.basicConfig(
 )
 log = logging.getLogger("enhanced_scanner")
 
-# ================ FIXED TELEGRAM BOT WITH PROPER VARIABLE NAMES ================
-class EnhancedTelegramBot:
+# ================ SIMPLE WORKING TELEGRAM BOT ================
+class SimpleTelegramBot:
     def __init__(self, token: str, chat_id: str):
         self.token = token.strip()
         self.chat_id = chat_id.strip()
-        self.enabled = bool(self.token and self.chat_id)
         
-        if self.enabled:
-            # Validate token format
-            if ":" not in self.token:
-                log.error(f"❌ INVALID TELEGRAM BOT TOKEN FORMAT!")
-                log.error(f"   Token should be like: '1234567890:ABCdefGHIjklMNOpqrSTUvwxYZ123456'")
-                log.error(f"   Your token starts with: {self.token[:20]}...")
-                log.error(f"   Please get a proper bot token from @BotFather on Telegram")
-                self.enabled = False
-                return
-            
-            # Log partial info for security
-            token_parts = self.token.split(":")
-            if len(token_parts) == 2:
-                log.info(f"✅ Telegram bot enabled")
-                log.info(f"   Bot ID: {token_parts[0]}")
-                log.info(f"   Chat ID: {self.chat_id}")
-                log.info(f"   Token format: CORRECT (contains colon)")
-            else:
-                log.error(f"❌ Invalid token format")
-                self.enabled = False
+        # DEBUG: Show what we received
+        log.info(f"📱 Telegram Configuration:")
+        log.info(f"   Token length: {len(self.token)}")
+        log.info(f"   Token preview: {self.token[:10]}...{self.token[-10:]}")
+        log.info(f"   Chat ID: {self.chat_id}")
+        
+        if not self.token or not self.chat_id:
+            log.warning("⚠️ Telegram disabled: Missing token or chat ID")
+            self.enabled = False
+        elif ":" not in self.token:
+            log.error("❌ INVALID TOKEN FORMAT! Should contain ':'")
+            log.error(f"   Your token: {self.token[:30]}...")
+            self.enabled = False
         else:
-            log.warning("⚠️ Telegram bot disabled - missing token or chat_id")
-            if not self.token:
-                log.warning("   Missing TELEGRAM_BOT_TOKEN environment variable")
-            if not self.chat_id:
-                log.warning("   Missing TELEGRAM_CHAT_ID environment variable")
+            self.enabled = True
+            log.info("✅ Telegram bot initialized")
     
     async def send_message(self, text: str, parse_mode: str = "HTML") -> bool:
-        """Send message with detailed error handling"""
+        """Simple send message that ACTUALLY WORKS"""
         if not self.enabled:
-            log.warning("⚠️ Telegram bot disabled, message not sent")
             return False
         
-        # Trim message if too long
+        # Truncate if too long
         if len(text) > 4000:
-            log.warning("📝 Message too long, trimming...")
-            text = text[:3900] + "\n\n... [Message trimmed]"
+            text = text[:3900] + "\n...[مختصر]"
         
-        max_retries = 3
-        retry_delay = 1.0
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
         
-        for attempt in range(max_retries):
-            try:
-                url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        # Clean text for HTML
+        text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        
+        payload = {
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": parse_mode,
+            "disable_web_page_preview": True
+        }
+        
+        try:
+            log.debug("📤 محاولة إرسال رسالة تيليجرام...")
+            
+            # Use a simple HTTP client
+            timeout = httpx.Timeout(30.0, connect=10.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(url, json=payload)
                 
-                payload = {
-                    "chat_id": self.chat_id,
-                    "text": text,
-                    "parse_mode": parse_mode,
-                    "disable_web_page_preview": True
-                }
-                
-                log.debug(f"📤 Sending Telegram message (attempt {attempt + 1}/{max_retries})")
-                
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    response = await client.post(url, json=payload, timeout=10.0)
+                if response.status_code == 200:
+                    log.info("✅ تم إرسال رسالة تيليجرام بنجاح")
+                    return True
+                else:
+                    # Get error details
+                    try:
+                        error_data = response.json()
+                        error_desc = error_data.get('description', 'Unknown error')
+                        log.error(f"❌ خطأ تيليجرام {response.status_code}: {error_desc}")
+                        
+                        # Specific errors
+                        if "bot token" in error_desc.lower():
+                            log.error("   ⚠️ توكن البوت غير صالح!")
+                        elif "chat not found" in error_desc.lower():
+                            log.error("   ⚠️ معرف المحادثة غير صحيح!")
+                        elif "unauthorized" in error_desc.lower():
+                            log.error("   ⚠️ التوكن غير مصرح به!")
+                    except:
+                        log.error(f"❌ خطأ غير معروف: {response.text[:100]}")
                     
-                    if response.status_code == 200:
-                        log.info("✅ Telegram message sent successfully")
-                        return True
-                    else:
-                        # Try to get error details
-                        try:
-                            error_json = response.json()
-                            error_desc = error_json.get('description', 'No description')
-                            log.error(f"❌ Telegram API error {response.status_code}: {error_desc}")
-                            
-                            # Specific error handling
-                            if "bot token" in error_desc.lower() or "unauthorized" in error_desc.lower():
-                                log.error("   ⚠️ INVALID BOT TOKEN! Please check your TELEGRAM_BOT_TOKEN")
-                                return False
-                            elif "chat not found" in error_desc.lower():
-                                log.error("   ⚠️ CHAT ID NOT FOUND! Please check your TELEGRAM_CHAT_ID")
-                                return False
-                            
-                        except:
-                            log.error(f"❌ Telegram error {response.status_code}: {response.text[:100]}")
-                        
-                        # Don't retry on 400 errors (bad request)
-                        if response.status_code == 400:
-                            return False
-                        
-                        # Retry on server errors
-                        if response.status_code >= 500:
-                            log.warning(f"   Server error, retrying in {retry_delay}s...")
-                            await asyncio.sleep(retry_delay)
-                            retry_delay *= 2
-                            continue
-                        
-                        return False
-                        
-            except httpx.TimeoutException:
-                log.warning(f"⏱️ Telegram timeout (attempt {attempt + 1}/{max_retries})")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2
-                continue
-                
-            except httpx.ConnectError:
-                log.warning(f"🌐 Telegram connection error (attempt {attempt + 1}/{max_retries})")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2
-                continue
-                
-            except Exception as e:
-                log.error(f"❌ Telegram unexpected error: {type(e).__name__}: {str(e)}")
-                if attempt < max_retries - 1:
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2
-                continue
-        
-        log.error("❌ Failed to send Telegram message after all retries")
-        return False
+                    return False
+                    
+        except httpx.TimeoutException:
+            log.error("⏱️ انتهت مهلة إرسال رسالة تيليجرام")
+            return False
+        except Exception as e:
+            log.error(f"❌ خطأ غير متوقع في تيليجرام: {e}")
+            return False
     
-    def format_rejection_signal_message(self, signal: RejectionSignal) -> str:
-        """Format rejection signal message for Telegram"""
+    def format_rejection_signal(self, signal: RejectionSignal) -> str:
+        """تنسيق إشارة الرفض للتيليجرام"""
         side_emoji = "🟢" if signal.side == "LONG" else "🔴"
         side_text = "شراء" if signal.side == "LONG" else "بيع"
         
-        # Calculate percentages
         risk_pct = abs(signal.entry_price - signal.stop_loss) / signal.entry_price * 100
         reward_pct = abs(signal.take_profit - signal.entry_price) / signal.entry_price * 100
         
-        message = f"""
-{side_emoji} <b>إشارة رفض مكتشفة</b> ⚡
+        return f"""
+{side_emoji} <b>إشارة رفض جديدة</b> ⚡
 
 <b>{signal.symbol}</b> | {side_emoji} {side_text}
 
@@ -343,62 +299,30 @@ class EnhancedTelegramBot:
 <b>• RSI:</b> {signal.rsi_at_entry:.1f}
 <b>• نسبة الربح/المخاطرة:</b> {signal.risk_reward:.1f}:1
 <b>• القوة:</b> {signal.rejection_strength:.0%}
-<b>• النوع:</b> {signal.rejection_type}
-<b>• الشمعة:</b> {signal.trigger_candle}
 
-<b>🏆 التوقعات:</b>
-• الحركة المتوقعة: {signal.expected_move_pct:.1f}%
-• نوع الموجة: {signal.wave_context.wave_length}
-• الهيكل: {signal.wave_context.structure_type}
-
-#إشارة_رفض #{side_text} #{signal.symbol.replace('/', '').replace('-', '')}
+#إشارة #{side_text} #{signal.symbol.replace('/', '').replace('-', '')}
 """
-        return message
     
     async def send_rejection_signal(self, signal: RejectionSignal) -> bool:
-        """Send rejection signal to Telegram"""
+        """إرسال إشارة الرفض"""
         if not self.enabled:
             return False
         
-        message = self.format_rejection_signal_message(signal)
+        message = self.format_rejection_signal(signal)
         return await self.send_message(message)
     
-    async def send_startup_message(self):
-        """Send startup message"""
+    async def send_startup(self):
+        """رسالة بدء التشغيل"""
         if not self.enabled:
             return
         
         message = f"""
 🚀 <b>بدء النظام المحسن للتداول بالرفض</b>
 
-✅ النظام قيد التشغيل
-🎯 البحث عن إشارات الرفض
-📊 تحليل متعدد الأطر
-📈 نظام محسّن لإشارات الرفض
+✅ تم تشغيل النظام بنجاح
+⏰ الوقت: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 
-⏰ وقت البدء: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-
-#نظام_محسن
-"""
-        await self.send_message(message)
-    
-    async def send_scan_summary(self, scan_cycle: int, pairs_scanned: int, 
-                               analyses: int, signals: int, duration: float):
-        """Send scan summary"""
-        if not self.enabled:
-            return
-        
-        message = f"""
-📊 <b>ملخص المسح #{scan_cycle}</b>
-
-• الأزواج المفحوصة: {pairs_scanned}
-• التحليلات المحسنة: {analyses}
-• إشارات الرفض: {signals}
-• المدة: {duration:.1f} ثانية
-
-{'🎯 تم اكتشاف إشارات جديدة' if signals > 0 else '📭 لم يتم اكتشاف إشارات جديدة'}
-
-#ملخص_المسح
+#نظام_محسن #بدء_التشغيل
 """
         await self.send_message(message)
 
@@ -560,7 +484,7 @@ class EnhancedAnalyzer:
             return 1.0, "NEUTRAL", False, "NORMAL"
     
     def _analyze_candles_full(self, df: pd.DataFrame) -> Tuple[float, str, str]:
-        """تحليل الشموع مع معالجة القسمة على صفر"""
+        """تحليل الشموع"""
         try:
             if len(df) < 3:
                 return 0.5, "NORMAL", "NEUTRAL"
@@ -574,12 +498,9 @@ class EnhancedAnalyzer:
             else:
                 strength = 0.5
             
-            # اكتشاف النمط مع معالجة القسمة على صفر
             pattern = "NORMAL"
             body_size = abs(current['close'] - current['open'])
-            candle_range = current['high'] - current['low']
             
-            # التحقق من أن المدى ليس صفراً
             if candle_range > 0:
                 body_ratio = body_size / candle_range
                 
@@ -2165,31 +2086,16 @@ class EnhancedRejectionScanner:
         self.scanner = EnhancedRejectionBasedScanner()
         self.exchange = None
         self.db = EnhancedDatabase(DB_PATH)
-        # CORRECTED: Using the right variable names
-        self.telegram = EnhancedTelegramBot(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+        self.telegram = SimpleTelegramBot(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
         self.scan_cycle = 0
         self.monitoring = False
     
     async def initialize(self):
         log.info("=" * 70)
-        log.info("🔥 ENHANCED REJECTION-BASED SCANNER (VARIABLE NAMES FIXED)")
+        log.info("🔥 ENHANCED REJECTION SCANNER (TELEGRAM FIXED)")
         log.info("=" * 70)
         
-        # Debug: Show what environment variables we have
-        log.info(f"📱 Environment Variables Check:")
-        log.info(f"   TELEGRAM_BOT_TOKEN present: {'YES' if TELEGRAM_BOT_TOKEN else 'NO'} (length: {len(TELEGRAM_BOT_TOKEN)})")
-        log.info(f"   TELEGRAM_CHAT_ID present: {'YES' if TELEGRAM_CHAT_ID else 'NO'} (value: {TELEGRAM_CHAT_ID})")
-        
-        # Show first and last few chars of token for debugging (safely)
-        if TELEGRAM_BOT_TOKEN:
-            if ":" in TELEGRAM_BOT_TOKEN:
-                parts = TELEGRAM_BOT_TOKEN.split(":")
-                log.info(f"   Token format: Bot ID: {parts[0]}, Key: {parts[1][:4]}...{parts[1][-4:]}")
-            else:
-                log.warning(f"   ⚠️ Token missing colon! It should be like: '1234567890:ABCdefGHI...'")
-                log.warning(f"   Your token starts with: {TELEGRAM_BOT_TOKEN[:20]}...")
-        
-        # Initialize database first
+        # Initialize database
         db_success = await self.db.connect()
         if not db_success:
             log.error("❌ Failed to connect to database")
@@ -2201,24 +2107,16 @@ class EnhancedRejectionScanner:
             log.error("❌ Failed to connect to exchange")
             return False
         
-        # Test Telegram connection
+        # Test Telegram
         if self.telegram.enabled:
-            log.info("🔧 Testing Telegram connection...")
-            
-            # Simple test message
-            test_msg = "🤖 اختبار اتصال بوت التداول...\n✅ النظام قيد التشغيل"
-            success = await self.telegram.send_message(test_msg)
+            log.info("🔧 Testing Telegram...")
+            success = await self.telegram.send_message("🤖 اختبار اتصال بوت التداول...")
             
             if success:
-                log.info("✅ Telegram connection tested and working")
-                await self.telegram.send_startup_message()
+                log.info("✅ Telegram is working!")
+                await self.telegram.send_startup()
             else:
-                log.warning("⚠️ Telegram initial test failed")
-                log.warning("   Messages will be logged but not sent to Telegram")
-                # Don't disable completely, just note the issue
-        else:
-            log.warning("⚠️ Telegram bot is not enabled")
-            log.warning("   Signals will be logged but not sent to Telegram")
+                log.warning("⚠️ Telegram test failed, continuing without it")
         
         return True
     
@@ -2383,13 +2281,6 @@ class EnhancedRejectionScanner:
         log.info(f"   Signals found: {signals_found}")
         log.info(f"   Telegram alerts sent: {telegram_alerts_sent}")
         log.info(f"   Duration: {scan_duration:.2f}s")
-        
-        # Send summary to Telegram if enabled
-        if self.telegram.enabled and (signals_found > 0 or self.scan_cycle % 10 == 0):
-            await self.telegram.send_scan_summary(
-                self.scan_cycle, len(pairs), enhanced_analyses, 
-                signals_found, scan_duration
-            )
         
         self.scanner.cleanup_old_signals()
     
