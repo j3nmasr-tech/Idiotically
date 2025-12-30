@@ -25,7 +25,8 @@ import json
 from collections import defaultdict
 
 # ================ HIGH-FREQUENCY CONFIG ================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+# CORRECTED VARIABLE NAMES!
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 DB_PATH = "/app/data/enhanced_rejection_scanner.db"
 
@@ -199,17 +200,33 @@ logging.basicConfig(
 )
 log = logging.getLogger("enhanced_scanner")
 
-# ================ FIXED TELEGRAM BOT WITH PROPER ALERT SENDING ================
+# ================ FIXED TELEGRAM BOT WITH PROPER VARIABLE NAMES ================
 class EnhancedTelegramBot:
     def __init__(self, token: str, chat_id: str):
-        self.token = token
-        self.chat_id = chat_id
-        self.enabled = bool(token and chat_id)
+        self.token = token.strip()
+        self.chat_id = chat_id.strip()
+        self.enabled = bool(self.token and self.chat_id)
         
         if self.enabled:
-            log.info(f"✅ Telegram bot enabled")
-            log.info(f"   Token: {self.token[:10]}...")
-            log.info(f"   Chat ID: {self.chat_id}")
+            # Validate token format
+            if ":" not in self.token:
+                log.error(f"❌ INVALID TELEGRAM BOT TOKEN FORMAT!")
+                log.error(f"   Token should be like: '1234567890:ABCdefGHIjklMNOpqrSTUvwxYZ123456'")
+                log.error(f"   Your token starts with: {self.token[:20]}...")
+                log.error(f"   Please get a proper bot token from @BotFather on Telegram")
+                self.enabled = False
+                return
+            
+            # Log partial info for security
+            token_parts = self.token.split(":")
+            if len(token_parts) == 2:
+                log.info(f"✅ Telegram bot enabled")
+                log.info(f"   Bot ID: {token_parts[0]}")
+                log.info(f"   Chat ID: {self.chat_id}")
+                log.info(f"   Token format: CORRECT (contains colon)")
+            else:
+                log.error(f"❌ Invalid token format")
+                self.enabled = False
         else:
             log.warning("⚠️ Telegram bot disabled - missing token or chat_id")
             if not self.token:
@@ -256,6 +273,15 @@ class EnhancedTelegramBot:
                             error_json = response.json()
                             error_desc = error_json.get('description', 'No description')
                             log.error(f"❌ Telegram API error {response.status_code}: {error_desc}")
+                            
+                            # Specific error handling
+                            if "bot token" in error_desc.lower() or "unauthorized" in error_desc.lower():
+                                log.error("   ⚠️ INVALID BOT TOKEN! Please check your TELEGRAM_BOT_TOKEN")
+                                return False
+                            elif "chat not found" in error_desc.lower():
+                                log.error("   ⚠️ CHAT ID NOT FOUND! Please check your TELEGRAM_CHAT_ID")
+                                return False
+                            
                         except:
                             log.error(f"❌ Telegram error {response.status_code}: {response.text[:100]}")
                         
@@ -2139,14 +2165,29 @@ class EnhancedRejectionScanner:
         self.scanner = EnhancedRejectionBasedScanner()
         self.exchange = None
         self.db = EnhancedDatabase(DB_PATH)
-        self.telegram = EnhancedTelegramBot(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+        # CORRECTED: Using the right variable names
+        self.telegram = EnhancedTelegramBot(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
         self.scan_cycle = 0
         self.monitoring = False
     
     async def initialize(self):
         log.info("=" * 70)
-        log.info("🔥 ENHANCED REJECTION-BASED SCANNER (TELEGRAM FIXED)")
+        log.info("🔥 ENHANCED REJECTION-BASED SCANNER (VARIABLE NAMES FIXED)")
         log.info("=" * 70)
+        
+        # Debug: Show what environment variables we have
+        log.info(f"📱 Environment Variables Check:")
+        log.info(f"   TELEGRAM_BOT_TOKEN present: {'YES' if TELEGRAM_BOT_TOKEN else 'NO'} (length: {len(TELEGRAM_BOT_TOKEN)})")
+        log.info(f"   TELEGRAM_CHAT_ID present: {'YES' if TELEGRAM_CHAT_ID else 'NO'} (value: {TELEGRAM_CHAT_ID})")
+        
+        # Show first and last few chars of token for debugging (safely)
+        if TELEGRAM_BOT_TOKEN:
+            if ":" in TELEGRAM_BOT_TOKEN:
+                parts = TELEGRAM_BOT_TOKEN.split(":")
+                log.info(f"   Token format: Bot ID: {parts[0]}, Key: {parts[1][:4]}...{parts[1][-4:]}")
+            else:
+                log.warning(f"   ⚠️ Token missing colon! It should be like: '1234567890:ABCdefGHI...'")
+                log.warning(f"   Your token starts with: {TELEGRAM_BOT_TOKEN[:20]}...")
         
         # Initialize database first
         db_success = await self.db.connect()
@@ -2162,8 +2203,19 @@ class EnhancedRejectionScanner:
         
         # Test Telegram connection
         if self.telegram.enabled:
-            await self.telegram.send_startup_message()
-            log.info("✅ Telegram connection tested and working")
+            log.info("🔧 Testing Telegram connection...")
+            
+            # Simple test message
+            test_msg = "🤖 اختبار اتصال بوت التداول...\n✅ النظام قيد التشغيل"
+            success = await self.telegram.send_message(test_msg)
+            
+            if success:
+                log.info("✅ Telegram connection tested and working")
+                await self.telegram.send_startup_message()
+            else:
+                log.warning("⚠️ Telegram initial test failed")
+                log.warning("   Messages will be logged but not sent to Telegram")
+                # Don't disable completely, just note the issue
         else:
             log.warning("⚠️ Telegram bot is not enabled")
             log.warning("   Signals will be logged but not sent to Telegram")
