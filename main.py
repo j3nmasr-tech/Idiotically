@@ -3128,16 +3128,21 @@ async def start_http_server(scanner, port=8000):
             
             elif path == '/recent':
                 if scanner.db:
+                    # FIX: Use traditional cursor pattern instead of async with
                     scanner.db.row_factory = aiosqlite.Row
-                    async with scanner.db.execute("""
+                    cursor = await scanner.db.execute("""
                         SELECT symbol, side, entry_price, zone_type, total_score, 
                                data_quality, passed_filters, created_at
                         FROM rejection_data_collection 
                         ORDER BY created_at DESC 
                         LIMIT 20
-                    """) as cursor:
-                        rows = await cursor.fetchall()
-                        signals = [dict(row) for row in rows]
+                    """)
+                    rows = await cursor.fetchall()
+                    await cursor.close()
+                    
+                    signals = []
+                    for row in rows:
+                        signals.append(dict(row))
                     
                     response = json.dumps({"signals": signals, "count": len(signals)}, indent=2)
                 else:
@@ -3145,14 +3150,19 @@ async def start_http_server(scanner, port=8000):
             
             elif path == '/scores':
                 if scanner.db:
+                    # FIX: Use traditional cursor pattern instead of async with
                     scanner.db.row_factory = aiosqlite.Row
-                    async with scanner.db.execute("""
+                    cursor = await scanner.db.execute("""
                         SELECT total_score, data_quality, COUNT(*) as count
                         FROM rejection_data_collection 
                         GROUP BY data_quality
-                    """) as cursor:
-                        rows = await cursor.fetchall()
-                        score_dist = [dict(row) for row in rows]
+                    """)
+                    rows = await cursor.fetchall()
+                    await cursor.close()
+                    
+                    score_dist = []
+                    for row in rows:
+                        score_dist.append(dict(row))
                     
                     response = json.dumps({"score_distribution": score_dist}, indent=2)
                 else:
@@ -3174,8 +3184,15 @@ async def start_http_server(scanner, port=8000):
     server = await asyncio.start_server(handle_request, '0.0.0.0', port)
     log.info(f"🌐 HTTP server started on port {port}")
     
-    async with server:
-        await server.serve_forever()
+    # FIX: Use try/finally pattern instead of async with if needed
+    try:
+        async with server:
+            await server.serve_forever()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        server.close()
+        await server.wait_closed()
 
 # ================ ENTRY POINT ================
 async def main():
@@ -3187,19 +3204,33 @@ async def main():
     scanner = CompleteRejectionScanner()
     
     try:
+        # Start HTTP server
         http_task = asyncio.create_task(start_http_server(scanner, port=8080))
         await asyncio.sleep(1)
+        
+        # Run main scanner
         await scanner.run()
         
     except KeyboardInterrupt:
         log.info("Received interrupt, shutting down...")
+    except Exception as e:
+        log.error(f"Main error: {e}")
+        import traceback
+        log.error(f"Traceback: {traceback.format_exc()}")
     finally:
+        # Cleanup
         if 'http_task' in locals():
             http_task.cancel()
             try:
                 await http_task
             except asyncio.CancelledError:
                 pass
+        
+        # Cleanup scanner
+        try:
+            await scanner.cleanup()
+        except Exception as e:
+            log.error(f"Cleanup error: {e}")
 
 if __name__ == "__main__":
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -3214,3 +3245,5 @@ if __name__ == "__main__":
         log.info("Scanner stopped by user")
     except Exception as e:
         log.error(f"Fatal error: {e}")
+        import traceback
+        log.error(f"Traceback: {traceback.format_exc()}")
