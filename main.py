@@ -537,7 +537,7 @@ class IndicatorAnalyzer:
         # Composite scores
         momentum_score = self._calculate_momentum_score(rsi_analysis, macd_analysis)
         trend_score = self._calculate_trend_score(ma_analysis, macd_analysis)
-        volatility_score = bb_analysis['bb_width']
+        volatility_score = bb_analysis['width']
         
         return IndicatorAnalysis(
             rsi_value=rsi_analysis['value'],
@@ -739,11 +739,12 @@ class IndicatorAnalyzer:
         upper_band = ma_20 + (std_20 * 2)
         lower_band = ma_20 - (std_20 * 2)
         
-        if len(upper_band) == 0:
+        if len(upper_band) == 0 or pd.isna(ma_20.iloc[-1]) or ma_20.iloc[-1] == 0:
             return {"position": "MIDDLE", "squeeze": False, "width": 0.0}
         
         current_upper = upper_band.iloc[-1]
         current_lower = lower_band.iloc[-1]
+        current_ma_20 = ma_20.iloc[-1]
         
         # Position
         if current_price >= current_upper * 0.99:
@@ -754,7 +755,7 @@ class IndicatorAnalyzer:
             bb_position = "MIDDLE"
         
         # Squeeze detection
-        band_width = (current_upper - current_lower) / ma_20.iloc[-1] * 100
+        band_width = (current_upper - current_lower) / current_ma_20 * 100
         
         # Calculate average width
         if len(upper_band) > 50:
@@ -807,15 +808,21 @@ class IndicatorAnalyzer:
     
     def _calculate_obv(self, df: pd.DataFrame) -> pd.Series:
         """Calculate On Balance Volume"""
-        obv = pd.Series(0, index=df.index)
+        obv = pd.Series(0.0, index=df.index, dtype='float64')
+        
+        if len(df) < 2:
+            return obv
         
         for i in range(1, len(df)):
-            if df['close'].iloc[i] > df['close'].iloc[i-1]:
-                obv.iloc[i] = obv.iloc[i-1] + df['volume'].iloc[i]
-            elif df['close'].iloc[i] < df['close'].iloc[i-1]:
-                obv.iloc[i] = obv.iloc[i-1] - df['volume'].iloc[i]
-            else:
-                obv.iloc[i] = obv.iloc[i-1]
+            try:
+                if df['close'].iloc[i] > df['close'].iloc[i-1]:
+                    obv.iloc[i] = float(obv.iloc[i-1]) + float(df['volume'].iloc[i])
+                elif df['close'].iloc[i] < df['close'].iloc[i-1]:
+                    obv.iloc[i] = float(obv.iloc[i-1]) - float(df['volume'].iloc[i])
+                else:
+                    obv.iloc[i] = float(obv.iloc[i-1])
+            except Exception as e:
+                obv.iloc[i] = float(obv.iloc[i-1])
         
         return obv
     
