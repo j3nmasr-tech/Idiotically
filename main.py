@@ -1916,11 +1916,11 @@ class EnhancedRejectionBasedScanner:
             target_pct = float(np.random.uniform(MIN_TARGET_PCT, MAX_TARGET_PCT))
             
             if side == "LONG":
-                entry_price = float(best_zone.price_level * 1.001) if best_zone.zone_type != "NO_ZONE" else current_price
+                entry_price = float(current_price)  # Always use current price
                 stop_loss = float(entry_price * (1 - stop_loss_pct / 100))
                 take_profit = float(entry_price * (1 + target_pct / 100))
             else:
-                entry_price = float(best_zone.price_level * 0.999) if best_zone.zone_type != "NO_ZONE" else current_price
+                entry_price = float(current_price)  # Always use current price
                 stop_loss = float(entry_price * (1 + stop_loss_pct / 100))
                 take_profit = float(entry_price * (1 - target_pct / 100))
             
