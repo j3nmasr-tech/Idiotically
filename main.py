@@ -2826,7 +2826,7 @@ Will analyze patterns after collection
                         current_price = float(ticker['last'])
                         
                         if status == 'PENDING':
-                            if abs(current_price - entry) / entry <= 1.0:
+                            if True:  # Simplest, always true
                                 await self.db.execute("""
                                     UPDATE rejection_data_collection SET 
                                         status = 'TRIGGERED',
