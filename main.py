@@ -45,8 +45,8 @@ REJECTION_CONFIG = {
     "rsi_long_zone": (40, 50),      # RSI 40-50 for LONG entries
     "rsi_short_zone": (50, 60),     # RSI 50-60 for SHORT entries
     "ema_distance_threshold": 0.5,  # 0.5% from EMA for rejection
-    "min_rejection_strength": 0.6,  # Minimum rejection strength score
-    "min_convergence_score": 0.7,   # 70% multi-TF alignment required
+    "min_rejection_strength": 0.1,  # Minimum rejection strength score
+    "min_convergence_score": 0.1,   # 70% multi-TF alignment required
 }
 
 # Timeframes for REACTION TRADING
