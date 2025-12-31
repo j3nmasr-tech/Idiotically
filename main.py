@@ -24,52 +24,321 @@ from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, asdict
 import json
 
-# ================ HIGH-FREQUENCY CONFIG ================
+# =====================================================================
+# 🔥 CENTRALIZED CONFIGURATION CONTROL - CONTROL EVERYTHING HERE!
+# =====================================================================
+
+# ================ EXCHANGE & TELEGRAM ================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_PATH = "/app/data/rejection_scanner.db"
 
-# Ultra high-frequency scanning - REACTION TRADING
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 5))   # 5 seconds - ULTRA FAST FOR REJECTIONS
-TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 100))   # Scan many pairs
-MIN_VOLUME_USD = 500000  # $500K minimum - more opportunities
+# Exchange settings
+EXCHANGE_NAME = "okx"  # okx, binance, bybit
+EXCHANGE_TYPE = "spot"  # spot, futures
 
-# Trading parameters (REJECTION-BASED)
-MAX_STOP_LOSS_PCT = 1.0    # 1% maximum stop loss
-MIN_TARGET_PCT = 1.5       # 1.5% minimum target (asymmetric payoff)
-MAX_TARGET_PCT = 6.0       # 4% maximum target
-MIN_RISK_REWARD = 2.0      # Minimum 1:2 risk/reward
+# ================ SCANNING & VOLUME FILTERS ================
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 5))  # seconds
+TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 100))  # pairs to scan
+MIN_VOLUME_USD = 500000  # $500K minimum
+MAX_PAIRS_PER_SCAN = 50  # Don't scan more than this per cycle
+DELAY_BETWEEN_PAIRS_MS = 10  # ms between pairs
 
-# Rejection scanning
-REJECTION_CONFIG = {
-    "rsi_long_zone": (40, 50),      # RSI 40-50 for LONG entries
-    "rsi_short_zone": (50, 60),     # RSI 50-60 for SHORT entries
-    "ema_distance_threshold": 0.5,  # 0.5% from EMA for rejection
-    "min_rejection_strength": 0.1,  # Minimum rejection strength score
-    "min_convergence_score": 0.1,   # 70% multi-TF alignment required
-}
-
-# Timeframes for REACTION TRADING
+# ================ TIME FRAME CONFIGURATION ================
 TIMEFRAMES = {
-    "1H": "1h",      # Wave length context ONLY
-    "15M": "15m",    # Strength and structure
-    "5M": "5m",      # Primary rejection analysis
-    "3M": "3m",      # Fast trigger (MAIN)
-    "1M": "1m"       # Entry timing (ULTRA FAST)
+    "1H": {
+        "ccxt_code": "1h",
+        "candle_limit": 100,
+        "weight": 0.1,
+        "enabled": True,
+        "purpose": "wave_context"
+    },
+    "15M": {
+        "ccxt_code": "15m",
+        "candle_limit": 80,
+        "weight": 0.15,
+        "enabled": True,
+        "purpose": "strength_analysis"
+    },
+    "5M": {
+        "ccxt_code": "5m",
+        "candle_limit": 50,
+        "weight": 0.2,
+        "enabled": True,
+        "purpose": "rejection_analysis"
+    },
+    "3M": {
+        "ccxt_code": "3m",
+        "candle_limit": 50,
+        "weight": 0.25,
+        "enabled": True,
+        "purpose": "entry_timing"
+    },
+    "1M": {
+        "ccxt_code": "1m",
+        "candle_limit": 50,
+        "weight": 0.3,
+        "enabled": True,
+        "purpose": "entry_confirmation"
+    }
 }
 
-# EMA periods for rejection detection
-EMA_PERIODS = {
-    "fast": 9,
-    "medium": 21,
-    "slow": 50,
-    "very_slow": 200
+# ================ TRADE PARAMETERS ================
+MAX_STOP_LOSS_PCT = 1.0      # 1% maximum stop loss
+MIN_TARGET_PCT = 1.5         # 1.5% minimum target
+MAX_TARGET_PCT = 6.0         # 4% maximum target
+MIN_RISK_REWARD = 2.0        # Minimum 1:2 risk/reward
+
+# Entry price offsets
+ENTRY_PRICE_OFFSET_PCT = 0.1  # 0.1% offset from zone for entry
+SL_OFFSET_MULTIPLIER = 1.0    # Multiplier for SL distance
+
+# ================ LAYER 1: WAVE CONTEXT FILTERS ================
+WAVE_CONTEXT = {
+    "enabled": True,
+    "min_data_candles": 20,
+    
+    # Wave length classification
+    "short_threshold": 15,
+    "medium_threshold": 30,
+    
+    # Wave maturity
+    "max_wave_maturity": 0.8,  # Avoid waves > 80% mature
+    
+    # Structure preferences
+    "impulsive_weight": 0.6,
+    "corrective_weight": 0.8,
+    "compression_weight": 0.4,
+    
+    # Context side
+    "slope_threshold": 0.001,
 }
 
-# RSI settings for rejection zones
-RSI_PERIOD = 14
-RSI_OVERBOUGHT = 70
-RSI_OVERSOLD = 30
+# ================ LAYER 2: MARKET STRENGTH FILTERS ================
+MARKET_STRENGTH = {
+    "enabled": True,
+    "min_candles": 10,
+    
+    # Candle speed
+    "min_candle_speed": 0.3,
+    "pref_candle_speed": 0.5,
+    
+    # Distance ratio
+    "min_distance_ratio": 0.3,
+    "pref_distance_ratio": 0.4,
+    
+    # Volume participation
+    "min_volume_participation": 0.3,
+    "pref_volume_participation": 0.4,
+    
+    # Overall strength
+    "min_strength_score": 0.4,
+    "pref_strength_score": 0.5,
+}
+
+# ================ LAYER 3: CANDLE PATTERN FILTERS ================
+CANDLE_PATTERNS = {
+    "enabled": True,
+    "require_confirmation": True,
+    
+    # Minimum reliability scores for patterns
+    "min_reliability": {
+        "HAMMER": 0.6,
+        "HANGING_MAN": 0.6,
+        "ENGULFING_BULLISH": 0.7,
+        "ENGULFING_BEARISH": 0.7,
+        "DOJI": 0.5,
+        "PINBAR": 0.7,
+        "MORNING_STAR": 0.75,
+        "EVENING_STAR": 0.75,
+        "THREE_WHITE_SOLDIERS": 0.7,
+        "THREE_BLACK_CROWS": 0.7
+    },
+    
+    # Pattern confirmation required?
+    "confirmation_required": {
+        "HAMMER": True,
+        "HANGING_MAN": True,
+        "DOJI": True,
+        "MORNING_STAR": False,
+        "EVENING_STAR": False,
+        "ENGULFING_BULLISH": False,
+        "ENGULFING_BEARISH": False,
+        "PINBAR": False
+    },
+    
+    # Minimum body/range ratios
+    "min_body_ratio": 0.05,
+    "min_wick_ratio": 0.3,
+}
+
+# ================ LAYER 4: INDICATOR FILTERS ================
+INDICATORS = {
+    "enabled": True,
+    
+    # RSI settings
+    "rsi_period": 14,
+    "rsi_overbought": 70,
+    "rsi_oversold": 30,
+    "rsi_long_zone": (40, 50),   # For LONG entries
+    "rsi_short_zone": (50, 60),  # For SHORT entries
+    "min_rsi_momentum": 0.3,
+    
+    # Moving averages
+    "ema_periods": {
+        "fast": 9,
+        "medium": 21,
+        "slow": 50,
+        "very_slow": 200
+    },
+    "max_ma_distance_pct": 5.0,
+    
+    # MACD
+    "min_macd_momentum": 0.2,
+    "require_macd_alignment": True,
+    
+    # Bollinger Bands
+    "bb_period": 20,
+    "bb_std": 2,
+    "max_bb_width_pct": 10.0,
+    "prefer_bb_squeeze": True,
+    
+    # Volume
+    "require_volume_spike": True,
+    "volume_spike_multiplier": 1.5,
+    "min_obv_trend_strength": 0.3,
+    
+    # Composite scores
+    "min_momentum_score": 0.3,
+    "min_trend_score": 0.3,
+    "max_volatility_score": 0.8,
+}
+
+# ================ LAYER 5: VOLUME PROFILE FILTERS ================
+VOLUME_PROFILE = {
+    "enabled": True,
+    "min_volume_levels": 10,
+    "min_volume_clusters": 2,
+    "volume_cluster_lookback": 20,
+}
+
+# ================ LAYER 6: MULTI-TF CONVERGENCE FILTERS ================
+MULTITF_CONVERGENCE = {
+    "enabled": True,
+    "min_timeframes_required": 1,  # Need at least 3 TFs confirming
+    
+    # Minimum convergence score (0-1)
+    "min_convergence_score": 0.7,
+    "pref_convergence_score": 0.8,
+    
+    # Weights for each timeframe in convergence calculation
+    "timeframe_weights": {
+        "1H": 0.1,
+        "15M": 0.15,
+        "5M": 0.2,
+        "3M": 0.25,
+        "1M": 0.3
+    },
+    
+    # Required confirmations per timeframe
+    "required_confirmations": {
+        "1H": True,   # Must confirm on 1H
+        "15M": True,  # Must confirm on 15M
+        "3M": True,   # Must confirm on 3M (entry TF)
+    }
+}
+
+# ================ LAYER 7: REJECTION ZONE FILTERS ================
+REJECTION_ZONES = {
+    "enabled": True,
+    
+    # Zone types to look for
+    "zone_types_enabled": [
+        "EMA_SUPPORT",
+        "EMA_RESISTANCE", 
+        "RANGE_LOW",
+        "RANGE_HIGH",
+        "FAILED_BREAKDOWN",
+        "FAILED_BREAKOUT"
+    ],
+    
+    # EMA rejection settings
+    "ema_distance_threshold_pct": 0.5,
+    "ema_strength_weights": {
+        "fast": 0.7,
+        "medium": 0.8,
+        "slow": 0.9,
+        "very_slow": 0.9
+    },
+    
+    # Range settings
+    "range_distance_threshold_pct": 0.3,
+    "range_lookback_candles": 20,
+    
+    # Failed break settings
+    "failed_break_threshold_pct": 0.5,
+    "failed_break_lookback_candles": 10,
+    
+    # Volume confirmation
+    "require_volume_confirmation": True,
+    "volume_spike_multiplier": 1.5,
+    "volume_decrease_for_failed_breaks": True,
+    
+    # RSI position in zone
+    "require_rsi_in_zone": True,
+    
+    # Overall rejection strength
+    "min_rejection_strength": 0.6,
+    "pref_rejection_strength": 0.7,
+}
+
+# ================ SIGNAL GENERATION FILTERS ================
+SIGNAL_GENERATION = {
+    # Risk management
+    "max_position_size_pct": 5.0,
+    "max_daily_loss_pct": 10.0,
+    
+    # Deduplication
+    "one_signal_per_symbol": True,
+    "min_time_between_signals_minutes": 30,
+    
+    # Entry triggers
+    "allowed_rejection_types": [
+        "WICK_REJECTION",
+        "MOMENTUM_REJECTION", 
+        "PRICE_REJECTION"
+    ],
+    
+    "allowed_trigger_candles": [
+        "SUPPORT_WICK",
+        "RESISTANCE_WICK",
+        "BULLISH_REVERSAL",
+        "BEARISH_REVERSAL",
+        "SUPPORT_HOLD",
+        "RESISTANCE_HOLD"
+    ],
+    
+    # Minimum conditions required
+    "min_conditions_met": 5,
+    "required_conditions": [
+        "STRENGTH_REJECTION_SETUP",
+        "VOLUME_CONFIRMED",
+        "RSI_IN_ZONE"
+    ]
+}
+
+# ================ MONITORING & NOTIFICATIONS ================
+MONITORING = {
+    "check_interval_seconds": 2,
+    "cleanup_interval_minutes": 5,
+    "send_entry_notifications": True,
+    "send_close_notifications": True,
+    "send_summary_notifications": True,
+}
+
+# =====================================================================
+# 🔥 END OF CONFIGURATION - BELOW IS THE MAIN CODE
+# =====================================================================
 
 # ================ DATA STRUCTURES ================
 @dataclass
@@ -358,7 +627,14 @@ class CandlePatternScanner:
             if pattern:
                 patterns.append(pattern)
         
-        return patterns
+        # Filter by minimum reliability
+        filtered_patterns = []
+        for pattern in patterns:
+            min_reliability = CANDLE_PATTERNS["min_reliability"].get(pattern.pattern_name, 0.5)
+            if pattern.reliability >= min_reliability:
+                filtered_patterns.append(pattern)
+        
+        return filtered_patterns
     
     def _check_hammer_hanging_man(self, candles: pd.DataFrame, idx: int, timeframe: str) -> Optional[CandlePattern]:
         """Check for Hammer/Hanging Man pattern"""
@@ -382,11 +658,12 @@ class CandlePatternScanner:
             if idx > 0:
                 prev_trend = candles.iloc[idx-1]['close'] < candles.iloc[idx-1]['open']
                 if prev_trend:  # Downtrend → Hammer
+                    confirmation_required = CANDLE_PATTERNS["confirmation_required"].get("HAMMER", True)
                     return CandlePattern(
                         pattern_name="HAMMER",
                         pattern_type="BULLISH_REVERSAL",
                         reliability=0.7,
-                        confirmation_required=True,
+                        confirmation_required=confirmation_required,
                         timeframe=timeframe,
                         has_long_wick=True,
                         has_short_wick=False,
@@ -394,11 +671,12 @@ class CandlePatternScanner:
                         engulfing_size=0.0
                     )
                 else:  # Uptrend → Hanging Man
+                    confirmation_required = CANDLE_PATTERNS["confirmation_required"].get("HANGING_MAN", True)
                     return CandlePattern(
                         pattern_name="HANGING_MAN",
                         pattern_type="BEARISH_REVERSAL",
                         reliability=0.65,
-                        confirmation_required=True,
+                        confirmation_required=confirmation_required,
                         timeframe=timeframe,
                         has_long_wick=True,
                         has_short_wick=False,
@@ -426,11 +704,12 @@ class CandlePatternScanner:
             current['close'] > previous['open'] and    # Closes above previous open
             current_body > previous_body * 1.2):       # Body engulfs previous
             
+            confirmation_required = CANDLE_PATTERNS["confirmation_required"].get("ENGULFING_BULLISH", False)
             return CandlePattern(
                 pattern_name="ENGULFING_BULLISH",
                 pattern_type="BULLISH_REVERSAL",
                 reliability=0.75,
-                confirmation_required=False,
+                confirmation_required=confirmation_required,
                 timeframe=timeframe,
                 has_long_wick=False,
                 has_short_wick=False,
@@ -445,11 +724,12 @@ class CandlePatternScanner:
               current['close'] < previous['open'] and    # Closes below previous open
               current_body > previous_body * 1.2):       # Body engulfs previous
             
+            confirmation_required = CANDLE_PATTERNS["confirmation_required"].get("ENGULFING_BEARISH", False)
             return CandlePattern(
                 pattern_name="ENGULFING_BEARISH",
                 pattern_type="BEARISH_REVERSAL",
                 reliability=0.75,
-                confirmation_required=False,
+                confirmation_required=confirmation_required,
                 timeframe=timeframe,
                 has_long_wick=False,
                 has_short_wick=False,
@@ -469,11 +749,12 @@ class CandlePatternScanner:
         
         # Doji: very small body relative to range
         if body_size <= total_range * 0.1:
+            confirmation_required = CANDLE_PATTERNS["confirmation_required"].get("DOJI", True)
             return CandlePattern(
                 pattern_name="DOJI",
                 pattern_type="REVERSAL",
                 reliability=0.6,
-                confirmation_required=True,
+                confirmation_required=confirmation_required,
                 timeframe=timeframe,
                 has_long_wick=True,
                 has_short_wick=True,
@@ -498,12 +779,13 @@ class CandlePatternScanner:
             (lower_wick >= body_size * 3 and upper_wick <= body_size * 0.5)):   # Lower pin
             
             pattern_type = "BULLISH_REVERSAL" if lower_wick > upper_wick else "BEARISH_REVERSAL"
+            confirmation_required = CANDLE_PATTERNS["confirmation_required"].get("PINBAR", False)
             
             return CandlePattern(
                 pattern_name="PINBAR",
                 pattern_type=pattern_type,
                 reliability=0.8,
-                confirmation_required=False,
+                confirmation_required=confirmation_required,
                 timeframe=timeframe,
                 has_long_wick=True,
                 has_short_wick=False,
@@ -530,11 +812,12 @@ class CandlePatternScanner:
         if (first_bearish and second_small and third_bullish and
             third['close'] > first['close']):
             
+            confirmation_required = CANDLE_PATTERNS["confirmation_required"].get("MORNING_STAR", False)
             return CandlePattern(
                 pattern_name="MORNING_STAR",
                 pattern_type="BULLISH_REVERSAL",
                 reliability=0.8,
-                confirmation_required=False,
+                confirmation_required=confirmation_required,
                 timeframe=timeframe,
                 has_long_wick=False,
                 has_short_wick=False,
@@ -549,11 +832,12 @@ class CandlePatternScanner:
         if (first_bullish and second_small and third_bearish and
             third['close'] < first['close']):
             
+            confirmation_required = CANDLE_PATTERNS["confirmation_required"].get("EVENING_STAR", False)
             return CandlePattern(
                 pattern_name="EVENING_STAR",
                 pattern_type="BEARISH_REVERSAL",
                 reliability=0.8,
-                confirmation_required=False,
+                confirmation_required=confirmation_required,
                 timeframe=timeframe,
                 has_long_wick=False,
                 has_short_wick=False,
@@ -659,7 +943,7 @@ class IndicatorAnalyzer:
             volatility_score=volatility_score
         )
     
-    def calculate_rsi(self, prices: pd.Series, period: int = 14) -> pd.Series:
+    def calculate_rsi(self, prices: pd.Series, period: int = INDICATORS["rsi_period"]) -> pd.Series:
         """Calculate RSI"""
         delta = prices.diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -673,7 +957,7 @@ class IndicatorAnalyzer:
         # Calculate RSI
         rsi = self.calculate_rsi(df['close'])
         
-        if len(rsi) < 14:
+        if len(rsi) < INDICATORS["rsi_period"]:
             return {"value": 50.0, "trend": "NEUTRAL", "divergence": "NONE", "momentum": 0.5}
         
         current_rsi = float(rsi.iloc[-1])
@@ -685,6 +969,10 @@ class IndicatorAnalyzer:
         # RSI momentum (slope)
         rsi_slope = self._calculate_slope(rsi.values[-5:])
         rsi_momentum = float(min(abs(rsi_slope) * 10, 1.0))  # Normalize to 0-1
+        
+        # Check minimum momentum
+        if rsi_momentum < INDICATORS["min_rsi_momentum"]:
+            rsi_momentum = 0.0
         
         # RSI divergence
         divergence = self._detect_rsi_divergence(df['close'].values, rsi.values)
@@ -746,10 +1034,11 @@ class IndicatorAnalyzer:
         current_price = float(df['close'].iloc[-1])
         
         # Calculate multiple MAs
-        ma_9 = float(df['close'].rolling(window=9).mean().iloc[-1])
-        ma_21 = float(df['close'].rolling(window=21).mean().iloc[-1])
-        ma_50 = float(df['close'].rolling(window=50).mean().iloc[-1])
-        ma_200 = float(df['close'].rolling(window=200).mean().iloc[-1])
+        ema_periods = INDICATORS["ema_periods"]
+        ma_9 = float(df['close'].ewm(span=ema_periods["fast"], adjust=False).mean().iloc[-1])
+        ma_21 = float(df['close'].ewm(span=ema_periods["medium"], adjust=False).mean().iloc[-1])
+        ma_50 = float(df['close'].ewm(span=ema_periods["slow"], adjust=False).mean().iloc[-1])
+        ma_200 = float(df['close'].ewm(span=ema_periods["very_slow"], adjust=False).mean().iloc[-1])
         
         # Check alignment
         mas = [ma_9, ma_21, ma_50, ma_200]
@@ -771,6 +1060,10 @@ class IndicatorAnalyzer:
         # Distance from key MA (200)
         if ma_200 > 0:
             ma_distance = float(abs(current_price - ma_200) / ma_200 * 100)
+            
+            # Check max distance
+            if ma_distance > INDICATORS["max_ma_distance_pct"]:
+                ma_distance = INDICATORS["max_ma_distance_pct"]
         else:
             ma_distance = 0.0
         
@@ -814,6 +1107,10 @@ class IndicatorAnalyzer:
         else:
             macd_momentum = 0.0
         
+        # Check minimum momentum
+        if macd_momentum < INDICATORS["min_macd_momentum"]:
+            macd_momentum = 0.0
+        
         # Trend
         macd_trend = "BULLISH" if current_macd > 0 else "BEARISH"
         
@@ -828,11 +1125,14 @@ class IndicatorAnalyzer:
         current_price = float(df['close'].iloc[-1])
         
         # Calculate Bollinger Bands
-        ma_20 = df['close'].rolling(window=20).mean()
-        std_20 = df['close'].rolling(window=20).std()
+        bb_period = INDICATORS["bb_period"]
+        bb_std = INDICATORS["bb_std"]
         
-        upper_band = ma_20 + (std_20 * 2)
-        lower_band = ma_20 - (std_20 * 2)
+        ma_20 = df['close'].rolling(window=bb_period).mean()
+        std_20 = df['close'].rolling(window=bb_period).std()
+        
+        upper_band = ma_20 + (std_20 * bb_std)
+        lower_band = ma_20 - (std_20 * bb_std)
         
         if len(upper_band) == 0 or pd.isna(ma_20.iloc[-1]) or ma_20.iloc[-1] == 0:
             return {"position": "MIDDLE", "squeeze": False, "width": 0.0}
@@ -854,6 +1154,10 @@ class IndicatorAnalyzer:
             band_width = float((current_upper - current_lower) / current_ma_20 * 100)
         else:
             band_width = 0.0
+        
+        # Check max width
+        if band_width > INDICATORS["max_bb_width_pct"]:
+            band_width = INDICATORS["max_bb_width_pct"]
         
         # Calculate average width
         if len(upper_band) > 50:
@@ -888,7 +1192,14 @@ class IndicatorAnalyzer:
         avg_volume = float(df['volume'].rolling(20).mean().iloc[-1])
         current_volume = float(df['volume'].iloc[-1])
         
-        volume_spike = bool(current_volume > avg_volume * 1.5)
+        volume_spike_multiplier = INDICATORS["volume_spike_multiplier"]
+        require_volume_spike = INDICATORS["require_volume_spike"]
+        
+        volume_spike = bool(current_volume > avg_volume * volume_spike_multiplier)
+        
+        # If required but not present, mark as false
+        if require_volume_spike and not volume_spike:
+            volume_spike = False
         
         # OBV (On Balance Volume) trend
         obv = self._calculate_obv(df)
@@ -988,7 +1299,13 @@ class IndicatorAnalyzer:
         scores.append(float(macd_analysis['momentum']))
         weights.append(0.4)
         
-        return float(np.average(scores, weights=weights))
+        momentum_score = float(np.average(scores, weights=weights))
+        
+        # Check minimum momentum
+        if momentum_score < INDICATORS["min_momentum_score"]:
+            momentum_score = 0.0
+        
+        return momentum_score
     
     def _calculate_trend_score(self, ma_analysis: Dict, macd_analysis: Dict) -> float:
         """Calculate overall trend score"""
@@ -1013,7 +1330,13 @@ class IndicatorAnalyzer:
             scores.append(0.5)
         weights.append(0.5)
         
-        return float(np.average(scores, weights=weights))
+        trend_score = float(np.average(scores, weights=weights))
+        
+        # Check minimum trend score
+        if trend_score < INDICATORS["min_trend_score"]:
+            trend_score = 0.0
+        
+        return trend_score
     
     def _get_default_analysis(self) -> IndicatorAnalysis:
         return IndicatorAnalysis(
@@ -1060,6 +1383,10 @@ class EnhancedRejectionBasedScanner:
         
         def should_generate_signal(self, symbol: str, side: str, price: float) -> bool:
             """Check if we should generate a new signal - TRADE-BASED"""
+            
+            # Check if one signal per symbol is enabled
+            if not SIGNAL_GENERATION["one_signal_per_symbol"]:
+                return True
             
             # Check if symbol already has an active signal
             if symbol in self.active_signals:
@@ -1140,7 +1467,8 @@ class EnhancedRejectionBasedScanner:
             "no_strength": 0,
             "no_rejection_zone": 0,
             "no_candle_pattern": 0,
-            "low_convergence": 0
+            "low_convergence": 0,
+            "failed_indicators": 0
         }
         self.deduplicator = self.SignalDeduplicator()
         self.active_signal_ids = set()
@@ -1155,10 +1483,14 @@ class EnhancedRejectionBasedScanner:
         Determine context only
         """
         try:
+            if not WAVE_CONTEXT["enabled"]:
+                return self._get_default_wave_context()
+            
             if df_1h is None or df_15m is None:
                 return self._get_default_wave_context()
             
-            if len(df_1h) < 20 or len(df_15m) < 30:
+            min_candles = WAVE_CONTEXT["min_data_candles"]
+            if len(df_1h) < min_candles or len(df_15m) < min_candles:
                 return self._get_default_wave_context()
             
             # 1. Analyze wave length on 1H
@@ -1204,9 +1536,12 @@ class EnhancedRejectionBasedScanner:
             # Wave length classification
             move_ratio = total_move / avg_candle_size
             
-            if move_ratio < 15:
+            short_threshold = WAVE_CONTEXT["short_threshold"]
+            medium_threshold = WAVE_CONTEXT["medium_threshold"]
+            
+            if move_ratio < short_threshold:
                 wave_length = "SHORT"
-            elif move_ratio < 30:
+            elif move_ratio < medium_threshold:
                 wave_length = "MEDIUM"
             else:
                 wave_length = "EXTENDED"
@@ -1225,6 +1560,11 @@ class EnhancedRejectionBasedScanner:
                 wave_maturity = min(distance_pct / (volatility_pct * 2), 1.0)
             else:
                 wave_maturity = 0.5
+            
+            # Apply max wave maturity filter
+            max_maturity = WAVE_CONTEXT["max_wave_maturity"]
+            if wave_maturity > max_maturity:
+                wave_maturity = max_maturity
             
             return wave_length, float(wave_maturity)
             
@@ -1307,9 +1647,11 @@ class EnhancedRejectionBasedScanner:
             # Combine with weights
             total_slope = (slope_1h * 0.7 + slope_15m * 0.3)
             
-            if total_slope > 0.001:
+            slope_threshold = WAVE_CONTEXT["slope_threshold"]
+            
+            if total_slope > slope_threshold:
                 return "BULLISH_CONTEXT"
-            elif total_slope < -0.001:
+            elif total_slope < -slope_threshold:
                 return "BEARISH_CONTEXT"
             else:
                 return "NEUTRAL"
@@ -1337,7 +1679,10 @@ class EnhancedRejectionBasedScanner:
         - Volume participation
         """
         try:
-            if df is None or len(df) < 20:
+            if not MARKET_STRENGTH["enabled"]:
+                return self._get_default_market_strength()
+            
+            if df is None or len(df) < MARKET_STRENGTH["min_candles"]:
                 return self._get_default_market_strength()
             
             # 1. Candle speed analysis
@@ -1360,6 +1705,19 @@ class EnhancedRejectionBasedScanner:
             # 6. Interpret strength patterns
             is_continuation, is_rejection_setup, is_absorption, is_compression = \
                 self._interpret_strength_patterns(df, candle_speed, volume_participation)
+            
+            # Apply filters
+            if candle_speed < MARKET_STRENGTH["min_candle_speed"]:
+                candle_speed = 0.0
+            
+            if distance_ratio < MARKET_STRENGTH["min_distance_ratio"]:
+                distance_ratio = 0.0
+            
+            if volume_participation < MARKET_STRENGTH["min_volume_participation"]:
+                volume_participation = 0.0
+            
+            if strength_score < MARKET_STRENGTH["min_strength_score"]:
+                strength_score = 0.0
             
             return MarketStrength(
                 candle_speed=candle_speed,
@@ -1397,7 +1755,9 @@ class EnhancedRejectionBasedScanner:
             
             avg_speed = np.mean(speeds)
             # Normalize: 0.5% = 0.5, 1% = 0.75, 2% = 1.0
-            return float(min(avg_speed / 2.0, 1.0))
+            speed_score = float(min(avg_speed / 2.0, 1.0))
+            
+            return speed_score
             
         except Exception as e:
             return 0.5
@@ -1428,7 +1788,7 @@ class EnhancedRejectionBasedScanner:
                 return 0.0
             
             # Calculate fast EMA
-            ema_fast = df['close'].ewm(span=EMA_PERIODS['fast'], adjust=False).mean()
+            ema_fast = df['close'].ewm(span=INDICATORS["ema_periods"]["fast"], adjust=False).mean()
             ema_values = ema_fast.values[-10:]
             
             if len(ema_values) < 5:
@@ -1535,6 +1895,9 @@ class EnhancedRejectionBasedScanner:
         zones = []
         
         try:
+            if not REJECTION_ZONES["enabled"]:
+                return zones
+            
             if df is None or len(df) < 20:
                 return zones
             
@@ -1550,12 +1913,15 @@ class EnhancedRejectionBasedScanner:
             failed_zones = self._find_failed_break_zones(df, current_price)
             zones.extend(failed_zones)
             
-            # 4. RSI position analysis for each zone
-            for zone in zones:
+            # 4. Filter by enabled zone types
+            enabled_zones = [z for z in zones if z.zone_type in REJECTION_ZONES["zone_types_enabled"]]
+            
+            # 5. RSI position analysis for each zone
+            for zone in enabled_zones:
                 zone.rsi_position = self._analyze_rsi_position(rsi_value, zone.zone_type)
             
-            # Filter to active zones only
-            active_zones = [z for z in zones if z.is_active]
+            # 6. Filter to active zones only
+            active_zones = [z for z in enabled_zones if z.is_active]
             
             return active_zones
             
@@ -1576,7 +1942,8 @@ class EnhancedRejectionBasedScanner:
                 distance_pct = abs(current_price - ema_value) / ema_value * 100
                 
                 # Check if price is near EMA (within threshold)
-                if distance_pct <= REJECTION_CONFIG["ema_distance_threshold"]:
+                threshold = REJECTION_ZONES["ema_distance_threshold_pct"]
+                if distance_pct <= threshold:
                     # Determine if it's support or resistance
                     if current_price > ema_value:
                         # Price above EMA - potential support
@@ -1588,12 +1955,8 @@ class EnhancedRejectionBasedScanner:
                         is_active = True
                     
                     # Calculate rejection strength based on EMA importance
-                    if ema_name == "fast":
-                        strength = 0.7
-                    elif ema_name == "medium":
-                        strength = 0.8
-                    else:  # slow or very_slow
-                        strength = 0.9
+                    strength_weights = REJECTION_ZONES["ema_strength_weights"]
+                    strength = strength_weights.get(ema_name, 0.7)
                     
                     zones.append(RejectionZone(
                         zone_type=zone_type,
@@ -1617,13 +1980,16 @@ class EnhancedRejectionBasedScanner:
             if len(df) < 20:
                 return zones
             
-            # Recent range (last 20 candles)
-            recent_high = float(df['high'].values[-20:].max())
-            recent_low = float(df['low'].values[-20:].min())
+            # Recent range (last N candles)
+            lookback = REJECTION_ZONES["range_lookback_candles"]
+            recent_high = float(df['high'].values[-lookback:].max())
+            recent_low = float(df['low'].values[-lookback:].min())
+            
+            threshold = REJECTION_ZONES["range_distance_threshold_pct"]
             
             # Check range high
             high_distance_pct = abs(current_price - recent_high) / recent_high * 100
-            if high_distance_pct <= 0.3:  # Very close to range high
+            if high_distance_pct <= threshold:
                 zones.append(RejectionZone(
                     zone_type="RANGE_HIGH",
                     price_level=recent_high,
@@ -1635,7 +2001,7 @@ class EnhancedRejectionBasedScanner:
             
             # Check range low
             low_distance_pct = abs(current_price - recent_low) / recent_low * 100
-            if low_distance_pct <= 0.3:  # Very close to range low
+            if low_distance_pct <= threshold:
                 zones.append(RejectionZone(
                     zone_type="RANGE_LOW",
                     price_level=recent_low,
@@ -1658,14 +2024,17 @@ class EnhancedRejectionBasedScanner:
             if len(df) < 10:
                 return zones
             
+            lookback = REJECTION_ZONES["failed_break_lookback_candles"]
+            threshold = REJECTION_ZONES["failed_break_threshold_pct"] / 100
+            
             # Check for recent failed breakouts
             recent_high = float(df['high'].values[-5:].max())
-            prev_high = float(df['high'].values[-10:-5].max())
+            prev_high = float(df['high'].values[-lookback:-5].max())
             
             # Failed breakout (price tried to break high but failed)
-            if current_price < recent_high and recent_high > prev_high * 1.005:  # 0.5% attempt
+            if current_price < recent_high and recent_high > prev_high * (1 + threshold):
                 # Check if price rejected from the high
-                if any(df['close'].values[-5:] < recent_high * 0.995):  # Rejected by 0.5%
+                if any(df['close'].values[-5:] < recent_high * (1 - threshold)):
                     zones.append(RejectionZone(
                         zone_type="FAILED_BREAKOUT",
                         price_level=recent_high,
@@ -1677,12 +2046,12 @@ class EnhancedRejectionBasedScanner:
             
             # Check for recent failed breakdowns
             recent_low = float(df['low'].values[-5:].min())
-            prev_low = float(df['low'].values[-10:-5].min())
+            prev_low = float(df['low'].values[-lookback:-5].min())
             
             # Failed breakdown (price tried to break low but failed)
-            if current_price > recent_low and recent_low < prev_low * 0.995:  # 0.5% attempt
+            if current_price > recent_low and recent_low < prev_low * (1 - threshold):
                 # Check if price rejected from the low
-                if any(df['close'].values[-5:] > recent_low * 1.005):  # Rejected by 0.5%
+                if any(df['close'].values[-5:] > recent_low * (1 + threshold)):
                     zones.append(RejectionZone(
                         zone_type="FAILED_BREAKDOWN",
                         price_level=recent_low,
@@ -1699,21 +2068,26 @@ class EnhancedRejectionBasedScanner:
     
     def _analyze_rsi_position(self, rsi_value: float, zone_type: str) -> str:
         """Analyze RSI position relative to zone"""
+        if not REJECTION_ZONES["require_rsi_in_zone"]:
+            return "NEUTRAL"
+        
         # Check if RSI is in rejection zones
         if "SUPPORT" in zone_type or "LOW" in zone_type or "BREAKDOWN" in zone_type:
             # For LONG setups, we want RSI in 40-50 zone
-            if REJECTION_CONFIG["rsi_long_zone"][0] <= rsi_value <= REJECTION_CONFIG["rsi_long_zone"][1]:
+            rsi_long_zone = INDICATORS["rsi_long_zone"]
+            if rsi_long_zone[0] <= rsi_value <= rsi_long_zone[1]:
                 return "IN_ZONE"
-            elif rsi_value < 30:
+            elif rsi_value < INDICATORS["rsi_oversold"]:
                 return "OVEREXTENDED"
             else:
                 return "NEUTRAL"
         
         elif "RESISTANCE" in zone_type or "HIGH" in zone_type or "BREAKOUT" in zone_type:
             # For SHORT setups, we want RSI in 50-60 zone
-            if REJECTION_CONFIG["rsi_short_zone"][0] <= rsi_value <= REJECTION_CONFIG["rsi_short_zone"][1]:
+            rsi_short_zone = INDICATORS["rsi_short_zone"]
+            if rsi_short_zone[0] <= rsi_value <= rsi_short_zone[1]:
                 return "IN_ZONE"
-            elif rsi_value > 70:
+            elif rsi_value > INDICATORS["rsi_overbought"]:
                 return "OVEREXTENDED"
             else:
                 return "NEUTRAL"
@@ -1724,6 +2098,9 @@ class EnhancedRejectionBasedScanner:
     
     def analyze_candle_patterns(self, multi_tf_data: Dict[str, pd.DataFrame]) -> Tuple[List[CandlePattern], Optional[CandlePattern]]:
         """Analyze candle patterns on all timeframes"""
+        if not CANDLE_PATTERNS["enabled"]:
+            return [], None
+        
         all_patterns = []
         
         for tf_name, df in multi_tf_data.items():
@@ -1740,9 +2117,16 @@ class EnhancedRejectionBasedScanner:
     
     def analyze_indicators_all_timeframes(self, multi_tf_data: Dict[str, pd.DataFrame]) -> Dict[str, IndicatorAnalysis]:
         """Analyze indicators on all timeframes"""
+        if not INDICATORS["enabled"]:
+            return {tf: self.indicator_analyzer._get_default_analysis() for tf in TIMEFRAMES.keys()}
+        
         indicators = {}
         
-        for tf_name in ["1H", "15M", "5M", "3M", "1M"]:
+        for tf_name, tf_config in TIMEFRAMES.items():
+            if not tf_config["enabled"]:
+                indicators[tf_name] = self.indicator_analyzer._get_default_analysis()
+                continue
+                
             df = multi_tf_data.get(tf_name)
             if df is not None and len(df) >= 50:
                 indicators[tf_name] = self.indicator_analyzer.analyze_all_indicators(df)
@@ -1756,11 +2140,14 @@ class EnhancedRejectionBasedScanner:
         volume_profile = {}
         volume_clusters = []
         
+        if not VOLUME_PROFILE["enabled"]:
+            return volume_profile, volume_clusters
+        
         if len(df) < 20:
             return volume_profile, volume_clusters
         
         # Calculate volume profile (simplified)
-        price_levels = np.linspace(df['low'].min(), df['high'].max(), 20)
+        price_levels = np.linspace(df['low'].min(), df['high'].max(), VOLUME_PROFILE["min_volume_levels"])
         
         for level in price_levels:
             # Find candles touching this level (±0.5%)
@@ -1768,34 +2155,52 @@ class EnhancedRejectionBasedScanner:
             volume_at_level = float(df.loc[mask, 'volume'].sum())
             volume_profile[f"{level:.4f}"] = volume_at_level
         
-        # Find high volume clusters (top 5)
+        # Find high volume clusters (top N)
+        lookback = VOLUME_PROFILE["volume_cluster_lookback"]
+        min_clusters = VOLUME_PROFILE["min_volume_clusters"]
+        
         df_sorted = df.sort_values('volume', ascending=False)
-        top_volumes = df_sorted.head(5)
+        top_volumes = df_sorted.head(lookback)
         
         for _, row in top_volumes.iterrows():
             cluster_price = float((row['high'] + row['low'] + row['close']) / 3)
             volume_clusters.append(cluster_price)
+        
+        # Ensure minimum clusters
+        if len(volume_clusters) < min_clusters:
+            # Add current price as cluster if needed
+            current_price = float(df['close'].iloc[-1])
+            volume_clusters.append(current_price)
         
         return volume_profile, volume_clusters
     
     def check_multi_tf_confirmation(self, indicators: Dict[str, IndicatorAnalysis], 
                                    side: str, zone_type: str) -> Dict[str, bool]:
         """Check which timeframes confirm the signal"""
+        if not MULTITF_CONVERGENCE["enabled"]:
+            return {tf_name: True for tf_name in indicators.keys()}
+        
         confirmation = {}
+        required_confirmations = MULTITF_CONVERGENCE["required_confirmations"]
         
         for tf_name, analysis in indicators.items():
+            # Check if timeframe is enabled
+            if not TIMEFRAMES[tf_name]["enabled"]:
+                confirmation[tf_name] = True  # Skip disabled timeframes
+                continue
+            
             confirms = False
             
             if side == "LONG":
                 confirms = (
-                    analysis.rsi_value < 60 and  # Not overbought
+                    analysis.rsi_value < INDICATORS["rsi_overbought"] and  # Not overbought
                     analysis.macd_trend in ["BULLISH", "NEUTRAL"] and
                     analysis.ma_alignment in ["BULLISH_ALIGNED", "MIXED"] and
                     analysis.bb_position != "UPPER_BAND"  # Not at top of band
                 )
             else:  # SHORT
                 confirms = (
-                    analysis.rsi_value > 40 and  # Not oversold
+                    analysis.rsi_value > INDICATORS["rsi_oversold"] and  # Not oversold
                     analysis.macd_trend in ["BEARISH", "NEUTRAL"] and
                     analysis.ma_alignment in ["BEARISH_ALIGNED", "MIXED"] and
                     analysis.bb_position != "LOWER_BAND"  # Not at bottom of band
@@ -1806,27 +2211,52 @@ class EnhancedRejectionBasedScanner:
                (side == "SHORT" and analysis.rsi_divergence == "BEARISH_DIVERGENCE"):
                 confirms = True
             
+            # Check required confirmations
+            if tf_name in required_confirmations and required_confirmations[tf_name]:
+                # This timeframe MUST confirm
+                if not confirms:
+                    confirmation[tf_name] = False
+                    continue
+            
             confirmation[tf_name] = bool(confirms)
         
         return confirmation
     
     def calculate_convergence_score(self, confirmation: Dict[str, bool]) -> float:
         """Calculate multi-timeframe convergence score"""
+        if not MULTITF_CONVERGENCE["enabled"]:
+            return 1.0
+        
         if not confirmation:
             return 0.0
         
-        # Higher weight for lower timeframes
-        weights = {"1M": 0.3, "3M": 0.25, "5M": 0.2, "15M": 0.15, "1H": 0.1}
+        # Use configured weights
+        weights = MULTITF_CONVERGENCE["timeframe_weights"]
         
         weighted_score = 0.0
+        total_weight = 0.0
+        
         for tf_name, confirms in confirmation.items():
+            # Skip disabled timeframes
+            if not TIMEFRAMES[tf_name]["enabled"]:
+                continue
+                
             weight = weights.get(tf_name, 0.1)
             weighted_score += (1 if confirms else 0) * weight
+            total_weight += weight
         
-        return float(weighted_score)
+        if total_weight == 0:
+            return 0.0
+        
+        convergence_score = float(weighted_score / total_weight)
+        
+        return convergence_score
     
     def pattern_confirms_rejection(self, pattern: Optional[CandlePattern], side: str) -> bool:
         """Check if candle pattern confirms rejection direction"""
+        if not CANDLE_PATTERNS["enabled"]:
+            return True  # Skip if disabled
+        
         if not pattern:
             return True  # No pattern is okay
         
@@ -1839,7 +2269,7 @@ class EnhancedRejectionBasedScanner:
     
     # ========== REJECTION SIGNAL GENERATION ==========
     
-    def calculate_rsi(self, prices: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
+    def calculate_rsi(self, prices: pd.Series, period: int = INDICATORS["rsi_period"]) -> pd.Series:
         """Calculate RSI"""
         delta = prices.diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -1852,12 +2282,12 @@ class EnhancedRejectionBasedScanner:
         """Calculate current EMA values"""
         try:
             emas = {}
-            for name, period in EMA_PERIODS.items():
+            for name, period in INDICATORS["ema_periods"].items():
                 ema_series = df['close'].ewm(span=period, adjust=False).mean()
                 emas[name] = float(ema_series.iloc[-1]) if len(ema_series) > 0 else 0.0
             return emas
         except Exception as e:
-            return {name: 0.0 for name in EMA_PERIODS.keys()}
+            return {name: 0.0 for name in INDICATORS["ema_periods"].keys()}
     
     def generate_enhanced_rejection_signal(self, multi_tf_data: Dict[str, pd.DataFrame], 
                                           symbol: str) -> Optional[RejectionSignal]:
@@ -1866,29 +2296,35 @@ class EnhancedRejectionBasedScanner:
         """
         try:
             # Get timeframe data
-            tf_1h = multi_tf_data.get("1H")
-            tf_15m = multi_tf_data.get("15M")
-            tf_5m = multi_tf_data.get("5M")
-            tf_3m = multi_tf_data.get("3M")
-            tf_1m = multi_tf_data.get("1M")
+            tf_1h = multi_tf_data.get("1H") if TIMEFRAMES["1H"]["enabled"] else None
+            tf_15m = multi_tf_data.get("15M") if TIMEFRAMES["15M"]["enabled"] else None
+            tf_5m = multi_tf_data.get("5M") if TIMEFRAMES["5M"]["enabled"] else None
+            tf_3m = multi_tf_data.get("3M") if TIMEFRAMES["3M"]["enabled"] else None
+            tf_1m = multi_tf_data.get("1M") if TIMEFRAMES["1M"]["enabled"] else None
             
             # Check data availability - need at least 15m and 3m
-            if tf_15m is None or tf_3m is None:
+            if (tf_15m is None or tf_3m is None) and (TIMEFRAMES["15M"]["enabled"] or TIMEFRAMES["3M"]["enabled"]):
                 log.debug(f"{symbol}: Missing key timeframe data")
                 return None
             
-            if len(tf_15m) < 30 or len(tf_3m) < 20:
+            if (tf_15m is not None and len(tf_15m) < 30) or (tf_3m is not None and len(tf_3m) < 20):
                 log.debug(f"{symbol}: Insufficient data")
                 return None
             
             # ===== 1. WAVE CONTEXT ANALYSIS =====
             wave_context = self.analyze_wave_context(tf_1h, tf_15m)
             
+            # Check wave maturity filter
+            if wave_context.wave_maturity > WAVE_CONTEXT["max_wave_maturity"]:
+                self.daily_stats["rejections_filtered"] += 1
+                log.debug(f"{symbol}: Wave too mature ({wave_context.wave_maturity:.2f})")
+                return None
+            
             # ===== 2. MARKET STRENGTH ANALYSIS =====
             market_strength = self.analyze_market_strength(tf_15m)
             
             # CRITICAL: No strength → no trade
-            if market_strength.strength_score < 0.4:
+            if market_strength.strength_score < MARKET_STRENGTH["min_strength_score"]:
                 self.daily_stats["no_strength"] += 1
                 log.debug(f"{symbol}: No market strength ({market_strength.strength_score:.2f})")
                 return None
@@ -1899,6 +2335,25 @@ class EnhancedRejectionBasedScanner:
             # ===== 4. INDICATOR ANALYSIS (ALL TIMEFRAMES) =====
             indicators = self.analyze_indicators_all_timeframes(multi_tf_data)
             
+            # Check indicator filters
+            entry_tf = "3M"
+            entry_indicators = indicators.get(entry_tf)
+            if entry_indicators:
+                if entry_indicators.momentum_score < INDICATORS["min_momentum_score"]:
+                    self.daily_stats["failed_indicators"] += 1
+                    log.debug(f"{symbol}: Low momentum score ({entry_indicators.momentum_score:.2f})")
+                    return None
+                
+                if entry_indicators.trend_score < INDICATORS["min_trend_score"]:
+                    self.daily_stats["failed_indicators"] += 1
+                    log.debug(f"{symbol}: Low trend score ({entry_indicators.trend_score:.2f})")
+                    return None
+                
+                if entry_indicators.volatility_score > INDICATORS["max_volatility_score"]:
+                    self.daily_stats["failed_indicators"] += 1
+                    log.debug(f"{symbol}: Too volatile ({entry_indicators.volatility_score:.2f})")
+                    return NULL
+                
             # ===== 5. VOLUME PROFILE ANALYSIS =====
             volume_profile, volume_clusters = self.analyze_volume_profile(tf_3m)
             
@@ -1925,16 +2380,27 @@ class EnhancedRejectionBasedScanner:
                 # Check volume confirmation
                 zone.volume_confirmation = self._check_volume_confirmation(tf_3m, zone.zone_type)
                 
-                # Only consider zones with volume confirmation
-                if zone.volume_confirmation:
-                    valid_zones.append(zone)
+                # Check if volume confirmation is required
+                if REJECTION_ZONES["require_volume_confirmation"] and not zone.volume_confirmation:
+                    continue
+                
+                # Only consider zones with proper RSI position
+                if REJECTION_ZONES["require_rsi_in_zone"] and zone.rsi_position != "IN_ZONE":
+                    continue
+                
+                valid_zones.append(zone)
             
             if not valid_zones:
-                log.debug(f"{symbol}: No volume confirmation at rejection zones")
+                log.debug(f"{symbol}: No valid rejection zones after filters")
                 return None
             
             # Select strongest rejection zone
             best_zone = max(valid_zones, key=lambda z: z.strength)
+            
+            # Check minimum rejection strength
+            if best_zone.strength < REJECTION_ZONES["min_rejection_strength"]:
+                log.debug(f"{symbol}: Rejection too weak ({best_zone.strength:.2f})")
+                return NULL
             
             # Determine trade side based on zone type
             side = None
@@ -1957,10 +2423,17 @@ class EnhancedRejectionBasedScanner:
             multi_tf_confirmation = self.check_multi_tf_confirmation(indicators, side, best_zone.zone_type)
             convergence_score = self.calculate_convergence_score(multi_tf_confirmation)
             
-            # FIXED: Proper convergence check
-            if convergence_score < REJECTION_CONFIG["min_convergence_score"]:
+            # Check minimum convergence
+            if convergence_score < MULTITF_CONVERGENCE["min_convergence_score"]:
                 self.daily_stats["low_convergence"] += 1
                 log.debug(f"{symbol}: Low multi-TF convergence ({convergence_score:.2f})")
+                return None
+            
+            # Check minimum timeframes confirming
+            confirmed_count = sum(1 for confirms in multi_tf_confirmation.values() if confirms)
+            if confirmed_count < MULTITF_CONVERGENCE["min_timeframes_required"]:
+                self.daily_stats["low_convergence"] += 1
+                log.debug(f"{symbol}: Only {confirmed_count} TFs confirming")
                 return None
             
             # ===== 9. RSI POSITION CHECK =====
@@ -1980,23 +2453,34 @@ class EnhancedRejectionBasedScanner:
             # ===== 11. ANALYZE REJECTION CANDLE =====
             rejection_type, trigger_candle = self._analyze_rejection_candle(tf_3m, side, best_zone)
             
-            if not rejection_type:
+            if not rejection_type or not trigger_candle:
                 log.debug(f"{symbol}: No clear rejection candle")
+                return None
+            
+            # Check if rejection type is allowed
+            if rejection_type not in SIGNAL_GENERATION["allowed_rejection_types"]:
+                log.debug(f"{symbol}: Rejection type {rejection_type} not allowed")
+                return None
+            
+            if trigger_candle not in SIGNAL_GENERATION["allowed_trigger_candles"]:
+                log.debug(f"{symbol}: Trigger candle {trigger_candle} not allowed")
                 return None
             
             # ===== 12. CALCULATE ENTRY, SL, TP =====
             stop_loss_pct = float(np.random.uniform(0.5, MAX_STOP_LOSS_PCT))
             target_pct = float(np.random.uniform(MIN_TARGET_PCT, MAX_TARGET_PCT))
             
+            entry_offset = ENTRY_PRICE_OFFSET_PCT / 100
+            
             if side == "LONG":
                 # Entry at rejection zone (slightly above for LONG)
-                entry_price = float(best_zone.price_level * 1.001)  # 0.1% above support
-                stop_loss = float(entry_price * (1 - stop_loss_pct / 100))
+                entry_price = float(best_zone.price_level * (1 + entry_offset))
+                stop_loss = float(entry_price * (1 - stop_loss_pct / 100 * SL_OFFSET_MULTIPLIER))
                 take_profit = float(entry_price * (1 + target_pct / 100))
             else:  # SHORT
                 # Entry at rejection zone (slightly below for SHORT)
-                entry_price = float(best_zone.price_level * 0.999)  # 0.1% below resistance
-                stop_loss = float(entry_price * (1 + stop_loss_pct / 100))
+                entry_price = float(best_zone.price_level * (1 - entry_offset))
+                stop_loss = float(entry_price * (1 + stop_loss_pct / 100 * SL_OFFSET_MULTIPLIER))
                 take_profit = float(entry_price * (1 - target_pct / 100))
             
             # Calculate Risk/Reward
@@ -2018,7 +2502,7 @@ class EnhancedRejectionBasedScanner:
                 best_zone, market_strength, wave_context, current_rsi, convergence_score
             )
             
-            if rejection_strength < REJECTION_CONFIG["min_rejection_strength"]:
+            if rejection_strength < REJECTION_ZONES["min_rejection_strength"]:
                 log.debug(f"{symbol}: Rejection too weak ({rejection_strength:.2f})")
                 return None
             
@@ -2027,6 +2511,17 @@ class EnhancedRejectionBasedScanner:
                 wave_context, market_strength, best_zone, rejection_type,
                 dominant_pattern, multi_tf_confirmation
             )
+            
+            # Check minimum conditions
+            if len(conditions_met) < SIGNAL_GENERATION["min_conditions_met"]:
+                log.debug(f"{symbol}: Only {len(conditions_met)} conditions met")
+                return None
+            
+            # Check required conditions
+            for required_condition in SIGNAL_GENERATION["required_conditions"]:
+                if required_condition not in conditions_met:
+                    log.debug(f"{symbol}: Missing required condition: {required_condition}")
+                    return None
             
             # ===== 15. CREATE SIGNAL ID =====
             signal_id = hashlib.md5(
@@ -2093,7 +2588,7 @@ class EnhancedRejectionBasedScanner:
             log.info(f"   RSI: {current_rsi:.1f}, R:R: {risk_reward:.1f}:1")
             log.info(f"   Wave: {wave_context.wave_length}, Maturity: {wave_context.wave_maturity:.1%}")
             log.info(f"   Candle Patterns: {len(candle_patterns)}, Dominant: {dominant_pattern.pattern_name if dominant_pattern else 'None'}")
-            log.info(f"   Multi-TF Confirmation: {sum(multi_tf_confirmation.values())}/{len(multi_tf_confirmation)}")
+            log.info(f"   Multi-TF Confirmation: {confirmed_count}/{len(multi_tf_confirmation)}")
             log.info(f"   Convergence Score: {convergence_score:.2%}")
             
             return signal
@@ -2120,12 +2615,13 @@ class EnhancedRejectionBasedScanner:
             if prev_volume > 0:
                 volume_ratio = recent_volume / prev_volume
                 
-                # Volume spike (1.5x or more) is confirmation
-                if volume_ratio >= 1.5:
+                # Volume spike check
+                volume_spike_multiplier = REJECTION_ZONES["volume_spike_multiplier"]
+                if volume_ratio >= volume_spike_multiplier:
                     return True
             
             # Also check if volume is decreasing into the zone (for failed breaks)
-            if "FAILED" in zone_type:
+            if "FAILED" in zone_type and REJECTION_ZONES["volume_decrease_for_failed_breaks"]:
                 volume_trend = np.polyfit(range(5), recent_candles['volume'].values[-5:], 1)[0]
                 if volume_trend < 0:  # Decreasing volume into the level
                     return True
@@ -2216,13 +2712,14 @@ class EnhancedRejectionBasedScanner:
         weights.append(0.2)
         
         # 3. Wave context (15%)
-        # Favor corrective waves at support/resistance
-        if wave.structure_type == "CORRECTIVE":
-            wave_score = 0.8
-        elif wave.structure_type == "COMPRESSION":
-            wave_score = 0.7
-        else:
-            wave_score = 0.5
+        # Get structure weights
+        structure_weights = {
+            "IMPULSIVE": WAVE_CONTEXT["impulsive_weight"],
+            "CORRECTIVE": WAVE_CONTEXT["corrective_weight"],
+            "COMPRESSION": WAVE_CONTEXT["compression_weight"]
+        }
+        
+        wave_score = structure_weights.get(wave.structure_type, 0.5)
         
         # Adjust for wave maturity (early waves better)
         wave_score *= (1 - wave.wave_maturity * 0.5)  # Reduce if too mature
@@ -2320,22 +2817,18 @@ class CompleteRejectionScanner:
         log.info("=" * 70)
         log.info("TRADER ROLE: Discretionary reaction trader")
         log.info("SPECIALTY: COMPLETE ANALYSIS - All timeframes, all indicators, all patterns")
-        log.info("ANALYSIS LAYERS:")
-        log.info("  1. Wave Length & Context (1H/15M)")
-        log.info("  2. Market Strength (Speed/Distance/EMA/Volume)")
-        log.info("  3. Candle Patterns (All reversal/continuation patterns)")
-        log.info("  4. Indicators (RSI/MACD/MA/BB/Volume)")
-        log.info("  5. Volume Profile & Clusters")
-        log.info("  6. Multi-Timeframe Confirmation")
-        log.info("  7. Rejection Zone Detection")
-        log.info("PHILOSOPHY: Wave length sets context, Complete analysis makes decision")
-        log.info("ENTRY RULE: Multi-confirmed rejection pulls the trigger")
+        log.info("=" * 70)
+        log.info("📊 CONFIGURATION SUMMARY:")
+        log.info(f"   Timeframes enabled: {', '.join([tf for tf, config in TIMEFRAMES.items() if config['enabled']])}")
+        log.info(f"   Min strength score: {MARKET_STRENGTH['min_strength_score']}")
+        log.info(f"   Min rejection strength: {REJECTION_ZONES['min_rejection_strength']}")
+        log.info(f"   Min convergence: {MULTITF_CONVERGENCE['min_convergence_score']}")
+        log.info(f"   RSI LONG zone: {INDICATORS['rsi_long_zone']}")
+        log.info(f"   RSI SHORT zone: {INDICATORS['rsi_short_zone']}")
+        log.info("=" * 70)
         log.info(f"SCAN INTERVAL: {SCAN_INTERVAL} seconds")
-        log.info("TIME FRAMES: 1H/15M/5M/3M/1M (Full spectrum)")
-        log.info("REJECTION ZONES: EMA, Range, Failed breaks with volume confirmation")
-        log.info("RSI ZONES: 40-50 (LONG), 50-60 (SHORT)")
-        log.info("MIN CONVERGENCE: 70% multi-TF alignment required")
-        log.info("DEDUPLICATION: ONE TRADE PER SYMBOL")
+        log.info(f"MAX PAIRS PER SCAN: {MAX_PAIRS_PER_SCAN}")
+        log.info(f"DEDUPLICATION: {'ONE TRADE PER SYMBOL' if SIGNAL_GENERATION['one_signal_per_symbol'] else 'DISABLED'}")
         log.info("=" * 70)
         
         # Initialize database
@@ -2430,6 +2923,7 @@ class CompleteRejectionScanner:
                 no_zone_count INTEGER,
                 no_candle_pattern_count INTEGER,
                 low_convergence_count INTEGER,
+                failed_indicators_count INTEGER,
                 win_rate REAL,
                 avg_win REAL,
                 avg_loss REAL,
@@ -2448,9 +2942,9 @@ class CompleteRejectionScanner:
     async def _init_exchange(self):
         """Initialize exchange connection"""
         try:
-            self.exchange = ccxt.okx({
+            self.exchange = getattr(ccxt, EXCHANGE_NAME)({
                 "enableRateLimit": True,
-                "options": {"defaultType": "spot"},
+                "options": {"defaultType": EXCHANGE_TYPE},
                 "timeout": 20000,
                 "rateLimit": 50
             })
@@ -2470,35 +2964,34 @@ class CompleteRejectionScanner:
             return
         
         try:
+            # Count enabled timeframes
+            enabled_tfs = [tf for tf, config in TIMEFRAMES.items() if config["enabled"]]
+            
             message = f"""
-🎯 <b>COMPLETE REJECTION-BASED HIGH-FREQUENCY SCANNER</b>
+🎯 <b>COMPLETE REJECTION-BASED HIGH-FREQUENCY SCANNER STARTED</b>
 
-<b>🧠 TRADER MINDSET:</b>
-• Reaction trader (not prediction-based)
-• Rejection specialist with complete analysis
-• Comfortable being wrong
-• Emotionless with losses
-• Hunts expansion, accepts losses
+<b>📊 CONFIGURATION SUMMARY:</b>
+• Timeframes: {len(enabled_tfs)} enabled ({', '.join(enabled_tfs)})
+• Scan interval: {SCAN_INTERVAL}s, Max pairs: {MAX_PAIRS_PER_SCAN}
+• Min strength: {MARKET_STRENGTH['min_strength_score']}
+• Min rejection: {REJECTION_ZONES['min_rejection_strength']}
+• Min convergence: {MULTITF_CONVERGENCE['min_convergence_score']}
+• RSI zones: LONG {INDICATORS['rsi_long_zone']}, SHORT {INDICATORS['rsi_short_zone']}
+• Deduplication: {'ONE per symbol' if SIGNAL_GENERATION['one_signal_per_symbol'] else 'OFF'}
 
-<b>📊 COMPLETE ANALYSIS FRAMEWORK (7 LAYERS):</b>
-1️⃣ <b>الطول الموجي (Wave Length)</b> → السياق فقط
-2️⃣ <b>قوة السوق (Market Strength)</b> → قوة الحركة
-3️⃣ <b>أنماط الشموع (Candle Patterns)</b> → تأكيد الانعكاس
-4️⃣ <b>المؤشرات (Indicators)</b> → كل المؤشرات
-5️⃣ <b>ملف الفوليوم (Volume Profile)</b> → التراكمات
-6️⃣ <b>تأكيد الإطارات الزمنية</b> → الاتساق
-7️⃣ <b>مناطق الرفض (Rejection Zones)</b> → الزناد النهائي
+<b>🔧 FILTERS ENABLED:</b>
+• Wave Context: {'✅' if WAVE_CONTEXT['enabled'] else '❌'}
+• Market Strength: {'✅' if MARKET_STRENGTH['enabled'] else '❌'}
+• Candle Patterns: {'✅' if CANDLE_PATTERNS['enabled'] else '❌'}
+• Indicators: {'✅' if INDICATORS['enabled'] else '❌'}
+• Volume Profile: {'✅' if VOLUME_PROFILE['enabled'] else '❌'}
+• Multi-TF: {'✅' if MULTITF_CONVERGENCE['enabled'] else '❌'}
+• Rejection Zones: {'✅' if REJECTION_ZONES['enabled'] else '❌'}
 
-<b>⚡ إعدادات الدخول الصارمة:</b>
-• تقارب الإطارات: 70% كحد أدنى
-• صفقة واحدة لكل عملة فقط
+<b>⚡ 7-LAYER ANALYSIS ACTIVE</b>
+Scanner is now hunting for high-probability rejections with complete analysis!
 
-<b>🎯 فلسفة الدخول:</b>
-الطول الموجي يحدد السياق
-التحليل الكامل يحدد القرار
-والرفض المؤكد هو الزناد
-
-#تحليل_كاملي #رفض_مؤكد #صفقة_واحدة
+#تحليل_كاملي #بدء_الماسح #7_طبقات #رفض_مؤكد
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -2518,17 +3011,15 @@ class CompleteRejectionScanner:
         """Fetch data for all timeframes"""
         data = {}
         
-        for tf_name, tf in TIMEFRAMES.items():
-            try:
-                # Adjust limits based on timeframe
-                if tf_name == "1H":
-                    limit = 100
-                elif tf_name == "15M":
-                    limit = 80
-                else:  # 5M, 3M, 1M
-                    limit = 50
+        for tf_name, tf_config in TIMEFRAMES.items():
+            if not tf_config["enabled"]:
+                continue
                 
-                ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
+            try:
+                limit = tf_config["candle_limit"]
+                tf_code = tf_config["ccxt_code"]
+                
+                ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=tf_code, limit=limit)
                 
                 if ohlcv and len(ohlcv) >= 20:
                     df = pd.DataFrame(
@@ -2824,8 +3315,8 @@ class CompleteRejectionScanner:
     
     async def send_trade_trigger_notification(self, symbol: str, side: str, entry_price: float):
         """Send notification when trade is triggered/entered"""
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            log.warning(f"⚠️ Telegram credentials missing. Skipping trigger notification for {symbol}")
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not MONITORING["send_entry_notifications"]:
+            log.warning(f"⚠️ Telegram notifications disabled. Skipping trigger notification for {symbol}")
             return
         
         try:
@@ -2880,8 +3371,8 @@ class CompleteRejectionScanner:
                                            close_reason: str, entry_price: float, 
                                            close_price: float, risk_reward: float):
         """Send notification when trade hits TP/SL"""
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            log.warning(f"⚠️ Telegram credentials missing. Skipping close notification for {symbol}")
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not MONITORING["send_close_notifications"]:
+            log.warning(f"⚠️ Telegram notifications disabled. Skipping close notification for {symbol}")
             return
         
         try:
@@ -3026,7 +3517,8 @@ class CompleteRejectionScanner:
                                 self.scanner.deduplicator.update_signal_status(pos_id, "TRIGGERED")
                                 
                                 # SEND TRIGGER NOTIFICATION
-                                await self.send_trade_trigger_notification(symbol, side, current_price)
+                                if MONITORING["send_entry_notifications"]:
+                                    await self.send_trade_trigger_notification(symbol, side, current_price)
                                 
                                 log.info(f"✅ Complete rejection position triggered: {symbol} {side} @ {current_price:.4f}")
                                 continue  # Skip SL/TP check for this cycle
@@ -3079,15 +3571,16 @@ class CompleteRejectionScanner:
                             self.scanner.active_signal_ids.discard(pos_id)
                             
                             # SEND CLOSE NOTIFICATION
-                            await self.send_trade_close_notification(
-                                symbol=symbol,
-                                side=side,
-                                pnl_percent=pnl_percent,
-                                close_reason=close_reason,
-                                entry_price=entry,
-                                close_price=current_price,
-                                risk_reward=risk_reward
-                            )
+                            if MONITORING["send_close_notifications"]:
+                                await self.send_trade_close_notification(
+                                    symbol=symbol,
+                                    side=side,
+                                    pnl_percent=pnl_percent,
+                                    close_reason=close_reason,
+                                    entry_price=entry,
+                                    close_price=current_price,
+                                    risk_reward=risk_reward
+                                )
                             
                             log.info(f"📤 Complete Telegram close notification sent for {symbol}: {close_reason} ({pnl_percent:.2f}%)")
                     
@@ -3096,11 +3589,11 @@ class CompleteRejectionScanner:
                         continue
                 
                 # Clean up old closed signals periodically
-                if int(time.time()) % 300 < 2:  # Every ~5 minutes
+                if int(time.time()) % (MONITORING["cleanup_interval_minutes"] * 60) < 2:
                     self.scanner.deduplicator.remove_closed_signals()
                 
                 # Fast monitoring for rejection trading
-                await asyncio.sleep(2)  # Check every 2 seconds
+                await asyncio.sleep(MONITORING["check_interval_seconds"])
                 
             except Exception as e:
                 log.error(f"Monitoring loop error: {e}")
@@ -3125,6 +3618,8 @@ class CompleteRejectionScanner:
                     await asyncio.sleep(SCAN_INTERVAL)
                     continue
                 
+                # Limit pairs per scan
+                pairs = pairs[:MAX_PAIRS_PER_SCAN]
                 log.info(f"Scanning {len(pairs)} active pairs with COMPLETE analysis")
                 
                 signals_found = 0
@@ -3136,8 +3631,9 @@ class CompleteRejectionScanner:
                         # Fetch data for all timeframes
                         multi_tf_data = await self.fetch_timeframe_data(symbol)
                         
-                        # Need key timeframes for complete analysis
-                        required_tfs = ["1H", "15M", "3M"]  # Context + Strength + Entry
+                        # Check if we have minimum required data
+                        required_tfs = [tf for tf, config in TIMEFRAMES.items() 
+                                       if config["enabled"] and tf in ["15M", "3M"]]
                         has_all_data = all(tf in multi_tf_data for tf in required_tfs)
                         
                         if not has_all_data:
@@ -3157,7 +3653,7 @@ class CompleteRejectionScanner:
                         pairs_processed += 1
                         
                         # Ultra-fast between pairs
-                        await asyncio.sleep(0.01)  # 10ms between pairs
+                        await asyncio.sleep(DELAY_BETWEEN_PAIRS_MS / 1000)
                         
                     except Exception as e:
                         log.debug(f"Pair error {symbol}: {str(e)[:50]}")
@@ -3176,18 +3672,20 @@ class CompleteRejectionScanner:
                 log.info(f"   No zone: {stats.get('no_rejection_zone', 0)}")
                 log.info(f"   No pattern: {stats.get('no_candle_pattern', 0)}")
                 log.info(f"   Low convergence: {stats.get('low_convergence', 0)}")
+                log.info(f"   Failed indicators: {stats.get('failed_indicators', 0)}")
                 
                 scan_duration = time.time() - start_time
                 log.info(f"Complete scan #{self.scan_cycle}: {signals_found} rejections in {scan_duration:.2f}s")
                 
                 # Log detailed stats periodically
-                if self.scan_cycle % 20 == 0:
+                if self.scan_cycle % 20 == 0 and MONITORING["send_summary_notifications"]:
                     total_filtered = (
                         stats.get('rejections_filtered', 0) +
                         stats.get('no_strength', 0) +
                         stats.get('no_rejection_zone', 0) +
                         stats.get('no_candle_pattern', 0) +
-                        stats.get('low_convergence', 0)
+                        stats.get('low_convergence', 0) +
+                        stats.get('failed_indicators', 0)
                     )
                     total_analyzed = signals_found + total_filtered
                     
@@ -3231,8 +3729,8 @@ class CompleteRejectionScanner:
     
     async def send_final_stats(self):
         """Send final statistics"""
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            log.warning("⚠️ Telegram credentials missing. Skipping final stats.")
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID or not MONITORING["send_summary_notifications"]:
+            log.warning("⚠️ Telegram summary notifications disabled. Skipping final stats.")
             return
         
         try:
@@ -3248,7 +3746,8 @@ class CompleteRejectionScanner:
                 stats.get('no_strength', 0) +
                 stats.get('no_rejection_zone', 0) +
                 stats.get('no_candle_pattern', 0) +
-                stats.get('low_convergence', 0)
+                stats.get('low_convergence', 0) +
+                stats.get('failed_indicators', 0)
             )
             
             if total_analyzed > 0:
@@ -3258,11 +3757,23 @@ class CompleteRejectionScanner:
                 no_zone_pct = stats.get('no_rejection_zone', 0) / total_analyzed * 100
                 no_pattern_pct = stats.get('no_candle_pattern', 0) / total_analyzed * 100
                 low_convergence_pct = stats.get('low_convergence', 0) / total_analyzed * 100
+                failed_indicators_pct = stats.get('failed_indicators', 0) / total_analyzed * 100
             else:
-                found_pct = filtered_pct = no_strength_pct = no_zone_pct = no_pattern_pct = low_convergence_pct = 0
+                found_pct = filtered_pct = no_strength_pct = no_zone_pct = no_pattern_pct = low_convergence_pct = failed_indicators_pct = 0
             
             # Calculate success rate
             success_rate = found_pct if total_analyzed > 0 else 0
+            
+            # Count enabled filters
+            enabled_filters = sum([
+                WAVE_CONTEXT["enabled"],
+                MARKET_STRENGTH["enabled"],
+                CANDLE_PATTERNS["enabled"],
+                INDICATORS["enabled"],
+                VOLUME_PROFILE["enabled"],
+                MULTITF_CONVERGENCE["enabled"],
+                REJECTION_ZONES["enabled"]
+            ])
             
             message = f"""
 🛑 <b>تم إيقاف ماسح الرفض الكامل</b>
@@ -3275,25 +3786,19 @@ class CompleteRejectionScanner:
 • رفض شراء: {stats['long_rejections']}
 • رفض بيع: {stats['short_rejections']}
 
-<b>🚫 أسباب الفلترة (7 طبقات تحليل):</b>
+<b>🚫 أسباب الفلترة ({enabled_filters}/7 طبقات تحليل):</b>
 • مفلتر (تكرار): {stats.get('rejections_filtered', 0)} ({filtered_pct:.1f}%)
 • بدون قوة كافية: {stats.get('no_strength', 0)} ({no_strength_pct:.1f}%)
 • بدون منطقة رفض: {stats.get('no_rejection_zone', 0)} ({no_zone_pct:.1f}%)
 • بدون نمط شموع: {stats.get('no_candle_pattern', 0)} ({no_pattern_pct:.1f}%)
 • تقارب إطارات منخفض: {stats.get('low_convergence', 0)} ({low_convergence_pct:.1f}%)
+• مؤشرات فاشلة: {stats.get('failed_indicators', 0)} ({failed_indicators_pct:.1f}%)
 
 <b>⚡ الصفقات النشطة:</b>
 • حالياً: {active_count} صفقة نشطة
 
 <b>🧠 فلسفة التاجر المحققة:</b>
-تم الالتزام بـ 7 طبقات تحليل كاملة:
-1. الطول الموجي ← السياق
-2. قوة السوق ← قوة الحركة  
-3. أنماط الشموع ← تأكيد الانعكاس
-4. المؤشرات ← كل المؤشرات
-5. ملف الفوليوم ← التراكمات
-6. تأكيد الإطارات ← الاتساق
-7. مناطق الرفض ← الزناد النهائي
+تم الالتزام بـ {enabled_filters} طبقات تحليل كاملة من أصل 7
 
 تم الالتزام بـ:
 • الدخول عند الرفض فقط بعد تحليل كامل
@@ -3363,82 +3868,50 @@ async def start_http_server(scanner, port=8000):
                     "scan_cycle": scanner.scan_cycle,
                     "active_trades": active_count,
                     "daily_stats": stats,
-                    "analysis_layers": {
-                        "wave_context": "Wave length and maturity analysis",
-                        "market_strength": "Speed, distance, EMA angle, volume participation",
-                        "candle_patterns": "All reversal/continuation patterns detection",
-                        "indicators": "RSI, MACD, MA, Bollinger Bands, Volume analysis",
-                        "volume_profile": "Volume at price levels and clusters",
-                        "multi_tf_confirmation": "5 timeframe convergence analysis",
-                        "rejection_zones": "EMA, Range, Failed break rejection detection"
-                    },
-                    "requirements": {
-                        "min_convergence": "70% multi-TF alignment",
-                        "min_rejection_strength": "60% rejection strength",
-                        "risk_reward": "Minimum 1:2",
-                        "deduplication": "One trade per symbol"
-                    },
-                    "telegram": {
-                        "configured": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID),
-                        "notifications": "Signal + Entry + TP/SL alerts"
+                    "configuration": {
+                        "timeframes_enabled": {tf: config["enabled"] for tf, config in TIMEFRAMES.items()},
+                        "min_strength_score": MARKET_STRENGTH["min_strength_score"],
+                        "min_rejection_strength": REJECTION_ZONES["min_rejection_strength"],
+                        "min_convergence_score": MULTITF_CONVERGENCE["min_convergence_score"],
+                        "rsi_zones": {
+                            "long": INDICATORS["rsi_long_zone"],
+                            "short": INDICATORS["rsi_short_zone"]
+                        },
+                        "deduplication": SIGNAL_GENERATION["one_signal_per_symbol"],
+                        "filters_enabled": {
+                            "wave_context": WAVE_CONTEXT["enabled"],
+                            "market_strength": MARKET_STRENGTH["enabled"],
+                            "candle_patterns": CANDLE_PATTERNS["enabled"],
+                            "indicators": INDICATORS["enabled"],
+                            "volume_profile": VOLUME_PROFILE["enabled"],
+                            "multi_tf": MULTITF_CONVERGENCE["enabled"],
+                            "rejection_zones": REJECTION_ZONES["enabled"]
+                        }
                     }
+                }, indent=2)
+            
+            elif path == '/config':
+                response = json.dumps({
+                    "scan_settings": SCANNING_SETTINGS,
+                    "trade_parameters": {
+                        "max_stop_loss_pct": MAX_STOP_LOSS_PCT,
+                        "min_target_pct": MIN_TARGET_PCT,
+                        "max_target_pct": MAX_TARGET_PCT,
+                        "min_risk_reward": MIN_RISK_REWARD
+                    },
+                    "wave_context": WAVE_CONTEXT,
+                    "market_strength": MARKET_STRENGTH,
+                    "candle_patterns": CANDLE_PATTERNS,
+                    "indicators": INDICATORS,
+                    "volume_profile": VOLUME_PROFILE,
+                    "multi_tf_convergence": MULTITF_CONVERGENCE,
+                    "rejection_zones": REJECTION_ZONES,
+                    "signal_generation": SIGNAL_GENERATION,
+                    "monitoring": MONITORING
                 }, indent=2)
             
             elif path == '/stats':
                 response = json.dumps(scanner.scanner.get_daily_stats(), indent=2)
-            
-            elif path == '/analysis':
-                response = json.dumps({
-                    "trader_role": "Professional discretionary crypto trader",
-                    "specialization": "COMPLETE 7-layer rejection analysis",
-                    "analysis_layers": [
-                        {
-                            "layer": "Wave Context",
-                            "description": "Wave length and maturity analysis (no counting)",
-                            "timeframes": "1H + 15M",
-                            "outputs": ["wave_length", "wave_maturity", "expansion_speed", "structure_type", "context_side"]
-                        },
-                        {
-                            "layer": "Market Strength",
-                            "description": "Measure market momentum and participation",
-                            "timeframes": "15M + 5M",
-                            "outputs": ["candle_speed", "distance_ratio", "ema_angle", "volume_participation", "strength_score", "strength_patterns"]
-                        },
-                        {
-                            "layer": "Candle Patterns",
-                            "description": "Detect all Japanese candlestick patterns",
-                            "timeframes": "All (1H to 1M)",
-                            "outputs": ["hammer", "engulfing", "doji", "pinbar", "morning_star", "evening_star", "soldiers", "crows"]
-                        },
-                        {
-                            "layer": "Indicators",
-                            "description": "Comprehensive technical indicator analysis",
-                            "timeframes": "All (1H to 1M)",
-                            "outputs": ["RSI", "MACD", "Moving Averages", "Bollinger Bands", "Volume indicators", "Support/Resistance"]
-                        },
-                        {
-                            "layer": "Volume Profile",
-                            "description": "Volume at price levels and high volume clusters",
-                            "timeframes": "3M (entry)",
-                            "outputs": ["volume_profile", "volume_clusters", "accumulation_zones"]
-                        },
-                        {
-                            "layer": "Multi-TF Confirmation",
-                            "description": "Check alignment across all timeframes",
-                            "timeframes": "1H, 15M, 5M, 3M, 1M",
-                            "outputs": ["confirmation_map", "convergence_score", "alignment_status"]
-                        },
-                        {
-                            "layer": "Rejection Zones",
-                            "description": "Detect and analyze rejection areas",
-                            "timeframes": "3M (main), 1M (timing)",
-                            "outputs": ["zone_type", "zone_price", "rejection_strength", "volume_confirmation", "trigger_candle"]
-                        }
-                    ],
-                    "entry_philosophy": "Enter on first strong confirmed rejection after complete analysis",
-                    "frequency_rule": "High frequency + asymmetric payoff",
-                    "mindset": "Reaction trader, rejection specialist, not prediction-based, comfortable being wrong"
-                }, indent=2)
             
             elif path == '/recent':
                 if scanner.db:
