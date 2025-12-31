@@ -21,7 +21,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 import json
 
 # ================ HIGH-FREQUENCY CONFIG ================
@@ -35,9 +35,9 @@ TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 100))   # Scan many pairs
 MIN_VOLUME_USD = 500000  # $500K minimum - more opportunities
 
 # Trading parameters (REJECTION-BASED)
-MAX_STOP_LOSS_PCT = 2.0    # 1% maximum stop loss
-MIN_TARGET_PCT = 0.5       # 1.5% minimum target (asymmetric payoff)
-MAX_TARGET_PCT = 20.0       # 4% maximum target
+MAX_STOP_LOSS_PCT = 1.0    # 1% maximum stop loss
+MIN_TARGET_PCT = 1.5       # 1.5% minimum target (asymmetric payoff)
+MAX_TARGET_PCT = 6.0       # 4% maximum target
 MIN_RISK_REWARD = 2.0      # Minimum 1:2 risk/reward
 
 # Rejection scanning
@@ -80,6 +80,16 @@ class WaveContext:
     expansion_speed: float     # 0-1 (slow to fast)
     structure_type: str        # IMPULSIVE, CORRECTIVE, COMPRESSION
     context_side: str          # BULLISH_CONTEXT, BEARISH_CONTEXT, NEUTRAL
+    
+    def to_dict(self) -> Dict:
+        """Convert to serializable dictionary"""
+        return {
+            "wave_length": str(self.wave_length),
+            "wave_maturity": float(self.wave_maturity),
+            "expansion_speed": float(self.expansion_speed),
+            "structure_type": str(self.structure_type),
+            "context_side": str(self.context_side)
+        }
 
 @dataclass
 class MarketStrength:
@@ -95,6 +105,20 @@ class MarketStrength:
     is_rejection_setup: bool   # Strong move + weak volume
     is_absorption: bool        # Weak move + rising volume
     is_compression: bool       # Flat price + compression
+    
+    def to_dict(self) -> Dict:
+        """Convert to serializable dictionary"""
+        return {
+            "candle_speed": float(self.candle_speed),
+            "distance_ratio": float(self.distance_ratio),
+            "ema_angle": float(self.ema_angle),
+            "volume_participation": float(self.volume_participation),
+            "strength_score": float(self.strength_score),
+            "is_continuation": bool(self.is_continuation),
+            "is_rejection_setup": bool(self.is_rejection_setup),
+            "is_absorption": bool(self.is_absorption),
+            "is_compression": bool(self.is_compression)
+        }
 
 @dataclass
 class RejectionZone:
@@ -106,6 +130,17 @@ class RejectionZone:
     volume_confirmation: bool  # Volume spike at rejection
     rsi_position: str          # IN_ZONE, OVEREXTENDED, NEUTRAL
     is_active: bool           # Currently being rejected
+    
+    def to_dict(self) -> Dict:
+        """Convert to serializable dictionary"""
+        return {
+            "zone_type": str(self.zone_type),
+            "price_level": float(self.price_level),
+            "strength": float(self.strength),
+            "volume_confirmation": bool(self.volume_confirmation),
+            "rsi_position": str(self.rsi_position),
+            "is_active": bool(self.is_active)
+        }
 
 @dataclass
 class CandlePattern:
@@ -121,6 +156,20 @@ class CandlePattern:
     has_short_wick: bool
     body_ratio: float          # Body size relative to wick
     engulfing_size: float      # For engulfing patterns
+    
+    def to_dict(self) -> Dict:
+        """Convert to serializable dictionary"""
+        return {
+            "pattern_name": str(self.pattern_name),
+            "pattern_type": str(self.pattern_type),
+            "reliability": float(self.reliability),
+            "confirmation_required": bool(self.confirmation_required),
+            "timeframe": str(self.timeframe),
+            "has_long_wick": bool(self.has_long_wick),
+            "has_short_wick": bool(self.has_short_wick),
+            "body_ratio": float(self.body_ratio),
+            "engulfing_size": float(self.engulfing_size)
+        }
 
 @dataclass
 class IndicatorAnalysis:
@@ -160,6 +209,46 @@ class IndicatorAnalysis:
     momentum_score: float      # 0-1 overall momentum
     trend_score: float         # 0-1 trend strength
     volatility_score: float    # 0-1 volatility
+    
+    def to_dict(self) -> Dict:
+        """Convert to serializable dictionary"""
+        return {
+            # RSI
+            "rsi_value": float(self.rsi_value),
+            "rsi_trend": str(self.rsi_trend),
+            "rsi_divergence": str(self.rsi_divergence),
+            "rsi_momentum": float(self.rsi_momentum),
+            
+            # Moving Averages
+            "ma_alignment": str(self.ma_alignment),
+            "price_vs_ma": str(self.price_vs_ma),
+            "ma_distance": float(self.ma_distance),
+            
+            # MACD
+            "macd_signal": str(self.macd_signal),
+            "macd_momentum": float(self.macd_momentum),
+            "macd_trend": str(self.macd_trend),
+            
+            # Bollinger Bands
+            "bb_position": str(self.bb_position),
+            "bb_squeeze": bool(self.bb_squeeze),
+            "bb_width": float(self.bb_width),
+            
+            # Volume indicators
+            "volume_trend": str(self.volume_trend),
+            "volume_spike": bool(self.volume_spike),
+            "obv_trend": str(self.obv_trend),
+            
+            # Support/Resistance
+            "key_support": float(self.key_support),
+            "key_resistance": float(self.key_resistance),
+            "sr_strength": float(self.sr_strength),
+            
+            # Composite scores
+            "momentum_score": float(self.momentum_score),
+            "trend_score": float(self.trend_score),
+            "volatility_score": float(self.volatility_score)
+        }
 
 @dataclass
 class RejectionSignal:
@@ -301,7 +390,7 @@ class CandlePatternScanner:
                         timeframe=timeframe,
                         has_long_wick=True,
                         has_short_wick=False,
-                        body_ratio=body_size/total_range,
+                        body_ratio=body_size/total_range if total_range > 0 else 0.0,
                         engulfing_size=0.0
                     )
                 else:  # Uptrend → Hanging Man
@@ -313,7 +402,7 @@ class CandlePatternScanner:
                         timeframe=timeframe,
                         has_long_wick=True,
                         has_short_wick=False,
-                        body_ratio=body_size/total_range,
+                        body_ratio=body_size/total_range if total_range > 0 else 0.0,
                         engulfing_size=0.0
                     )
         
@@ -345,8 +434,8 @@ class CandlePatternScanner:
                 timeframe=timeframe,
                 has_long_wick=False,
                 has_short_wick=False,
-                body_ratio=current_body/(current['high'] - current['low']),
-                engulfing_size=current_body/previous_body
+                body_ratio=current_body/(current['high'] - current['low']) if (current['high'] - current['low']) > 0 else 0.0,
+                engulfing_size=current_body/previous_body if previous_body > 0 else 0.0
             )
         
         # Bearish Engulfing
@@ -364,8 +453,8 @@ class CandlePatternScanner:
                 timeframe=timeframe,
                 has_long_wick=False,
                 has_short_wick=False,
-                body_ratio=current_body/(current['high'] - current['low']),
-                engulfing_size=current_body/previous_body
+                body_ratio=current_body/(current['high'] - current['low']) if (current['high'] - current['low']) > 0 else 0.0,
+                engulfing_size=current_body/previous_body if previous_body > 0 else 0.0
             )
         
         return None
@@ -388,7 +477,7 @@ class CandlePatternScanner:
                 timeframe=timeframe,
                 has_long_wick=True,
                 has_short_wick=True,
-                body_ratio=body_size/total_range,
+                body_ratio=body_size/total_range if total_range > 0 else 0.0,
                 engulfing_size=0.0
             )
         
@@ -418,7 +507,7 @@ class CandlePatternScanner:
                 timeframe=timeframe,
                 has_long_wick=True,
                 has_short_wick=False,
-                body_ratio=body_size/total_range,
+                body_ratio=body_size/total_range if total_range > 0 else 0.0,
                 engulfing_size=0.0
             )
         
@@ -449,7 +538,7 @@ class CandlePatternScanner:
                 timeframe=timeframe,
                 has_long_wick=False,
                 has_short_wick=False,
-                body_ratio=abs(third['close'] - third['open'])/(third['high'] - third['low']),
+                body_ratio=abs(third['close'] - third['open'])/(third['high'] - third['low']) if (third['high'] - third['low']) > 0 else 0.0,
                 engulfing_size=0.0
             )
         
@@ -468,7 +557,7 @@ class CandlePatternScanner:
                 timeframe=timeframe,
                 has_long_wick=False,
                 has_short_wick=False,
-                body_ratio=abs(third['close'] - third['open'])/(third['high'] - third['low']),
+                body_ratio=abs(third['close'] - third['open'])/(third['high'] - third['low']) if (third['high'] - third['low']) > 0 else 0.0,
                 engulfing_size=0.0
             )
         
@@ -585,9 +674,9 @@ class IndicatorAnalyzer:
         rsi = self.calculate_rsi(df['close'])
         
         if len(rsi) < 14:
-            return {"value": 50, "trend": "NEUTRAL", "divergence": "NONE", "momentum": 0.5}
+            return {"value": 50.0, "trend": "NEUTRAL", "divergence": "NONE", "momentum": 0.5}
         
-        current_rsi = rsi.iloc[-1]
+        current_rsi = float(rsi.iloc[-1])
         
         # RSI trend
         rsi_ma = rsi.rolling(window=5).mean()
@@ -595,7 +684,7 @@ class IndicatorAnalyzer:
         
         # RSI momentum (slope)
         rsi_slope = self._calculate_slope(rsi.values[-5:])
-        rsi_momentum = min(abs(rsi_slope) * 10, 1.0)  # Normalize to 0-1
+        rsi_momentum = float(min(abs(rsi_slope) * 10, 1.0))  # Normalize to 0-1
         
         # RSI divergence
         divergence = self._detect_rsi_divergence(df['close'].values, rsi.values)
@@ -643,24 +732,24 @@ class IndicatorAnalyzer:
             # Peak
             if (data[i] > data[i-2] and data[i] > data[i-1] and 
                 data[i] > data[i+1] and data[i] > data[i+2]):
-                peaks.append(data[i])
+                peaks.append(float(data[i]))
             
             # Trough
             elif (data[i] < data[i-2] and data[i] < data[i-1] and 
                   data[i] < data[i+1] and data[i] < data[i+2]):
-                troughs.append(data[i])
+                troughs.append(float(data[i]))
         
         return peaks, troughs
     
     def _analyze_moving_averages(self, df: pd.DataFrame) -> Dict:
         """Analyze moving averages alignment"""
-        current_price = df['close'].iloc[-1]
+        current_price = float(df['close'].iloc[-1])
         
         # Calculate multiple MAs
-        ma_9 = df['close'].rolling(window=9).mean().iloc[-1]
-        ma_21 = df['close'].rolling(window=21).mean().iloc[-1]
-        ma_50 = df['close'].rolling(window=50).mean().iloc[-1]
-        ma_200 = df['close'].rolling(window=200).mean().iloc[-1]
+        ma_9 = float(df['close'].rolling(window=9).mean().iloc[-1])
+        ma_21 = float(df['close'].rolling(window=21).mean().iloc[-1])
+        ma_50 = float(df['close'].rolling(window=50).mean().iloc[-1])
+        ma_200 = float(df['close'].rolling(window=200).mean().iloc[-1])
         
         # Check alignment
         mas = [ma_9, ma_21, ma_50, ma_200]
@@ -680,7 +769,10 @@ class IndicatorAnalyzer:
             price_position = "BETWEEN"
         
         # Distance from key MA (200)
-        ma_distance = abs(current_price - ma_200) / ma_200 * 100
+        if ma_200 > 0:
+            ma_distance = float(abs(current_price - ma_200) / ma_200 * 100)
+        else:
+            ma_distance = 0.0
         
         return {
             "alignment": alignment,
@@ -700,13 +792,13 @@ class IndicatorAnalyzer:
         if len(macd) < 2:
             return {"signal": "NEUTRAL", "momentum": 0.0, "trend": "NEUTRAL"}
         
-        current_macd = macd.iloc[-1]
-        current_signal = signal.iloc[-1]
-        current_hist = histogram.iloc[-1]
+        current_macd = float(macd.iloc[-1])
+        current_signal = float(signal.iloc[-1])
+        current_hist = float(histogram.iloc[-1])
         
         # Signal cross
-        prev_macd = macd.iloc[-2]
-        prev_signal = signal.iloc[-2]
+        prev_macd = float(macd.iloc[-2])
+        prev_signal = float(signal.iloc[-2])
         
         if prev_macd < prev_signal and current_macd > current_signal:
             macd_signal = "BULLISH_CROSS"
@@ -716,8 +808,11 @@ class IndicatorAnalyzer:
             macd_signal = "NEUTRAL"
         
         # Momentum
-        macd_momentum = abs(current_hist) / df['close'].iloc[-1] * 1000
-        macd_momentum = min(macd_momentum, 1.0)  # Normalize
+        if df['close'].iloc[-1] > 0:
+            macd_momentum = float(abs(current_hist) / df['close'].iloc[-1] * 1000)
+            macd_momentum = min(macd_momentum, 1.0)  # Normalize
+        else:
+            macd_momentum = 0.0
         
         # Trend
         macd_trend = "BULLISH" if current_macd > 0 else "BEARISH"
@@ -730,7 +825,7 @@ class IndicatorAnalyzer:
     
     def _analyze_bollinger_bands(self, df: pd.DataFrame) -> Dict:
         """Analyze Bollinger Bands"""
-        current_price = df['close'].iloc[-1]
+        current_price = float(df['close'].iloc[-1])
         
         # Calculate Bollinger Bands
         ma_20 = df['close'].rolling(window=20).mean()
@@ -742,9 +837,9 @@ class IndicatorAnalyzer:
         if len(upper_band) == 0 or pd.isna(ma_20.iloc[-1]) or ma_20.iloc[-1] == 0:
             return {"position": "MIDDLE", "squeeze": False, "width": 0.0}
         
-        current_upper = upper_band.iloc[-1]
-        current_lower = lower_band.iloc[-1]
-        current_ma_20 = ma_20.iloc[-1]
+        current_upper = float(upper_band.iloc[-1])
+        current_lower = float(lower_band.iloc[-1])
+        current_ma_20 = float(ma_20.iloc[-1])
         
         # Position
         if current_price >= current_upper * 0.99:
@@ -755,14 +850,17 @@ class IndicatorAnalyzer:
             bb_position = "MIDDLE"
         
         # Squeeze detection
-        band_width = (current_upper - current_lower) / current_ma_20 * 100
+        if current_ma_20 > 0:
+            band_width = float((current_upper - current_lower) / current_ma_20 * 100)
+        else:
+            band_width = 0.0
         
         # Calculate average width
         if len(upper_band) > 50:
             avg_width = ((upper_band - lower_band) / ma_20 * 100).rolling(50).mean().iloc[-1]
-            bb_squeeze = band_width < avg_width * 0.7  # 30% narrower than average
+            bb_squeeze = bool(band_width < float(avg_width) * 0.7)  # 30% narrower than average
         else:
-            bb_squeeze = band_width < 2.0  # Less than 2% width
+            bb_squeeze = bool(band_width < 2.0)  # Less than 2% width
         
         return {
             "position": bb_position,
@@ -787,10 +885,10 @@ class IndicatorAnalyzer:
             volume_trend = "FLAT"
         
         # Volume spike
-        avg_volume = df['volume'].rolling(20).mean().iloc[-1]
-        current_volume = df['volume'].iloc[-1]
+        avg_volume = float(df['volume'].rolling(20).mean().iloc[-1])
+        current_volume = float(df['volume'].iloc[-1])
         
-        volume_spike = current_volume > avg_volume * 1.5
+        volume_spike = bool(current_volume > avg_volume * 1.5)
         
         # OBV (On Balance Volume) trend
         obv = self._calculate_obv(df)
@@ -832,18 +930,18 @@ class IndicatorAnalyzer:
             return {"support": 0.0, "resistance": 0.0, "strength": 0.0}
         
         # Find recent highs and lows
-        recent_high = df['high'].rolling(20).max().iloc[-1]
-        recent_low = df['low'].rolling(20).min().iloc[-1]
+        recent_high = float(df['high'].rolling(20).max().iloc[-1])
+        recent_low = float(df['low'].rolling(20).min().iloc[-1])
         
         # Find stronger S/R from larger timeframe
         if len(df) >= 100:
-            major_high = df['high'].rolling(100).max().iloc[-1]
-            major_low = df['low'].rolling(100).min().iloc[-1]
+            major_high = float(df['high'].rolling(100).max().iloc[-1])
+            major_low = float(df['low'].rolling(100).min().iloc[-1])
         else:
             major_high = recent_high
             major_low = recent_low
         
-        current_price = df['close'].iloc[-1]
+        current_price = float(df['close'].iloc[-1])
         
         # Determine nearest support and resistance
         support = major_low if abs(current_price - major_low) < abs(current_price - recent_low) else recent_low
@@ -853,11 +951,11 @@ class IndicatorAnalyzer:
         support_touches = sum((df['low'] <= support * 1.005) & (df['low'] >= support * 0.995))
         resistance_touches = sum((df['high'] >= resistance * 0.995) & (df['high'] <= resistance * 1.005))
         
-        sr_strength = min(max(support_touches, resistance_touches) / 20, 1.0)
+        sr_strength = float(min(max(support_touches, resistance_touches) / 20, 1.0))
         
         return {
-            "support": support,
-            "resistance": resistance,
+            "support": float(support),
+            "resistance": float(resistance),
             "strength": sr_strength
         }
     
@@ -868,7 +966,7 @@ class IndicatorAnalyzer:
         
         x = np.arange(len(data))
         slope, _ = np.polyfit(x, data, 1)
-        return slope
+        return float(slope)
     
     def _calculate_momentum_score(self, rsi_analysis: Dict, macd_analysis: Dict) -> float:
         """Calculate overall momentum score"""
@@ -876,7 +974,7 @@ class IndicatorAnalyzer:
         weights = []
         
         # RSI momentum (40%)
-        scores.append(rsi_analysis['momentum'])
+        scores.append(float(rsi_analysis['momentum']))
         weights.append(0.4)
         
         # RSI divergence (20%)
@@ -887,10 +985,10 @@ class IndicatorAnalyzer:
         weights.append(0.2)
         
         # MACD momentum (40%)
-        scores.append(macd_analysis['momentum'])
+        scores.append(float(macd_analysis['momentum']))
         weights.append(0.4)
         
-        return np.average(scores, weights=weights)
+        return float(np.average(scores, weights=weights))
     
     def _calculate_trend_score(self, ma_analysis: Dict, macd_analysis: Dict) -> float:
         """Calculate overall trend score"""
@@ -915,7 +1013,7 @@ class IndicatorAnalyzer:
             scores.append(0.5)
         weights.append(0.5)
         
-        return np.average(scores, weights=weights)
+        return float(np.average(scores, weights=weights))
     
     def _get_default_analysis(self) -> IndicatorAnalysis:
         return IndicatorAnalysis(
@@ -1128,7 +1226,7 @@ class EnhancedRejectionBasedScanner:
             else:
                 wave_maturity = 0.5
             
-            return wave_length, wave_maturity
+            return wave_length, float(wave_maturity)
             
         except Exception as e:
             return "MEDIUM", 0.5
@@ -1154,10 +1252,9 @@ class EnhancedRejectionBasedScanner:
                 return 0.5
             
             avg_speed = np.mean(candle_speeds)
-            max_speed = np.max(candle_speeds)
             
             # Normalize to 0-1
-            expansion_speed = min(avg_speed / 5.0, 1.0)  # 5% avg range = max speed
+            expansion_speed = float(min(avg_speed / 5.0, 1.0))  # 5% avg range = max speed
             
             return expansion_speed
             
@@ -1300,7 +1397,7 @@ class EnhancedRejectionBasedScanner:
             
             avg_speed = np.mean(speeds)
             # Normalize: 0.5% = 0.5, 1% = 0.75, 2% = 1.0
-            return min(avg_speed / 2.0, 1.0)
+            return float(min(avg_speed / 2.0, 1.0))
             
         except Exception as e:
             return 0.5
@@ -1317,7 +1414,7 @@ class EnhancedRejectionBasedScanner:
             if prices[0] > 0:
                 distance_pct = total_distance / prices[0] * 100
                 # Normalize: 5% move in 10 candles = 1.0
-                return min(distance_pct / 5.0, 1.0)
+                return float(min(distance_pct / 5.0, 1.0))
             
             return 0.5
             
@@ -1345,7 +1442,7 @@ class EnhancedRejectionBasedScanner:
             avg_price = np.mean(ema_values)
             if avg_price > 0:
                 angle_metric = abs(slope / avg_price * 1000)  # Scale for sensitivity
-                return min(angle_metric, 1.0)
+                return float(min(angle_metric, 1.0))
             
             return 0.0
             
@@ -1365,9 +1462,9 @@ class EnhancedRejectionBasedScanner:
                 ratio = recent_volume / avg_volume
                 # Normalize: 1.0 = average, 1.5 = 0.75, 2.0 = 1.0, 0.5 = 0.25
                 if ratio >= 1.0:
-                    return min((ratio - 1.0) * 2, 1.0)  # 1.0→0, 1.5→1.0
+                    return float(min((ratio - 1.0) * 2, 1.0))  # 1.0→0, 1.5→1.0
                 else:
-                    return max((ratio - 1.0) * 2, 0.0)  # 0.5→0, 1.0→0
+                    return float(max((ratio - 1.0) * 2, 0.0))  # 0.5→0, 1.0→0
             
             return 0.5
             
@@ -1381,7 +1478,7 @@ class EnhancedRejectionBasedScanner:
         weights = [0.2, 0.2, 0.2, 0.4]  # candle_speed, distance, ema_angle, volume
         factors = [candle_speed, distance_ratio, ema_angle, volume_participation]
         
-        return np.average(factors, weights=weights)
+        return float(np.average(factors, weights=weights))
     
     def _interpret_strength_patterns(self, df: pd.DataFrame, candle_speed: float, 
                                     volume_participation: float) -> Tuple[bool, bool, bool, bool]:
@@ -1410,7 +1507,7 @@ class EnhancedRejectionBasedScanner:
             
             is_compression = (range_pct < 1.0 and volume_participation < 0.5)
             
-            return is_continuation, is_rejection_setup, is_absorption, is_compression
+            return bool(is_continuation), bool(is_rejection_setup), bool(is_absorption), bool(is_compression)
             
         except Exception as e:
             return False, False, False, False
@@ -1500,8 +1597,8 @@ class EnhancedRejectionBasedScanner:
                     
                     zones.append(RejectionZone(
                         zone_type=zone_type,
-                        price_level=ema_value,
-                        strength=strength,
+                        price_level=float(ema_value),
+                        strength=float(strength),
                         volume_confirmation=False,  # Will be checked later
                         rsi_position="IN_ZONE",
                         is_active=is_active
@@ -1521,9 +1618,8 @@ class EnhancedRejectionBasedScanner:
                 return zones
             
             # Recent range (last 20 candles)
-            recent_high = df['high'].values[-20:].max()
-            recent_low = df['low'].values[-20:].min()
-            range_mid = (recent_high + recent_low) / 2
+            recent_high = float(df['high'].values[-20:].max())
+            recent_low = float(df['low'].values[-20:].min())
             
             # Check range high
             high_distance_pct = abs(current_price - recent_high) / recent_high * 100
@@ -1563,8 +1659,8 @@ class EnhancedRejectionBasedScanner:
                 return zones
             
             # Check for recent failed breakouts
-            recent_high = df['high'].values[-5:].max()
-            prev_high = df['high'].values[-10:-5].max()
+            recent_high = float(df['high'].values[-5:].max())
+            prev_high = float(df['high'].values[-10:-5].max())
             
             # Failed breakout (price tried to break high but failed)
             if current_price < recent_high and recent_high > prev_high * 1.005:  # 0.5% attempt
@@ -1580,8 +1676,8 @@ class EnhancedRejectionBasedScanner:
                     ))
             
             # Check for recent failed breakdowns
-            recent_low = df['low'].values[-5:].min()
-            prev_low = df['low'].values[-10:-5].min()
+            recent_low = float(df['low'].values[-5:].min())
+            prev_low = float(df['low'].values[-10:-5].min())
             
             # Failed breakdown (price tried to break low but failed)
             if current_price > recent_low and recent_low < prev_low * 0.995:  # 0.5% attempt
@@ -1669,7 +1765,7 @@ class EnhancedRejectionBasedScanner:
         for level in price_levels:
             # Find candles touching this level (±0.5%)
             mask = (df['low'] <= level * 1.005) & (df['high'] >= level * 0.995)
-            volume_at_level = df.loc[mask, 'volume'].sum()
+            volume_at_level = float(df.loc[mask, 'volume'].sum())
             volume_profile[f"{level:.4f}"] = volume_at_level
         
         # Find high volume clusters (top 5)
@@ -1677,7 +1773,7 @@ class EnhancedRejectionBasedScanner:
         top_volumes = df_sorted.head(5)
         
         for _, row in top_volumes.iterrows():
-            cluster_price = (row['high'] + row['low'] + row['close']) / 3
+            cluster_price = float((row['high'] + row['low'] + row['close']) / 3)
             volume_clusters.append(cluster_price)
         
         return volume_profile, volume_clusters
@@ -1710,7 +1806,7 @@ class EnhancedRejectionBasedScanner:
                (side == "SHORT" and analysis.rsi_divergence == "BEARISH_DIVERGENCE"):
                 confirms = True
             
-            confirmation[tf_name] = confirms
+            confirmation[tf_name] = bool(confirms)
         
         return confirmation
     
@@ -1722,12 +1818,12 @@ class EnhancedRejectionBasedScanner:
         # Higher weight for lower timeframes
         weights = {"1M": 0.3, "3M": 0.25, "5M": 0.2, "15M": 0.15, "1H": 0.1}
         
-        weighted_score = 0
+        weighted_score = 0.0
         for tf_name, confirms in confirmation.items():
             weight = weights.get(tf_name, 0.1)
             weighted_score += (1 if confirms else 0) * weight
         
-        return weighted_score
+        return float(weighted_score)
     
     def pattern_confirms_rejection(self, pattern: Optional[CandlePattern], side: str) -> bool:
         """Check if candle pattern confirms rejection direction"""
@@ -1758,10 +1854,10 @@ class EnhancedRejectionBasedScanner:
             emas = {}
             for name, period in EMA_PERIODS.items():
                 ema_series = df['close'].ewm(span=period, adjust=False).mean()
-                emas[name] = ema_series.iloc[-1] if len(ema_series) > 0 else 0
+                emas[name] = float(ema_series.iloc[-1]) if len(ema_series) > 0 else 0.0
             return emas
         except Exception as e:
-            return {name: 0 for name in EMA_PERIODS.keys()}
+            return {name: 0.0 for name in EMA_PERIODS.keys()}
     
     def generate_enhanced_rejection_signal(self, multi_tf_data: Dict[str, pd.DataFrame], 
                                           symbol: str) -> Optional[RejectionSignal]:
@@ -1807,12 +1903,12 @@ class EnhancedRejectionBasedScanner:
             volume_profile, volume_clusters = self.analyze_volume_profile(tf_3m)
             
             # ===== 6. REJECTION ZONE ANALYSIS =====
-            current_price = tf_3m['close'].iloc[-1]
+            current_price = float(tf_3m['close'].iloc[-1])
             emas = self.calculate_emas(tf_3m)
             
             # Calculate RSI on 3M
             rsi_series = self.calculate_rsi(tf_3m['close'])
-            current_rsi = rsi_series.iloc[-1] if len(rsi_series) > 0 else 50
+            current_rsi = float(rsi_series.iloc[-1]) if len(rsi_series) > 0 else 50.0
             
             # Find rejection zones
             rejection_zones = self.find_rejection_zones(tf_3m, current_price, current_rsi, emas)
@@ -1861,6 +1957,7 @@ class EnhancedRejectionBasedScanner:
             multi_tf_confirmation = self.check_multi_tf_confirmation(indicators, side, best_zone.zone_type)
             convergence_score = self.calculate_convergence_score(multi_tf_confirmation)
             
+            # FIXED: Proper convergence check
             if convergence_score < REJECTION_CONFIG["min_convergence_score"]:
                 self.daily_stats["low_convergence"] += 1
                 log.debug(f"{symbol}: Low multi-TF convergence ({convergence_score:.2f})")
@@ -1877,6 +1974,7 @@ class EnhancedRejectionBasedScanner:
             # ===== 10. TRADE-BASED DEDUPLICATION CHECK =====
             if not self.deduplicator.should_generate_signal(symbol, side, current_price):
                 self.daily_stats["rejections_filtered"] += 1
+                log.debug(f"{symbol}: Duplicate signal filtered")
                 return None
             
             # ===== 11. ANALYZE REJECTION CANDLE =====
@@ -1887,19 +1985,19 @@ class EnhancedRejectionBasedScanner:
                 return None
             
             # ===== 12. CALCULATE ENTRY, SL, TP =====
-            stop_loss_pct = np.random.uniform(0.5, MAX_STOP_LOSS_PCT)
-            target_pct = np.random.uniform(MIN_TARGET_PCT, MAX_TARGET_PCT)
+            stop_loss_pct = float(np.random.uniform(0.5, MAX_STOP_LOSS_PCT))
+            target_pct = float(np.random.uniform(MIN_TARGET_PCT, MAX_TARGET_PCT))
             
             if side == "LONG":
                 # Entry at rejection zone (slightly above for LONG)
-                entry_price = best_zone.price_level * 1.001  # 0.1% above support
-                stop_loss = entry_price * (1 - stop_loss_pct / 100)
-                take_profit = entry_price * (1 + target_pct / 100)
+                entry_price = float(best_zone.price_level * 1.001)  # 0.1% above support
+                stop_loss = float(entry_price * (1 - stop_loss_pct / 100))
+                take_profit = float(entry_price * (1 + target_pct / 100))
             else:  # SHORT
                 # Entry at rejection zone (slightly below for SHORT)
-                entry_price = best_zone.price_level * 0.999  # 0.1% below resistance
-                stop_loss = entry_price * (1 + stop_loss_pct / 100)
-                take_profit = entry_price * (1 - target_pct / 100)
+                entry_price = float(best_zone.price_level * 0.999)  # 0.1% below resistance
+                stop_loss = float(entry_price * (1 + stop_loss_pct / 100))
+                take_profit = float(entry_price * (1 - target_pct / 100))
             
             # Calculate Risk/Reward
             risk = abs(entry_price - stop_loss)
@@ -1908,7 +2006,7 @@ class EnhancedRejectionBasedScanner:
             if risk == 0:
                 return None
             
-            risk_reward = reward / risk
+            risk_reward = float(reward / risk)
             
             # Minimum R:R check
             if risk_reward < MIN_RISK_REWARD:
@@ -2002,6 +2100,8 @@ class EnhancedRejectionBasedScanner:
             
         except Exception as e:
             log.error(f"Rejection signal error for {symbol}: {e}")
+            import traceback
+            log.error(f"Traceback: {traceback.format_exc()}")
             return None
     
     def _check_volume_confirmation(self, df: pd.DataFrame, zone_type: str) -> bool:
@@ -2108,11 +2208,11 @@ class EnhancedRejectionBasedScanner:
         weights = []
         
         # 1. Zone strength (20%)
-        factors.append(zone.strength)
+        factors.append(float(zone.strength))
         weights.append(0.2)
         
         # 2. Market strength (20%)
-        factors.append(strength.strength_score)
+        factors.append(float(strength.strength_score))
         weights.append(0.2)
         
         # 3. Wave context (15%)
@@ -2127,7 +2227,7 @@ class EnhancedRejectionBasedScanner:
         # Adjust for wave maturity (early waves better)
         wave_score *= (1 - wave.wave_maturity * 0.5)  # Reduce if too mature
         
-        factors.append(wave_score)
+        factors.append(float(wave_score))
         weights.append(0.15)
         
         # 4. RSI position (15%)
@@ -2138,19 +2238,19 @@ class EnhancedRejectionBasedScanner:
         else:
             rsi_score = 0.5
         
-        factors.append(rsi_score)
+        factors.append(float(rsi_score))
         weights.append(0.15)
         
         # 5. Multi-TF convergence (20%)
-        factors.append(convergence_score)
+        factors.append(float(convergence_score))
         weights.append(0.2)
         
         # 6. Volume confirmation (10%)
         volume_score = 0.8 if zone.volume_confirmation else 0.3
-        factors.append(volume_score)
+        factors.append(float(volume_score))
         weights.append(0.1)
         
-        return np.average(factors, weights=weights)
+        return float(np.average(factors, weights=weights))
     
     def _get_rejection_conditions(self, wave: WaveContext, strength: MarketStrength, 
                                  zone: RejectionZone, rejection_type: str,
@@ -2178,11 +2278,11 @@ class EnhancedRejectionBasedScanner:
         if zone.volume_confirmation:
             conditions.append("VOLUME_CONFIRMED")
         
-        # Rejection type
-        conditions.append(f"REJECTION_{rejection_type}")
-        
         # RSI condition
         conditions.append(f"RSI_{zone.rsi_position}")
+        
+        # Rejection type
+        conditions.append(f"REJECTION_{rejection_type}")
         
         # Candle pattern condition
         if dominant_pattern:
@@ -2482,7 +2582,7 @@ class CompleteRejectionScanner:
             return []
     
     async def save_complete_signal(self, signal: RejectionSignal) -> bool:
-        """Save complete signal to database"""
+        """Save complete signal to database - FIXED SERIALIZATION"""
         try:
             # Prepare strength flags
             strength_flags = []
@@ -2499,21 +2599,21 @@ class CompleteRejectionScanner:
             candle_patterns_list = []
             if signal.candle_patterns:
                 for pattern in signal.candle_patterns:
-                    candle_patterns_list.append({
-                        "name": pattern.pattern_name,
-                        "type": pattern.pattern_type,
-                        "reliability": pattern.reliability,
-                        "timeframe": pattern.timeframe
-                    })
+                    candle_patterns_list.append(pattern.to_dict())
             
             # Prepare dominant pattern
             dominant_pattern_info = None
             if signal.dominant_pattern:
-                dominant_pattern_info = {
-                    "name": signal.dominant_pattern.pattern_name,
-                    "type": signal.dominant_pattern.pattern_type,
-                    "reliability": signal.dominant_pattern.reliability
-                }
+                dominant_pattern_info = signal.dominant_pattern.to_dict()
+            
+            # Serialize volume profile
+            serialized_volume_profile = {}
+            if signal.volume_profile:
+                for key, value in signal.volume_profile.items():
+                    serialized_volume_profile[str(key)] = float(value)
+            
+            # Serialize volume clusters
+            serialized_volume_clusters = [float(v) for v in signal.volume_clusters]
             
             # Insert signal
             await self.db.execute("""
@@ -2535,49 +2635,49 @@ class CompleteRejectionScanner:
                 signal.signal_id,
                 signal.symbol,
                 signal.side,
-                signal.entry_price,
-                signal.stop_loss,
-                signal.take_profit,
+                float(signal.entry_price),
+                float(signal.stop_loss),
+                float(signal.take_profit),
                 
-                signal.wave_context.wave_length,
-                signal.wave_context.wave_maturity,
-                signal.wave_context.expansion_speed,
-                signal.wave_context.structure_type,
-                signal.wave_context.context_side,
+                str(signal.wave_context.wave_length),
+                float(signal.wave_context.wave_maturity),
+                float(signal.wave_context.expansion_speed),
+                str(signal.wave_context.structure_type),
+                str(signal.wave_context.context_side),
                 
-                signal.market_strength.candle_speed,
-                signal.market_strength.distance_ratio,
-                signal.market_strength.ema_angle,
-                signal.market_strength.volume_participation,
-                signal.market_strength.strength_score,
+                float(signal.market_strength.candle_speed),
+                float(signal.market_strength.distance_ratio),
+                float(signal.market_strength.ema_angle),
+                float(signal.market_strength.volume_participation),
+                float(signal.market_strength.strength_score),
                 json.dumps(strength_flags),
                 
-                signal.rejection_zone.zone_type,
-                signal.rejection_zone.price_level,
-                signal.rejection_zone.strength,
-                signal.rejection_strength,
-                signal.rsi_at_entry,
-                signal.rejection_type,
-                signal.trigger_candle,
+                str(signal.rejection_zone.zone_type),
+                float(signal.rejection_zone.price_level),
+                float(signal.rejection_zone.strength),
+                float(signal.rejection_strength),
+                float(signal.rsi_at_entry),
+                str(signal.rejection_type),
+                str(signal.trigger_candle),
                 
                 json.dumps(candle_patterns_list),
                 json.dumps(dominant_pattern_info),
                 
-                json.dumps(signal.indicators_1h.__dict__),
-                json.dumps(signal.indicators_15m.__dict__),
-                json.dumps(signal.indicators_5m.__dict__),
-                json.dumps(signal.indicators_3m.__dict__),
-                json.dumps(signal.indicators_1m.__dict__),
+                json.dumps(signal.indicators_1h.to_dict()),
+                json.dumps(signal.indicators_15m.to_dict()),
+                json.dumps(signal.indicators_5m.to_dict()),
+                json.dumps(signal.indicators_3m.to_dict()),
+                json.dumps(signal.indicators_1m.to_dict()),
                 
-                json.dumps(signal.volume_profile),
-                json.dumps(signal.volume_clusters),
+                json.dumps(serialized_volume_profile),
+                json.dumps(serialized_volume_clusters),
                 
                 json.dumps(signal.multi_tf_confirmation),
-                signal.convergence_score,
+                float(signal.convergence_score),
                 
-                signal.risk_reward,
-                signal.expected_move_pct,
-                signal.timeframe_used,
+                float(signal.risk_reward),
+                float(signal.expected_move_pct),
+                str(signal.timeframe_used),
                 
                 json.dumps(signal.conditions_met)
             ))
@@ -2589,6 +2689,8 @@ class CompleteRejectionScanner:
             
         except Exception as e:
             log.error(f"Error saving complete signal: {e}")
+            import traceback
+            log.error(f"Traceback: {traceback.format_exc()}")
             return False
     
     async def format_complete_signal_message(self, signal: RejectionSignal) -> str:
@@ -2762,7 +2864,7 @@ class CompleteRejectionScanner:
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=10) as client:
                 await client.post(url, json={
                     "chat_id": TELEGRAM_CHAT_ID,
                     "text": message,
@@ -2837,7 +2939,7 @@ class CompleteRejectionScanner:
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=10) as client:
                 response = await client.post(url, json={
                     "chat_id": TELEGRAM_CHAT_ID,
                     "text": message,
@@ -2855,69 +2957,31 @@ class CompleteRejectionScanner:
             log.error(f"Close notification error: {e}")
     
     async def send_telegram_alert(self, signal: RejectionSignal):
-        """Send Telegram alert for complete signal - FIXED VERSION"""
+        """Send Telegram alert for complete signal"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             log.warning(f"⚠️ Telegram credentials missing. Skipping alert for {signal.symbol}")
-            return False
+            return
         
         try:
-            # Format the complete message
             message = await self.format_complete_signal_message(signal)
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                # Try with HTML
-                payload = {
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(url, json={
                     "chat_id": TELEGRAM_CHAT_ID,
                     "text": message,
                     "parse_mode": "HTML"
-                }
+                })
                 
-                try:
-                    response = await client.post(url, json=payload, timeout=30.0)
-                    
-                    if response.status_code == 200:
-                        log.info(f"✅ Telegram alert sent for {signal.symbol}")
-                        return True
-                    else:
-                        log.error(f"❌ Telegram API error: {response.status_code} - {response.text}")
-                        
-                        # Try without HTML
-                        try:
-                            # Create a simplified plain text version
-                            plain_message = f"""
-Signal: {signal.symbol} {signal.side}
-Entry: {signal.entry_price:.6f}
-SL: {signal.stop_loss:.6f} (Risk: {abs(signal.entry_price - signal.stop_loss)/signal.entry_price*100:.2f}%)
-TP: {signal.take_profit:.6f} (Target: {signal.expected_move_pct:.1f}%)
-Strength: {signal.rejection_strength:.1%}
-Zone: {signal.rejection_zone.zone_type}
-RSI: {signal.rsi_at_entry:.1f}
-R:R: {signal.risk_reward:.1f}:1
-"""
-                            
-                            plain_payload = {
-                                "chat_id": TELEGRAM_CHAT_ID,
-                                "text": plain_message
-                            }
-                            
-                            plain_response = await client.post(url, json=plain_payload, timeout=30.0)
-                            if plain_response.status_code == 200:
-                                log.info(f"✅ Plain text alert sent for {signal.symbol}")
-                                return True
-                        except Exception as e_plain:
-                            log.error(f"❌ Plain text also failed: {e_plain}")
-                        
-                        return False
-                        
-                except Exception as e:
-                    log.error(f"❌ Telegram request error for {signal.symbol}: {e}")
-                    return False
-                
+                if response.status_code == 200:
+                    log.info(f"📤 Complete Telegram rejection alert sent: {signal.symbol}")
+                else:
+                    log.error(f"❌ Telegram API error: {response.status_code} - {response.text}")
+            
         except Exception as e:
-            log.error(f"❌ Telegram alert error for {signal.symbol}: {e}")
-            return False
+            log.error(f"Telegram error: {e}")
+            import traceback
+            log.error(f"Traceback: {traceback.format_exc()}")
     
     async def monitor_positions(self):
         """Monitor and close positions with trade-based deduplication"""
@@ -2940,7 +3004,7 @@ R:R: {signal.risk_reward:.1f}:1
                     try:
                         # Get current price
                         ticker = await self.exchange.fetch_ticker(symbol)
-                        current_price = ticker['last']
+                        current_price = float(ticker['last'])
                         
                         # For PENDING positions: check if price reached entry
                         if status == 'PENDING':
@@ -2968,7 +3032,7 @@ R:R: {signal.risk_reward:.1f}:1
                                 continue  # Skip SL/TP check for this cycle
                         
                         # Check SL/TP for ALL positions (including newly triggered ones)
-                        pnl_percent = 0
+                        pnl_percent = 0.0
                         close_reason = None
                         
                         if side == "LONG":
@@ -2993,7 +3057,7 @@ R:R: {signal.risk_reward:.1f}:1
                                 SELECT risk_reward FROM complete_rejection_signals WHERE id = ?
                             """, (pos_id,)) as cursor:
                                 row = await cursor.fetchone()
-                                risk_reward = row[0] if row else 0
+                                risk_reward = float(row[0]) if row else 0.0
                             
                             # Update database
                             await self.db.execute("""
@@ -3043,7 +3107,7 @@ R:R: {signal.risk_reward:.1f}:1
                 await asyncio.sleep(5)
     
     async def high_freq_complete_scanning(self):
-        """Main high-frequency scanning loop for complete rejection analysis - FIXED"""
+        """Main high-frequency scanning loop for complete rejection analysis"""
         log.info("🚀 Starting COMPLETE rejection-based high-frequency scanning...")
         
         while True:
@@ -3083,21 +3147,12 @@ R:R: {signal.risk_reward:.1f}:1
                         signal = self.scanner.generate_enhanced_rejection_signal(multi_tf_data, symbol)
                         
                         if signal:
-                            log.info(f"🎯 Signal generated for {symbol}: {signal.side} @ {signal.entry_price:.6f}")
-                            
-                            # Save to database
+                            # Save and send
                             saved = await self.save_complete_signal(signal)
                             
                             if saved:
-                                log.info(f"💾 Signal saved to DB for {symbol}")
-                                
-                                # Send to Telegram
-                                telegram_sent = await self.send_telegram_alert(signal)
-                                if telegram_sent:
-                                    signals_found += 1
-                                    log.info(f"📤 Telegram alert sent for {symbol}")
-                                else:
-                                    log.warning(f"⚠️ Telegram failed for {symbol}")
+                                await self.send_telegram_alert(signal)
+                                signals_found += 1
                         
                         pairs_processed += 1
                         
@@ -3251,7 +3306,7 @@ R:R: {signal.risk_reward:.1f}:1
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=10) as client:
                 await client.post(url, json={
                     "chat_id": TELEGRAM_CHAT_ID,
                     "text": message,
