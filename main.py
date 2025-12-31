@@ -2251,7 +2251,6 @@ class CompleteRejectionScanner:
             os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
             self.db = await aiosqlite.connect(DB_PATH)
             
-            # Enhanced data collection table
             await self.db.execute("""
             CREATE TABLE IF NOT EXISTS rejection_data_collection (
                 id TEXT PRIMARY KEY,
@@ -2303,7 +2302,6 @@ class CompleteRejectionScanner:
                 
                 conditions_met TEXT,
                 
-                -- DATA COLLECTION FIELDS
                 filter_scores TEXT NOT NULL,
                 total_score REAL NOT NULL,
                 passed_filters TEXT NOT NULL,
@@ -2323,20 +2321,6 @@ class CompleteRejectionScanner:
             )
             """)
             
-            # Data analysis table
-            await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS data_analysis (
-                date DATE PRIMARY KEY,
-                total_signals INTEGER,
-                high_score_signals INTEGER,
-                medium_score_signals INTEGER,
-                low_score_signals INTEGER,
-                avg_total_score REAL,
-                filter_stats TEXT,
-                correlation_stats TEXT
-            )
-            """)
-            
             await self.db.commit()
             log.info("✅ Data collection database initialized")
             
@@ -2344,142 +2328,9 @@ class CompleteRejectionScanner:
             log.error(f"Database error: {e}")
             raise
     
-    async def _init_exchange(self):
-        """Initialize exchange connection"""
-        try:
-            self.exchange = ccxt.okx({
-                "enableRateLimit": True,
-                "options": {"defaultType": "spot"},
-                "timeout": 20000,
-                "rateLimit": 50
-            })
-            
-            ticker = await self.exchange.fetch_ticker("BTC/USDT")
-            log.info(f"✅ Exchange connected. BTC: ${ticker['last']:.2f}")
-            
-        except Exception as e:
-            log.error(f"Exchange error: {e}")
-            raise
-    
-    async def _send_startup_message(self):
-        """Send startup message to Telegram"""
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            log.warning("⚠️ Telegram credentials not set. Notifications disabled.")
-            return
-        
-        try:
-            message = f"""
-📊 <b>DATA COLLECTION SCANNER STARTED</b>
-
-<b>🎯 MODE:</b> Data Collection & Analysis
-<b>🧠 APPROACH:</b> Scientific - Collect ALL data, analyze patterns later
-
-<b>📈 DATA COLLECTION:</b>
-• All filters are SCORING BONUSES, not requirements
-• Recording EVERYTHING - good, medium, and poor signals
-• Scoring each signal (0-100 scale)
-• Data quality: GOOD (70+), MEDIUM (50-70), POOR (<50)
-
-<b>🔍 9 FILTERS SCORED:</b>
-1. Market Strength (0-1)
-2. Rejection Zone (0-1)  
-3. Volume Confirmation (0-1)
-4. Candle Patterns (0-1)
-5. Multi-TF Convergence (0-1)
-6. RSI Position (0-1)
-7. Risk/Reward (0-1)
-8. Rejection Strength (0-1)
-9. Pattern Confirmation (0-1)
-
-<b>📊 OUTPUT:</b>
-Complete database for analysis
-Can later determine which filters actually matter
-
-<b>⏱️ FREQUENCY:</b>
-Scanning every {SCAN_INTERVAL} seconds
-Collecting up to {self.max_signals} signals
-
-#DataCollection #RejectionAnalysis #PatternResearch
-"""
-            
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(url, json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML"
-                })
-                
-            log.info("✅ Data collection startup message sent")
-                
-        except Exception as e:
-            log.error(f"Telegram startup error: {e}")
-    
-    async def fetch_timeframe_data(self, symbol: str) -> Dict[str, pd.DataFrame]:
-        """Fetch data for all timeframes"""
-        data = {}
-        
-        for tf_name, tf in TIMEFRAMES.items():
-            try:
-                if tf_name == "1H":
-                    limit = 100
-                elif tf_name == "15M":
-                    limit = 80
-                else:
-                    limit = 50
-                
-                ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-                
-                if ohlcv and len(ohlcv) >= 20:
-                    df = pd.DataFrame(
-                        ohlcv,
-                        columns=["timestamp", "open", "high", "low", "close", "volume"]
-                    )
-                    
-                    for col in ["open", "high", "low", "close", "volume"]:
-                        df[col] = pd.to_numeric(df[col], errors='coerce')
-                    
-                    df = df.dropna()
-                    
-                    if len(df) >= 15:
-                        data[tf_name] = df
-                    
-            except Exception as e:
-                log.debug(f"{symbol} {tf_name}: {str(e)[:50]}")
-                continue
-        
-        return data
-    
-    async def get_active_pairs(self) -> List[Tuple[str, float]]:
-        """Get active trading pairs"""
-        try:
-            tickers = await self.exchange.fetch_tickers()
-            active_pairs = []
-            
-            for symbol, ticker in tickers.items():
-                if symbol.endswith('/USDT'):
-                    volume = ticker.get('quoteVolume', 0)
-                    
-                    if volume >= MIN_VOLUME_USD:
-                        bid = ticker.get('bid', 0)
-                        ask = ticker.get('ask', 0)
-                        
-                        if bid > 0 and ask > 0:
-                            spread = (ask - bid) / bid * 100
-                            if spread < 0.1:
-                                active_pairs.append((symbol, volume))
-            
-            active_pairs.sort(key=lambda x: x[1], reverse=True)
-            return active_pairs[:TOP_N_VOLUME]
-            
-        except Exception as e:
-            log.error(f"Error getting pairs: {e}")
-            return []
-    
     async def save_data_signal(self, signal: RejectionSignal) -> bool:
         """Save data signal to database"""
         try:
-            # Prepare data
             strength_flags = []
             if signal.market_strength.is_continuation:
                 strength_flags.append("CONTINUATION")
@@ -2506,7 +2357,6 @@ Collecting up to {self.max_signals} signals
             
             serialized_volume_clusters = [float(v) for v in signal.volume_clusters]
             
-            # FIXED: Database insert with correct number of columns (46 columns, 46 question marks)
             await self.db.execute("""
                 INSERT INTO rejection_data_collection (
                     id, symbol, side, entry_price, stop_loss, take_profit,
@@ -2531,20 +2381,20 @@ Collecting up to {self.max_signals} signals
                 float(signal.entry_price),
                 float(signal.stop_loss),
                 float(signal.take_profit),
-                
+
                 str(signal.wave_context.wave_length),
                 float(signal.wave_context.wave_maturity),
                 float(signal.wave_context.expansion_speed),
                 str(signal.wave_context.structure_type),
                 str(signal.wave_context.context_side),
-                
+
                 float(signal.market_strength.candle_speed),
                 float(signal.market_strength.distance_ratio),
                 float(signal.market_strength.ema_angle),
                 float(signal.market_strength.volume_participation),
                 float(signal.market_strength.strength_score),
                 json.dumps(strength_flags),
-                
+
                 str(signal.rejection_zone.zone_type),
                 float(signal.rejection_zone.price_level),
                 float(signal.rejection_zone.strength),
@@ -2552,544 +2402,46 @@ Collecting up to {self.max_signals} signals
                 float(signal.rsi_at_entry),
                 str(signal.rejection_type),
                 str(signal.trigger_candle),
-                
+
                 json.dumps(candle_patterns_list),
                 json.dumps(dominant_pattern_info),
-                
+
                 json.dumps(signal.indicators_1h.to_dict()),
                 json.dumps(signal.indicators_15m.to_dict()),
                 json.dumps(signal.indicators_5m.to_dict()),
                 json.dumps(signal.indicators_3m.to_dict()),
                 json.dumps(signal.indicators_1m.to_dict()),
-                
+
                 json.dumps(serialized_volume_profile),
                 json.dumps(serialized_volume_clusters),
-                
+
                 json.dumps(signal.multi_tf_confirmation),
                 float(signal.convergence_score),
-                
+
                 float(signal.risk_reward),
                 float(signal.expected_move_pct),
                 str(signal.timeframe_used),
-                
+
                 json.dumps(signal.conditions_met),
-                
+
                 json.dumps(signal.filter_scores),
                 float(signal.total_score),
                 json.dumps(signal.passed_filters),
                 json.dumps(signal.failed_filters),
                 str(signal.data_quality),
-                
-                "PENDING",  # status
-                datetime.now().strftime('%Y-%m-%d %H:%M:%S')  # created_at
+
+                "PENDING",
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             ))
             
             await self.db.commit()
-            
             self.signals_collected += 1
-            log.info(f"✅ Data collected: {signal.symbol} (Score: {signal.total_score:.1f}, Quality: {signal.data_quality})")
-            log.info(f"   Total collected: {self.signals_collected}/{self.max_signals}")
-            
+            log.info(f"✅ Data collected: {signal.symbol} ({signal.total_score:.1f})")
             return True
             
         except Exception as e:
             log.error(f"Error saving data signal: {e}")
-            import traceback
-            log.error(f"Traceback: {traceback.format_exc()}")
             return False
-    
-    async def send_signal_to_telegram(self, signal: RejectionSignal) -> bool:
-        """Send EVERY signal to Telegram"""
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            log.debug("Telegram credentials not set. Skipping signal notification.")
-            return False
-        
-        try:
-            # Get top 3 filter scores
-            top_scores = sorted(
-                [(name, score) for name, score in signal.filter_scores.items()],
-                key=lambda x: x[1],
-                reverse=True
-            )[:3]
-            
-            top_scores_text = ", ".join([f"{name}: {score:.2f}" for name, score in top_scores])
-            
-            emoji = "✅" if signal.data_quality == "GOOD" else "⚠️" if signal.data_quality == "MEDIUM" else "❌"
-            
-            message = f"""
-{emoji} <b>DATA SIGNAL COLLECTED</b>
-
-<b>🎯 {signal.symbol}</b> | {signal.side}
-<b>💰 Entry:</b> {signal.entry_price:.4f}
-<b>🛡️ Stop Loss:</b> {signal.stop_loss:.4f}
-<b>🎯 Take Profit:</b> {signal.take_profit:.4f}
-
-<b>📊 Score:</b> {signal.total_score:.1f}/100
-<b>📈 Quality:</b> {signal.data_quality}
-<b>📈 R:R:</b> {signal.risk_reward:.2f}:1
-
-<b>🔍 Rejection Zone:</b> {signal.rejection_zone.zone_type}
-<b>📉 RSI:</b> {signal.rsi_at_entry:.1f}
-<b>🎯 Type:</b> {signal.rejection_type}
-
-<b>✅ Filters Passed:</b> {len(signal.passed_filters)}/9
-<b>🚫 Filters Failed:</b> {len(signal.failed_filters)}/9
-
-<b>🏆 Top Scores:</b>
-{top_scores_text}
-
-<b>📈 Conditions:</b>
-{', '.join(signal.conditions_met[:5])}{'...' if len(signal.conditions_met) > 5 else ''}
-
-<b>⏰ Collected at:</b> {datetime.fromtimestamp(signal.signal_timestamp).strftime('%H:%M:%S')}
-<b>#DataCollection</b> #{signal.data_quality} #{signal.side}
-"""
-            
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.post(url, json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML",
-                    "disable_notification": signal.data_quality == "POOR"
-                })
-                
-                if response.status_code == 200:
-                    log.info(f"📤 Signal sent to Telegram: {signal.symbol}")
-                    return True
-                else:
-                    log.warning(f"Telegram response: {response.status_code}")
-                    return False
-                
-        except Exception as e:
-            log.error(f"Telegram signal error: {e}")
-            return False
-    
-    async def send_position_update_to_telegram(self, signal_id: str, symbol: str, side: str, 
-                                             entry: float, sl: float, tp: float, 
-                                             current_price: float, status: str,
-                                             total_score: float, data_quality: str,
-                                             pnl_percent: float = 0.0, close_reason: str = None):
-        """Send position update to Telegram (TRIGGERED, TP_HIT, SL_HIT)"""
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            log.debug("Telegram credentials not set. Skipping position update.")
-            return False
-        
-        try:
-            if status == "TRIGGERED":
-                pnl_emoji = "🎯"
-                title = "POSITION TRIGGERED"
-                status_text = "Entry hit - position active"
-                notification = False
-            elif status == "CLOSED":
-                if close_reason == "TP_HIT":
-                    pnl_emoji = "💰" if pnl_percent > 0 else "📉"
-                    title = "TAKE PROFIT HIT!"
-                    status_text = f"Target reached: {pnl_percent:+.2f}%"
-                    notification = True
-                elif close_reason == "SL_HIT":
-                    pnl_emoji = "🛑" if pnl_percent < 0 else "📉"
-                    title = "STOP LOSS HIT!"
-                    status_text = f"Stop loss triggered: {pnl_percent:+.2f}%"
-                    notification = True
-                else:
-                    pnl_emoji = "📊"
-                    title = "POSITION CLOSED"
-                    status_text = f"Closed: {pnl_percent:+.2f}%"
-                    notification = False
-            else:
-                return False
-            
-            quality_emoji = "✅" if data_quality == "GOOD" else "⚠️" if data_quality == "MEDIUM" else "❌"
-            
-            message = f"""
-{pnl_emoji} <b>{title}</b>
-
-<b>📈 {symbol}</b> | {side} | {quality_emoji} {data_quality}
-<b>💰 Entry:</b> {entry:.4f}
-<b>📊 Current:</b> {current_price:.4f}
-<b>📈 Score:</b> {total_score:.1f}/100
-
-<b>🎯 Status:</b> {status_text}
-
-<b>🛡️ Stop Loss:</b> {sl:.4f}
-<b>🎯 Take Profit:</b> {tp:.4f}
-
-<b>📊 PnL:</b> {pnl_percent:+.2f}%
-<b>📍 Distance to SL:</b> {abs(current_price - sl) / entry * 100:.2f}%
-<b>📍 Distance to TP:</b> {abs(tp - current_price) / entry * 100:.2f}%
-
-<b>⏰ Time:</b> {datetime.now().strftime('%H:%M:%S')}
-<b>#{status}</b> #{'Profit' if pnl_percent > 0 else 'Loss'} #{data_quality}
-"""
-            
-            # Add retry logic for Telegram
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-                    async with httpx.AsyncClient(timeout=10) as client:
-                        response = await client.post(url, json={
-                            "chat_id": TELEGRAM_CHAT_ID,
-                            "text": message,
-                            "parse_mode": "HTML",
-                            "disable_notification": not notification
-                        })
-                        
-                        if response.status_code == 200:
-                            log.info(f"📤 Position update sent to Telegram: {symbol} {status}")
-                            return True
-                        else:
-                            log.warning(f"Telegram response {attempt+1}/{max_retries}: {response.status_code}")
-                            if attempt < max_retries - 1:
-                                await asyncio.sleep(1)
-                            
-                    except Exception as e:
-                        log.error(f"Telegram send attempt {attempt+1}/{max_retries} failed: {e}")
-                        if attempt < max_retries - 1:
-                            await asyncio.sleep(1)
-            
-            return False
-                
-        except Exception as e:
-            log.error(f"Telegram position update error: {e}")
-            return False
-    
-    async def send_data_collection_update(self):
-        """Send periodic update to Telegram"""
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            return
-        
-        try:
-            stats = self.scanner.get_daily_stats()
-            completion_pct = (self.signals_collected / self.max_signals) * 100
-            
-            message = f"""
-📈 <b>DATA COLLECTION UPDATE</b>
-
-<b>Progress:</b> {self.signals_collected}/{self.max_signals} ({completion_pct:.1f}%)
-
-<b>📊 Collection Stats:</b>
-• Total Signals: {stats['rejections_found']}
-• High Score (70+): {stats['high_score_signals']}
-• Medium Score (50-70): {stats['medium_score_signals']}
-• Low Score (<50): {stats['low_score_signals']}
-• Long Signals: {stats['long_rejections']}
-• Short Signals: {stats['short_rejections']}
-
-<b>🎯 Current Cycle:</b> #{self.scan_cycle}
-<b>⏱️ Scan Interval:</b> {SCAN_INTERVAL}s
-
-<b>📝 Notes:</b>
-Collecting ALL data points
-No filtering - only scoring
-Will analyze patterns after collection
-
-#DataCollection #ProgressUpdate #{'AlmostDone' if completion_pct > 80 else 'Collecting'}
-"""
-            
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(url, json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML"
-                })
-                
-            log.info(f"📤 Data collection update sent: {self.signals_collected}/{self.max_signals}")
-                
-        except Exception as e:
-            log.error(f"Telegram update error: {e}")
-    
-    async def monitor_positions(self):
-        """Monitor positions for data collection - WITH TELEGRAM NOTIFICATIONS"""
-        log.info("👀 Starting data collection monitoring with Telegram notifications...")
-        
-        while True:
-            try:
-                if self.signals_collected >= self.max_signals:
-                    log.info(f"✅ Reached max signals ({self.max_signals}), stopping monitoring")
-                    break
-                
-                async with self.db.execute("""
-                    SELECT id, symbol, side, entry_price, stop_loss, take_profit, status, total_score, data_quality
-                    FROM rejection_data_collection 
-                    WHERE status IN ('PENDING', 'TRIGGERED')
-                    LIMIT 10
-                """) as cursor:
-                    positions = await cursor.fetchall()
-                
-                for pos_id, symbol, side, entry, sl, tp, status, total_score, data_quality in positions:
-                    try:
-                        ticker = await self.exchange.fetch_ticker(symbol)
-                        current_price = float(ticker['last'])
-                        
-                        if status == 'PENDING':
-                            if abs(current_price - entry) / entry <= 0.005:
-                                await self.db.execute("""
-                                    UPDATE rejection_data_collection SET 
-                                        status = 'TRIGGERED',
-                                        triggered_at = CURRENT_TIMESTAMP,
-                                        trigger_price = ?
-                                    WHERE id = ?
-                                """, (current_price, pos_id))
-                                
-                                await self.db.commit()
-                                self.scanner.deduplicator.update_signal_status(pos_id, "TRIGGERED")
-                                log.info(f"✅ Data position triggered: {symbol} @ {current_price:.4f}")
-                                
-                                # Send Telegram notification for trigger
-                                await self.send_position_update_to_telegram(
-                                    pos_id, symbol, side, entry, sl, tp, 
-                                    current_price, "TRIGGERED", total_score, data_quality
-                                )
-                                continue
-                        
-                        pnl_percent = 0.0
-                        close_reason = None
-                        
-                        # FIXED: Correct PnL calculation for LONG and SHORT positions
-                        if side == "LONG":
-                            if current_price <= sl:
-                                close_reason = "SL_HIT"
-                                pnl_percent = ((current_price - entry) / entry) * 100
-                                log.info(f"📊 {symbol} LONG SL HIT: {current_price:.4f} <= {sl:.4f}, PnL: {pnl_percent:.2f}%")
-                            elif current_price >= tp:
-                                close_reason = "TP_HIT"
-                                pnl_percent = ((current_price - entry) / entry) * 100
-                                log.info(f"📊 {symbol} LONG TP HIT: {current_price:.4f} >= {tp:.4f}, PnL: {pnl_percent:.2f}%")
-                        
-                        else:  # SHORT position
-                            if current_price >= sl:
-                                close_reason = "SL_HIT"
-                                pnl_percent = ((entry - current_price) / entry) * 100
-                                log.info(f"📊 {symbol} SHORT SL HIT: {current_price:.4f} >= {sl:.4f}, PnL: {pnl_percent:.2f}%")
-                            elif current_price <= tp:
-                                close_reason = "TP_HIT"
-                                pnl_percent = ((entry - current_price) / entry) * 100
-                                log.info(f"📊 {symbol} SHORT TP HIT: {current_price:.4f} <= {tp:.4f}, PnL: {pnl_percent:.2f}%")
-                        
-                        if close_reason:
-                            # Update database first
-                            await self.db.execute("""
-                                UPDATE rejection_data_collection SET 
-                                    status = 'CLOSED',
-                                    closed_at = CURRENT_TIMESTAMP,
-                                    close_price = ?,
-                                    pnl_percent = ?,
-                                    close_reason = ?
-                                WHERE id = ?
-                            """, (current_price, pnl_percent, close_reason, pos_id))
-                            
-                            await self.db.commit()
-                            self.scanner.deduplicator.update_signal_status(pos_id, "CLOSED")
-                            self.scanner.active_signal_ids.discard(pos_id)
-                            
-                            log.info(f"📊 Data position closed: {symbol} {close_reason} ({pnl_percent:+.2f}%)")
-                            
-                            # FIXED: Send Telegram notification for closure
-                            await self.send_position_update_to_telegram(
-                                pos_id, symbol, side, entry, sl, tp, 
-                                current_price, "CLOSED", total_score, data_quality,
-                                pnl_percent, close_reason
-                            )
-                    
-                    except Exception as e:
-                        log.error(f"Monitor error for {symbol}: {e}")
-                        continue
-                
-                # Clean up old signals every 5 minutes
-                if int(time.time()) % 300 < 2:
-                    self.scanner.deduplicator.remove_closed_signals()
-                
-                await asyncio.sleep(2)
-                
-            except Exception as e:
-                log.error(f"Monitoring loop error: {e}")
-                await asyncio.sleep(5)
-    
-    async def high_freq_data_collection(self):
-        """Main data collection loop"""
-        log.info("🚀 Starting high-frequency data collection...")
-        
-        while True:
-            try:
-                if self.signals_collected >= self.max_signals:
-                    log.info(f"✅ Reached max signals ({self.max_signals}), stopping collection")
-                    await self.send_final_stats()
-                    break
-                
-                self.scan_cycle += 1
-                start_time = time.time()
-                
-                log.info(f"📊 Data collection cycle #{self.scan_cycle} ({self.signals_collected}/{self.max_signals})")
-                
-                pairs = await self.get_active_pairs()
-                
-                if not pairs:
-                    log.warning("No active pairs found")
-                    await asyncio.sleep(SCAN_INTERVAL)
-                    continue
-                
-                log.info(f"Scanning {len(pairs)} pairs for data collection")
-                
-                signals_found = 0
-                pairs_processed = 0
-                
-                for symbol, volume in pairs:
-                    try:
-                        multi_tf_data = await self.fetch_timeframe_data(symbol)
-                        
-                        required_tfs = ["1H", "15M", "3M"]
-                        has_all_data = all(tf in multi_tf_data for tf in required_tfs)
-                        
-                        if not has_all_data:
-                            continue
-                        
-                        signal = self.scanner.generate_enhanced_rejection_signal(multi_tf_data, symbol)
-                        
-                        if signal:
-                            saved = await self.save_data_signal(signal)
-                            if saved:
-                                # Send to Telegram - EVERY SIGNAL
-                                await self.send_signal_to_telegram(signal)
-                                signals_found += 1
-                        
-                        pairs_processed += 1
-                        await asyncio.sleep(0.01)
-                        
-                    except Exception as e:
-                        log.debug(f"Pair error {symbol}: {str(e)[:50]}")
-                        continue
-                
-                self.scanner.daily_stats["pairs_scanned"] += pairs_processed
-                self.scanner.daily_stats["signals_collected"] += signals_found
-                
-                stats = self.scanner.get_daily_stats()
-                log.info(f"📈 Collection stats: Found {signals_found}, Total: {self.signals_collected}/{self.max_signals}")
-                log.info(f"   Score distribution: High {stats['high_score_signals']}, Medium {stats['medium_score_signals']}, Low {stats['low_score_signals']}")
-                
-                scan_duration = time.time() - start_time
-                log.info(f"Data collection #{self.scan_cycle}: {signals_found} signals in {scan_duration:.2f}s")
-                
-                # Send update every 50 cycles or every 100 signals
-                if self.scan_cycle % 50 == 0 or self.signals_collected % 100 == 0:
-                    await self.send_data_collection_update()
-                
-                wait_time = max(0.1, SCAN_INTERVAL - scan_duration)
-                log.info(f"Next data collection in {wait_time:.1f}s...")
-                await asyncio.sleep(wait_time)
-                
-            except Exception as e:
-                log.error(f"Data collection loop error: {e}")
-                await asyncio.sleep(10)
-    
-    async def run(self):
-        """Run the data collection scanner"""
-        try:
-            await self.initialize()
-            
-            await asyncio.gather(
-                self.high_freq_data_collection(),
-                self.monitor_positions()
-            )
-            
-        except KeyboardInterrupt:
-            log.info("Data collection stopped by user")
-            await self.send_final_stats()
-            
-        except Exception as e:
-            log.error(f"Data collection crashed: {e}")
-            
-        finally:
-            await self.cleanup()
-    
-    async def send_final_stats(self):
-        """Send final statistics"""
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            log.warning("⚠️ Telegram credentials missing. Skipping final stats.")
-            return
-        
-        try:
-            stats = self.scanner.get_daily_stats()
-            completion_pct = (self.signals_collected / self.max_signals) * 100
-            
-            # Calculate average scores
-            async with self.db.execute("""
-                SELECT total_score, data_quality FROM rejection_data_collection
-            """) as cursor:
-                rows = await cursor.fetchall()
-                total_scores = [row[0] for row in rows]
-                data_qualities = [row[1] for row in rows]
-            
-            avg_score = np.mean(total_scores) if total_scores else 0
-            good_count = data_qualities.count("GOOD")
-            medium_count = data_qualities.count("MEDIUM")
-            poor_count = data_qualities.count("POOR")
-            
-            message = f"""
-✅ <b>DATA COLLECTION COMPLETED</b>
-
-<b>📊 Final Statistics:</b>
-• Total Signals Collected: {self.signals_collected}
-• Completion: {completion_pct:.1f}%
-• Average Score: {avg_score:.1f}/100
-• Data Quality Distribution:
-  - GOOD (70+): {good_count} signals
-  - MEDIUM (50-70): {medium_count} signals  
-  - POOR (<50): {poor_count} signals
-
-<b>📈 Collection Details:</b>
-• Scan Cycles: {self.scan_cycle}
-• Pairs Scanned: {stats['pairs_scanned']}
-• Long Signals: {stats['long_rejections']}
-• Short Signals: {stats['short_rejections']}
-
-<b>🔍 Next Steps:</b>
-1. Analyze database to find patterns
-2. Determine which filters actually matter
-3. Calculate success rates for each filter
-4. Optimize trading system based on data
-
-<b>📁 Database Location:</b>
-{DB_PATH}
-
-<b>📚 Data Analysis:</b>
-You can now:
-• Query the database for patterns
-• Calculate correlation between filters and success
-• Find optimal filter combinations
-• Build data-driven trading rules
-
-#DataCollectionComplete #AnalysisReady #{'FullDataset' if completion_pct > 95 else 'PartialDataset'}
-"""
-            
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(url, json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML"
-                })
-                
-            log.info("✅ Final data collection stats sent to Telegram")
-                
-        except Exception as e:
-            log.error(f"Final stats error: {e}")
-    
-    async def cleanup(self):
-        """Cleanup resources"""
-        try:
-            if self.exchange:
-                await self.exchange.close()
-                log.info("Exchange closed")
-            
-            if self.db:
-                await self.db.close()
-                log.info("Database closed")
-                
-        except Exception as e:
-            log.error(f"Cleanup error: {e}")
 
 # ================ SIMPLE HTTP SERVER ================
 async def start_http_server(scanner, port=8000):
@@ -3128,21 +2480,16 @@ async def start_http_server(scanner, port=8000):
             
             elif path == '/recent':
                 if scanner.db:
-                    # FIX: Use traditional cursor pattern instead of async with
                     scanner.db.row_factory = aiosqlite.Row
-                    cursor = await scanner.db.execute("""
+                    async with scanner.db.execute("""
                         SELECT symbol, side, entry_price, zone_type, total_score, 
                                data_quality, passed_filters, created_at
                         FROM rejection_data_collection 
                         ORDER BY created_at DESC 
                         LIMIT 20
-                    """)
-                    rows = await cursor.fetchall()
-                    await cursor.close()
-                    
-                    signals = []
-                    for row in rows:
-                        signals.append(dict(row))
+                    """) as cursor:
+                        rows = await cursor.fetchall()
+                        signals = [dict(row) for row in rows]
                     
                     response = json.dumps({"signals": signals, "count": len(signals)}, indent=2)
                 else:
@@ -3150,19 +2497,14 @@ async def start_http_server(scanner, port=8000):
             
             elif path == '/scores':
                 if scanner.db:
-                    # FIX: Use traditional cursor pattern instead of async with
                     scanner.db.row_factory = aiosqlite.Row
-                    cursor = await scanner.db.execute("""
+                    async with scanner.db.execute("""
                         SELECT total_score, data_quality, COUNT(*) as count
                         FROM rejection_data_collection 
                         GROUP BY data_quality
-                    """)
-                    rows = await cursor.fetchall()
-                    await cursor.close()
-                    
-                    score_dist = []
-                    for row in rows:
-                        score_dist.append(dict(row))
+                    """) as cursor:
+                        rows = await cursor.fetchall()
+                        score_dist = [dict(row) for row in rows]
                     
                     response = json.dumps({"score_distribution": score_dist}, indent=2)
                 else:
@@ -3184,15 +2526,8 @@ async def start_http_server(scanner, port=8000):
     server = await asyncio.start_server(handle_request, '0.0.0.0', port)
     log.info(f"🌐 HTTP server started on port {port}")
     
-    # FIXED: Added missing try: before except
-    try:
-        async with server:
-            await server.serve_forever()
-    except asyncio.CancelledError:
-        pass
-    finally:
-        server.close()
-        await server.wait_closed()
+    async with server:
+        await server.serve_forever()
 
 # ================ ENTRY POINT ================
 async def main():
@@ -3204,33 +2539,19 @@ async def main():
     scanner = CompleteRejectionScanner()
     
     try:
-        # Start HTTP server
         http_task = asyncio.create_task(start_http_server(scanner, port=8080))
         await asyncio.sleep(1)
-        
-        # Run main scanner
         await scanner.run()
         
     except KeyboardInterrupt:
         log.info("Received interrupt, shutting down...")
-    except Exception as e:
-        log.error(f"Main error: {e}")
-        import traceback
-        log.error(f"Traceback: {traceback.format_exc()}")
     finally:
-        # Cleanup
         if 'http_task' in locals():
             http_task.cancel()
             try:
                 await http_task
             except asyncio.CancelledError:
                 pass
-        
-        # Cleanup scanner
-        try:
-            await scanner.cleanup()
-        except Exception as e:
-            log.error(f"Cleanup error: {e}")
 
 if __name__ == "__main__":
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -3245,5 +2566,3 @@ if __name__ == "__main__":
         log.info("Scanner stopped by user")
     except Exception as e:
         log.error(f"Fatal error: {e}")
-        import traceback
-        log.error(f"Traceback: {traceback.format_exc()}")
