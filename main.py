@@ -3128,7 +3128,6 @@ async def start_http_server(scanner, port=8000):
             
             elif path == '/recent':
                 if scanner.db:
-                    # FIX: Use traditional cursor pattern instead of async with
                     scanner.db.row_factory = aiosqlite.Row
                     cursor = await scanner.db.execute("""
                         SELECT symbol, side, entry_price, zone_type, total_score, 
@@ -3150,7 +3149,6 @@ async def start_http_server(scanner, port=8000):
             
             elif path == '/scores':
                 if scanner.db:
-                    # FIX: Use traditional cursor pattern instead of async with
                     scanner.db.row_factory = aiosqlite.Row
                     cursor = await scanner.db.execute("""
                         SELECT total_score, data_quality, COUNT(*) as count
@@ -3184,66 +3182,5 @@ async def start_http_server(scanner, port=8000):
     server = await asyncio.start_server(handle_request, '0.0.0.0', port)
     log.info(f"🌐 HTTP server started on port {port}")
     
-    # FIX: Use try/finally pattern instead of async with if needed
-    try:
-        async with server:
-            await server.serve_forever()
-    except asyncio.CancelledError:
-        pass
-    finally:
-        server.close()
-        await server.wait_closed()
-
-# ================ ENTRY POINT ================
-async def main():
-    """Main function to run the data collection scanner"""
-    log.info("=" * 70)
-    log.info("🚀 STARTING DATA COLLECTION SCANNER")
-    log.info("=" * 70)
-    
-    scanner = CompleteRejectionScanner()
-    
-    try:
-        # Start HTTP server
-        http_task = asyncio.create_task(start_http_server(scanner, port=8080))
-        await asyncio.sleep(1)
-        
-        # Run main scanner
-        await scanner.run()
-        
-    except KeyboardInterrupt:
-        log.info("Received interrupt, shutting down...")
-    except Exception as e:
-        log.error(f"Main error: {e}")
-        import traceback
-        log.error(f"Traceback: {traceback.format_exc()}")
-    finally:
-        # Cleanup
-        if 'http_task' in locals():
-            http_task.cancel()
-            try:
-                await http_task
-            except asyncio.CancelledError:
-                pass
-        
-        # Cleanup scanner
-        try:
-            await scanner.cleanup()
-        except Exception as e:
-            log.error(f"Cleanup error: {e}")
-
-if __name__ == "__main__":
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("⚠️ Telegram credentials not set. Notifications will not be sent.")
-        log.warning("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID environment variables.")
-    
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("Scanner stopped by user")
-    except Exception as e:
-        log.error(f"Fatal error: {e}")
-        import traceback
-        log.error(f"Traceback: {traceback.format_exc()}")
+    # SIMPLEST FIX: Just serve forever
+    await server.serve_forever()
