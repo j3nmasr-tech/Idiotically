@@ -2578,7 +2578,6 @@ Collecting up to {self.max_signals} signals
                 json.dumps(signal.passed_filters),
                 json.dumps(signal.failed_filters),
                 str(signal.data_quality)
-                # 44 values total
             ))
             
             await self.db.commit()
@@ -2662,6 +2661,84 @@ Collecting up to {self.max_signals} signals
             log.error(f"Telegram signal error: {e}")
             return False
     
+    async def send_position_update_to_telegram(self, signal_id: str, symbol: str, side: str, 
+                                             entry: float, sl: float, tp: float, 
+                                             current_price: float, status: str,
+                                             total_score: float, data_quality: str,
+                                             pnl_percent: float = 0.0, close_reason: str = None):
+        """Send position update to Telegram (TRIGGERED, TP_HIT, SL_HIT)"""
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            log.debug("Telegram credentials not set. Skipping position update.")
+            return False
+        
+        try:
+            if status == "TRIGGERED":
+                pnl_emoji = "🎯"
+                title = "POSITION TRIGGERED"
+                status_text = "Entry hit - position active"
+                notification = False
+            elif status == "CLOSED":
+                if close_reason == "TP_HIT":
+                    pnl_emoji = "💰" if pnl_percent > 0 else "📉"
+                    title = "TAKE PROFIT HIT!"
+                    status_text = f"Target reached: {pnl_percent:+.2f}%"
+                    notification = True
+                elif close_reason == "SL_HIT":
+                    pnl_emoji = "🛑" if pnl_percent < 0 else "📉"
+                    title = "STOP LOSS HIT!"
+                    status_text = f"Stop loss triggered: {pnl_percent:+.2f}%"
+                    notification = True
+                else:
+                    pnl_emoji = "📊"
+                    title = "POSITION CLOSED"
+                    status_text = f"Closed: {pnl_percent:+.2f}%"
+                    notification = False
+            else:
+                return False
+            
+            quality_emoji = "✅" if data_quality == "GOOD" else "⚠️" if data_quality == "MEDIUM" else "❌"
+            
+            message = f"""
+{pnl_emoji} <b>{title}</b>
+
+<b>📈 {symbol}</b> | {side} | {quality_emoji} {data_quality}
+<b>💰 Entry:</b> {entry:.4f}
+<b>📊 Current:</b> {current_price:.4f}
+<b>📈 Score:</b> {total_score:.1f}/100
+
+<b>🎯 Status:</b> {status_text}
+
+<b>🛡️ Stop Loss:</b> {sl:.4f}
+<b>🎯 Take Profit:</b> {tp:.4f}
+
+<b>📊 PnL:</b> {pnl_percent:+.2f}%
+<b>📍 Distance to SL:</b> {abs(current_price - sl) / entry * 100:.2f}%
+<b>📍 Distance to TP:</b> {abs(tp - current_price) / entry * 100:.2f}%
+
+<b>⏰ Time:</b> {datetime.now().strftime('%H:%M:%S')}
+<b>#{status}</b> #{'Profit' if pnl_percent > 0 else 'Loss'} #{data_quality}
+"""
+            
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(url, json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": message,
+                    "parse_mode": "HTML",
+                    "disable_notification": not notification
+                })
+                
+                if response.status_code == 200:
+                    log.info(f"📤 Position update sent to Telegram: {symbol} {status}")
+                    return True
+                else:
+                    log.warning(f"Telegram response: {response.status_code}")
+                    return False
+                
+        except Exception as e:
+            log.error(f"Telegram position update error: {e}")
+            return False
+    
     async def send_data_collection_update(self):
         """Send periodic update to Telegram"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -2709,8 +2786,8 @@ Will analyze patterns after collection
             log.error(f"Telegram update error: {e}")
     
     async def monitor_positions(self):
-        """Monitor positions for data collection"""
-        log.info("👀 Starting data collection monitoring...")
+        """Monitor positions for data collection - WITH TELEGRAM NOTIFICATIONS"""
+        log.info("👀 Starting data collection monitoring with Telegram notifications...")
         
         while True:
             try:
@@ -2719,14 +2796,14 @@ Will analyze patterns after collection
                     break
                 
                 async with self.db.execute("""
-                    SELECT id, symbol, side, entry_price, stop_loss, take_profit, status
+                    SELECT id, symbol, side, entry_price, stop_loss, take_profit, status, total_score, data_quality
                     FROM rejection_data_collection 
                     WHERE status IN ('PENDING', 'TRIGGERED')
                     LIMIT 10
                 """) as cursor:
                     positions = await cursor.fetchall()
                 
-                for pos_id, symbol, side, entry, sl, tp, status in positions:
+                for pos_id, symbol, side, entry, sl, tp, status, total_score, data_quality in positions:
                     try:
                         ticker = await self.exchange.fetch_ticker(symbol)
                         current_price = float(ticker['last'])
@@ -2744,6 +2821,12 @@ Will analyze patterns after collection
                                 await self.db.commit()
                                 self.scanner.deduplicator.update_signal_status(pos_id, "TRIGGERED")
                                 log.info(f"✅ Data position triggered: {symbol} @ {current_price:.4f}")
+                                
+                                # Send Telegram notification for trigger
+                                await self.send_position_update_to_telegram(
+                                    pos_id, symbol, side, entry, sl, tp, 
+                                    current_price, "TRIGGERED", total_score, data_quality
+                                )
                                 continue
                         
                         pnl_percent = 0.0
@@ -2781,6 +2864,13 @@ Will analyze patterns after collection
                             self.scanner.active_signal_ids.discard(pos_id)
                             
                             log.info(f"📊 Data position closed: {symbol} {close_reason} ({pnl_percent:.2f}%)")
+                            
+                            # Send Telegram notification for closure
+                            await self.send_position_update_to_telegram(
+                                pos_id, symbol, side, entry, sl, tp, 
+                                current_price, "CLOSED", total_score, data_quality,
+                                pnl_percent, close_reason
+                            )
                     
                     except Exception as e:
                         log.error(f"Monitor error for {symbol}: {e}")
