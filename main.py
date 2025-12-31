@@ -2506,7 +2506,7 @@ Collecting up to {self.max_signals} signals
             
             serialized_volume_clusters = [float(v) for v in signal.volume_clusters]
             
-            # Insert data - FIXED: 44 question marks for 44 columns
+            # FIXED: Database insert with correct number of columns (46 columns, 46 question marks)
             await self.db.execute("""
                 INSERT INTO rejection_data_collection (
                     id, symbol, side, entry_price, stop_loss, take_profit,
@@ -2521,8 +2521,9 @@ Collecting up to {self.max_signals} signals
                     multi_tf_confirmation, convergence_score,
                     risk_reward, expected_move, timeframe_used,
                     conditions_met,
-                    filter_scores, total_score, passed_filters, failed_filters, data_quality
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    filter_scores, total_score, passed_filters, failed_filters, data_quality,
+                    status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 signal.signal_id,
                 signal.symbol,
@@ -2577,7 +2578,10 @@ Collecting up to {self.max_signals} signals
                 float(signal.total_score),
                 json.dumps(signal.passed_filters),
                 json.dumps(signal.failed_filters),
-                str(signal.data_quality)
+                str(signal.data_quality),
+                
+                "PENDING",  # status
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S')  # created_at
             ))
             
             await self.db.commit()
@@ -2719,21 +2723,33 @@ Collecting up to {self.max_signals} signals
 <b>#{status}</b> #{'Profit' if pnl_percent > 0 else 'Loss'} #{data_quality}
 """
             
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.post(url, json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML",
-                    "disable_notification": not notification
-                })
-                
-                if response.status_code == 200:
-                    log.info(f"📤 Position update sent to Telegram: {symbol} {status}")
-                    return True
-                else:
-                    log.warning(f"Telegram response: {response.status_code}")
-                    return False
+            # Add retry logic for Telegram
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+                    async with httpx.AsyncClient(timeout=10) as client:
+                        response = await client.post(url, json={
+                            "chat_id": TELEGRAM_CHAT_ID,
+                            "text": message,
+                            "parse_mode": "HTML",
+                            "disable_notification": not notification
+                        })
+                        
+                        if response.status_code == 200:
+                            log.info(f"📤 Position update sent to Telegram: {symbol} {status}")
+                            return True
+                        else:
+                            log.warning(f"Telegram response {attempt+1}/{max_retries}: {response.status_code}")
+                            if attempt < max_retries - 1:
+                                await asyncio.sleep(1)
+                            
+                    except Exception as e:
+                        log.error(f"Telegram send attempt {attempt+1}/{max_retries} failed: {e}")
+                        if attempt < max_retries - 1:
+                            await asyncio.sleep(1)
+            
+            return False
                 
         except Exception as e:
             log.error(f"Telegram position update error: {e}")
@@ -2832,23 +2848,29 @@ Will analyze patterns after collection
                         pnl_percent = 0.0
                         close_reason = None
                         
+                        # FIXED: Correct PnL calculation for LONG and SHORT positions
                         if side == "LONG":
                             if current_price <= sl:
                                 close_reason = "SL_HIT"
                                 pnl_percent = ((current_price - entry) / entry) * 100
+                                log.info(f"📊 {symbol} LONG SL HIT: {current_price:.4f} <= {sl:.4f}, PnL: {pnl_percent:.2f}%")
                             elif current_price >= tp:
                                 close_reason = "TP_HIT"
                                 pnl_percent = ((current_price - entry) / entry) * 100
+                                log.info(f"📊 {symbol} LONG TP HIT: {current_price:.4f} >= {tp:.4f}, PnL: {pnl_percent:.2f}%")
                         
-                        else:
+                        else:  # SHORT position
                             if current_price >= sl:
                                 close_reason = "SL_HIT"
                                 pnl_percent = ((entry - current_price) / entry) * 100
+                                log.info(f"📊 {symbol} SHORT SL HIT: {current_price:.4f} >= {sl:.4f}, PnL: {pnl_percent:.2f}%")
                             elif current_price <= tp:
                                 close_reason = "TP_HIT"
                                 pnl_percent = ((entry - current_price) / entry) * 100
+                                log.info(f"📊 {symbol} SHORT TP HIT: {current_price:.4f} <= {tp:.4f}, PnL: {pnl_percent:.2f}%")
                         
                         if close_reason:
+                            # Update database first
                             await self.db.execute("""
                                 UPDATE rejection_data_collection SET 
                                     status = 'CLOSED',
@@ -2863,9 +2885,9 @@ Will analyze patterns after collection
                             self.scanner.deduplicator.update_signal_status(pos_id, "CLOSED")
                             self.scanner.active_signal_ids.discard(pos_id)
                             
-                            log.info(f"📊 Data position closed: {symbol} {close_reason} ({pnl_percent:.2f}%)")
+                            log.info(f"📊 Data position closed: {symbol} {close_reason} ({pnl_percent:+.2f}%)")
                             
-                            # Send Telegram notification for closure
+                            # FIXED: Send Telegram notification for closure
                             await self.send_position_update_to_telegram(
                                 pos_id, symbol, side, entry, sl, tp, 
                                 current_price, "CLOSED", total_score, data_quality,
@@ -2876,6 +2898,7 @@ Will analyze patterns after collection
                         log.error(f"Monitor error for {symbol}: {e}")
                         continue
                 
+                # Clean up old signals every 5 minutes
                 if int(time.time()) % 300 < 2:
                     self.scanner.deduplicator.remove_closed_signals()
                 
