@@ -2506,7 +2506,7 @@ Collecting up to {self.max_signals} signals
             
             serialized_volume_clusters = [float(v) for v in signal.volume_clusters]
             
-            # Insert data
+            # Insert data - FIXED: 44 question marks for 44 columns
             await self.db.execute("""
                 INSERT INTO rejection_data_collection (
                     id, symbol, side, entry_price, stop_loss, take_profit,
@@ -2522,7 +2522,7 @@ Collecting up to {self.max_signals} signals
                     risk_reward, expected_move, timeframe_used,
                     conditions_met,
                     filter_scores, total_score, passed_filters, failed_filters, data_quality
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 signal.signal_id,
                 signal.symbol,
@@ -2578,6 +2578,7 @@ Collecting up to {self.max_signals} signals
                 json.dumps(signal.passed_filters),
                 json.dumps(signal.failed_filters),
                 str(signal.data_quality)
+                # 44 values total
             ))
             
             await self.db.commit()
@@ -2592,6 +2593,73 @@ Collecting up to {self.max_signals} signals
             log.error(f"Error saving data signal: {e}")
             import traceback
             log.error(f"Traceback: {traceback.format_exc()}")
+            return False
+    
+    async def send_signal_to_telegram(self, signal: RejectionSignal) -> bool:
+        """Send EVERY signal to Telegram"""
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            log.debug("Telegram credentials not set. Skipping signal notification.")
+            return False
+        
+        try:
+            # Get top 3 filter scores
+            top_scores = sorted(
+                [(name, score) for name, score in signal.filter_scores.items()],
+                key=lambda x: x[1],
+                reverse=True
+            )[:3]
+            
+            top_scores_text = ", ".join([f"{name}: {score:.2f}" for name, score in top_scores])
+            
+            emoji = "✅" if signal.data_quality == "GOOD" else "⚠️" if signal.data_quality == "MEDIUM" else "❌"
+            
+            message = f"""
+{emoji} <b>DATA SIGNAL COLLECTED</b>
+
+<b>🎯 {signal.symbol}</b> | {signal.side}
+<b>💰 Entry:</b> {signal.entry_price:.4f}
+<b>🛡️ Stop Loss:</b> {signal.stop_loss:.4f}
+<b>🎯 Take Profit:</b> {signal.take_profit:.4f}
+
+<b>📊 Score:</b> {signal.total_score:.1f}/100
+<b>📈 Quality:</b> {signal.data_quality}
+<b>📈 R:R:</b> {signal.risk_reward:.2f}:1
+
+<b>🔍 Rejection Zone:</b> {signal.rejection_zone.zone_type}
+<b>📉 RSI:</b> {signal.rsi_at_entry:.1f}
+<b>🎯 Type:</b> {signal.rejection_type}
+
+<b>✅ Filters Passed:</b> {len(signal.passed_filters)}/9
+<b>🚫 Filters Failed:</b> {len(signal.failed_filters)}/9
+
+<b>🏆 Top Scores:</b>
+{top_scores_text}
+
+<b>📈 Conditions:</b>
+{', '.join(signal.conditions_met[:5])}{'...' if len(signal.conditions_met) > 5 else ''}
+
+<b>⏰ Collected at:</b> {datetime.fromtimestamp(signal.signal_timestamp).strftime('%H:%M:%S')}
+<b>#DataCollection</b> #{signal.data_quality} #{signal.side}
+"""
+            
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(url, json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": message,
+                    "parse_mode": "HTML",
+                    "disable_notification": signal.data_quality == "POOR"
+                })
+                
+                if response.status_code == 200:
+                    log.info(f"📤 Signal sent to Telegram: {signal.symbol}")
+                    return True
+                else:
+                    log.warning(f"Telegram response: {response.status_code}")
+                    return False
+                
+        except Exception as e:
+            log.error(f"Telegram signal error: {e}")
             return False
     
     async def send_data_collection_update(self):
@@ -2769,7 +2837,10 @@ Will analyze patterns after collection
                         
                         if signal:
                             saved = await self.save_data_signal(signal)
-                            signals_found += 1
+                            if saved:
+                                # Send to Telegram - EVERY SIGNAL
+                                await self.send_signal_to_telegram(signal)
+                                signals_found += 1
                         
                         pairs_processed += 1
                         await asyncio.sleep(0.01)
