@@ -2600,70 +2600,181 @@ Collecting up to {self.max_signals} signals
             return False
     
     async def send_signal_to_telegram(self, signal: RejectionSignal) -> bool:
-        """Send EVERY signal to Telegram"""
+        """Send COMPLETE signal breakdown to Telegram - ALL DATA"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             log.debug("Telegram credentials not set. Skipping signal notification.")
             return False
         
         try:
-            # Get top 3 filter scores
-            top_scores = sorted(
-                [(name, score) for name, score in signal.filter_scores.items()],
-                key=lambda x: x[1],
-                reverse=True
-            )[:3]
+            # Calculate percentages
+            risk_pct = abs((signal.entry_price - signal.stop_loss) / signal.entry_price * 100)
+            reward_pct = abs((signal.take_profit - signal.entry_price) / signal.entry_price * 100)
+            filter_pass_rate = (len(signal.passed_filters) / 9) * 100
             
-            top_scores_text = ", ".join([f"{name}: {score:.2f}" for name, score in top_scores])
+            # Format filter scores
+            filter_scores_text = "\n".join([f"  {name}: {score:.2f}" for name, score in signal.filter_scores.items()])
             
-            emoji = "✅" if signal.data_quality == "GOOD" else "⚠️" if signal.data_quality == "MEDIUM" else "❌"
+            # Format indicator analysis for each timeframe
+            indicator_texts = []
+            for tf in ["1H", "15M", "5M", "3M", "1M"]:
+                indicators = getattr(signal, f"indicators_{tf.lower()}")
+                if indicators:
+                    indicator_texts.append(f"""
+{tf} Indicators:
+  RSI: {indicators.rsi_value:.1f} ({indicators.rsi_trend}, {indicators.rsi_divergence})
+  MA: {indicators.ma_alignment}, Price vs MA: {indicators.price_vs_ma}
+  MACD: {indicators.macd_signal} ({indicators.macd_trend})
+  BB: {indicators.bb_position}, Squeeze: {indicators.bb_squeeze}
+  Volume: {indicators.volume_trend}, Spike: {indicators.volume_spike}
+  Momentum: {indicators.momentum_score:.2f}, Trend: {indicators.trend_score:.2f}""")
             
+            # Format candle patterns
+            candle_patterns_text = ""
+            if signal.candle_patterns:
+                candle_patterns_text = "\n".join([f"  • {p.pattern_name} ({p.pattern_type}) - Reliability: {p.reliability:.2f}" for p in signal.candle_patterns[:5]])
+                if len(signal.candle_patterns) > 5:
+                    candle_patterns_text += f"\n  ... and {len(signal.candle_patterns) - 5} more patterns"
+            
+            # Format dominant pattern
+            dominant_pattern_text = ""
+            if signal.dominant_pattern:
+                dp = signal.dominant_pattern
+                dominant_pattern_text = f"""
+Dominant Pattern: {dp.pattern_name}
+  Type: {dp.pattern_type}
+  Reliability: {dp.reliability:.2f}
+  Timeframe: {dp.timeframe}
+  Confirmation Required: {dp.confirmation_required}"""
+            
+            # Format multi-timeframe confirmation
+            mtf_confirmation_text = ""
+            if signal.multi_tf_confirmation:
+                mtf_confirmation_text = "\n".join([f"  {tf}: {'✅' if confirms else '❌'}" for tf, confirms in signal.multi_tf_confirmation.items()])
+            
+            # Format conditions
+            conditions_text = ", ".join(signal.conditions_met)
+            
+            # Build COMPLETE message
             message = f"""
-{emoji} <b>DATA SIGNAL COLLECTED</b>
+📊 COMPLETE SIGNAL BREAKDOWN
 
-<b>🎯 {signal.symbol}</b> | {signal.side}
-<b>💰 Entry:</b> {signal.entry_price:.4f}
-<b>🛡️ Stop Loss:</b> {signal.stop_loss:.4f}
-<b>🎯 Take Profit:</b> {signal.take_profit:.4f}
+=== BASIC INFO ===
+Signal ID: {signal.signal_id[:12]}...
+Symbol: {signal.symbol}
+Side: {signal.side}
+Entry: {signal.entry_price:.8f}
+Stop Loss: {signal.stop_loss:.8f} ({risk_pct:.2f}%)
+Take Profit: {signal.take_profit:.8f} ({reward_pct:.2f}%)
+Risk/Reward: {signal.risk_reward:.2f}:1
+Expected Move: {signal.expected_move_pct:.2f}%
+Timeframe: {signal.timeframe_used}
+Timestamp: {datetime.fromtimestamp(signal.signal_timestamp).strftime('%Y-%m-%d %H:%M:%S')}
 
-<b>📊 Score:</b> {signal.total_score:.1f}/100
-<b>📈 Quality:</b> {signal.data_quality}
-<b>📈 R:R:</b> {signal.risk_reward:.2f}:1
+=== REJECTION DETAILS ===
+Rejection Type: {signal.rejection_type}
+Trigger Candle: {signal.trigger_candle}
+RSI at Entry: {signal.rsi_at_entry:.1f}
+Rejection Strength: {signal.rejection_strength:.2f}
 
-<b>🔍 Rejection Zone:</b> {signal.rejection_zone.zone_type}
-<b>📉 RSI:</b> {signal.rsi_at_entry:.1f}
-<b>🎯 Type:</b> {signal.rejection_type}
+=== SCORING & QUALITY ===
+Total Score: {signal.total_score:.1f}/100
+Data Quality: {signal.data_quality}
+Filter Pass Rate: {filter_pass_rate:.1f}%
+Filters Passed ({len(signal.passed_filters)}): {', '.join(signal.passed_filters)}
+Filters Failed ({len(signal.failed_filters)}): {', '.join(signal.failed_filters)}
 
-<b>✅ Filters Passed:</b> {len(signal.passed_filters)}/9
-<b>🚫 Filters Failed:</b> {len(signal.failed_filters)}/9
+=== FILTER SCORES (0-1) ===
+{filter_scores_text}
 
-<b>🏆 Top Scores:</b>
-{top_scores_text}
+=== WAVE CONTEXT ===
+Wave Length: {signal.wave_context.wave_length}
+Wave Maturity: {signal.wave_context.wave_maturity:.2f}
+Expansion Speed: {signal.wave_context.expansion_speed:.2f}
+Structure Type: {signal.wave_context.structure_type}
+Context Side: {signal.wave_context.context_side}
 
-<b>📈 Conditions:</b>
-{', '.join(signal.conditions_met[:5])}{'...' if len(signal.conditions_met) > 5 else ''}
+=== MARKET STRENGTH ===
+Candle Speed: {signal.market_strength.candle_speed:.2f}
+Distance Ratio: {signal.market_strength.distance_ratio:.2f}
+EMA Angle: {signal.market_strength.ema_angle:.2f}
+Volume Participation: {signal.market_strength.volume_participation:.2f}
+Strength Score: {signal.market_strength.strength_score:.2f}
+Continuation: {signal.market_strength.is_continuation}
+Rejection Setup: {signal.market_strength.is_rejection_setup}
+Absorption: {signal.market_strength.is_absorption}
+Compression: {signal.market_strength.is_compression}
 
-<b>⏰ Collected at:</b> {datetime.fromtimestamp(signal.signal_timestamp).strftime('%H:%M:%S')}
-<b>#DataCollection</b> #{signal.data_quality} #{signal.side}
+=== REJECTION ZONE ===
+Zone Type: {signal.rejection_zone.zone_type}
+Price Level: {signal.rejection_zone.price_level:.8f}
+Zone Strength: {signal.rejection_zone.strength:.2f}
+Volume Confirmation: {signal.rejection_zone.volume_confirmation}
+RSI Position: {signal.rejection_zone.rsi_position}
+Active: {signal.rejection_zone.is_active}
+
+=== CANDLE PATTERNS ===
+{candle_patterns_text}
+{dominant_pattern_text}
+
+=== INDICATOR ANALYSIS ===
+{''.join(indicator_texts)}
+
+=== VOLUME ANALYSIS ===
+Volume Profile: {len(signal.volume_profile)} price levels analyzed
+Volume Clusters: {len(signal.volume_clusters)} clusters
+
+=== MULTI-TIMEFRAME CONFIRMATION ===
+Convergence Score: {signal.convergence_score:.2f}
+{mtf_confirmation_text}
+
+=== CONDITIONS MET ({len(signal.conditions_met)}) ===
+{conditions_text}
+
+=== STATISTICS ===
+Total Data Points: 1
+Signal ID: {signal.signal_id}
+Database Table: rejection_data_collection
 """
             
+            # Send multiple messages if too long (Telegram has 4096 char limit)
+            messages = []
+            max_length = 4000
+            
+            if len(message) > max_length:
+                # Split by sections
+                sections = message.split("\n===")
+                current_message = ""
+                for section in sections:
+                    if len(current_message) + len(section) < max_length:
+                        current_message += "\n===" + section
+                    else:
+                        messages.append(current_message)
+                        current_message = "===" + section
+                if current_message:
+                    messages.append(current_message)
+            else:
+                messages.append(message)
+            
+            # Send all messages
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.post(url, json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML",
-                    "disable_notification": signal.data_quality == "POOR"
-                })
-                
-                if response.status_code == 200:
-                    log.info(f"📤 Signal sent to Telegram: {signal.symbol}")
-                    return True
-                else:
-                    log.warning(f"Telegram response: {response.status_code}")
-                    return False
-                
+                for i, msg in enumerate(messages):
+                    await client.post(url, json={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "text": msg,
+                        "parse_mode": None,
+                        "disable_notification": i > 0  # Only notify for first message
+                    })
+                    if i < len(messages) - 1:
+                        await asyncio.sleep(0.5)  # Small delay between messages
+            
+            log.info(f"📤 Complete signal breakdown sent to Telegram: {signal.symbol}")
+            return True
+            
         except Exception as e:
             log.error(f"Telegram signal error: {e}")
+            import traceback
+            log.error(f"Traceback: {traceback.format_exc()}")
             return False
 
     # ============ SIMPLE TP/SL MONITORING - MINIMAL CHANGE ============
@@ -2799,12 +2910,6 @@ Collecting up to {self.max_signals} signals
         except Exception as e:
             log.error(f"Telegram TP/SL error: {e}")
             return False
-    
-    # ============ REMOVE COMPLEX MONITORING FUNCTIONS ============
-    # Delete or comment out these functions:
-    # 1. monitor_positions() - too complex with triggering
-    # 2. send_position_update_to_telegram() - sends trigger notifications
-    # 3. Any other function with "trigger" logic
     
     async def send_data_collection_update(self):
         """Send periodic update to Telegram"""
