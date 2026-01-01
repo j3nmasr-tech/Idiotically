@@ -30,14 +30,14 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_PATH = "/app/data/rejection_data_collection.db"
 
 # Ultra high-frequency scanning - DATA COLLECTION
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 3))   # 3 seconds - FAST DATA COLLECTION
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 30))   # 3 seconds - FAST DATA COLLECTION
 TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 100))   # Scan many pairs
 MIN_VOLUME_USD = 500000  # $500K minimum
 
 # Trading parameters (for scoring reference only)
 MAX_STOP_LOSS_PCT = 1.0
 MIN_TARGET_PCT = 1.5
-MAX_TARGET_PCT = 3.0
+MAX_TARGET_PCT = 3.0  # Changed to 3% max profit
 MIN_RISK_REWARD = 2.0
 
 # Rejection scanning - ALL AS SCORING BONUSES
@@ -2369,18 +2369,18 @@ class CompleteRejectionScanner:
         
         try:
             message = f"""
-📊 <b>DATA COLLECTION SCANNER STARTED</b>
+DATA COLLECTION SCANNER STARTED
 
-<b>🎯 MODE:</b> Data Collection & Analysis
-<b>🧠 APPROACH:</b> Scientific - Collect ALL data, analyze patterns later
+MODE: Data Collection & Analysis
+APPROACH: Scientific - Collect ALL data, analyze patterns later
 
-<b>📈 DATA COLLECTION:</b>
+DATA COLLECTION:
 • All filters are SCORING BONUSES, not requirements
 • Recording EVERYTHING - good, medium, and poor signals
 • Scoring each signal (0-100 scale)
 • Data quality: GOOD (70+), MEDIUM (50-70), POOR (<50)
 
-<b>🔍 9 FILTERS SCORED:</b>
+9 FILTERS SCORED:
 1. Market Strength (0-1)
 2. Rejection Zone (0-1)  
 3. Volume Confirmation (0-1)
@@ -2391,11 +2391,11 @@ class CompleteRejectionScanner:
 8. Rejection Strength (0-1)
 9. Pattern Confirmation (0-1)
 
-<b>📊 OUTPUT:</b>
+OUTPUT:
 Complete database for analysis
 Can later determine which filters actually matter
 
-<b>⏱️ FREQUENCY:</b>
+FREQUENCY:
 Scanning every {SCAN_INTERVAL} seconds
 Collecting up to {self.max_signals} signals
 
@@ -2406,8 +2406,7 @@ Collecting up to {self.max_signals} signals
             async with httpx.AsyncClient(timeout=10) as client:
                 await client.post(url, json={
                     "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML"
+                    "text": message
                 })
                 
             log.info("✅ Data collection startup message sent")
@@ -2663,7 +2662,7 @@ Dominant Pattern: {dp.pattern_name}
             message1 = f"""
 📊 COMPLETE SIGNAL BREAKDOWN - PART 1/4
 
-=== BASIC INFO ===
+BASIC INFO
 Signal ID: {signal.signal_id[:12]}...
 Symbol: {signal.symbol}
 Side: {signal.side}
@@ -2675,7 +2674,7 @@ Expected Move: {signal.expected_move_pct:.2f}%
 Timeframe: {signal.timeframe_used}
 Timestamp: {datetime.fromtimestamp(signal.signal_timestamp).strftime('%Y-%m-%d %H:%M:%S')}
 
-=== REJECTION DETAILS ===
+REJECTION DETAILS
 Rejection Type: {signal.rejection_type}
 Trigger Candle: {signal.trigger_candle}
 RSI at Entry: {signal.rsi_at_entry:.1f}
@@ -2686,7 +2685,7 @@ Rejection Strength: {signal.rejection_strength:.2f}
             message2 = f"""
 📊 COMPLETE SIGNAL BREAKDOWN - PART 2/4
 
-=== SCORING & QUALITY ===
+SCORING & QUALITY
 Total Score: {signal.total_score:.1f}/100
 Data Quality: {signal.data_quality}
 Filter Pass Rate: {filter_pass_rate:.1f}%
@@ -2695,10 +2694,10 @@ Filters Passed ({len(signal.passed_filters)}): {', '.join(signal.passed_filters[
 Filters Failed ({len(signal.failed_filters)}): {', '.join(signal.failed_filters[:5])}
 {'' if len(signal.failed_filters) <= 5 else '...'}
 
-=== FILTER SCORES (0-1) ===
+FILTER SCORES (0-1)
 {filter_scores_text}
 
-=== WAVE CONTEXT ===
+WAVE CONTEXT
 Wave Length: {signal.wave_context.wave_length}
 Wave Maturity: {signal.wave_context.wave_maturity:.2f}
 Expansion Speed: {signal.wave_context.expansion_speed:.2f}
@@ -2710,7 +2709,7 @@ Context Side: {signal.wave_context.context_side}
             message3 = f"""
 📊 COMPLETE SIGNAL BREAKDOWN - PART 3/4
 
-=== MARKET STRENGTH ===
+MARKET STRENGTH
 Candle Speed: {signal.market_strength.candle_speed:.2f}
 Distance Ratio: {signal.market_strength.distance_ratio:.2f}
 EMA Angle: {signal.market_strength.ema_angle:.2f}
@@ -2721,7 +2720,7 @@ Rejection Setup: {signal.market_strength.is_rejection_setup}
 Absorption: {signal.market_strength.is_absorption}
 Compression: {signal.market_strength.is_compression}
 
-=== REJECTION ZONE ===
+REJECTION ZONE
 Zone Type: {signal.rejection_zone.zone_type}
 Price Level: {signal.rejection_zone.price_level:.8f}
 Zone Strength: {signal.rejection_zone.strength:.2f}
@@ -2729,7 +2728,7 @@ Volume Confirmation: {signal.rejection_zone.volume_confirmation}
 RSI Position: {signal.rejection_zone.rsi_position}
 Active: {signal.rejection_zone.is_active}
 
-=== CANDLE PATTERNS ===
+CANDLE PATTERNS
 {candle_patterns_text}
 {dominant_pattern_text}
 """
@@ -2738,21 +2737,21 @@ Active: {signal.rejection_zone.is_active}
             message4 = f"""
 📊 COMPLETE SIGNAL BREAKDOWN - PART 4/4
 
-=== INDICATOR ANALYSIS ===
+INDICATOR ANALYSIS
 {indicator_texts}
 
-=== VOLUME ANALYSIS ===
+VOLUME ANALYSIS
 Volume Profile: {len(signal.volume_profile)} price levels analyzed
 Volume Clusters: {len(signal.volume_clusters)} clusters
 
-=== MULTI-TIMEFRAME CONFIRMATION ===
+MULTI-TIMEFRAME CONFIRMATION
 Convergence Score: {signal.convergence_score:.2f}
 {mtf_confirmation_text}
 
-=== CONDITIONS MET ({len(signal.conditions_met)}) ===
+CONDITIONS MET ({len(signal.conditions_met)})
 {conditions_text}
 
-=== STATISTICS ===
+STATISTICS
 Total Data Points: 1
 Signal ID: {signal.signal_id}
 Database Table: rejection_data_collection
@@ -2768,7 +2767,6 @@ Database Table: rejection_data_collection
                         response = await client.post(url, json={
                             "chat_id": TELEGRAM_CHAT_ID,
                             "text": msg,
-                            "parse_mode": None,
                             "disable_notification": i > 0  # Only notify for first message
                         })
                         
@@ -2794,7 +2792,7 @@ Database Table: rejection_data_collection
             log.error(f"Traceback: {traceback.format_exc()}")
             return False
     
-    # ============ SIMPLE TP/SL MONITORING - MINIMAL CHANGE ============
+    # ============ SIMPLE TP/SL MONITORING ============
     
     async def simple_tp_sl_monitor(self):
         """
@@ -2883,7 +2881,7 @@ Database Table: rejection_data_collection
                                           current_price: float, close_reason: str,
                                           total_score: float, data_quality: str,
                                           pnl_percent: float):
-        """Send ONLY TP/SL updates to Telegram - NO TRIGGER NOTIFICATIONS"""
+        """Send ONLY TP/SL updates to Telegram"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             return False
         
@@ -2898,27 +2896,26 @@ Database Table: rejection_data_collection
             result = f"{pnl_percent:+.2f}% {'PROFIT' if pnl_percent > 0 else 'LOSS'}"
             
             text = f"""
-{emoji} <b>{title}</b>
+{emoji} {title}
 
-<b>📈 {symbol}</b> | {side}
-<b>📊 Score:</b> {total_score:.1f}/100 ({data_quality})
-<b>🎯 Entry:</b> {entry:.4f}
-<b>📊 Close:</b> {current_price:.4f}
-<b>💰 Result:</b> {result}
+📈 {symbol} | {side}
+📊 Score: {total_score:.1f}/100 ({data_quality})
+🎯 Entry: {entry:.4f}
+📊 Close: {current_price:.4f}
+💰 Result: {result}
 
-<b>🛡️ Stop Loss:</b> {sl:.4f}
-<b>🎯 Take Profit:</b> {tp:.4f}
+🛡️ Stop Loss: {sl:.4f}
+🎯 Take Profit: {tp:.4f}
 
-<b>⏰ Time:</b> {datetime.now().strftime('%H:%M:%S')}
-<b>#{close_reason}</b> #{'Profit' if pnl_percent > 0 else 'Loss'} #{symbol.replace('/', '')}
+⏰ Time: {datetime.now().strftime('%H:%M:%S')}
+#{close_reason} #{'Profit' if pnl_percent > 0 else 'Loss'} #{symbol.replace('/', '')}
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             async with httpx.AsyncClient(timeout=10) as client:
                 await client.post(url, json={
                     "chat_id": TELEGRAM_CHAT_ID,
-                    "text": text,
-                    "parse_mode": "HTML"
+                    "text": text
                 })
             
             log.info(f"📤 Sent {close_reason} update for {symbol} to Telegram")
@@ -2938,11 +2935,11 @@ Database Table: rejection_data_collection
             completion_pct = (self.signals_collected / self.max_signals) * 100
             
             message = f"""
-📈 <b>DATA COLLECTION UPDATE</b>
+📈 DATA COLLECTION UPDATE
 
-<b>Progress:</b> {self.signals_collected}/{self.max_signals} ({completion_pct:.1f}%)
+Progress: {self.signals_collected}/{self.max_signals} ({completion_pct:.1f}%)
 
-<b>📊 Collection Stats:</b>
+📊 Collection Stats:
 • Total Signals: {stats['rejections_found']}
 • High Score (70+): {stats['high_score_signals']}
 • Medium Score (50-70): {stats['medium_score_signals']}
@@ -2950,10 +2947,10 @@ Database Table: rejection_data_collection
 • Long Signals: {stats['long_rejections']}
 • Short Signals: {stats['short_rejections']}
 
-<b>🎯 Current Cycle:</b> #{self.scan_cycle}
-<b>⏱️ Scan Interval:</b> {SCAN_INTERVAL}s
+🎯 Current Cycle: #{self.scan_cycle}
+⏱️ Scan Interval: {SCAN_INTERVAL}s
 
-<b>📝 Notes:</b>
+📝 Notes:
 Collecting ALL data points
 No filtering - only scoring
 Will analyze patterns after collection
@@ -2965,8 +2962,7 @@ Will analyze patterns after collection
             async with httpx.AsyncClient(timeout=10) as client:
                 await client.post(url, json={
                     "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML"
+                    "text": message
                 })
                 
             log.info(f"📤 Data collection update sent: {self.signals_collected}/{self.max_signals}")
@@ -3095,9 +3091,9 @@ Will analyze patterns after collection
             poor_count = data_qualities.count("POOR")
             
             message = f"""
-✅ <b>DATA COLLECTION COMPLETED</b>
+✅ DATA COLLECTION COMPLETED
 
-<b>📊 Final Statistics:</b>
+📊 Final Statistics:
 • Total Signals Collected: {self.signals_collected}
 • Completion: {completion_pct:.1f}%
 • Average Score: {avg_score:.1f}/100
@@ -3106,22 +3102,22 @@ Will analyze patterns after collection
   - MEDIUM (50-70): {medium_count} signals  
   - POOR (<50): {poor_count} signals
 
-<b>📈 Collection Details:</b>
+📈 Collection Details:
 • Scan Cycles: {self.scan_cycle}
 • Pairs Scanned: {stats['pairs_scanned']}
 • Long Signals: {stats['long_rejections']}
 • Short Signals: {stats['short_rejections']}
 
-<b>🔍 Next Steps:</b>
+🔍 Next Steps:
 1. Analyze database to find patterns
 2. Determine which filters actually matter
 3. Calculate success rates for each filter
 4. Optimize trading system based on data
 
-<b>📁 Database Location:</b>
+📁 Database Location:
 {DB_PATH}
 
-<b>📚 Data Analysis:</b>
+📚 Data Analysis:
 You can now:
 • Query the database for patterns
 • Calculate correlation between filters and success
@@ -3135,8 +3131,7 @@ You can now:
             async with httpx.AsyncClient(timeout=10) as client:
                 await client.post(url, json={
                     "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML"
+                    "text": message
                 })
                 
             log.info("✅ Final data collection stats sent to Telegram")
