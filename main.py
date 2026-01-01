@@ -2600,7 +2600,7 @@ Collecting up to {self.max_signals} signals
             return False
     
     async def send_signal_to_telegram(self, signal: RejectionSignal) -> bool:
-        """Send COMPLETE signal breakdown to Telegram - ALL DATA"""
+        """Send COMPLETE signal breakdown to Telegram - PROPERLY SPLIT"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             log.debug("Telegram credentials not set. Skipping signal notification.")
             return False
@@ -2615,18 +2615,21 @@ Collecting up to {self.max_signals} signals
             filter_scores_text = "\n".join([f"  {name}: {score:.2f}" for name, score in signal.filter_scores.items()])
             
             # Format indicator analysis for each timeframe
-            indicator_texts = []
+            indicator_sections = []
             for tf in ["1H", "15M", "5M", "3M", "1M"]:
                 indicators = getattr(signal, f"indicators_{tf.lower()}")
                 if indicators:
-                    indicator_texts.append(f"""
+                    indicator_text = f"""
 {tf} Indicators:
   RSI: {indicators.rsi_value:.1f} ({indicators.rsi_trend}, {indicators.rsi_divergence})
   MA: {indicators.ma_alignment}, Price vs MA: {indicators.price_vs_ma}
   MACD: {indicators.macd_signal} ({indicators.macd_trend})
   BB: {indicators.bb_position}, Squeeze: {indicators.bb_squeeze}
   Volume: {indicators.volume_trend}, Spike: {indicators.volume_spike}
-  Momentum: {indicators.momentum_score:.2f}, Trend: {indicators.trend_score:.2f}""")
+  Momentum: {indicators.momentum_score:.2f}, Trend: {indicators.trend_score:.2f}"""
+                    indicator_sections.append(indicator_text)
+            
+            indicator_texts = "".join(indicator_sections)
             
             # Format candle patterns
             candle_patterns_text = ""
@@ -2654,9 +2657,11 @@ Dominant Pattern: {dp.pattern_name}
             # Format conditions
             conditions_text = ", ".join(signal.conditions_met)
             
-            # Build COMPLETE message
-            message = f"""
-📊 COMPLETE SIGNAL BREAKDOWN
+            # ===== SPLIT INTO MULTIPLE MESSAGES =====
+            
+            # Message 1: Basic Info
+            message1 = f"""
+📊 COMPLETE SIGNAL BREAKDOWN - PART 1/4
 
 === BASIC INFO ===
 Signal ID: {signal.signal_id[:12]}...
@@ -2675,13 +2680,20 @@ Rejection Type: {signal.rejection_type}
 Trigger Candle: {signal.trigger_candle}
 RSI at Entry: {signal.rsi_at_entry:.1f}
 Rejection Strength: {signal.rejection_strength:.2f}
+"""
+            
+            # Message 2: Scoring & Quality
+            message2 = f"""
+📊 COMPLETE SIGNAL BREAKDOWN - PART 2/4
 
 === SCORING & QUALITY ===
 Total Score: {signal.total_score:.1f}/100
 Data Quality: {signal.data_quality}
 Filter Pass Rate: {filter_pass_rate:.1f}%
-Filters Passed ({len(signal.passed_filters)}): {', '.join(signal.passed_filters)}
-Filters Failed ({len(signal.failed_filters)}): {', '.join(signal.failed_filters)}
+Filters Passed ({len(signal.passed_filters)}): {', '.join(signal.passed_filters[:5])}
+{'' if len(signal.passed_filters) <= 5 else '...'}
+Filters Failed ({len(signal.failed_filters)}): {', '.join(signal.failed_filters[:5])}
+{'' if len(signal.failed_filters) <= 5 else '...'}
 
 === FILTER SCORES (0-1) ===
 {filter_scores_text}
@@ -2692,6 +2704,11 @@ Wave Maturity: {signal.wave_context.wave_maturity:.2f}
 Expansion Speed: {signal.wave_context.expansion_speed:.2f}
 Structure Type: {signal.wave_context.structure_type}
 Context Side: {signal.wave_context.context_side}
+"""
+            
+            # Message 3: Market Analysis
+            message3 = f"""
+📊 COMPLETE SIGNAL BREAKDOWN - PART 3/4
 
 === MARKET STRENGTH ===
 Candle Speed: {signal.market_strength.candle_speed:.2f}
@@ -2715,9 +2732,14 @@ Active: {signal.rejection_zone.is_active}
 === CANDLE PATTERNS ===
 {candle_patterns_text}
 {dominant_pattern_text}
+"""
+            
+            # Message 4: Indicators & Conditions
+            message4 = f"""
+📊 COMPLETE SIGNAL BREAKDOWN - PART 4/4
 
 === INDICATOR ANALYSIS ===
-{''.join(indicator_texts)}
+{indicator_texts}
 
 === VOLUME ANALYSIS ===
 Volume Profile: {len(signal.volume_profile)} price levels analyzed
@@ -2736,39 +2758,34 @@ Signal ID: {signal.signal_id}
 Database Table: rejection_data_collection
 """
             
-            # Send multiple messages if too long (Telegram has 4096 char limit)
-            messages = []
-            max_length = 4000
-            
-            if len(message) > max_length:
-                # Split by sections
-                sections = message.split("\n===")
-                current_message = ""
-                for section in sections:
-                    if len(current_message) + len(section) < max_length:
-                        current_message += "\n===" + section
-                    else:
-                        messages.append(current_message)
-                        current_message = "===" + section
-                if current_message:
-                    messages.append(current_message)
-            else:
-                messages.append(message)
-            
-            # Send all messages
+            # Send all 4 messages
+            messages = [message1, message2, message3, message4]
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            async with httpx.AsyncClient(timeout=10) as client:
-                for i, msg in enumerate(messages):
-                    await client.post(url, json={
-                        "chat_id": TELEGRAM_CHAT_ID,
-                        "text": msg,
-                        "parse_mode": None,
-                        "disable_notification": i > 0  # Only notify for first message
-                    })
-                    if i < len(messages) - 1:
-                        await asyncio.sleep(0.5)  # Small delay between messages
             
-            log.info(f"📤 Complete signal breakdown sent to Telegram: {signal.symbol}")
+            async with httpx.AsyncClient(timeout=30) as client:  # Increased timeout
+                for i, msg in enumerate(messages):
+                    try:
+                        response = await client.post(url, json={
+                            "chat_id": TELEGRAM_CHAT_ID,
+                            "text": msg,
+                            "parse_mode": None,
+                            "disable_notification": i > 0  # Only notify for first message
+                        })
+                        
+                        if response.status_code != 200:
+                            log.error(f"Telegram error for part {i+1}: {response.status_code} - {response.text[:100]}")
+                        else:
+                            log.debug(f"Telegram part {i+1}/4 sent successfully")
+                        
+                        # Wait between messages
+                        if i < len(messages) - 1:
+                            await asyncio.sleep(1.0)  # 1 second delay between messages
+                            
+                    except Exception as e:
+                        log.error(f"Error sending Telegram part {i+1}: {e}")
+                        continue
+            
+            log.info(f"📤 Complete signal breakdown sent to Telegram (4 parts): {signal.symbol}")
             return True
             
         except Exception as e:
@@ -2776,7 +2793,7 @@ Database Table: rejection_data_collection
             import traceback
             log.error(f"Traceback: {traceback.format_exc()}")
             return False
-
+    
     # ============ SIMPLE TP/SL MONITORING - MINIMAL CHANGE ============
     
     async def simple_tp_sl_monitor(self):
