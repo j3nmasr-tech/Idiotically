@@ -30,8 +30,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_PATH = "/app/data/rejection_data_collection.db"
 
 # Ultra high-frequency scanning - DATA COLLECTION
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 120))   # 3 seconds - FAST DATA COLLECTION
-TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 100))   # Scan many pairs
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 60))   # 3 seconds - FAST DATA COLLECTION
+TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 50))   # Scan many pairs
 MIN_VOLUME_USD = 500000  # $500K minimum
 
 # Trading parameters (for scoring reference only)
