@@ -37,7 +37,7 @@ MIN_VOLUME_USD = 500000  # $500K minimum
 # Trading parameters (for scoring reference only)
 MAX_STOP_LOSS_PCT = 1.0
 MIN_TARGET_PCT = 1.5
-MAX_TARGET_PCT = 6.0
+MAX_TARGET_PCT = 3.0
 MIN_RISK_REWARD = 2.0
 
 # Rejection scanning - ALL AS SCORING BONUSES
