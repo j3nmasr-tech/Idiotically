@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 
 """
-🔥 REJECTION-BASED DATA COLLECTION SCANNER
-Professional discretionary trading system - DATA COLLECTION MODE
-All filters are SCORING BONUSES, not requirements
-Collect ALL data, analyze patterns later
-TRADER MINDSET: Data scientist, pattern researcher
+🔥 REJECTION-BASED TRADING SCANNER
+Professional discretionary trading system
+All filters contribute to signal scoring
+Collect signals with comprehensive analysis
+TRADER MINDSET: Systematic signal generation
 """
 
 import os
@@ -27,26 +27,26 @@ import json
 # ================ HIGH-FREQUENCY CONFIG ================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-DB_PATH = "/app/data/rejection_data_collection.db"
+DB_PATH = "/app/data/rejection_signals.db"
 
-# Ultra high-frequency scanning - DATA COLLECTION
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 30))   # 3 seconds - FAST DATA COLLECTION
+# Ultra high-frequency scanning
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 30))   # 3 seconds
 TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 100))   # Scan many pairs
 MIN_VOLUME_USD = 500000  # $500K minimum
 
-# Trading parameters (for scoring reference only)
+# Trading parameters
 MAX_STOP_LOSS_PCT = 1.0
 MIN_TARGET_PCT = 1.5
-MAX_TARGET_PCT = 3.0  # Changed to 3% max profit
+MAX_TARGET_PCT = 4.0  # Changed to 3% max profit
 MIN_RISK_REWARD = 2.0
 
-# Rejection scanning - ALL AS SCORING BONUSES
+# Rejection scanning
 REJECTION_CONFIG = {
     "rsi_long_zone": (40, 50),
     "rsi_short_zone": (50, 60),
     "ema_distance_threshold": 0.5,
-    "min_rejection_strength": 0.6,  # Scoring reference only
-    "min_convergence_score": 0.7,   # Scoring reference only
+    "min_rejection_strength": 0.6,
+    "min_convergence_score": 0.7,
 }
 
 # Timeframes for analysis
@@ -216,7 +216,7 @@ class IndicatorAnalysis:
 
 @dataclass
 class RejectionSignal:
-    """Rejection-based trade signal - DATA COLLECTION MODE"""
+    """Rejection-based trade signal"""
     signal_id: str
     symbol: str
     side: str
@@ -265,12 +265,11 @@ class RejectionSignal:
     multi_tf_confirmation: Dict[str, bool]
     convergence_score: float
     
-    # DATA COLLECTION FIELDS
+    # Filter scores
     filter_scores: Dict[str, float]  # Scores for each filter (0-1)
     total_score: float               # Overall score (0-100)
     passed_filters: List[str]        # Which filters passed
     failed_filters: List[str]        # Which filters failed
-    data_quality: str                # GOOD, MEDIUM, POOR
 
 # ================ PROFESSIONAL LOGGING ================
 logging.basicConfig(
@@ -278,7 +277,7 @@ logging.basicConfig(
     format='%(asctime)s | %(levelname)8s | %(name)s | %(message)s',
     datefmt='%H:%M:%S'
 )
-log = logging.getLogger("rejection_data_collector")
+log = logging.getLogger("rejection_scanner")
 
 # ================ CANDLE PATTERN SCANNER ================
 class CandlePatternScanner:
@@ -954,9 +953,9 @@ class IndicatorAnalyzer:
             volatility_score=0.5
         )
 
-# ================ CORE REJECTION ENGINE - DATA COLLECTION MODE ================
+# ================ CORE REJECTION ENGINE ================
 class EnhancedRejectionBasedScanner:
-    """High-frequency rejection scanner - DATA COLLECTION MODE"""
+    """High-frequency rejection scanner"""
     
     class SignalDeduplicator:
         """Prevents duplicate signal generation"""
@@ -1028,7 +1027,7 @@ class EnhancedRejectionBasedScanner:
             "long_rejections": 0,
             "short_rejections": 0,
             "pairs_scanned": 0,
-            "signals_collected": 0,
+            "signals_generated": 0,
             "high_score_signals": 0,
             "medium_score_signals": 0,
             "low_score_signals": 0
@@ -1737,8 +1736,8 @@ class EnhancedRejectionBasedScanner:
         
         return filter_scores, passed_filters, failed_filters
     
-    def _calculate_total_score(self, filter_scores: Dict[str, float]) -> Tuple[float, str]:
-        """Calculate total score and data quality"""
+    def _calculate_total_score(self, filter_scores: Dict[str, float]) -> float:
+        """Calculate total score"""
         weights = {
             "market_strength": 0.10,
             "rejection_zone": 0.15,
@@ -1758,16 +1757,9 @@ class EnhancedRejectionBasedScanner:
         
         total_score = total_score * 100  # Convert to 0-100 scale
         
-        if total_score >= 70:
-            data_quality = "GOOD"
-        elif total_score >= 50:
-            data_quality = "MEDIUM"
-        else:
-            data_quality = "POOR"
-        
-        return float(total_score), data_quality
+        return float(total_score)
     
-    # ========== REJECTION SIGNAL GENERATION - DATA COLLECTION MODE ==========
+    # ========== REJECTION SIGNAL GENERATION ==========
     
     def calculate_rsi(self, prices: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
         """Calculate RSI"""
@@ -1792,8 +1784,7 @@ class EnhancedRejectionBasedScanner:
     def generate_enhanced_rejection_signal(self, multi_tf_data: Dict[str, pd.DataFrame], 
                                           symbol: str) -> Optional[RejectionSignal]:
         """
-        Generate COMPLETE rejection-based signal with ALL analyses
-        DATA COLLECTION MODE: All filters are scoring bonuses, not requirements
+        Generate rejection-based signal with comprehensive analysis
         """
         try:
             # Get timeframe data
@@ -1818,10 +1809,6 @@ class EnhancedRejectionBasedScanner:
             # ===== 2. MARKET STRENGTH ANALYSIS =====
             market_strength = self.analyze_market_strength(tf_15m)
             
-            # DATA COLLECTION: No filtering, just record
-            if market_strength.strength_score < 0.4:
-                log.debug(f"{symbol}: Low market strength ({market_strength.strength_score:.2f}) - recording anyway")
-            
             # ===== 3. CANDLE PATTERN ANALYSIS =====
             candle_patterns, dominant_pattern = self.analyze_candle_patterns(multi_tf_data)
             
@@ -1840,20 +1827,6 @@ class EnhancedRejectionBasedScanner:
             
             rejection_zones = self.find_rejection_zones(tf_3m, current_price, current_rsi, emas)
             
-            # DATA COLLECTION: Record even if no zones
-            if not rejection_zones:
-                log.debug(f"{symbol}: No rejection zones found - recording contextual data")
-                # Create a dummy zone for data collection
-                dummy_zone = RejectionZone(
-                    zone_type="NO_ZONE",
-                    price_level=current_price,
-                    strength=0.0,
-                    volume_confirmation=False,
-                    rsi_position="NEUTRAL",
-                    is_active=False
-                )
-                rejection_zones = [dummy_zone]
-            
             # Check volume confirmation
             valid_zones = []
             for zone in rejection_zones:
@@ -1861,66 +1834,52 @@ class EnhancedRejectionBasedScanner:
                 valid_zones.append(zone)
             
             # Select best zone
-            best_zone = max(valid_zones, key=lambda z: z.strength) if valid_zones else rejection_zones[0]
+            best_zone = max(valid_zones, key=lambda z: z.strength) if valid_zones else None
             
             # Determine trade side
             side = None
-            if best_zone.zone_type in ["EMA_SUPPORT", "RANGE_LOW", "FAILED_BREAKDOWN", "DEMAND"]:
-                side = "LONG"
-            elif best_zone.zone_type in ["EMA_RESISTANCE", "RANGE_HIGH", "FAILED_BREAKOUT", "SUPPLY"]:
-                side = "SHORT"
-            else:
-                # For NO_ZONE or unknown zones, determine from context
+            if best_zone:
+                if best_zone.zone_type in ["EMA_SUPPORT", "RANGE_LOW", "FAILED_BREAKDOWN", "DEMAND"]:
+                    side = "LONG"
+                elif best_zone.zone_type in ["EMA_RESISTANCE", "RANGE_HIGH", "FAILED_BREAKOUT", "SUPPLY"]:
+                    side = "SHORT"
+            
+            if not side:
+                # Determine from context if no clear zone
                 if current_rsi < 50:
                     side = "LONG"
                 else:
                     side = "SHORT"
             
             # ===== 7. CANDLE PATTERN CONFIRMATION =====
-            # DATA COLLECTION: No filtering, just record
             pattern_confirms = self.pattern_confirms_rejection(dominant_pattern, side)
-            if not pattern_confirms:
-                log.debug(f"{symbol}: Candle pattern doesn't confirm {side} - recording anyway")
             
             # ===== 8. MULTI-TIMEFRAME CONFIRMATION =====
-            multi_tf_confirmation = self.check_multi_tf_confirmation(indicators, side, best_zone.zone_type)
+            multi_tf_confirmation = self.check_multi_tf_confirmation(indicators, side, best_zone.zone_type if best_zone else "NO_ZONE")
             convergence_score = self.calculate_convergence_score(multi_tf_confirmation)
             
-            # DATA COLLECTION: Record even with low convergence
-            if convergence_score < REJECTION_CONFIG["min_convergence_score"]:
-                log.debug(f"{symbol}: Low multi-TF convergence ({convergence_score:.2f}) - recording anyway")
-            
-            # ===== 9. RSI POSITION CHECK =====
-            # DATA COLLECTION: No filtering, just record
-            if side == "LONG" and best_zone.rsi_position != "IN_ZONE":
-                log.debug(f"{symbol}: RSI not in LONG zone ({current_rsi:.1f}) - recording anyway")
-            elif side == "SHORT" and best_zone.rsi_position != "IN_ZONE":
-                log.debug(f"{symbol}: RSI not in SHORT zone ({current_rsi:.1f}) - recording anyway")
-            
-            # ===== 10. TRADE DEDUPLICATION =====
-            # Still apply deduplication to avoid spam
+            # ===== 9. TRADE DEDUPLICATION =====
             if not self.deduplicator.should_generate_signal(symbol, side, current_price):
                 log.debug(f"{symbol}: Duplicate signal filtered")
                 return None
             
-            # ===== 11. ANALYZE REJECTION CANDLE =====
+            # ===== 10. ANALYZE REJECTION CANDLE =====
             rejection_type, trigger_candle = self._analyze_rejection_candle(tf_3m, side, best_zone)
             
             if not rejection_type:
                 rejection_type = "NO_CLEAR_REJECTION"
                 trigger_candle = "NONE"
-                log.debug(f"{symbol}: No clear rejection candle - recording contextual data")
             
-            # ===== 12. CALCULATE ENTRY, SL, TP =====
+            # ===== 11. CALCULATE ENTRY, SL, TP =====
             stop_loss_pct = float(np.random.uniform(0.5, MAX_STOP_LOSS_PCT))
             target_pct = float(np.random.uniform(MIN_TARGET_PCT, MAX_TARGET_PCT))
             
             if side == "LONG":
-                entry_price = float(best_zone.price_level * 1.001) if best_zone.zone_type != "NO_ZONE" else current_price
+                entry_price = float(best_zone.price_level * 1.001) if best_zone else current_price
                 stop_loss = float(entry_price * (1 - stop_loss_pct / 100))
                 take_profit = float(entry_price * (1 + target_pct / 100))
             else:
-                entry_price = float(best_zone.price_level * 0.999) if best_zone.zone_type != "NO_ZONE" else current_price
+                entry_price = float(best_zone.price_level * 0.999) if best_zone else current_price
                 stop_loss = float(entry_price * (1 + stop_loss_pct / 100))
                 take_profit = float(entry_price * (1 - target_pct / 100))
             
@@ -1933,40 +1892,32 @@ class EnhancedRejectionBasedScanner:
             else:
                 risk_reward = float(reward / risk)
             
-            # DATA COLLECTION: Record even with poor R:R
-            if risk_reward < MIN_RISK_REWARD:
-                log.debug(f"{symbol}: R:R too low ({risk_reward:.1f}:1) - recording anyway")
-            
-            # ===== 13. CALCULATE REJECTION STRENGTH =====
+            # ===== 12. CALCULATE REJECTION STRENGTH =====
             rejection_strength = self._calculate_rejection_strength(
                 best_zone, market_strength, wave_context, current_rsi, convergence_score
             )
             
-            # DATA COLLECTION: Record even with weak rejection
-            if rejection_strength < REJECTION_CONFIG["min_rejection_strength"]:
-                log.debug(f"{symbol}: Rejection too weak ({rejection_strength:.2f}) - recording anyway")
-            
-            # ===== 14. CALCULATE FILTER SCORES =====
+            # ===== 13. CALCULATE FILTER SCORES =====
             filter_scores, passed_filters, failed_filters = self._calculate_filter_scores(
                 market_strength, rejection_zones, candle_patterns, dominant_pattern,
-                side, best_zone.zone_type, convergence_score, risk_reward, rejection_strength
+                side, best_zone.zone_type if best_zone else "NO_ZONE", convergence_score, risk_reward, rejection_strength
             )
             
-            # ===== 15. CALCULATE TOTAL SCORE =====
-            total_score, data_quality = self._calculate_total_score(filter_scores)
+            # ===== 14. CALCULATE TOTAL SCORE =====
+            total_score = self._calculate_total_score(filter_scores)
             
-            # ===== 16. DETERMINE CONDITIONS MET =====
+            # ===== 15. DETERMINE CONDITIONS MET =====
             conditions_met = self._get_rejection_conditions(
                 wave_context, market_strength, best_zone, rejection_type,
                 dominant_pattern, multi_tf_confirmation
             )
             
-            # ===== 17. CREATE SIGNAL ID =====
+            # ===== 16. CREATE SIGNAL ID =====
             signal_id = hashlib.md5(
                 f"{symbol}:{side}:{entry_price:.8f}:{time.time()}:{total_score:.2f}".encode()
             ).hexdigest()
             
-            # ===== 18. CREATE COMPLETE SIGNAL =====
+            # ===== 17. CREATE COMPLETE SIGNAL =====
             signal = RejectionSignal(
                 signal_id=signal_id,
                 symbol=symbol,
@@ -1978,7 +1929,14 @@ class EnhancedRejectionBasedScanner:
                 
                 wave_context=wave_context,
                 market_strength=market_strength,
-                rejection_zone=best_zone,
+                rejection_zone=best_zone or RejectionZone(
+                    zone_type="NO_ZONE",
+                    price_level=current_price,
+                    strength=0.0,
+                    volume_confirmation=False,
+                    rsi_position="NEUTRAL",
+                    is_active=False
+                ),
                 
                 rejection_type=rejection_type,
                 trigger_candle=trigger_candle,
@@ -2007,19 +1965,18 @@ class EnhancedRejectionBasedScanner:
                 multi_tf_confirmation=multi_tf_confirmation,
                 convergence_score=convergence_score,
                 
-                # DATA COLLECTION FIELDS
+                # Filter scores
                 filter_scores=filter_scores,
                 total_score=total_score,
                 passed_filters=passed_filters,
-                failed_filters=failed_filters,
-                data_quality=data_quality
+                failed_filters=failed_filters
             )
             
-            # ===== 19. UPDATE TRACKING =====
+            # ===== 18. UPDATE TRACKING =====
             self.deduplicator.register_signal(signal)
             self.active_signal_ids.add(signal_id)
             
-            # ===== 20. UPDATE STATISTICS =====
+            # ===== 19. UPDATE STATISTICS =====
             self.daily_stats["rejections_found"] += 1
             if side == "LONG":
                 self.daily_stats["long_rejections"] += 1
@@ -2033,12 +1990,11 @@ class EnhancedRejectionBasedScanner:
             else:
                 self.daily_stats["low_score_signals"] += 1
             
-            # ===== 21. LOG DATA COLLECTION INFO =====
-            log.info(f"📊 DATA COLLECTION: {symbol} {side} @ {entry_price:.4f}")
-            log.info(f"   Score: {total_score:.1f}/100 ({data_quality})")
+            # ===== 20. LOG SIGNAL INFO =====
+            log.info(f"📊 SIGNAL: {symbol} {side} @ {entry_price:.4f}")
+            log.info(f"   Score: {total_score:.1f}/100")
+            log.info(f"   Zone: {best_zone.zone_type if best_zone else 'NO_ZONE'}, RSI: {current_rsi:.1f}")
             log.info(f"   Passed: {len(passed_filters)}/{len(filter_scores)} filters")
-            log.info(f"   Zone: {best_zone.zone_type}, RSI: {current_rsi:.1f}")
-            log.info(f"   Filters passed: {', '.join(passed_filters[:3])}{'...' if len(passed_filters) > 3 else ''}")
             
             return signal
             
@@ -2137,7 +2093,7 @@ class EnhancedRejectionBasedScanner:
         factors = []
         weights = []
         
-        factors.append(float(zone.strength))
+        factors.append(float(zone.strength) if zone else 0.0)
         weights.append(0.2)
         
         factors.append(float(strength.strength_score))
@@ -2154,9 +2110,9 @@ class EnhancedRejectionBasedScanner:
         factors.append(float(wave_score))
         weights.append(0.15)
         
-        if zone.rsi_position == "IN_ZONE":
+        if zone and zone.rsi_position == "IN_ZONE":
             rsi_score = 0.9
-        elif zone.rsi_position == "OVEREXTENDED":
+        elif zone and zone.rsi_position == "OVEREXTENDED":
             rsi_score = 0.3
         else:
             rsi_score = 0.5
@@ -2167,7 +2123,7 @@ class EnhancedRejectionBasedScanner:
         factors.append(float(convergence_score))
         weights.append(0.2)
         
-        volume_score = 0.8 if zone.volume_confirmation else 0.3
+        volume_score = 0.8 if (zone and zone.volume_confirmation) else 0.3
         factors.append(float(volume_score))
         weights.append(0.1)
         
@@ -2192,11 +2148,14 @@ class EnhancedRejectionBasedScanner:
         if strength.is_compression:
             conditions.append("STRENGTH_COMPRESSION")
         
-        conditions.append(f"ZONE_{zone.zone_type}")
-        if zone.volume_confirmation:
-            conditions.append("VOLUME_CONFIRMED")
+        if zone:
+            conditions.append(f"ZONE_{zone.zone_type}")
+            if zone.volume_confirmation:
+                conditions.append("VOLUME_CONFIRMED")
+            conditions.append(f"RSI_{zone.rsi_position}")
+        else:
+            conditions.append("ZONE_NONE")
         
-        conditions.append(f"RSI_{zone.rsi_position}")
         conditions.append(f"REJECTION_{rejection_type}")
         
         if dominant_pattern:
@@ -2218,26 +2177,22 @@ class EnhancedRejectionBasedScanner:
 
 # ================ MAIN SCANNER SYSTEM ================
 class CompleteRejectionScanner:
-    """Main scanner system - DATA COLLECTION MODE"""
+    """Main scanner system"""
     
     def __init__(self):
         self.scanner = EnhancedRejectionBasedScanner()
         self.exchange = None
         self.db = None
         self.scan_cycle = 0
-        self.signals_collected = 0
-        self.max_signals = 10000  # Stop after collecting this many
+        self.signals_generated = 0
+        self.max_signals = 10000  # Stop after generating this many
     
     async def initialize(self):
         """Initialize the scanner"""
         log.info("=" * 70)
-        log.info("📊 REJECTION-BASED DATA COLLECTION SCANNER")
+        log.info("📊 REJECTION-BASED TRADING SCANNER")
         log.info("=" * 70)
-        log.info("MODE: DATA COLLECTION - All filters are scoring bonuses")
-        log.info("PURPOSE: Collect data to analyze what actually works")
-        log.info("NO FILTERING: All signals recorded regardless of quality")
-        log.info("SCORING: Each filter contributes to total score (0-100)")
-        log.info("DATA QUALITY: GOOD (70+), MEDIUM (50-70), POOR (<50)")
+        log.info(f"SCAN INTERVAL: {SCAN_INTERVAL}s")
         log.info(f"MAX SIGNALS: {self.max_signals}")
         log.info("=" * 70)
         
@@ -2251,9 +2206,9 @@ class CompleteRejectionScanner:
             os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
             self.db = await aiosqlite.connect(DB_PATH)
             
-            # Enhanced data collection table
+            # Enhanced signals table
             await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS rejection_data_collection (
+            CREATE TABLE IF NOT EXISTS rejection_signals (
                 id TEXT PRIMARY KEY,
                 symbol TEXT NOT NULL,
                 side TEXT NOT NULL,
@@ -2303,12 +2258,10 @@ class CompleteRejectionScanner:
                 
                 conditions_met TEXT,
                 
-                -- DATA COLLECTION FIELDS
                 filter_scores TEXT NOT NULL,
                 total_score REAL NOT NULL,
                 passed_filters TEXT NOT NULL,
                 failed_filters TEXT NOT NULL,
-                data_quality TEXT NOT NULL,
                 
                 status TEXT DEFAULT 'PENDING',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -2323,9 +2276,9 @@ class CompleteRejectionScanner:
             )
             """)
             
-            # Data analysis table
+            # Statistics table
             await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS data_analysis (
+            CREATE TABLE IF NOT EXISTS signal_stats (
                 date DATE PRIMARY KEY,
                 total_signals INTEGER,
                 high_score_signals INTEGER,
@@ -2338,7 +2291,7 @@ class CompleteRejectionScanner:
             """)
             
             await self.db.commit()
-            log.info("✅ Data collection database initialized")
+            log.info("✅ Database initialized")
             
         except Exception as e:
             log.error(f"Database error: {e}")
@@ -2369,37 +2322,24 @@ class CompleteRejectionScanner:
         
         try:
             message = f"""
-DATA COLLECTION SCANNER STARTED
+REJECTION SCANNER STARTED
 
-MODE: Data Collection & Analysis
-APPROACH: Scientific - Collect ALL data, analyze patterns later
+SCANNER CONFIGURATION:
+Scan Interval: {SCAN_INTERVAL}s
+Max Signals: {self.max_signals}
+Pairs: Top {TOP_N_VOLUME} by volume
+Min Volume: ${MIN_VOLUME_USD:,}
 
-DATA COLLECTION:
-• All filters are SCORING BONUSES, not requirements
-• Recording EVERYTHING - good, medium, and poor signals
-• Scoring each signal (0-100 scale)
-• Data quality: GOOD (70+), MEDIUM (50-70), POOR (<50)
+SIGNAL ANALYSIS:
+9 Filter Scoring System
+Multi-Timeframe Confirmation
+Wave Context Analysis
+Volume Profile Analysis
+Candle Pattern Detection
 
-9 FILTERS SCORED:
-1. Market Strength (0-1)
-2. Rejection Zone (0-1)  
-3. Volume Confirmation (0-1)
-4. Candle Patterns (0-1)
-5. Multi-TF Convergence (0-1)
-6. RSI Position (0-1)
-7. Risk/Reward (0-1)
-8. Rejection Strength (0-1)
-9. Pattern Confirmation (0-1)
+DATABASE: {DB_PATH}
 
-OUTPUT:
-Complete database for analysis
-Can later determine which filters actually matter
-
-FREQUENCY:
-Scanning every {SCAN_INTERVAL} seconds
-Collecting up to {self.max_signals} signals
-
-#DataCollection #RejectionAnalysis #PatternResearch
+#RejectionScanner #TradingSignals
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -2409,7 +2349,7 @@ Collecting up to {self.max_signals} signals
                     "text": message
                 })
                 
-            log.info("✅ Data collection startup message sent")
+            log.info("✅ Startup message sent")
                 
         except Exception as e:
             log.error(f"Telegram startup error: {e}")
@@ -2475,8 +2415,8 @@ Collecting up to {self.max_signals} signals
             log.error(f"Error getting pairs: {e}")
             return []
     
-    async def save_data_signal(self, signal: RejectionSignal) -> bool:
-        """Save data signal to database"""
+    async def save_signal(self, signal: RejectionSignal) -> bool:
+        """Save signal to database"""
         try:
             # Prepare data
             strength_flags = []
@@ -2505,9 +2445,8 @@ Collecting up to {self.max_signals} signals
             
             serialized_volume_clusters = [float(v) for v in signal.volume_clusters]
             
-            # FIXED: Database insert with correct number of columns (46 columns, 46 question marks)
             await self.db.execute("""
-                INSERT INTO rejection_data_collection (
+                INSERT INTO rejection_signals (
                     id, symbol, side, entry_price, stop_loss, take_profit,
                     wave_length, wave_maturity, expansion_speed, structure_type, context_side,
                     candle_speed, distance_ratio, ema_angle, volume_participation, 
@@ -2520,10 +2459,10 @@ Collecting up to {self.max_signals} signals
                     multi_tf_confirmation, convergence_score,
                     risk_reward, expected_move, timeframe_used,
                     conditions_met,
-                    filter_scores, total_score, passed_filters, failed_filters, data_quality,
+                    filter_scores, total_score, passed_filters, failed_filters,
                     status, created_at
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 
-                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 signal.signal_id,
                 signal.symbol,
@@ -2578,7 +2517,6 @@ Collecting up to {self.max_signals} signals
                 float(signal.total_score),
                 json.dumps(signal.passed_filters),
                 json.dumps(signal.failed_filters),
-                str(signal.data_quality),
                 
                 "PENDING",  # status
                 datetime.now().strftime('%Y-%m-%d %H:%M:%S')  # created_at
@@ -2586,20 +2524,20 @@ Collecting up to {self.max_signals} signals
             
             await self.db.commit()
             
-            self.signals_collected += 1
-            log.info(f"✅ Data collected: {signal.symbol} (Score: {signal.total_score:.1f}, Quality: {signal.data_quality})")
-            log.info(f"   Total collected: {self.signals_collected}/{self.max_signals}")
+            self.signals_generated += 1
+            log.info(f"✅ Signal saved: {signal.symbol} (Score: {signal.total_score:.1f})")
+            log.info(f"   Total generated: {self.signals_generated}/{self.max_signals}")
             
             return True
             
         except Exception as e:
-            log.error(f"Error saving data signal: {e}")
+            log.error(f"Error saving signal: {e}")
             import traceback
             log.error(f"Traceback: {traceback.format_exc()}")
             return False
     
     async def send_signal_to_telegram(self, signal: RejectionSignal) -> bool:
-        """Send PROFESSIONAL signal breakdown to Telegram - NO EMOJIS, CLEAN FORMAT"""
+        """Send PROFESSIONAL signal breakdown to Telegram"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             log.debug("Telegram credentials not set. Skipping signal notification.")
             return False
@@ -2663,7 +2601,7 @@ Risk/Reward: {signal.risk_reward:.2f}:1
 Expected Move: {signal.expected_move_pct:.2f}%
 
 ANALYSIS:
-Score: {signal.total_score:.1f}/100 ({signal.data_quality})
+Score: {signal.total_score:.1f}/100
 Rejection: {signal.rejection_type} at {signal.rejection_zone.zone_type}
 Rejection Strength: {signal.rejection_strength:.2f}
 Zone Strength: {signal.rejection_zone.strength:.2f}
@@ -2692,10 +2630,6 @@ Passed: {len(signal.passed_filters)}/{len(signal.filter_scores)} filters
             if volume_sr:
                 message += f"\nVOLUME CLUSTERS:\n{volume_sr}"
             
-            # Add warning for poor quality signals
-            if signal.data_quality == "POOR":
-                message += f"\n\nWARNING: Low quality signal - {', '.join(signal.failed_filters[:3])} failed"
-            
             # Add key indicator alerts
             if signal.indicators_3m.bb_squeeze:
                 message += "\nNOTE: Bollinger Band Squeeze detected"
@@ -2712,7 +2646,7 @@ Passed: {len(signal.passed_filters)}/{len(signal.filter_scores)} filters
                 })
                 
                 if response.status_code == 200:
-                    log.info(f"📤 Professional signal: {signal.symbol} (Score: {signal.total_score:.1f})")
+                    log.info(f"📤 Signal sent: {signal.symbol} (Score: {signal.total_score:.1f})")
                     return True
                 else:
                     log.error(f"Telegram error: {response.status_code} - {response.text[:100]}")
@@ -2730,17 +2664,16 @@ Passed: {len(signal.passed_filters)}/{len(signal.filter_scores)} filters
         """
         ULTRA-SIMPLE TP/SL MONITOR
         Only checks for TP or SL hits
-        No triggering logic - just TP/SL
         """
-        log.info("🎯 Starting simple TP/SL monitor...")
+        log.info("🎯 Starting TP/SL monitor...")
         
         while True:
             try:
                 # Get signals that haven't hit TP/SL yet
                 async with self.db.execute("""
                     SELECT id, symbol, side, entry_price, stop_loss, take_profit, 
-                           total_score, data_quality
-                    FROM rejection_data_collection 
+                           total_score
+                    FROM rejection_signals 
                     WHERE status NOT IN ('TP_HIT', 'SL_HIT')
                     ORDER BY created_at DESC
                     LIMIT 100
@@ -2748,7 +2681,7 @@ Passed: {len(signal.passed_filters)}/{len(signal.filter_scores)} filters
                     signals = await cursor.fetchall()
                 
                 for signal in signals:
-                    signal_id, symbol, side, entry, sl, tp, total_score, data_quality = signal
+                    signal_id, symbol, side, entry, sl, tp, total_score = signal
                     
                     try:
                         # Get current price
@@ -2778,7 +2711,7 @@ Passed: {len(signal.passed_filters)}/{len(signal.filter_scores)} filters
                             
                             # Update database
                             await self.db.execute("""
-                                UPDATE rejection_data_collection SET 
+                                UPDATE rejection_signals SET 
                                     status = ?,
                                     closed_at = CURRENT_TIMESTAMP,
                                     close_price = ?,
@@ -2792,7 +2725,7 @@ Passed: {len(signal.passed_filters)}/{len(signal.filter_scores)} filters
                             # Send Telegram notification
                             await self.send_tp_sl_update_to_telegram(
                                 signal_id, symbol, side, entry, sl, tp, 
-                                current_price, close_reason, total_score, data_quality, pnl_percent
+                                current_price, close_reason, total_score, pnl_percent
                             )
                             
                             log.info(f"✅ {symbol} {side} {close_reason} at {current_price:.4f} (PnL: {pnl_percent:+.2f}%)")
@@ -2811,9 +2744,8 @@ Passed: {len(signal.passed_filters)}/{len(signal.filter_scores)} filters
     async def send_tp_sl_update_to_telegram(self, signal_id: str, symbol: str, side: str, 
                                           entry: float, sl: float, tp: float, 
                                           current_price: float, close_reason: str,
-                                          total_score: float, data_quality: str,
-                                          pnl_percent: float):
-        """Send ONLY TP/SL updates to Telegram"""
+                                          total_score: float, pnl_percent: float):
+        """Send TP/SL updates to Telegram"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             return False
         
@@ -2829,7 +2761,7 @@ Passed: {len(signal.passed_filters)}/{len(signal.filter_scores)} filters
 {title}
 
 {symbol} | {side}
-Score: {total_score:.1f}/100 ({data_quality})
+Score: {total_score:.1f}/100
 Entry: {entry:.4f}
 Close: {current_price:.4f}
 Result: {result}
@@ -2855,21 +2787,21 @@ Time: {datetime.now().strftime('%H:%M:%S')}
             log.error(f"Telegram TP/SL error: {e}")
             return False
     
-    async def send_data_collection_update(self):
+    async def send_scanner_update(self):
         """Send periodic update to Telegram"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             return
         
         try:
             stats = self.scanner.get_daily_stats()
-            completion_pct = (self.signals_collected / self.max_signals) * 100
+            completion_pct = (self.signals_generated / self.max_signals) * 100
             
             message = f"""
-DATA COLLECTION UPDATE
+SCANNER UPDATE
 
-Progress: {self.signals_collected}/{self.max_signals} ({completion_pct:.1f}%)
+Progress: {self.signals_generated}/{self.max_signals} ({completion_pct:.1f}%)
 
-Collection Stats:
+Scanner Stats:
 Total Signals: {stats['rejections_found']}
 High Score (70+): {stats['high_score_signals']}
 Medium Score (50-70): {stats['medium_score_signals']}
@@ -2880,12 +2812,7 @@ Short Signals: {stats['short_rejections']}
 Current Cycle: #{self.scan_cycle}
 Scan Interval: {SCAN_INTERVAL}s
 
-Notes:
-Collecting ALL data points
-No filtering - only scoring
-Will analyze patterns after collection
-
-#DataCollection #ProgressUpdate #{'AlmostDone' if completion_pct > 80 else 'Collecting'}
+#ScannerUpdate #{'AlmostComplete' if completion_pct > 80 else 'Running'}
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -2895,26 +2822,26 @@ Will analyze patterns after collection
                     "text": message
                 })
                 
-            log.info(f"📤 Data collection update sent: {self.signals_collected}/{self.max_signals}")
+            log.info(f"📤 Scanner update sent: {self.signals_generated}/{self.max_signals}")
                 
         except Exception as e:
             log.error(f"Telegram update error: {e}")
     
-    async def high_freq_data_collection(self):
-        """Main data collection loop"""
-        log.info("🚀 Starting high-frequency data collection...")
+    async def high_freq_scanner(self):
+        """Main scanning loop"""
+        log.info("🚀 Starting high-frequency scanner...")
         
         while True:
             try:
-                if self.signals_collected >= self.max_signals:
-                    log.info(f"✅ Reached max signals ({self.max_signals}), stopping collection")
+                if self.signals_generated >= self.max_signals:
+                    log.info(f"✅ Reached max signals ({self.max_signals}), stopping scanner")
                     await self.send_final_stats()
                     break
                 
                 self.scan_cycle += 1
                 start_time = time.time()
                 
-                log.info(f"📊 Data collection cycle #{self.scan_cycle} ({self.signals_collected}/{self.max_signals})")
+                log.info(f"📊 Scanner cycle #{self.scan_cycle} ({self.signals_generated}/{self.max_signals})")
                 
                 pairs = await self.get_active_pairs()
                 
@@ -2923,7 +2850,7 @@ Will analyze patterns after collection
                     await asyncio.sleep(SCAN_INTERVAL)
                     continue
                 
-                log.info(f"Scanning {len(pairs)} pairs for data collection")
+                log.info(f"Scanning {len(pairs)} pairs")
                 
                 signals_found = 0
                 pairs_processed = 0
@@ -2941,9 +2868,9 @@ Will analyze patterns after collection
                         signal = self.scanner.generate_enhanced_rejection_signal(multi_tf_data, symbol)
                         
                         if signal:
-                            saved = await self.save_data_signal(signal)
+                            saved = await self.save_signal(signal)
                             if saved:
-                                # Send to Telegram - EVERY SIGNAL
+                                # Send to Telegram
                                 await self.send_signal_to_telegram(signal)
                                 signals_found += 1
                         
@@ -2955,44 +2882,44 @@ Will analyze patterns after collection
                         continue
                 
                 self.scanner.daily_stats["pairs_scanned"] += pairs_processed
-                self.scanner.daily_stats["signals_collected"] += signals_found
+                self.scanner.daily_stats["signals_generated"] += signals_found
                 
                 stats = self.scanner.get_daily_stats()
-                log.info(f"📈 Collection stats: Found {signals_found}, Total: {self.signals_collected}/{self.max_signals}")
+                log.info(f"📈 Scanner stats: Found {signals_found}, Total: {self.signals_generated}/{self.max_signals}")
                 log.info(f"   Score distribution: High {stats['high_score_signals']}, Medium {stats['medium_score_signals']}, Low {stats['low_score_signals']}")
                 
                 scan_duration = time.time() - start_time
-                log.info(f"Data collection #{self.scan_cycle}: {signals_found} signals in {scan_duration:.2f}s")
+                log.info(f"Scanner cycle #{self.scan_cycle}: {signals_found} signals in {scan_duration:.2f}s")
                 
                 # Send update every 50 cycles or every 100 signals
-                if self.scan_cycle % 50 == 0 or self.signals_collected % 100 == 0:
-                    await self.send_data_collection_update()
+                if self.scan_cycle % 50 == 0 or self.signals_generated % 100 == 0:
+                    await self.send_scanner_update()
                 
                 wait_time = max(0.1, SCAN_INTERVAL - scan_duration)
-                log.info(f"Next data collection in {wait_time:.1f}s...")
+                log.info(f"Next scan in {wait_time:.1f}s...")
                 await asyncio.sleep(wait_time)
                 
             except Exception as e:
-                log.error(f"Data collection loop error: {e}")
+                log.error(f"Scanner loop error: {e}")
                 await asyncio.sleep(10)
     
     async def run(self):
-        """Run the data collection scanner"""
+        """Run the scanner"""
         try:
             await self.initialize()
             
-            # Run data collection and SIMPLE TP/SL monitoring
+            # Run scanner and TP/SL monitoring
             await asyncio.gather(
-                self.high_freq_data_collection(),
-                self.simple_tp_sl_monitor()  # Simple TP/SL monitoring only
+                self.high_freq_scanner(),
+                self.simple_tp_sl_monitor()
             )
             
         except KeyboardInterrupt:
-            log.info("Data collection stopped by user")
+            log.info("Scanner stopped by user")
             await self.send_final_stats()
             
         except Exception as e:
-            log.error(f"Data collection crashed: {e}")
+            log.error(f"Scanner crashed: {e}")
             
         finally:
             await self.cleanup()
@@ -3005,56 +2932,35 @@ Will analyze patterns after collection
         
         try:
             stats = self.scanner.get_daily_stats()
-            completion_pct = (self.signals_collected / self.max_signals) * 100
+            completion_pct = (self.signals_generated / self.max_signals) * 100
             
             # Calculate average scores
             async with self.db.execute("""
-                SELECT total_score, data_quality FROM rejection_data_collection
+                SELECT total_score FROM rejection_signals
             """) as cursor:
                 rows = await cursor.fetchall()
                 total_scores = [row[0] for row in rows]
-                data_qualities = [row[1] for row in rows]
             
             avg_score = np.mean(total_scores) if total_scores else 0
-            good_count = data_qualities.count("GOOD")
-            medium_count = data_qualities.count("MEDIUM")
-            poor_count = data_qualities.count("POOR")
             
             message = f"""
-DATA COLLECTION COMPLETED
+SCANNER COMPLETED
 
 Final Statistics:
-Total Signals Collected: {self.signals_collected}
+Total Signals Generated: {self.signals_generated}
 Completion: {completion_pct:.1f}%
 Average Score: {avg_score:.1f}/100
-Data Quality Distribution:
-  GOOD (70+): {good_count} signals
-  MEDIUM (50-70): {medium_count} signals  
-  POOR (<50): {poor_count} signals
 
-Collection Details:
+Scanner Details:
 Scan Cycles: {self.scan_cycle}
 Pairs Scanned: {stats['pairs_scanned']}
 Long Signals: {stats['long_rejections']}
 Short Signals: {stats['short_rejections']}
 
-Next Steps:
-1. Analyze database to find patterns
-2. Determine which filters actually matter
-3. Calculate success rates for each filter
-4. Optimize trading system based on data
-
 Database Location:
 {DB_PATH}
 
-Data Analysis:
-You can now:
-• Query the database for patterns
-• Calculate correlation between filters and success
-• Find optimal filter combinations
-• Build data-driven trading rules
-
-#DataCollectionComplete #AnalysisReady #{'FullDataset' if completion_pct > 95 else 'PartialDataset'}
+#ScannerComplete #AnalysisReady
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -3064,7 +2970,7 @@ You can now:
                     "text": message
                 })
                 
-            log.info("✅ Final data collection stats sent to Telegram")
+            log.info("✅ Final scanner stats sent to Telegram")
                 
         except Exception as e:
             log.error(f"Final stats error: {e}")
@@ -3104,15 +3010,14 @@ async def start_http_server(scanner, port=8000):
             if path == '/':
                 stats = scanner.scanner.get_daily_stats()
                 response = json.dumps({
-                    "status": "data_collection",
-                    "scanner": "Rejection-Based Data Collection Scanner",
+                    "status": "rejection_scanner",
+                    "scanner": "Rejection-Based Trading Scanner",
                     "scan_cycle": scanner.scan_cycle,
-                    "signals_collected": scanner.signals_collected,
+                    "signals_generated": scanner.signals_generated,
                     "max_signals": scanner.max_signals,
-                    "completion_percent": (scanner.signals_collected / scanner.max_signals) * 100,
+                    "completion_percent": (scanner.signals_generated / scanner.max_signals) * 100,
                     "daily_stats": stats,
-                    "mode": "ALL filters are scoring bonuses, no filtering",
-                    "scoring": "0-100 scale, data quality: GOOD/MEDIUM/POOR"
+                    "mode": "9-filter scoring system"
                 }, indent=2)
             
             elif path == '/stats':
@@ -3123,8 +3028,8 @@ async def start_http_server(scanner, port=8000):
                     scanner.db.row_factory = aiosqlite.Row
                     async with scanner.db.execute("""
                         SELECT symbol, side, entry_price, zone_type, total_score, 
-                               data_quality, passed_filters, created_at
-                        FROM rejection_data_collection 
+                               passed_filters, created_at
+                        FROM rejection_signals 
                         ORDER BY created_at DESC 
                         LIMIT 20
                     """) as cursor:
@@ -3139,12 +3044,14 @@ async def start_http_server(scanner, port=8000):
                 if scanner.db:
                     scanner.db.row_factory = aiosqlite.Row
                     async with scanner.db.execute("""
-                        SELECT total_score, data_quality, COUNT(*) as count
-                        FROM rejection_data_collection 
-                        GROUP BY data_quality
+                        SELECT 
+                            COUNT(CASE WHEN total_score >= 70 THEN 1 END) as high,
+                            COUNT(CASE WHEN total_score >= 50 AND total_score < 70 THEN 1 END) as medium,
+                            COUNT(CASE WHEN total_score < 50 THEN 1 END) as low
+                        FROM rejection_signals
                     """) as cursor:
                         rows = await cursor.fetchall()
-                        score_dist = [dict(row) for row in rows]
+                        score_dist = dict(rows[0]) if rows else {}
                     
                     response = json.dumps({"score_distribution": score_dist}, indent=2)
                 else:
@@ -3171,9 +3078,9 @@ async def start_http_server(scanner, port=8000):
 
 # ================ ENTRY POINT ================
 async def main():
-    """Main function to run the data collection scanner"""
+    """Main function to run the scanner"""
     log.info("=" * 70)
-    log.info("🚀 STARTING DATA COLLECTION SCANNER")
+    log.info("🚀 STARTING REJECTION SCANNER")
     log.info("=" * 70)
     
     scanner = CompleteRejectionScanner()
