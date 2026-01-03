@@ -37,7 +37,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_PATH = "/app/data/romeopt_v2.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))  # Longer interval for HTF focus
-TOP_N = int(os.getenv("TOP_N", 60))
+TOP_N = int(os.getenv("TOP_N", 100))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 5))
 
 # ---------------- LOGGING ----------------
@@ -126,9 +126,8 @@ class ProbabilityScore:
     
     @property
     def acceptable(self) -> bool:
-        """Accept if total >= MIN_SCORE (no component minimums)"""
-        # You can change this number to whatever you want
-        MIN_SCORE = 1.5  # ← CHANGE THIS NUMBER ONLY
+        """Accept if total >= 0.5 (no component minimums)"""
+        MIN_SCORE = 0.5  # ← CHANGE THIS NUMBER TO ADJUST SENSITIVITY
         return self.total_score >= MIN_SCORE
 
 # ---------------- TELEGRAM ----------------
@@ -1329,8 +1328,21 @@ Entry Precision: {setup['probability']['entry_precision']:.2f}
     # FIX: Use safe_json_serialize for all JSON fields
     async with db_lock:
         await db_conn.execute("""
-            INSERT INTO signals VALUES (
-                NULL, :symbol, :timestamp, :side,
+            INSERT INTO signals (
+                symbol, timestamp, side,
+                htf_bias, htf_range_high, htf_range_low, htf_premium_discount,
+                htf_liquidity_zones_json, htf_structure_json,
+                liquidity_from_json, liquidity_to_json, has_clear_target,
+                sweep_type, swept_price, sweep_impulsive, sweep_strength,
+                structure_shift_type, structure_shift_confirmed, structure_description,
+                entry_type, entry_price, entry_low, entry_high, entry_aligns_htf, entry_reaction_confirmed,
+                sl_price, sl_invalidation_type, risk_amount, sl_distance_pct,
+                tp1_price, tp1_type, tp2_price, tp2_type, tp3_price, tp3_type,
+                prob_htf_alignment, prob_liquidity_quality, prob_sweep_strength,
+                prob_structure_clarity, prob_entry_precision, prob_total_score, prob_acceptable,
+                current_price, status, notes
+            ) VALUES (
+                :symbol, :timestamp, :side,
                 :htf_bias, :htf_range_high, :htf_range_low, :htf_premium_discount,
                 :htf_liquidity_zones, :htf_structure,
                 :liquidity_from, :liquidity_to, :has_clear_target,
@@ -1440,7 +1452,7 @@ async def health():
     return {"status": "healthy", "scanner": "ROMEOTPT v2"}
 
 @app.get("/setups")
-async def get_setups(limit: int = 20, min_score: float = 0.5):  # Changed from 3.5 to 0.5
+async def get_setups(limit: int = 20, min_score: float = 0.5):
     async with db_lock:
         async with db_conn.execute(
             """SELECT * FROM signals 
