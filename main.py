@@ -44,7 +44,7 @@ WAVE_CONFIG = {
     "rsi_wave_2_4_zone": (35, 50),     # RSI for Wave 2/4 pullbacks (LONG entries)
     "rsi_wave_3_zone": (60, 75),       # RSI for Wave 3 (strong momentum)
     "rsi_wave_5_zone": (70, 85),       # RSI for Wave 5 (with divergence)
-    "min_wave_confidence": 0.20,       # Minimum confidence for wave count
+    "min_wave_confidence": 0.65,       # Minimum confidence for wave count
     "max_wave_maturity": 0.85,         # Maximum wave maturity to trade
     "wave_3_volume_multiplier": 1.8,   # Volume should be 1.8x for Wave 3
     "corrective_volume_multiplier": 0.7, # Volume should be lower for corrections
