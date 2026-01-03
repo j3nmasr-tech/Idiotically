@@ -1756,7 +1756,7 @@ class ElliottWaveScannerSystem:
             os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
             self.db = await aiosqlite.connect(DB_PATH)
             
-            # Elliott Wave signals table
+            # Elliott Wave signals table - FIXED to match insertion code
             await self.db.execute("""
             CREATE TABLE IF NOT EXISTS elliott_wave_signals (
                 id TEXT PRIMARY KEY,
@@ -1983,9 +1983,12 @@ class ElliottWaveScannerSystem:
             return []
     
     async def save_signal(self, signal: ElliottWaveSignal) -> bool:
-        """Save signal to database"""
+        """Save signal to database - FIXED VERSION"""
         try:
-            # Insert signal
+            # Debug log
+            log.debug(f"Saving signal for {signal.symbol}: wave type = {signal.wave_context.wave_type}")
+            
+            # Insert signal - FIXED: 26 columns with 26 values
             await self.db.execute("""
                 INSERT INTO elliott_wave_signals (
                     id, symbol, side, entry_price, stop_loss, take_profit,
@@ -1994,7 +1997,7 @@ class ElliottWaveScannerSystem:
                     zone_type, rejection_strength, rsi_position, trigger_type, confirmation_candle,
                     risk_reward, expected_move, fibonacci_target, timeframe_used,
                     elliott_rules_met
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 signal.signal_id,
                 signal.symbol,
@@ -2021,7 +2024,7 @@ class ElliottWaveScannerSystem:
                 signal.expected_move_pct,
                 signal.fibonacci_target,
                 signal.timeframe_used,
-                json.dumps(signal.elliott_rules_met)
+                json.dumps(signal.elliott_rules_met) if signal.elliott_rules_met else "[]"
             ))
             
             await self.db.commit()
