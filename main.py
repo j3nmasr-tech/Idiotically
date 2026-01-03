@@ -4,8 +4,8 @@
 """
 🔥 ELLIOTT WAVE HIGH-FREQUENCY SCALPER
 Professional discretionary Elliott Wave trading system
-موجات اليوت + القوة + الفوليوم + المؤشرات + الرفض
-TRADER MINDSET: Wave-based scalper (7-10 trades in hours)
+Wave counting + Wave strength + Volume confirmation + Rejection entries
+TRADER MINDSET: Wave-based reaction trader
 """
 
 import os
@@ -520,6 +520,62 @@ class ElliottWaveScanner:
             
             # Extended wave if move is > 10% in 30 periods
             return price_change > 10.0
+            
+        except Exception as e:
+            return False
+    
+    def _check_wave_divergence(self, df: pd.DataFrame, wave_type: str) -> bool:
+        """Check for divergence specific to wave type"""
+        try:
+            if len(df) < 30:
+                return False
+            
+            # Only check divergence for Wave 5 specifically
+            if wave_type == "IMPULSE_5":
+                return self._check_wave_5_divergence(df)
+            
+            # For other wave types, use general divergence check
+            return self._check_rsi_divergence(df)
+            
+        except Exception as e:
+            return False
+    
+    def _check_wave_5_divergence(self, df: pd.DataFrame) -> bool:
+        """Check for Wave 5 specific divergence"""
+        try:
+            if len(df) < 40:
+                return False
+            
+            # Get price and RSI data
+            prices = df['close'].values[-30:]
+            rsi_values = self.calculate_rsi(df['close']).values[-30:]
+            
+            # Find peaks for bullish trend (Wave 5 in uptrend)
+            peaks = []
+            for i in range(5, len(prices) - 5):
+                if prices[i] == prices[i-5:i+6].max():
+                    peaks.append((i, prices[i], rsi_values[i]))
+            
+            # Need at least 2 peaks to check divergence
+            if len(peaks) < 2:
+                return False
+            
+            # Get last two peaks
+            peak1 = peaks[-2]
+            peak2 = peaks[-1]
+            
+            # Classic Wave 5 divergence: Price makes higher high, RSI makes lower high
+            if peak2[1] > peak1[1] and peak2[2] < peak1[2]:
+                return True
+            
+            # Also check volume divergence (decreasing volume in Wave 5)
+            recent_volume = df['volume'].values[-10:].mean()
+            previous_volume = df['volume'].values[-20:-10].mean()
+            
+            if recent_volume < previous_volume * 0.8:  # Volume decreasing
+                return True
+            
+            return False
             
         except Exception as e:
             return False
