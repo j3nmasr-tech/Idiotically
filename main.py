@@ -1484,6 +1484,9 @@ class RejectionScanner:
         # Initialize database
         await self._init_database()
         
+        # Upgrade database schema if needed
+        await self._upgrade_database()
+        
         # Initialize exchange
         await self._init_exchange()
         
@@ -1554,24 +1557,24 @@ class RejectionScanner:
                 short_rejections INTEGER,
                 no_strength_count INTEGER,
                 no_zone_count INTEGER,
-                filtered_by_trigger INTEGER,
-                filtered_by_wave INTEGER,
-                filtered_by_strength INTEGER,
-                filtered_by_zone INTEGER,
-                filtered_by_rsi INTEGER,
-                filtered_by_rejection_strength INTEGER,
-                filtered_by_volume INTEGER,
-                filtered_by_context INTEGER,
-                filtered_by_risk INTEGER,
-                filtered_by_rr INTEGER,
-                passed_all_filters INTEGER,
+                filtered_by_trigger INTEGER DEFAULT 0,
+                filtered_by_wave INTEGER DEFAULT 0,
+                filtered_by_strength INTEGER DEFAULT 0,
+                filtered_by_zone INTEGER DEFAULT 0,
+                filtered_by_rsi INTEGER DEFAULT 0,
+                filtered_by_rejection_strength INTEGER DEFAULT 0,
+                filtered_by_volume INTEGER DEFAULT 0,
+                filtered_by_context INTEGER DEFAULT 0,
+                filtered_by_risk INTEGER DEFAULT 0,
+                filtered_by_rr INTEGER DEFAULT 0,
+                passed_all_filters INTEGER DEFAULT 0,
                 win_rate REAL,
                 avg_win REAL,
                 avg_loss REAL,
                 total_pnl REAL,
-                winners INTEGER,
-                losers INTEGER,
-                filter_efficiency REAL
+                winners INTEGER DEFAULT 0,
+                losers INTEGER DEFAULT 0,
+                filter_efficiency REAL DEFAULT 0
             )
             """)
             
@@ -1595,6 +1598,61 @@ class RejectionScanner:
         except Exception as e:
             log.error(f"Database error: {e}")
             raise
+    
+    async def _upgrade_database(self):
+        """Upgrade database schema if needed"""
+        try:
+            # Check if passed_filters column exists
+            async with self.db.execute("PRAGMA table_info(rejection_signals)") as cursor:
+                columns = await cursor.fetchall()
+                column_names = [col[1] for col in columns]
+            
+            # Add missing columns if they don't exist
+            columns_to_add = [
+                ('passed_filters', 'INTEGER DEFAULT 0'),
+                ('context_side', 'TEXT DEFAULT "NEUTRAL"'),
+                ('winner', 'INTEGER DEFAULT 0')
+            ]
+            
+            for column_name, column_type in columns_to_add:
+                if column_name not in column_names:
+                    log.info(f"🔄 Adding column {column_name} to rejection_signals table")
+                    await self.db.execute(f"ALTER TABLE rejection_signals ADD COLUMN {column_name} {column_type}")
+            
+            # Check performance_daily table
+            async with self.db.execute("PRAGMA table_info(performance_daily)") as cursor:
+                columns = await cursor.fetchall()
+                column_names = [col[1] for col in columns]
+            
+            # Add filter statistics columns to performance_daily
+            filter_columns = [
+                ('filtered_by_trigger', 'INTEGER DEFAULT 0'),
+                ('filtered_by_wave', 'INTEGER DEFAULT 0'),
+                ('filtered_by_strength', 'INTEGER DEFAULT 0'),
+                ('filtered_by_zone', 'INTEGER DEFAULT 0'),
+                ('filtered_by_rsi', 'INTEGER DEFAULT 0'),
+                ('filtered_by_rejection_strength', 'INTEGER DEFAULT 0'),
+                ('filtered_by_volume', 'INTEGER DEFAULT 0'),
+                ('filtered_by_context', 'INTEGER DEFAULT 0'),
+                ('filtered_by_risk', 'INTEGER DEFAULT 0'),
+                ('filtered_by_rr', 'INTEGER DEFAULT 0'),
+                ('passed_all_filters', 'INTEGER DEFAULT 0'),
+                ('winners', 'INTEGER DEFAULT 0'),
+                ('losers', 'INTEGER DEFAULT 0'),
+                ('filter_efficiency', 'REAL DEFAULT 0')
+            ]
+            
+            for column_name, column_type in filter_columns:
+                if column_name not in column_names:
+                    log.info(f"🔄 Adding column {column_name} to performance_daily table")
+                    await self.db.execute(f"ALTER TABLE performance_daily ADD COLUMN {column_name} {column_type}")
+            
+            await self.db.commit()
+            log.info("✅ Database schema upgraded successfully")
+            
+        except Exception as e:
+            log.error(f"Database upgrade error: {e}")
+            # Continue anyway, the app will work with partial functionality
     
     async def _init_exchange(self):
         """Initialize exchange connection"""
@@ -2074,14 +2132,15 @@ class RejectionScanner:
             log.error(f"Telegram error: {e}")
     
     async def monitor_positions(self):
-        """Monitor and close positions with winner tracking"""
+        """Monitor and close positions with winner tracking - FIXED VERSION"""
         log.info("👀 Starting position monitoring with WINNER tracking...")
         
         while True:
             try:
                 # Get ALL open positions (both pending and triggered)
+                # FIXED: Use simple SELECT without passed_filters in WHERE clause
                 async with self.db.execute("""
-                    SELECT id, symbol, side, entry_price, stop_loss, take_profit, status, passed_filters
+                    SELECT id, symbol, side, entry_price, stop_loss, take_profit, status
                     FROM rejection_signals 
                     WHERE status IN ('PENDING', 'TRIGGERED')
                 """) as cursor:
@@ -2090,7 +2149,7 @@ class RejectionScanner:
                 if positions:
                     log.debug(f"📊 Monitoring {len(positions)} open positions")
                 
-                for pos_id, symbol, side, entry, sl, tp, status, passed_filters in positions:
+                for pos_id, symbol, side, entry, sl, tp, status in positions:
                     try:
                         # Get current price
                         ticker = await self.exchange.fetch_ticker(symbol)
@@ -2142,12 +2201,13 @@ class RejectionScanner:
                                 pnl_percent = ((entry - current_price) / entry) * 100
                         
                         if close_reason:
-                            # Get risk_reward from database
+                            # Get risk_reward and passed_filters from database
                             async with self.db.execute("""
-                                SELECT risk_reward FROM rejection_signals WHERE id = ?
+                                SELECT risk_reward, passed_filters FROM rejection_signals WHERE id = ?
                             """, (pos_id,)) as cursor:
                                 row = await cursor.fetchone()
                                 risk_reward = row[0] if row else 0
+                                passed_filters = row[1] if row and row[1] is not None else 0
                             
                             # Determine if it's a winner
                             is_winner = pnl_percent > 0
@@ -2405,9 +2465,9 @@ class RejectionScanner:
 
 <b>🧠 فلسفة التاجر المحققة:</b>
 ‎الطول الموجي ← السياق
-‎القوة والفوليوم ← القرار
-‎الرفض ← الزناد
-‎الفلاتر ← الفائزون فقط
+القوة والفوليوم ← القرار
+الرفض ← الزناد
+الفلاتر ← الفائزون فقط
 
 <b>✅ تم الالتزام بـ:</b>
 ‎• الدخول عند الرفض فقط
