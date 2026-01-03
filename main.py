@@ -30,11 +30,11 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_PATH = "/app/data/wave_momentum.db"
 
-# Asset selection
-MAX_PRICE_USDT = 25.0  # Focus on low-price coins ($0-$5)
-MIN_VOLUME_USD = 250000  # $250K minimum (low efficiency, not dead)
-MAX_VOLUME_USD = 10000000  # $10M maximum (avoid over-efficient)
-PRICE_CHANGE_THRESHOLD = 0.15  # 15% minimum daily range for inefficiency
+# Asset selection - BROADENED for testing
+MAX_PRICE_USDT = 20.0  # Focus on low-price coins ($0-$10) - increased from $5
+MIN_VOLUME_USD = 100000  # $100K minimum (reduced for more opportunities)
+MAX_VOLUME_USD = 20000000  # $20M maximum (increased)
+PRICE_CHANGE_THRESHOLD = 0.10  # 10% minimum daily range for inefficiency
 
 # Timeframes for wave analysis
 class TimeframeRole(Enum):
@@ -217,15 +217,25 @@ logging.basicConfig(
 )
 log = logging.getLogger("wave_momentum")
 
-# ================ ASSET SELECTION ENGINE ================
-class AssetSelector:
-    """Select low-price, low-efficiency altcoins"""
+# ================ WAVE-MOMENTUM ENGINE ================
+class WaveMomentumTrader:
+    """Core trading engine mimicking human wave trader"""
     
     def __init__(self):
-        self.blacklist = set()
-        
-    async def filter_assets(self, exchange, all_symbols: List[str]) -> List[str]:
-        """Filter assets based on price and efficiency"""
+        self.active_signals = {}  # symbol: signal_id
+        self.trade_stats = {
+            "assets_scanned": 0,
+            "phase_skipped": 0,
+            "wave_structure_skipped": 0,
+            "transition_skipped": 0,
+            "quality_signals": 0,
+            "impulse_entries": 0
+        }
+    
+    # ========== ASSET SELECTION ==========
+    
+    async def select_wave_assets(self, exchange, all_symbols: List[str]) -> List[str]:
+        """Select assets suitable for wave trading"""
         selected = []
         
         for symbol in all_symbols:
@@ -236,56 +246,32 @@ class AssetSelector:
                 # Get ticker data
                 ticker = await exchange.fetch_ticker(symbol)
                 
-                # Price filter (low-price only)
+                # Price filter (low-price focus)
                 price = ticker['last']
                 if price > MAX_PRICE_USDT:
                     continue
                 
                 # Volume filter (not dead, not over-efficient)
-                volume = ticker['quoteVolume']
+                volume = ticker.get('quoteVolume', 0)
                 if volume < MIN_VOLUME_USD or volume > MAX_VOLUME_USD:
                     continue
                 
-                # Efficiency filter (needs volatility)
-                high = ticker['high']
-                low = ticker['low']
-                if high > 0:
-                    daily_range = (high - low) / high
-                    if daily_range < PRICE_CHANGE_THRESHOLD:
-                        continue  # Too efficient/stable
-                
-                # Spread filter (liquidity)
-                bid = ticker['bid']
-                ask = ticker['ask']
-                if bid > 0 and ask > 0:
-                    spread = (ask - bid) / bid
-                    if spread > 0.002:  # 0.2% max spread
-                        continue
+                # Skip if price is too low (potential illiquidity)
+                if price < 0.0001:
+                    continue
                 
                 selected.append(symbol)
+                
+                # Limit to top 100 for performance
+                if len(selected) >= 100:
+                    break
                 
             except Exception as e:
                 log.debug(f"Asset filter error {symbol}: {e}")
                 continue
         
-        log.info(f"✅ Selected {len(selected)} low-price altcoins")
+        log.info(f"✅ Selected {len(selected)} wave-trading assets")
         return selected
-
-# ================ WAVE-MOMENTUM ENGINE ================
-class WaveMomentumTrader:
-    """Core trading engine mimicking human wave trader"""
-    
-    def __init__(self):
-        self.asset_selector = AssetSelector()
-        self.active_signals = {}  # symbol: signal_id
-        self.trade_stats = {
-            "assets_scanned": 0,
-            "phase_skipped": 0,
-            "wave_structure_skipped": 0,
-            "transition_skipped": 0,
-            "quality_signals": 0,
-            "impulse_entries": 0
-        }
     
     # ========== HIGH TIMEFRAME: PERMISSION ONLY ==========
     
@@ -1090,7 +1076,7 @@ class WaveMomentumScanner:
         log.info("TRADER ROLE: Discretionary wave-energy specialist")
         log.info("SPECIALTY: First expansion wave after correction")
         log.info("PHILOSOPHY: Trade energy transitions, not predictions")
-        log.info("ASSET FOCUS: Low-price altcoins ($0-$5), inefficient markets")
+        log.info("ASSET FOCUS: Low-price altcoins ($0-$10), inefficient markets")
         log.info("TIMEFRAMES: 1H (permission), 15M (wave), 5M (entry)")
         log.info("ENTRY RULE: First impulse candle ONLY after correction")
         log.info("QUALITY FILTER: If unclear → NO SIGNAL")
@@ -1236,7 +1222,7 @@ class WaveMomentumScanner:
 <b>🎯 ASSET SELECTION:</b>
 • Price: ${MAX_PRICE_USDT} maximum
 • Volume: ${MIN_VOLUME_USD:,.0f} - ${MAX_VOLUME_USD:,.0f}
-• Inefficiency: >{PRICE_CHANGE_THRESHOLD*100:.0f}% daily range
+• Focus on low-price, inefficient altcoins
 
 <b>🚫 FORBIDDEN:</b>
 • Trading every breakout
@@ -1306,8 +1292,8 @@ I exit during impulse continuation, not at reversals.
             markets = await self.exchange.fetch_markets()
             all_symbols = [m['symbol'] for m in markets if m['quote'] == 'USDT']
             
-            # Filter using AssetSelector
-            selected = await self.asset_selector.filter_assets(self.exchange, all_symbols)
+            # Filter using trader's asset selection
+            selected = await self.trader.select_wave_assets(self.exchange, all_symbols)
             
             log.info(f"🌊 Selected {len(selected)} wave-trading assets")
             return selected
@@ -1628,6 +1614,13 @@ I exit during impulse continuation, not at reversals.
         """Main wave scanning loop"""
         log.info("🚀 Starting wave-momentum scanning...")
         
+        # FALLBACK ASSETS in case selection fails
+        FALLBACK_SYMBOLS = [
+            "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT",
+            "ADA/USDT", "AVAX/USDT", "DOT/USDT", "DOGE/USDT", "MATIC/USDT",
+            "SHIB/USDT", "TRX/USDT", "LINK/USDT", "UNI/USDT", "ATOM/USDT"
+        ]
+        
         while True:
             try:
                 self.scan_cycle += 1
@@ -1638,17 +1631,17 @@ I exit during impulse continuation, not at reversals.
                 # Get wave assets
                 assets = await self.get_wave_assets()
                 
+                # Use fallback if no assets found
                 if not assets:
-                    log.warning("No wave assets found")
-                    await asyncio.sleep(10)
-                    continue
+                    log.warning("No wave assets found, using fallback symbols")
+                    assets = FALLBACK_SYMBOLS
                 
-                log.info(f"Scanning {len(assets)} wave assets for energy transitions")
+                log.info(f"Scanning {len(assets)} assets for wave opportunities")
                 
                 signals_found = 0
                 
                 # Scan for wave opportunities
-                for symbol in assets[:50]:  # Limit to 50 for speed
+                for symbol in assets[:30]:  # Limit to 30 for speed
                     try:
                         # Skip if already has active signal
                         if symbol in self.trader.active_signals:
@@ -1656,6 +1649,11 @@ I exit during impulse continuation, not at reversals.
                         
                         # Fetch multi-timeframe data
                         multi_tf_data = await self.fetch_timeframe_data(symbol)
+                        
+                        # Check if we have all required timeframes
+                        required_tfs = ["1H", "15M", "5M"]
+                        if not all(tf in multi_tf_data for tf in required_tfs):
+                            continue
                         
                         # Generate wave signal
                         signal = self.trader.generate_wave_signal(multi_tf_data, symbol)
