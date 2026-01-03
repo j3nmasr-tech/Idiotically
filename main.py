@@ -126,13 +126,10 @@ class ProbabilityScore:
     
     @property
     def acceptable(self) -> bool:
-        """Accept if total >= 0.5 and all components > 0.2"""
-        return (self.total_score >= 0.5 and 
-                all([self.htf_alignment >= 0.2,
-                     self.liquidity_quality >= 0.2,
-                     self.sweep_strength >= 0.2,
-                     self.structure_clarity >= 0.2,
-                     self.entry_precision >= 0.2]))
+        """Accept if total >= MIN_SCORE (no component minimums)"""
+        # You can change this number to whatever you want
+        MIN_SCORE = 1.5  # ← CHANGE THIS NUMBER ONLY
+        return self.total_score >= MIN_SCORE
 
 # ---------------- TELEGRAM ----------------
 async def send_telegram(msg: str, parse_mode="HTML"):
@@ -1208,7 +1205,7 @@ async def scan_symbol_full(exchange, symbol: str) -> Optional[Dict]:
         log.debug(f"  {symbol}: Probability too low ({probability.total_score:.2f}/5)")
         return None
     
-    log.info(f"✅ {symbol}: A+ Setup detected! Score: {probability.total_score:.2f}/5")
+    log.info(f"✅ {symbol}: Setup detected! Score: {probability.total_score:.2f}/5")
     
     # --- COMPILE FINAL SETUP ---
     setup = {
@@ -1292,7 +1289,7 @@ async def send_setup_alert(setup: Dict):
     
     # Format message
     msg = f"""
-🔥 <b>ROMEOTPT A+ SETUP CONFIRMED</b>
+🔥 <b>ROMEOTPT SETUP CONFIRMED</b>
 
 <b>Symbol:</b> {setup['symbol']}
 <b>Side:</b> {setup['side']}
@@ -1426,7 +1423,7 @@ async def scanner_main(exchange):
                     continue
             
             if setups_found > 0:
-                log.info(f"✅ Found {setups_found} A+ setups")
+                log.info(f"✅ Found {setups_found} setups")
             else:
                 log.info("⏳ No setups found this scan")
             
@@ -1443,7 +1440,7 @@ async def health():
     return {"status": "healthy", "scanner": "ROMEOTPT v2"}
 
 @app.get("/setups")
-async def get_setups(limit: int = 20, min_score: float = 3.5):
+async def get_setups(limit: int = 20, min_score: float = 0.5):  # Changed from 3.5 to 0.5
     async with db_lock:
         async with db_conn.execute(
             """SELECT * FROM signals 
