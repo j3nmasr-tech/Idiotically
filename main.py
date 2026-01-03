@@ -2,11 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-🌊 WAVE-MOMENTUM TRADING SYSTEM
-Professional discretionary system focused on energy transitions
-First expansion wave after correction ONLY
-Low-price altcoins + Multi-timeframe wave logic
-TRADER MINDSET: Wave-energy specialist, energy transition hunter, QUALITY ONLY
+🎯 TRADER'S CORE LOGIC SYSTEM
+Professional discretionary system following human trader logic
+DIRECTION FIRST → IMPULSE CONFIRMATION
+TRADER MINDSET: Energy hunter, direction setter, impulse timer
 """
 
 import os
@@ -19,523 +18,460 @@ import httpx
 import ccxt.async_support as ccxt
 import pandas as pd
 import numpy as np
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
-from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple, Any, Set
+from dataclasses import dataclass, field
 import json
 from enum import Enum
+import traceback
 
-# ================ CORE CONFIG ================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-DB_PATH = "/app/data/wave_momentum.db"
+# ================ CONFIGURATION ================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+DB_PATH = "/app/data/trader_core.db"
 
-# Asset selection - BROADENED for testing
-MAX_PRICE_USDT = 20.0  # Focus on low-price coins ($0-$10) - increased from $5
-MIN_VOLUME_USD = 100000  # $100K minimum (reduced for more opportunities)
-MAX_VOLUME_USD = 20000000  # $20M maximum (increased)
-PRICE_CHANGE_THRESHOLD = 0.10  # 10% minimum daily range for inefficiency
+# Exchange configuration
+EXCHANGE_NAME = "okx"  # Change to binance, kucoin, etc.
+API_KEY = os.getenv("EXCHANGE_API_KEY", "")
+API_SECRET = os.getenv("EXCHANGE_API_SECRET", "")
+PASSPHRASE = os.getenv("EXCHANGE_PASSPHRASE", "")
 
-# Timeframes for wave analysis
-class TimeframeRole(Enum):
-    PERMISSION = "PERMISSION"  # 1H/4H - Direction only
-    WAVE_ID = "WAVE_ID"        # 15M/30M - Wave structure
-    EXECUTION = "EXECUTION"    # 3M/5M - Entry timing
+# Asset selection
+MAX_PRICE_USDT = 50.0
+MIN_VOLUME_USD = 50000
+MAX_VOLUME_USD = 50000000
 
+# Timeframe configuration
 TIMEFRAMES = {
-    "1H": {"tf": "1h", "role": TimeframeRole.PERMISSION, "candles": 50},
-    "15M": {"tf": "15m", "role": TimeframeRole.WAVE_ID, "candles": 75},
-    "5M": {"tf": "5m", "role": TimeframeRole.EXECUTION, "candles": 50}
+    "4H": {"tf": "4h", "candles": 100, "weight": 1.3},
+    "1H": {"tf": "1h", "candles": 80, "weight": 1.2},
+    "15M": {"tf": "15m", "candles": 60, "weight": 1.0},
+    "5M": {"tf": "5m", "candles": 40, "weight": 0.8}
 }
 
+# Trading parameters
+MIN_CONFIDENCE = 0.55
+MIN_RISK_REWARD = 1.8
+MAX_POSITION_SIZE = 0.1  # 10% of portfolio per trade
+STOP_LOSS_PCT = 0.02  # 2% initial stop loss
+TAKE_PROFIT_PCT = 0.04  # 4% initial take profit
+TRAILING_STOP_ACTIVATE = 0.015  # 1.5% profit activates trailing
+TRAILING_STOP_DISTANCE = 0.01  # 1% trailing distance
+
 # Wave parameters
-MIN_CORRECTION_CANDLES = 3  # Minimum correction duration
-MAX_CORRECTION_CANDLES = 20  # Maximum correction duration
-MIN_IMPULSE_CANDLES = 1  # First impulse candle to trigger
-MAX_IMPULSE_AGE = 3  # Max candles since first impulse
+WAVE_READY_THRESHOLD = 0.4
+STRENGTH_THRESHOLD = 0.4
+VOLUME_THRESHOLD = 1.3
 
-# Entry parameters
-MAX_STOP_PCT = 1.5  # 1.5% max stop (tight invalidation)
-TARGET_RANGE_PCT = (2.0, 6.0)  # 2-6% target range
-MIN_RISK_REWARD = 2.0  # 2:1 minimum
-
-# Strength thresholds (strict)
-MIN_CANDLE_SPEED = 0.7  # Fast candles only
-MIN_BODY_DOMINANCE = 0.6  # Body must dominate wick
-MIN_VOLUME_EXPANSION = 1.8  # 80% volume increase on impulse
-
-# RSI zones (confirmation only)
+# RSI parameters
 RSI_PERIOD = 14
-RSI_MOMENTUM_ZONE = (45, 55)  # Middle zone for transitions
+RSI_OVERBOUGHT = 70
+RSI_OVERSOLD = 30
 
-# EMA structure
-EMA_PERIODS = [9, 21]  # No slow EMA, no crossovers
-EMA_RESPECT_DISTANCE = 0.005  # 0.5% distance for structure respect
+# EMA parameters
+EMA_PERIODS = [9, 21, 50]
 
-# ================ WAVE DATA STRUCTURES ================
+# Scanning
+SCAN_INTERVAL = 10  # seconds
+MAX_SYMBOLS_PER_SCAN = 40
+MAX_CONCURRENT_FETCHES = 5
+
+# Risk management
+MAX_OPEN_POSITIONS = 5
+MAX_DAILY_LOSS_PCT = 3.0  # 3% max daily loss
+COOLDOWN_AFTER_LOSS = 300  # 5 minutes after loss
+
+# ================ DATA STRUCTURES ================
 @dataclass
-class MarketPhase:
-    """Market phase detection (HTF only)"""
-    phase: str  # IMPULSE_UP, IMPULSE_DOWN, CORRECTION_UP, CORRECTION_DOWN, COMPRESSION
-    confidence: float  # 0-1
-    bias_allowed: Optional[str]  # LONG, SHORT, SKIP
-    wave_count: Optional[int]  # Simple wave count in current phase
+class MarketDirection:
+    """Direction analysis across timeframes"""
+    primary_bias: str  # STRONG_UP, UP, NEUTRAL, DOWN, STRONG_DOWN
+    confidence: float
+    timeframe_alignment: Dict[str, str]
+    dominant_wave: str
+    alignment_score: float
     
     @property
-    def is_correction_ending(self) -> bool:
-        """Check if correction phase is mature enough to end"""
-        return self.phase.startswith("CORRECTION") and self.confidence > 0.7
-
-@dataclass
-class WaveStructure:
-    """Wave structure analysis (MTF)"""
-    wave_type: str  # IMPULSE_START, CORRECTION_COMPLETE, CORRECTION_MATURING, UNCLEAR
-    wave_length: float  # 0-1 (short to extended)
-    symmetry_score: float  # 0-1 (how symmetrical the wave is)
-    compression_level: float  # 0-1 (low to high compression)
-    expansion_potential: float  # 0-1 (potential for expansion)
-    
-    # Behavioral metrics
-    candle_speed_trend: float  # -1 to 1 (slowing to accelerating)
-    body_size_trend: float  # -1 to 1 (shrinking to expanding)
-    volume_trend: float  # -1 to 1 (declining to expanding)
-    momentum_trend: float  # -1 to 1 (cooling to heating)
+    def should_trade(self) -> bool:
+        return self.primary_bias in ["STRONG_UP", "UP", "DOWN", "STRONG_DOWN"] and self.confidence >= MIN_CONFIDENCE
     
     @property
-    def is_valid_setup(self) -> bool:
-        """Check if wave structure is valid for entry"""
-        if self.wave_type != "CORRECTION_COMPLETE":
-            return False
-        
-        # Must show correction behavior
-        if not (self.candle_speed_trend < 0 and 
-                self.body_size_trend < 0 and 
-                self.volume_trend < 0 and
-                self.momentum_trend < 0):
-            return False
-        
-        # But not too mature (avoid exhaustion)
-        if self.compression_level > 0.8:
-            return False
-            
-        return True
-
-@dataclass
-class EnergyTransition:
-    """Energy transition detection (LTF)"""
-    has_transition: bool
-    transition_type: Optional[str]  # CORRECTION_TO_IMPULSE, IMPULSE_ACCELERATION
-    first_impulse_candle_index: Optional[int]  # Index of first impulse candle
-    candle_dominance: float  # 0-1 (body dominance in impulse)
-    volume_expansion: float  # 0-1 (volume increase ratio)
-    momentum_turn: bool  # RSI turned with price
-    ema_structure_hold: bool  # EMA held during correction
-    
-    # Detailed metrics
-    impulse_candle_speed: float
-    impulse_body_ratio: float
-    correction_candle_speed: float
-    correction_body_ratio: float
+    def is_long(self) -> bool:
+        return self.primary_bias in ["STRONG_UP", "UP"]
     
     @property
-    def is_valid_entry(self) -> bool:
-        """Strict entry validation"""
-        if not self.has_transition:
-            return False
-            
-        if self.transition_type != "CORRECTION_TO_IMPULSE":
-            return False
-            
-        # All conditions must be met (STRICT)
-        conditions = [
-            self.candle_dominance >= MIN_BODY_DOMINANCE,
-            self.volume_expansion >= MIN_VOLUME_EXPANSION,
-            self.momentum_turn == True,
-            self.ema_structure_hold == True,
-            self.impulse_candle_speed >= MIN_CANDLE_SPEED,
-            self.impulse_body_ratio > self.correction_body_ratio * 1.5  # Significant increase
-        ]
-        
-        return all(conditions)
+    def is_short(self) -> bool:
+        return self.primary_bias in ["STRONG_DOWN", "DOWN"]
 
 @dataclass
-class WaveSignal:
-    """Complete wave-momentum signal"""
+class WaveEnergy:
+    """Wave length and energy analysis"""
+    wave_type: str
+    wave_stage: str
+    wave_length_score: float
+    energy_level: float
+    compression_ratio: float
+    momentum_gradient: float
+    volume_profile: float
+    candle_consistency: float
+    
+    @property
+    def ready_for_move(self) -> bool:
+        return all([
+            self.energy_level >= WAVE_READY_THRESHOLD,
+            self.compression_ratio >= 0.3,
+            self.momentum_gradient > -0.5
+        ])
+
+@dataclass
+class StrengthVolume:
+    """Strength and volume analysis"""
+    strength_score: float
+    volume_score: float
+    market_participation: float
+    body_dominance: float
+    volume_expansion: float
+    bid_ask_balance: float
+    
+    @property
+    def is_confirmed(self) -> bool:
+        return all([
+            self.strength_score >= STRENGTH_THRESHOLD,
+            self.volume_score >= VOLUME_THRESHOLD / 3,
+            self.body_dominance >= 0.4
+        ])
+
+@dataclass
+class IndicatorAlignment:
+    """Indicator analysis"""
+    rsi_position: float
+    rsi_momentum: float
+    ema_alignment: float
+    volume_trend: float
+    ema_order: str
+    price_vs_ema: str
+    macd_signal: str
+    
+    @property
+    def supports_long(self) -> bool:
+        return all([
+            self.rsi_position <= RSI_OVERBOUGHT - 10,
+            self.rsi_momentum >= -0.3,
+            self.ema_order in ["BULLISH", "MIXED"],
+            self.macd_signal in ["BULLISH", "NEUTRAL"]
+        ])
+    
+    @property
+    def supports_short(self) -> bool:
+        return all([
+            self.rsi_position >= RSI_OVERSOLD + 10,
+            self.rsi_momentum <= 0.3,
+            self.ema_order in ["BEARISH", "MIXED"],
+            self.macd_signal in ["BEARISH", "NEUTRAL"]
+        ])
+
+@dataclass
+class TradeSignal:
+    """Complete trade signal"""
     signal_id: str
     symbol: str
-    side: str  # LONG, SHORT
+    direction: str
+    timestamp: float
     
-    # Price levels
+    # Analysis components
+    market_direction: MarketDirection
+    wave_energy: WaveEnergy
+    strength_volume: StrengthVolume
+    indicators: IndicatorAlignment
+    
+    # Trade parameters
     entry_price: float
-    invalidation_price: float  # NOT stop-loss, wave invalidation
-    expansion_target: float  # Based on wave structure, not fixed %
+    stop_loss: float
+    take_profit: float
+    wave_target: float
     
-    # Wave analysis
-    market_phase: MarketPhase
-    wave_structure: WaveStructure
-    energy_transition: EnergyTransition
-    
-    # Strength metrics
-    impulse_strength: float  # 0-1
-    volume_confidence: float  # 0-1
-    structure_quality: float  # 0-1
+    # Metrics
+    overall_confidence: float
+    timeframe_alignment: float
+    risk_reward: float
+    quality_score: float
     
     # Context
-    higher_timeframe: str
-    wave_timeframe: str
+    primary_timeframe: str
     entry_timeframe: str
     
-    # Timing
-    correction_duration: int  # Candles in correction
-    impulse_age: int  # Candles since first impulse (0 = first candle)
-    signal_timestamp: float
-    
-    @property
-    def trade_quality(self) -> float:
-        """Overall trade quality score"""
-        weights = {
-            "phase_confidence": 0.2,
-            "wave_valid": 0.3,
-            "transition_quality": 0.3,
-            "impulse_strength": 0.2
-        }
-        
-        scores = [
-            self.market_phase.confidence,
-            1.0 if self.wave_structure.is_valid_setup else 0.0,
-            1.0 if self.energy_transition.is_valid_entry else 0.0,
-            self.impulse_strength
-        ]
-        
-        return np.average(scores, weights=list(weights.values()))
+    # Status
+    status: str = "PENDING"  # PENDING, TRIGGERED, CLOSED
+    entry_time: Optional[float] = None
+    exit_time: Optional[float] = None
+    exit_price: Optional[float] = None
+    pnl_pct: Optional[float] = None
+    exit_reason: Optional[str] = None
 
-# ================ PROFESSIONAL LOGGING ================
+@dataclass
+class Position:
+    """Active position"""
+    signal: TradeSignal
+    size: float
+    entry_time: float
+    current_stop: float
+    highest_price: float = 0
+    lowest_price: float = float('inf')
+    trailing_active: bool = False
+
+@dataclass
+class PerformanceStats:
+    """Performance tracking"""
+    total_scans: int = 0
+    signals_found: int = 0
+    trades_executed: int = 0
+    winning_trades: int = 0
+    losing_trades: int = 0
+    total_pnl_pct: float = 0.0
+    max_consecutive_wins: int = 0
+    max_consecutive_losses: int = 0
+    current_streak: int = 0
+    is_winning_streak: bool = True
+    daily_pnl_pct: float = 0.0
+    daily_loss_pct: float = 0.0
+
+# ================ LOGGING ================
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s | %(levelname)8s | %(name)s | %(message)s',
     datefmt='%H:%M:%S'
 )
-log = logging.getLogger("wave_momentum")
+log = logging.getLogger("trader_core")
 
-# ================ WAVE-MOMENTUM ENGINE ================
-class WaveMomentumTrader:
-    """Core trading engine mimicking human wave trader"""
+# ================ CORE ENGINE ================
+class TraderCoreEngine:
+    """Core trading engine implementing trader's logic"""
     
     def __init__(self):
-        self.active_signals = {}  # symbol: signal_id
-        self.trade_stats = {
-            "assets_scanned": 0,
-            "phase_skipped": 0,
-            "wave_structure_skipped": 0,
-            "transition_skipped": 0,
-            "quality_signals": 0,
-            "impulse_entries": 0
-        }
-    
-    # ========== ASSET SELECTION ==========
-    
-    async def select_wave_assets(self, exchange, all_symbols: List[str]) -> List[str]:
-        """Select assets suitable for wave trading"""
-        selected = []
+        self.positions: Dict[str, Position] = {}
+        self.signals: Dict[str, TradeSignal] = {}
+        self.stats = PerformanceStats()
+        self.daily_start_time = time.time()
+        self.last_loss_time = 0
+        self.exchange = None
+        self.db = None
         
-        for symbol in all_symbols:
-            if not symbol.endswith('/USDT'):
-                continue
+    async def initialize(self):
+        """Initialize engine"""
+        await self._init_database()
+        await self._init_exchange()
+        
+    async def _init_database(self):
+        """Initialize database"""
+        try:
+            os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+            self.db = await aiosqlite.connect(DB_PATH)
             
-            try:
-                # Get ticker data
-                ticker = await exchange.fetch_ticker(symbol)
-                
-                # Price filter (low-price focus)
-                price = ticker['last']
-                if price > MAX_PRICE_USDT:
+            # Create tables
+            await self.db.execute("""
+                CREATE TABLE IF NOT EXISTS signals (
+                    id TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    
+                    entry_price REAL,
+                    stop_loss REAL,
+                    take_profit REAL,
+                    wave_target REAL,
+                    
+                    confidence REAL,
+                    risk_reward REAL,
+                    quality_score REAL,
+                    
+                    primary_tf TEXT,
+                    entry_tf TEXT,
+                    
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    triggered_at TIMESTAMP,
+                    closed_at TIMESTAMP,
+                    
+                    exit_price REAL,
+                    pnl_pct REAL,
+                    exit_reason TEXT
+                )
+            """)
+            
+            await self.db.execute("""
+                CREATE TABLE IF NOT EXISTS performance (
+                    date DATE PRIMARY KEY,
+                    signals_found INTEGER,
+                    trades_executed INTEGER,
+                    winning_trades INTEGER,
+                    losing_trades INTEGER,
+                    total_pnl_pct REAL,
+                    win_rate REAL,
+                    avg_pnl REAL,
+                    best_trade REAL,
+                    worst_trade REAL
+                )
+            """)
+            
+            await self.db.commit()
+            log.info("✅ Database initialized")
+            
+        except Exception as e:
+            log.error(f"Database init error: {e}")
+            raise
+    
+    async def _init_exchange(self):
+        """Initialize exchange connection"""
+        try:
+            exchange_class = getattr(ccxt, EXCHANGE_NAME)
+            config = {
+                "enableRateLimit": True,
+                "options": {"defaultType": "spot"},
+                "timeout": 30000,
+            }
+            
+            if API_KEY and API_SECRET:
+                config.update({
+                    "apiKey": API_KEY,
+                    "secret": API_SECRET,
+                })
+                if PASSPHRASE:
+                    config["password"] = PASSPHRASE
+            
+            self.exchange = exchange_class(config)
+            
+            # Test connection
+            markets = await self.exchange.load_markets()
+            log.info(f"✅ Exchange {EXCHANGE_NAME} connected. {len(markets)} markets loaded")
+            
+        except Exception as e:
+            log.error(f"Exchange init error: {e}")
+            raise
+    
+    # ========== ASSET MANAGEMENT ==========
+    
+    async def get_trading_symbols(self) -> List[str]:
+        """Get symbols for trading"""
+        try:
+            markets = await self.exchange.load_markets()
+            symbols = []
+            
+            for symbol, market in markets.items():
+                if not market.get('active', True):
                     continue
                 
-                # Volume filter (not dead, not over-efficient)
+                # Filter for USDT pairs
+                if not symbol.endswith('/USDT'):
+                    continue
+                
+                # Check if spot trading is available
+                if not market.get('spot', False):
+                    continue
+                
+                symbols.append(symbol)
+            
+            # Prioritize by volume
+            prioritized = await self._prioritize_symbols(symbols[:100])
+            return prioritized[:MAX_SYMBOLS_PER_SCAN]
+            
+        except Exception as e:
+            log.error(f"Error getting symbols: {e}")
+            return ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT"]
+    
+    async def _prioritize_symbols(self, symbols: List[str]) -> List[str]:
+        """Prioritize symbols by opportunity"""
+        prioritized = []
+        
+        for symbol in symbols:
+            try:
+                ticker = await self.exchange.fetch_ticker(symbol)
+                price = ticker['last']
                 volume = ticker.get('quoteVolume', 0)
+                
+                # Basic filters
+                if price > MAX_PRICE_USDT:
+                    continue
                 if volume < MIN_VOLUME_USD or volume > MAX_VOLUME_USD:
                     continue
                 
-                # Skip if price is too low (potential illiquidity)
-                if price < 0.0001:
-                    continue
-                
-                selected.append(symbol)
-                
-                # Limit to top 100 for performance
-                if len(selected) >= 100:
-                    break
+                prioritized.append(symbol)
                 
             except Exception as e:
-                log.debug(f"Asset filter error {symbol}: {e}")
                 continue
         
-        log.info(f"✅ Selected {len(selected)} wave-trading assets")
-        return selected
+        return prioritized
     
-    # ========== HIGH TIMEFRAME: PERMISSION ONLY ==========
+    # ========== DATA FETCHING ==========
     
-    def analyze_market_phase(self, df_1h: pd.DataFrame) -> MarketPhase:
-        """HTF: Detect market phase, set bias permission ONLY"""
+    async def fetch_multi_tf_data(self, symbol: str) -> Dict[str, pd.DataFrame]:
+        """Fetch data for all timeframes"""
+        data = {}
         
-        if df_1h is None or len(df_1h) < 20:
-            return MarketPhase("COMPRESSION", 0.3, "SKIP", None)
+        tasks = []
+        for tf_name, tf_config in TIMEFRAMES.items():
+            task = self._fetch_single_tf(symbol, tf_name, tf_config)
+            tasks.append(task)
         
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for tf_name, result in zip(TIMEFRAMES.keys(), results):
+            if isinstance(result, pd.DataFrame) and not result.empty:
+                data[tf_name] = result
+        
+        return data
+    
+    async def _fetch_single_tf(self, symbol: str, tf_name: str, config: Dict) -> Optional[pd.DataFrame]:
+        """Fetch data for single timeframe"""
         try:
-            # Simple price structure analysis
-            prices = df_1h['close'].values[-20:]
-            highs = df_1h['high'].values[-20:]
-            lows = df_1h['low'].values[-20:]
+            ohlcv = await self.exchange.fetch_ohlcv(
+                symbol, 
+                timeframe=config['tf'], 
+                limit=config['candles']
+            )
             
-            # Trend detection
-            x = np.arange(len(prices))
-            slope, _ = np.polyfit(x, prices, 1)
-            slope_pct = slope / prices[0] * 100
-            
-            # Volatility structure
-            price_range = np.max(highs) - np.min(lows)
-            avg_range = np.mean(highs[-10:] - lows[-10:])
-            range_ratio = price_range / avg_range if avg_range > 0 else 1
-            
-            # Determine phase
-            if abs(slope_pct) > 2.0:  # Strong trend
-                if slope_pct > 0:
-                    phase = "IMPULSE_UP"
-                    bias = "LONG"
-                else:
-                    phase = "IMPULSE_DOWN"
-                    bias = "SHORT"
-                confidence = min(abs(slope_pct) / 5.0, 1.0)
-                
-            elif range_ratio < 1.5:  # Compression
-                phase = "COMPRESSION"
-                bias = "SKIP"
-                confidence = 0.5
-                
-            else:  # Correction
-                # Check if correcting from up or down trend
-                prev_trend = self._detect_previous_trend(df_1h)
-                if prev_trend == "UP":
-                    phase = "CORRECTION_DOWN"
-                    bias = "LONG"  # Correction down → prepare for LONG
-                else:
-                    phase = "CORRECTION_UP"
-                    bias = "SHORT"  # Correction up → prepare for SHORT
-                confidence = 0.7
-            
-            # Simple wave count in current phase
-            wave_count = self._count_simple_waves(df_1h, phase)
-            
-            return MarketPhase(phase, confidence, bias, wave_count)
-            
-        except Exception as e:
-            log.error(f"Phase analysis error: {e}")
-            return MarketPhase("COMPRESSION", 0.3, "SKIP", None)
-    
-    def _detect_previous_trend(self, df: pd.DataFrame) -> str:
-        """Detect previous trend before current action"""
-        if len(df) < 40:
-            return "NEUTRAL"
-        
-        # Look at earlier period
-        earlier_prices = df['close'].values[-40:-20]
-        if len(earlier_prices) < 10:
-            return "NEUTRAL"
-        
-        x = np.arange(len(earlier_prices))
-        slope, _ = np.polyfit(x, earlier_prices, 1)
-        
-        if slope > 0:
-            return "UP"
-        elif slope < 0:
-            return "DOWN"
-        else:
-            return "NEUTRAL"
-    
-    def _count_simple_waves(self, df: pd.DataFrame, phase: str) -> Optional[int]:
-        """Simple wave count based on swings"""
-        try:
-            if len(df) < 30:
+            if not ohlcv or len(ohlcv) < 20:
                 return None
             
-            highs = df['high'].values[-30:]
-            lows = df['low'].values[-30:]
+            df = pd.DataFrame(
+                ohlcv,
+                columns=["timestamp", "open", "high", "low", "close", "volume"]
+            )
             
-            # Find swing points
-            swing_count = 0
-            for i in range(2, len(highs)-2):
-                if highs[i] > highs[i-1] and highs[i] > highs[i+1]:
-                    swing_count += 1
-                elif lows[i] < lows[i-1] and lows[i] < lows[i+1]:
-                    swing_count += 1
+            # Convert types
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
             
-            # Count waves in current phase
-            if phase.startswith("CORRECTION"):
-                # Corrections typically have 3 waves (A-B-C)
-                return min(swing_count // 2, 3)
-            elif phase.startswith("IMPULSE"):
-                # Impulses typically 5 waves
-                return min(swing_count // 2, 5)
+            df = df.dropna()
             
-            return None
+            if len(df) >= 20:
+                # Add technical indicators
+                df = self._add_indicators(df)
+                return df
             
         except Exception as e:
-            return None
-    
-    # ========== MID TIMEFRAME: WAVE IDENTIFICATION ==========
-    
-    def analyze_wave_structure(self, df_15m: pd.DataFrame, bias: str) -> WaveStructure:
-        """MTF: Identify wave structure and correction completion"""
+            log.debug(f"Fetch error {symbol} {tf_name}: {str(e)[:50]}")
         
-        if df_15m is None or len(df_15m) < 30:
-            return self._get_default_wave_structure()
+        return None
+    
+    def _add_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Add technical indicators to dataframe"""
+        # RSI
+        df['rsi'] = self._calculate_rsi(df['close'])
         
-        try:
-            # Analyze recent price action for wave behavior
-            recent_data = df_15m.iloc[-30:]
-            
-            # Calculate behavioral metrics
-            candle_speed_trend = self._calculate_candle_speed_trend(recent_data)
-            body_size_trend = self._calculate_body_size_trend(recent_data)
-            volume_trend = self._calculate_volume_trend(recent_data)
-            momentum_trend = self._calculate_momentum_trend(recent_data)
-            
-            # Determine wave type based on behavior
-            wave_type = self._determine_wave_type(
-                candle_speed_trend, body_size_trend, 
-                volume_trend, momentum_trend
-            )
-            
-            # Calculate wave characteristics
-            wave_length = self._calculate_wave_length(recent_data)
-            symmetry_score = self._calculate_symmetry(recent_data, bias)
-            compression_level = self._calculate_compression(recent_data)
-            expansion_potential = self._calculate_expansion_potential(
-                wave_type, compression_level, momentum_trend
-            )
-            
-            return WaveStructure(
-                wave_type=wave_type,
-                wave_length=wave_length,
-                symmetry_score=symmetry_score,
-                compression_level=compression_level,
-                expansion_potential=expansion_potential,
-                candle_speed_trend=candle_speed_trend,
-                body_size_trend=body_size_trend,
-                volume_trend=volume_trend,
-                momentum_trend=momentum_trend
-            )
-            
-        except Exception as e:
-            log.error(f"Wave structure error: {e}")
-            return self._get_default_wave_structure()
-    
-    def _calculate_candle_speed_trend(self, df: pd.DataFrame) -> float:
-        """Calculate trend in candle speed (-1 to 1)"""
-        try:
-            if len(df) < 10:
-                return 0.0
-            
-            # Calculate speeds for two halves
-            half = len(df) // 2
-            first_half = df.iloc[:half]
-            second_half = df.iloc[half:]
-            
-            def avg_speed(data):
-                ranges = data['high'] - data['low']
-                closes = data['close']
-                speeds = ranges / closes * 100
-                return speeds.mean() if len(speeds) > 0 else 0.5
-            
-            speed1 = avg_speed(first_half)
-            speed2 = avg_speed(second_half)
-            
-            # Normalize trend
-            if speed1 == 0:
-                return 0.0
-            
-            trend = (speed2 - speed1) / speed1
-            return max(min(trend, 1.0), -1.0)
-            
-        except Exception as e:
-            return 0.0
-    
-    def _calculate_body_size_trend(self, df: pd.DataFrame) -> float:
-        """Calculate trend in body size (-1 to 1)"""
-        try:
-            if len(df) < 10:
-                return 0.0
-            
-            half = len(df) // 2
-            first_half = df.iloc[:half]
-            second_half = df.iloc[half:]
-            
-            def avg_body_ratio(data):
-                bodies = abs(data['close'] - data['open'])
-                ranges = data['high'] - data['low']
-                ratios = bodies / ranges
-                ratios = ratios.replace([np.inf, -np.inf], np.nan).dropna()
-                return ratios.mean() if len(ratios) > 0 else 0.5
-            
-            ratio1 = avg_body_ratio(first_half)
-            ratio2 = avg_body_ratio(second_half)
-            
-            if ratio1 == 0:
-                return 0.0
-            
-            trend = (ratio2 - ratio1) / ratio1
-            return max(min(trend, 1.0), -1.0)
-            
-        except Exception as e:
-            return 0.0
-    
-    def _calculate_volume_trend(self, df: pd.DataFrame) -> float:
-        """Calculate trend in volume (-1 to 1)"""
-        try:
-            if len(df) < 10:
-                return 0.0
-            
-            half = len(df) // 2
-            volume1 = df['volume'].iloc[:half].mean()
-            volume2 = df['volume'].iloc[half:].mean()
-            
-            if volume1 == 0:
-                return 0.0
-            
-            trend = (volume2 - volume1) / volume1
-            return max(min(trend, 1.0), -1.0)
-            
-        except Exception as e:
-            return 0.0
-    
-    def _calculate_momentum_trend(self, df: pd.DataFrame) -> float:
-        """Calculate trend in momentum (-1 to 1)"""
-        try:
-            if len(df) < 10:
-                return 0.0
-            
-            # Use RSI slope
-            rsi = self._calculate_rsi(df['close'])
-            if len(rsi) < 10:
-                return 0.0
-            
-            half = len(rsi) // 2
-            rsi1 = rsi.iloc[:half].mean()
-            rsi2 = rsi.iloc[half:].mean()
-            
-            # Momentum cooling = RSI moving toward 50
-            # Momentum heating = RSI moving away from 50
-            momentum1 = abs(rsi1 - 50)
-            momentum2 = abs(rsi2 - 50)
-            
-            if momentum1 == 0:
-                return 0.0
-            
-            trend = (momentum2 - momentum1) / momentum1
-            return max(min(trend, 1.0), -1.0)
-            
-        except Exception as e:
-            return 0.0
+        # EMAs
+        for period in EMA_PERIODS:
+            df[f'ema_{period}'] = df['close'].ewm(span=period, adjust=False).mean()
+        
+        # MACD
+        macd, signal, hist = self._calculate_macd(df['close'])
+        df['macd'] = macd
+        df['macd_signal'] = signal
+        df['macd_hist'] = hist
+        
+        # Volume indicators
+        df['volume_sma'] = df['volume'].rolling(window=20).mean()
+        df['volume_ratio'] = df['volume'] / df['volume_sma']
+        
+        return df
     
     def _calculate_rsi(self, prices: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
         """Calculate RSI"""
@@ -546,1057 +482,1205 @@ class WaveMomentumTrader:
         rsi = 100 - (100 / (1 + rs))
         return rsi
     
-    def _determine_wave_type(self, speed_trend: float, body_trend: float,
-                            volume_trend: float, momentum_trend: float) -> str:
-        """Determine wave type based on behavior"""
-        
-        # Correction behavior: everything slowing down
-        if (speed_trend < -0.3 and body_trend < -0.3 and 
-            volume_trend < -0.3 and momentum_trend < -0.2):
-            return "CORRECTION_COMPLETE"
-        
-        # Correction maturing: some slowing
-        elif (speed_trend < 0 and body_trend < 0 and 
-              volume_trend < 0 and momentum_trend < 0):
-            return "CORRECTION_MATURING"
-        
-        # Impulse start: everything accelerating
-        elif (speed_trend > 0.3 and body_trend > 0.3 and 
-              volume_trend > 0.3 and momentum_trend > 0.2):
-            return "IMPULSE_START"
-        
-        else:
-            return "UNCLEAR"
+    def _calculate_macd(self, prices: pd.Series, 
+                       fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+        """Calculate MACD"""
+        exp1 = prices.ewm(span=fast, adjust=False).mean()
+        exp2 = prices.ewm(span=slow, adjust=False).mean()
+        macd = exp1 - exp2
+        signal_line = macd.ewm(span=signal, adjust=False).mean()
+        histogram = macd - signal_line
+        return macd, signal_line, histogram
     
-    def _calculate_wave_length(self, df: pd.DataFrame) -> float:
-        """Calculate normalized wave length (0-1)"""
-        try:
-            if len(df) < 20:
-                return 0.5
-            
-            # Count significant moves
-            prices = df['close'].values
-            significant_moves = 0
-            
-            for i in range(1, len(prices)):
-                change_pct = abs(prices[i] - prices[i-1]) / prices[i-1] * 100
-                if change_pct > 0.5:  # 0.5% minimum for significant move
-                    significant_moves += 1
-            
-            # Normalize (20 candles max for analysis window)
-            wave_length = min(significant_moves / 10, 1.0)
-            return wave_length
-            
-        except Exception as e:
-            return 0.5
+    # ========== STEP 1: WATCH ALL TIMEFRAMES ==========
     
-    def _calculate_symmetry(self, df: pd.DataFrame, bias: str) -> float:
-        """Calculate wave symmetry (0-1)"""
+    async def analyze_market_direction(self, multi_tf_data: Dict[str, pd.DataFrame]) -> MarketDirection:
+        """Analyze direction across all timeframes"""
+        
+        if not multi_tf_data:
+            return MarketDirection("NEUTRAL", 0.0, {}, "UNKNOWN", 0.0)
+        
+        timeframe_biases = {}
+        biases = []
+        confidences = []
+        weights = []
+        
+        for tf_name, df in multi_tf_data.items():
+            if df is None or len(df) < 20:
+                continue
+            
+            bias, confidence = self._analyze_single_tf_direction(df, tf_name)
+            timeframe_biases[tf_name] = bias
+            biases.append(bias)
+            confidences.append(confidence)
+            weights.append(TIMEFRAMES[tf_name]['weight'])
+        
+        if not biases:
+            return MarketDirection("NEUTRAL", 0.0, {}, "UNKNOWN", 0.0)
+        
+        # Weighted aggregation
+        primary_bias = self._aggregate_weighted_biases(biases, confidences, weights)
+        overall_confidence = np.average(confidences, weights=weights)
+        
+        # Calculate alignment
+        alignment_score = self._calculate_alignment_score(timeframe_biases, primary_bias)
+        
+        # Detect dominant wave
+        dominant_wave = self._detect_dominant_wave(multi_tf_data)
+        
+        return MarketDirection(
+            primary_bias=primary_bias,
+            confidence=float(overall_confidence),
+            timeframe_alignment=timeframe_biases,
+            dominant_wave=dominant_wave,
+            alignment_score=alignment_score
+        )
+    
+    def _analyze_single_tf_direction(self, df: pd.DataFrame, tf_name: str) -> Tuple[str, float]:
+        """Analyze direction for single timeframe"""
         try:
-            if len(df) < 10:
-                return 0.5
+            prices = df['close'].values[-20:]
+            highs = df['high'].values[-20:]
+            lows = df['low'].values[-20:]
+            volumes = df['volume'].values[-20:]
             
-            # Simple symmetry: compare upward vs downward moves
-            prices = df['close'].values
-            up_moves = 0
-            down_moves = 0
+            # Price action metrics
+            x = np.arange(len(prices))
+            slope, _ = np.polyfit(x, prices, 1)
+            slope_pct = (slope / prices[0]) * 100 if prices[0] != 0 else 0
             
+            # Structure analysis
+            higher_highs = sum(1 for i in range(1, len(highs)) if highs[i] > highs[i-1])
+            higher_lows = sum(1 for i in range(1, len(lows)) if lows[i] > lows[i-1])
+            lower_highs = sum(1 for i in range(1, len(highs)) if highs[i] < highs[i-1])
+            lower_lows = sum(1 for i in range(1, len(lows)) if lows[i] < lows[i-1])
+            
+            # Volume analysis
+            volume_up = 0
+            volume_down = 0
             for i in range(1, len(prices)):
                 if prices[i] > prices[i-1]:
-                    up_moves += 1
+                    volume_up += volumes[i]
                 elif prices[i] < prices[i-1]:
-                    down_moves += 1
+                    volume_down += volumes[i]
             
-            total_moves = up_moves + down_moves
-            if total_moves == 0:
-                return 0.5
+            total_volume = volume_up + volume_down
+            volume_ratio = volume_up / total_volume if total_volume > 0 else 0.5
             
-            symmetry = min(up_moves, down_moves) / max(up_moves, down_moves)
+            # Calculate scores
+            up_score = (higher_highs + higher_lows) * 0.3 + volume_ratio * 0.4
+            down_score = (lower_highs + lower_lows) * 0.3 + (1 - volume_ratio) * 0.4
             
-            # Adjust for bias
-            if bias == "LONG" and up_moves > down_moves:
-                symmetry *= 1.2  # Favor symmetry in direction of bias
-            elif bias == "SHORT" and down_moves > up_moves:
-                symmetry *= 1.2
-            
-            return min(symmetry, 1.0)
-            
-        except Exception as e:
-            return 0.5
-    
-    def _calculate_compression(self, df: pd.DataFrame) -> float:
-        """Calculate compression level (0-1)"""
-        try:
-            if len(df) < 10:
-                return 0.5
-            
-            # Compression = low range + declining volume
-            ranges = df['high'] - df['low']
-            avg_range = ranges.mean()
-            recent_range = ranges.iloc[-5:].mean()
-            
-            volume_trend = self._calculate_volume_trend(df.iloc[-10:])
-            
-            if avg_range > 0:
-                range_compression = recent_range / avg_range
+            # Determine bias
+            if abs(slope_pct) > 2.0:
+                if slope_pct > 0:
+                    bias = "STRONG_UP"
+                    confidence = min(abs(slope_pct) / 5.0, 1.0)
+                else:
+                    bias = "STRONG_DOWN"
+                    confidence = min(abs(slope_pct) / 5.0, 1.0)
+            elif up_score > down_score * 1.5:
+                bias = "UP"
+                confidence = up_score / (up_score + down_score)
+            elif down_score > up_score * 1.5:
+                bias = "DOWN"
+                confidence = down_score / (up_score + down_score)
             else:
-                range_compression = 0.5
+                bias = "NEUTRAL"
+                confidence = 0.3
             
-            # Combine range compression with volume trend
-            compression = (range_compression + (1 - abs(volume_trend))) / 2
-            return min(compression, 1.0)
+            return bias, min(confidence, 1.0)
             
         except Exception as e:
-            return 0.5
+            return "NEUTRAL", 0.2
     
-    def _calculate_expansion_potential(self, wave_type: str, 
-                                      compression: float, momentum_trend: float) -> float:
-        """Calculate potential for expansion (0-1)"""
+    def _aggregate_weighted_biases(self, biases: List[str], confidences: List[float], 
+                                  weights: List[float]) -> str:
+        """Aggregate biases with weighting"""
+        bias_scores = {
+            "STRONG_UP": 0.0,
+            "UP": 0.0,
+            "NEUTRAL": 0.0,
+            "DOWN": 0.0,
+            "STRONG_DOWN": 0.0
+        }
         
-        if wave_type == "CORRECTION_COMPLETE":
-            # High compression + momentum ready to turn = high potential
-            potential = (1 - compression) * (1 + momentum_trend) / 2
-            return min(potential, 1.0)
+        for bias, confidence, weight in zip(biases, confidences, weights):
+            if bias in bias_scores:
+                bias_scores[bias] += confidence * weight
         
-        elif wave_type == "IMPULSE_START":
-            # Already expanding
-            return 0.8
+        # Find strongest bias
+        strongest = max(bias_scores.items(), key=lambda x: x[1])
         
-        else:
-            return 0.3
+        # Apply threshold
+        if strongest[1] < 1.0:
+            return "NEUTRAL"
+        
+        return strongest[0]
     
-    def _get_default_wave_structure(self) -> WaveStructure:
-        return WaveStructure(
-            wave_type="UNCLEAR",
-            wave_length=0.5,
-            symmetry_score=0.5,
-            compression_level=0.5,
-            expansion_potential=0.3,
-            candle_speed_trend=0.0,
-            body_size_trend=0.0,
-            volume_trend=0.0,
-            momentum_trend=0.0
-        )
-    
-    # ========== LOW TIMEFRAME: ENERGY TRANSITION ==========
-    
-    def detect_energy_transition(self, df_5m: pd.DataFrame, bias: str) -> EnergyTransition:
-        """LTF: Detect first impulse candle after correction"""
+    def _calculate_alignment_score(self, timeframe_biases: Dict[str, str], 
+                                  primary_bias: str) -> float:
+        """Calculate alignment score across timeframes"""
+        if not timeframe_biases:
+            return 0.0
         
-        if df_5m is None or len(df_5m) < 20:
-            return EnergyTransition(False, None, None, 0, 0, False, False, 0, 0, 0, 0)
+        aligned = 0
+        total = 0
+        
+        bias_groups = {
+            "STRONG_UP": ["STRONG_UP", "UP"],
+            "UP": ["STRONG_UP", "UP", "NEUTRAL"],
+            "DOWN": ["STRONG_DOWN", "DOWN", "NEUTRAL"],
+            "STRONG_DOWN": ["STRONG_DOWN", "DOWN"]
+        }
+        
+        allowed_biases = bias_groups.get(primary_bias, [])
+        
+        for bias in timeframe_biases.values():
+            total += 1
+            if bias in allowed_biases:
+                aligned += 1
+        
+        return aligned / total if total > 0 else 0.0
+    
+    def _detect_dominant_wave(self, multi_tf_data: Dict[str, pd.DataFrame]) -> str:
+        """Detect dominant wave type"""
+        try:
+            # Use 1H or 4H for wave detection
+            tf_to_check = multi_tf_data.get("4H") or multi_tf_data.get("1H")
+            if tf_to_check is None or len(tf_to_check) < 30:
+                return "UNKNOWN"
+            
+            prices = tf_to_check['close'].values[-30:]
+            ranges = tf_to_check['high'].values[-30:] - tf_to_check['low'].values[-30:]
+            
+            # Compression detection
+            range_cv = np.std(ranges[-10:]) / np.mean(ranges[-10:]) if np.mean(ranges[-10:]) > 0 else 1
+            if range_cv < 0.3:
+                return "COMPRESSION"
+            
+            # Trend strength
+            price_change = abs(prices[-1] - prices[0]) / prices[0] * 100
+            if price_change > 4:
+                # Check if impulse or correction
+                rsi = tf_to_check['rsi'].values[-10:]
+                if (price_change > 0 and np.mean(rsi) > 60) or (price_change < 0 and np.mean(rsi) < 40):
+                    return "IMPULSE"
+                else:
+                    return "CORRECTION"
+            
+            return "NEUTRAL"
+            
+        except Exception as e:
+            return "UNKNOWN"
+    
+    # ========== STEP 2: WAVE ENERGY ANALYSIS ==========
+    
+    def analyze_wave_energy(self, df: pd.DataFrame, direction: str) -> WaveEnergy:
+        """Analyze wave energy and length"""
         
         try:
-            # Find correction period (last N candles)
-            correction_period = self._identify_correction_period(df_5m)
+            if df is None or len(df) < 30:
+                return self._default_wave_energy()
             
-            if correction_period is None:
-                return EnergyTransition(False, None, None, 0, 0, False, False, 0, 0, 0, 0)
+            # Determine wave type and stage
+            wave_type, wave_stage = self._identify_wave_type_stage(df, direction)
             
-            # Check for first impulse candle AFTER correction
-            impulse_candle_idx = self._find_first_impulse_candle(df_5m, correction_period, bias)
+            # Calculate metrics
+            wave_length_score = self._calculate_wave_length_score(df, direction)
+            energy_level = self._calculate_energy_level(df)
+            compression_ratio = self._calculate_compression_ratio(df)
+            momentum_gradient = self._calculate_momentum_gradient(df)
+            volume_profile = self._calculate_volume_profile(df)
+            candle_consistency = self._calculate_candle_consistency(df, direction)
             
-            if impulse_candle_idx is None:
-                return EnergyTransition(False, None, None, 0, 0, False, False, 0, 0, 0, 0)
-            
-            # Analyze the transition
-            transition_analysis = self._analyze_transition(
-                df_5m, correction_period, impulse_candle_idx, bias
+            return WaveEnergy(
+                wave_type=wave_type,
+                wave_stage=wave_stage,
+                wave_length_score=float(wave_length_score),
+                energy_level=float(energy_level),
+                compression_ratio=float(compression_ratio),
+                momentum_gradient=float(momentum_gradient),
+                volume_profile=float(volume_profile),
+                candle_consistency=float(candle_consistency)
             )
             
-            return transition_analysis
+        except Exception as e:
+            log.error(f"Wave energy error: {e}")
+            return self._default_wave_energy()
+    
+    def _identify_wave_type_stage(self, df: pd.DataFrame, direction: str) -> Tuple[str, str]:
+        """Identify wave type and stage"""
+        try:
+            prices = df['close'].values[-20:]
+            
+            # Trend calculation
+            x = np.arange(len(prices))
+            slope, _ = np.polyfit(x, prices, 1)
+            trend_strength = abs(slope / prices[0]) * 100 if prices[0] != 0 else 0
+            
+            # Wave type
+            if trend_strength < 0.5:
+                wave_type = "COMPRESSION"
+            elif (direction == "LONG" and slope > 0) or (direction == "SHORT" and slope < 0):
+                wave_type = "IMPULSE"
+            else:
+                wave_type = "CORRECTION"
+            
+            # Wave stage
+            if wave_type == "COMPRESSION":
+                stage = "MATURE" if len(prices) > 15 else "DEVELOPING"
+            else:
+                price_change = abs(prices[-1] - prices[0]) / prices[0] * 100
+                if price_change < 2:
+                    stage = "EARLY"
+                elif price_change < 5:
+                    stage = "MID"
+                else:
+                    stage = "LATE"
+            
+            return wave_type, stage
             
         except Exception as e:
-            log.error(f"Transition detection error: {e}")
-            return EnergyTransition(False, None, None, 0, 0, False, False, 0, 0, 0, 0)
+            return "UNKNOWN", "UNKNOWN"
     
-    def _identify_correction_period(self, df: pd.DataFrame) -> Optional[Tuple[int, int]]:
-        """Identify start and end of correction period"""
+    def _calculate_wave_length_score(self, df: pd.DataFrame, direction: str) -> float:
+        """Calculate wave length potential"""
+        try:
+            # Look at volatility and recent moves
+            prices = df['close'].values[-30:]
+            returns = np.diff(prices) / prices[:-1]
+            
+            # Calculate expected move based on volatility
+            volatility = np.std(returns) * np.sqrt(252)  # Annualized
+            
+            # Adjust for compression
+            ranges = df['high'].values[-10:] - df['low'].values[-10:]
+            range_ratio = np.mean(ranges) / np.std(ranges) if np.std(ranges) > 0 else 1
+            
+            score = min(volatility * 2 * range_ratio, 1.0)
+            return max(score, 0.1)
+            
+        except Exception as e:
+            return 0.5
+    
+    def _calculate_energy_level(self, df: pd.DataFrame) -> float:
+        """Calculate accumulated energy"""
+        try:
+            # Energy = compression + volume accumulation
+            ranges = df['high'] - df['low']
+            volumes = df['volume']
+            
+            # Compression component
+            recent_range = ranges.iloc[-5:].mean()
+            avg_range = ranges.iloc[:-5].mean() if len(ranges) > 5 else recent_range
+            compression = 1.0 - (recent_range / avg_range if avg_range > 0 else 0.5)
+            
+            # Volume accumulation
+            recent_volume = volumes.iloc[-5:].mean()
+            avg_volume = volumes.iloc[:-5].mean() if len(volumes) > 5 else recent_volume
+            volume_ratio = min(recent_volume / avg_volume if avg_volume > 0 else 1.0, 2.0)
+            
+            energy = (compression * 0.6 + (volume_ratio / 2) * 0.4)
+            return min(energy, 1.0)
+            
+        except Exception as e:
+            return 0.5
+    
+    def _calculate_compression_ratio(self, df: pd.DataFrame) -> float:
+        """Calculate compression ratio"""
+        try:
+            ranges = df['high'] - df['low']
+            if len(ranges) < 10:
+                return 0.5
+            
+            recent_avg = ranges.iloc[-5:].mean()
+            historical_avg = ranges.iloc[:-5].mean() if len(ranges) > 5 else recent_avg
+            
+            if historical_avg > 0:
+                ratio = recent_avg / historical_avg
+                return max(0.0, 1.0 - ratio)
+            
+            return 0.5
+            
+        except Exception as e:
+            return 0.5
+    
+    def _calculate_momentum_gradient(self, df: pd.DataFrame) -> float:
+        """Calculate momentum gradient"""
         try:
             if len(df) < 10:
-                return None
+                return 0.0
             
-            # Look for slowing behavior in last N candles
-            for lookback in range(MAX_CORRECTION_CANDLES, MIN_CORRECTION_CANDLES - 1, -1):
-                if lookback > len(df):
-                    continue
-                
-                correction_data = df.iloc[-lookback:]
-                
-                # Calculate trends in correction period
-                speed_trend = self._calculate_candle_speed_trend(correction_data)
-                body_trend = self._calculate_body_size_trend(correction_data)
-                volume_trend = self._calculate_volume_trend(correction_data)
-                
-                # Check if shows correction behavior
-                if (speed_trend < -0.2 and body_trend < -0.2 and 
-                    volume_trend < -0.2):
-                    start_idx = len(df) - lookback
-                    end_idx = len(df) - 1
-                    return (start_idx, end_idx)
+            prices = df['close'].values
+            half = len(prices) // 2
             
-            return None
+            def calc_momentum(data):
+                if len(data) < 3:
+                    return 0.0
+                returns = np.diff(data) / data[:-1]
+                return np.mean(returns) * 100
+            
+            mom1 = calc_momentum(prices[:half])
+            mom2 = calc_momentum(prices[half:])
+            
+            if abs(mom1) > 0:
+                gradient = (mom2 - mom1) / abs(mom1)
+                return np.clip(gradient, -1, 1)
+            
+            return 0.0
             
         except Exception as e:
-            return None
+            return 0.0
     
-    def _find_first_impulse_candle(self, df: pd.DataFrame, 
-                                  correction_period: Tuple[int, int],
-                                  bias: str) -> Optional[int]:
-        """Find first impulse candle after correction"""
-        
-        correction_end = correction_period[1]
-        
-        # Look at candles immediately after correction
-        lookahead = min(MAX_IMPULSE_AGE, len(df) - correction_end - 1)
-        
-        for i in range(1, lookahead + 1):
-            candle_idx = correction_end + i
-            
-            if candle_idx >= len(df):
-                break
-            
-            candle = df.iloc[candle_idx]
-            prev_candle = df.iloc[candle_idx - 1]
-            
-            # Check if this candle shows impulse behavior
-            is_impulse = self._is_impulse_candle(candle, prev_candle, bias)
-            
-            if is_impulse:
-                return candle_idx
-        
-        return None
-    
-    def _is_impulse_candle(self, candle: pd.Series, prev_candle: pd.Series, 
-                          bias: str) -> bool:
-        """Check if candle shows impulse behavior"""
-        
-        candle_range = candle['high'] - candle['low']
-        candle_body = abs(candle['close'] - candle['open'])
-        
-        # Must be fast candle
-        if candle['close'] == 0:
-            return False
-        
-        speed = candle_range / candle['close'] * 100
-        if speed < 0.5:  # 0.5% minimum range
-            return False
-        
-        # Body must dominate
-        if candle_range > 0:
-            body_ratio = candle_body / candle_range
-            if body_ratio < 0.5:  # 50% minimum body dominance
-                return False
-        
-        # Check direction matches bias
-        if bias == "LONG":
-            if candle['close'] <= candle['open']:
-                return False  # Not bullish
-            # Check for significant upward move
-            if candle['close'] <= prev_candle['close'] * 1.002:  # Less than 0.2% up
-                return False
-                
-        elif bias == "SHORT":
-            if candle['close'] >= candle['open']:
-                return False  # Not bearish
-            # Check for significant downward move
-            if candle['close'] >= prev_candle['close'] * 0.998:  # Less than 0.2% down
-                return False
-        
-        return True
-    
-    def _analyze_transition(self, df: pd.DataFrame, correction_period: Tuple[int, int],
-                           impulse_idx: int, bias: str) -> EnergyTransition:
-        """Analyze the correction-to-impulse transition"""
-        
-        correction_start, correction_end = correction_period
-        impulse_candle = df.iloc[impulse_idx]
-        
-        # Calculate correction metrics
-        correction_data = df.iloc[correction_start:correction_end+1]
-        correction_candle_speed = self._calculate_candle_speed_trend(correction_data)
-        correction_body_ratio = self._calculate_body_size_trend(correction_data)
-        
-        # Calculate impulse candle metrics
-        impulse_range = impulse_candle['high'] - impulse_candle['low']
-        impulse_body = abs(impulse_candle['close'] - impulse_candle['open'])
-        
-        if impulse_range > 0:
-            impulse_body_ratio = impulse_body / impulse_range
-        else:
-            impulse_body_ratio = 0.5
-        
-        if impulse_candle['close'] > 0:
-            impulse_speed = impulse_range / impulse_candle['close'] * 100
-        else:
-            impulse_speed = 0.5
-        
-        # Volume expansion check
-        correction_volume = correction_data['volume'].mean()
-        impulse_volume = impulse_candle['volume']
-        
-        if correction_volume > 0:
-            volume_expansion = impulse_volume / correction_volume
-        else:
-            volume_expansion = 1.0
-        
-        # RSI momentum turn check
-        rsi_turn = self._check_rsi_turn(df, impulse_idx, bias)
-        
-        # EMA structure hold check
-        ema_hold = self._check_ema_structure(df, correction_period, bias)
-        
-        # Candle dominance (impulse vs correction)
-        candle_dominance = impulse_body_ratio
-        
-        return EnergyTransition(
-            has_transition=True,
-            transition_type="CORRECTION_TO_IMPULSE",
-            first_impulse_candle_index=impulse_idx,
-            candle_dominance=candle_dominance,
-            volume_expansion=volume_expansion,
-            momentum_turn=rsi_turn,
-            ema_structure_hold=ema_hold,
-            impulse_candle_speed=impulse_speed,
-            impulse_body_ratio=impulse_body_ratio,
-            correction_candle_speed=abs(correction_candle_speed),
-            correction_body_ratio=abs(correction_body_ratio)
-        )
-    
-    def _check_rsi_turn(self, df: pd.DataFrame, impulse_idx: int, bias: str) -> bool:
-        """Check if RSI turned with price"""
+    def _calculate_volume_profile(self, df: pd.DataFrame) -> float:
+        """Calculate volume profile quality"""
         try:
-            if len(df) < impulse_idx + 1:
-                return False
+            volumes = df['volume'].values
+            prices = df['close'].values
             
-            # Calculate RSI
-            rsi_series = self._calculate_rsi(df['close'])
+            if len(prices) < 10:
+                return 0.5
             
-            if len(rsi_series) < impulse_idx + 1:
-                return False
+            # Calculate volume distribution
+            price_changes = np.diff(prices) / prices[:-1]
+            up_volume = volumes[1:][price_changes > 0].sum()
+            down_volume = volumes[1:][price_changes < 0].sum()
             
-            current_rsi = rsi_series.iloc[impulse_idx]
-            prev_rsi = rsi_series.iloc[impulse_idx - 1] if impulse_idx > 0 else 50
+            total = up_volume + down_volume
+            if total > 0:
+                imbalance = abs(up_volume - down_volume) / total
+                return 1.0 - imbalance
             
-            if bias == "LONG":
-                # RSI should be turning up from oversold/neutral
-                return current_rsi > prev_rsi and current_rsi < 70
-            
-            elif bias == "SHORT":
-                # RSI should be turning down from overbought/neutral
-                return current_rsi < prev_rsi and current_rsi > 30
-            
-            return False
+            return 0.5
             
         except Exception as e:
-            return False
+            return 0.5
     
-    def _check_ema_structure(self, df: pd.DataFrame, 
-                            correction_period: Tuple[int, int], bias: str) -> bool:
-        """Check if EMA held structure during correction"""
+    def _calculate_candle_consistency(self, df: pd.DataFrame, direction: str) -> float:
+        """Calculate candle consistency"""
         try:
-            correction_start, correction_end = correction_period
-            correction_data = df.iloc[correction_start:correction_end+1]
+            if len(df) < 5:
+                return 0.5
             
-            # Calculate EMAs
-            ema9 = correction_data['close'].ewm(span=EMA_PERIODS[0], adjust=False).mean()
-            ema21 = correction_data['close'].ewm(span=EMA_PERIODS[1], adjust=False).mean()
+            closes = df['close'].values
+            opens = df['open'].values
             
-            # Check if price respected EMA during correction
-            if bias == "LONG":
-                # In correction down, price should not break below EMA significantly
-                prices = correction_data['close'].values
-                ema9_vals = ema9.values
-                
-                for i in range(len(prices)):
-                    if ema9_vals[i] > 0:
-                        distance = abs(prices[i] - ema9_vals[i]) / ema9_vals[i]
-                        if distance > EMA_RESPECT_DISTANCE * 2:  # Allow some leeway
-                            return False
-                return True
-                
-            elif bias == "SHORT":
-                # In correction up, price should not break above EMA significantly
-                prices = correction_data['close'].values
-                ema9_vals = ema9.values
-                
-                for i in range(len(prices)):
-                    if ema9_vals[i] > 0:
-                        distance = abs(prices[i] - ema9_vals[i]) / ema9_vals[i]
-                        if distance > EMA_RESPECT_DISTANCE * 2:
-                            return False
-                return True
+            consistent = 0
+            total = len(closes) - 1
             
-            return False
+            for i in range(1, len(closes)):
+                if direction == "LONG":
+                    # Prefer bullish or small bearish candles
+                    is_bullish = closes[i] > opens[i]
+                    is_small_bearish = closes[i] < opens[i] and (opens[i] - closes[i]) / opens[i] < 0.005
+                    if is_bullish or is_small_bearish:
+                        consistent += 1
+                else:
+                    # Prefer bearish or small bullish candles
+                    is_bearish = closes[i] < opens[i]
+                    is_small_bullish = closes[i] > opens[i] and (closes[i] - opens[i]) / opens[i] < 0.005
+                    if is_bearish or is_small_bullish:
+                        consistent += 1
+            
+            return consistent / total if total > 0 else 0.5
             
         except Exception as e:
-            return False
+            return 0.5
     
-    # ========== SIGNAL GENERATION ==========
+    # ========== STEP 3: STRENGTH + VOLUME ==========
     
-    def generate_wave_signal(self, multi_tf_data: Dict[str, pd.DataFrame], 
-                            symbol: str) -> Optional[WaveSignal]:
-        """Generate wave-momentum signal ONLY if all conditions align"""
+    def analyze_strength_volume(self, df: pd.DataFrame, direction: str) -> StrengthVolume:
+        """Analyze strength and volume"""
         
         try:
-            # 1. Get timeframe data
-            tf_1h = multi_tf_data.get("1H")
-            tf_15m = multi_tf_data.get("15M")
-            tf_5m = multi_tf_data.get("5M")
+            if df is None or len(df) < 10:
+                return self._default_strength_volume()
             
-            # Check data availability
-            if tf_1h is None or tf_15m is None or tf_5m is None:
+            # Calculate metrics
+            strength_score = self._calculate_strength_score(df, direction)
+            volume_score = self._calculate_volume_score(df)
+            market_participation = self._calculate_market_participation(df, direction)
+            body_dominance = self._calculate_body_dominance(df)
+            volume_expansion = self._calculate_volume_expansion(df)
+            bid_ask_balance = self._calculate_bid_ask_balance(df, direction)
+            
+            return StrengthVolume(
+                strength_score=float(strength_score),
+                volume_score=float(volume_score),
+                market_participation=float(market_participation),
+                body_dominance=float(body_dominance),
+                volume_expansion=float(volume_expansion),
+                bid_ask_balance=float(bid_ask_balance)
+            )
+            
+        except Exception as e:
+            log.error(f"Strength volume error: {e}")
+            return self._default_strength_volume()
+    
+    def _calculate_strength_score(self, df: pd.DataFrame, direction: str) -> float:
+        """Calculate move strength"""
+        try:
+            if len(df) < 3:
+                return 0.0
+            
+            # Analyze recent candles
+            recent = df.iloc[-3:]
+            scores = []
+            
+            for _, candle in recent.iterrows():
+                body = abs(candle['close'] - candle['open'])
+                range_ = candle['high'] - candle['low']
+                
+                if range_ > 0:
+                    body_ratio = body / range_
+                    
+                    # Direction-specific scoring
+                    if direction == "LONG":
+                        if candle['close'] > candle['open']:
+                            scores.append(body_ratio * 1.5)  # Bullish
+                        else:
+                            scores.append(body_ratio * 0.7)  # Bearish in long setup
+                    else:
+                        if candle['close'] < candle['open']:
+                            scores.append(body_ratio * 1.5)  # Bearish
+                        else:
+                            scores.append(body_ratio * 0.7)  # Bullish in short setup
+            
+            if scores:
+                return min(np.mean(scores) * 1.5, 1.0)
+            return 0.0
+            
+        except Exception as e:
+            return 0.0
+    
+    def _calculate_volume_score(self, df: pd.DataFrame) -> float:
+        """Calculate volume confirmation score"""
+        try:
+            if len(df) < 5:
+                return 0.5
+            
+            volumes = df['volume'].values
+            recent_volume = volumes[-3:].mean()
+            avg_volume = volumes[:-3].mean() if len(volumes) > 3 else recent_volume
+            
+            if avg_volume > 0:
+                ratio = recent_volume / avg_volume
+                return min(ratio / 2.0, 1.0)  # Cap at 2x
+            
+            return 0.5
+            
+        except Exception as e:
+            return 0.5
+    
+    def _calculate_market_participation(self, df: pd.DataFrame, direction: str) -> float:
+        """Calculate market participation"""
+        try:
+            volumes = df['volume'].values[-10:]
+            closes = df['close'].values[-10:]
+            
+            if len(closes) < 3:
+                return 0.5
+            
+            # Count significant moves with volume
+            significant_moves = 0
+            for i in range(1, len(closes)):
+                change_pct = abs(closes[i] - closes[i-1]) / closes[i-1] * 100
+                volume_ratio = volumes[i] / np.mean(volumes[:i]) if i > 1 else 1.0
+                
+                if change_pct > 0.3 and volume_ratio > 1.2:
+                    significant_moves += 1
+            
+            participation = significant_moves / (len(closes) - 1)
+            return min(participation * 1.5, 1.0)
+            
+        except Exception as e:
+            return 0.5
+    
+    def _calculate_body_dominance(self, df: pd.DataFrame) -> float:
+        """Calculate body dominance"""
+        try:
+            bodies = abs(df['close'] - df['open'])
+            ranges = df['high'] - df['low']
+            
+            valid = ranges > 0
+            if valid.any():
+                ratios = bodies[valid] / ranges[valid]
+                return float(ratios.mean())
+            
+            return 0.5
+            
+        except Exception as e:
+            return 0.5
+    
+    def _calculate_volume_expansion(self, df: pd.DataFrame) -> float:
+        """Calculate volume expansion"""
+        try:
+            volumes = df['volume'].values
+            if len(volumes) < 5:
+                return 1.0
+            
+            recent = volumes[-2:].mean()
+            previous = volumes[-4:-2].mean() if len(volumes) > 4 else recent
+            
+            if previous > 0:
+                return recent / previous
+            
+            return 1.0
+            
+        except Exception as e:
+            return 1.0
+    
+    def _calculate_bid_ask_balance(self, df: pd.DataFrame, direction: str) -> float:
+        """Estimate bid-ask balance"""
+        try:
+            closes = df['close'].values[-5:]
+            opens = df['open'].values[-5:]
+            
+            bullish = sum(1 for i in range(len(closes)) if closes[i] > opens[i])
+            bearish = sum(1 for i in range(len(closes)) if closes[i] < opens[i])
+            total = bullish + bearish
+            
+            if total > 0:
+                balance = (bullish - bearish) / total
+                
+                # Direction adjustment
+                if direction == "LONG":
+                    return max(balance, -0.3)
+                else:
+                    return min(balance, 0.3)
+            
+            return 0.0
+            
+        except Exception as e:
+            return 0.0
+    
+    # ========== STEP 4: INDICATOR ANALYSIS ==========
+    
+    def analyze_indicators(self, df: pd.DataFrame, direction: str) -> IndicatorAlignment:
+        """Analyze indicators"""
+        
+        try:
+            if df is None or len(df) < 30:
+                return self._default_indicators()
+            
+            # RSI analysis
+            rsi_position, rsi_momentum = self._analyze_rsi(df)
+            
+            # EMA analysis
+            ema_alignment, ema_order, price_vs_ema = self._analyze_emas(df)
+            
+            # Volume trend
+            volume_trend = self._analyze_volume_trend(df)
+            
+            # MACD signal
+            macd_signal = self._analyze_macd(df, direction)
+            
+            return IndicatorAlignment(
+                rsi_position=float(rsi_position),
+                rsi_momentum=float(rsi_momentum),
+                ema_alignment=float(ema_alignment),
+                volume_trend=float(volume_trend),
+                ema_order=ema_order,
+                price_vs_ema=price_vs_ema,
+                macd_signal=macd_signal
+            )
+            
+        except Exception as e:
+            log.error(f"Indicator error: {e}")
+            return self._default_indicators()
+    
+    def _analyze_rsi(self, df: pd.DataFrame) -> Tuple[float, float]:
+        """Analyze RSI"""
+        try:
+            if 'rsi' not in df.columns or len(df) < 10:
+                return 50.0, 0.0
+            
+            rsi = df['rsi'].values[-10:]
+            current_rsi = rsi[-1]
+            
+            # Momentum calculation
+            if len(rsi) >= 5:
+                x = np.arange(len(rsi))
+                slope, _ = np.polyfit(x, rsi, 1)
+                momentum = slope / 10  # Normalized
+            else:
+                momentum = 0.0
+            
+            return float(current_rsi), float(momentum)
+            
+        except Exception as e:
+            return 50.0, 0.0
+    
+    def _analyze_emas(self, df: pd.DataFrame) -> Tuple[float, str, str]:
+        """Analyze EMA alignment"""
+        try:
+            price = df['close'].iloc[-1]
+            
+            # Get EMAs
+            ema_fast = df[f'ema_{EMA_PERIODS[0]}'].iloc[-1]
+            ema_medium = df[f'ema_{EMA_PERIODS[1]}'].iloc[-1]
+            ema_slow = df[f'ema_{EMA_PERIODS[2]}'].iloc[-1]
+            
+            # Determine order
+            if ema_fast > ema_medium > ema_slow:
+                order = "BULLISH"
+            elif ema_fast < ema_medium < ema_slow:
+                order = "BEARISH"
+            else:
+                order = "MIXED"
+            
+            # Price position
+            if price > ema_fast and price > ema_medium and price > ema_slow:
+                price_position = "ABOVE_ALL"
+            elif price < ema_fast and price < ema_medium and price < ema_slow:
+                price_position = "BELOW_ALL"
+            else:
+                price_position = "BETWEEN"
+            
+            # Alignment score
+            distances = [
+                abs(ema_fast - ema_medium) / ema_medium if ema_medium > 0 else 0,
+                abs(ema_medium - ema_slow) / ema_slow if ema_slow > 0 else 0
+            ]
+            alignment = 1.0 - np.mean(distances) * 20  # Convert to 0-1
+            
+            return float(np.clip(alignment, 0.0, 1.0)), order, price_position
+            
+        except Exception as e:
+            return 0.5, "MIXED", "BETWEEN"
+    
+    def _analyze_volume_trend(self, df: pd.DataFrame) -> float:
+        """Analyze volume trend"""
+        try:
+            if 'volume_ratio' not in df.columns or len(df) < 10:
+                return 0.0
+            
+            ratios = df['volume_ratio'].values[-10:]
+            if len(ratios) >= 5:
+                x = np.arange(len(ratios))
+                slope, _ = np.polyfit(x, ratios, 1)
+                return float(np.clip(slope, -1, 1))
+            
+            return 0.0
+            
+        except Exception as e:
+            return 0.0
+    
+    def _analyze_macd(self, df: pd.DataFrame, direction: str) -> str:
+        """Analyze MACD"""
+        try:
+            if 'macd' not in df.columns or 'macd_signal' not in df.columns:
+                return "NEUTRAL"
+            
+            macd = df['macd'].iloc[-1]
+            signal = df['macd_signal'].iloc[-1]
+            hist = df['macd_hist'].iloc[-1]
+            
+            if macd > signal and hist > 0:
+                return "BULLISH"
+            elif macd < signal and hist < 0:
+                return "BEARISH"
+            else:
+                return "NEUTRAL"
+                
+        except Exception as e:
+            return "NEUTRAL"
+    
+    # ========== STEP 5: SIGNAL GENERATION ==========
+    
+    async def generate_trade_signal(self, symbol: str, 
+                                   multi_tf_data: Dict[str, pd.DataFrame]) -> Optional[TradeSignal]:
+        """Generate complete trade signal"""
+        
+        try:
+            # Update stats
+            self.stats.total_scans += 1
+            
+            # 1. WATCH ALL TIMEFRAMES - Determine direction
+            market_direction = await self.analyze_market_direction(multi_tf_data)
+            
+            if not market_direction.should_trade:
                 return None
             
-            if len(tf_1h) < 20 or len(tf_15m) < 30 or len(tf_5m) < 20:
+            # Determine direction
+            if market_direction.is_long:
+                direction = "LONG"
+            elif market_direction.is_short:
+                direction = "SHORT"
+            else:
                 return None
             
-            # 2. HIGH TIMEFRAME: Permission only
-            market_phase = self.analyze_market_phase(tf_1h)
-            
-            # Skip if no clear permission
-            if market_phase.bias_allowed == "SKIP":
-                self.trade_stats["phase_skipped"] += 1
-                log.debug(f"{symbol}: HTF says SKIP - {market_phase.phase}")
+            # Get entry timeframe data (15M preferred)
+            entry_tf_data = multi_tf_data.get("15M") or multi_tf_data.get("5M")
+            if entry_tf_data is None or len(entry_tf_data) < 20:
                 return None
             
-            # 3. MID TIMEFRAME: Wave identification
-            wave_structure = self.analyze_wave_structure(tf_15m, market_phase.bias_allowed)
+            # 2. WAVE ENERGY - Estimate potential
+            wave_energy = self.analyze_wave_energy(entry_tf_data, direction)
             
-            # Skip if wave structure not valid
-            if not wave_structure.is_valid_setup:
-                self.trade_stats["wave_structure_skipped"] += 1
-                log.debug(f"{symbol}: Invalid wave structure - {wave_structure.wave_type}")
+            if not wave_energy.ready_for_move:
                 return None
             
-            # 4. LOW TIMEFRAME: Energy transition
-            energy_transition = self.detect_energy_transition(tf_5m, market_phase.bias_allowed)
+            # 3. STRENGTH + VOLUME - Confirm move
+            strength_volume = self.analyze_strength_volume(entry_tf_data, direction)
             
-            # Skip if no valid transition
-            if not energy_transition.is_valid_entry:
-                self.trade_stats["transition_skipped"] += 1
-                log.debug(f"{symbol}: No valid energy transition")
+            if not strength_volume.is_confirmed:
                 return None
             
-            # 5. Calculate entry parameters
-            current_price = tf_5m['close'].iloc[-1]
-            entry_price = current_price  # Enter at current price (first impulse)
+            # 4. INDICATORS - Fine-tune timing
+            indicators = self.analyze_indicators(entry_tf_data, direction)
             
-            # Invalidation based on EMA structure
-            ema9 = tf_5m['close'].ewm(span=EMA_PERIODS[0], adjust=False).mean().iloc[-1]
+            if direction == "LONG" and not indicators.supports_long:
+                return None
+            elif direction == "SHORT" and not indicators.supports_short:
+                return None
             
-            if market_phase.bias_allowed == "LONG":
-                invalidation_price = ema9 * (1 - EMA_RESPECT_DISTANCE)
-                # Expansion target based on wave structure
-                expansion_multiplier = 1.0 + wave_structure.expansion_potential * 0.05  # 0-5%
-                expansion_target = entry_price * expansion_multiplier
-            else:  # SHORT
-                invalidation_price = ema9 * (1 + EMA_RESPECT_DISTANCE)
-                expansion_multiplier = 1.0 - wave_structure.expansion_potential * 0.05
-                expansion_target = entry_price * expansion_multiplier
+            # 5. CALCULATE TRADE PARAMETERS
+            current_price = entry_tf_data['close'].iloc[-1]
             
-            # Calculate strength metrics
-            impulse_strength = energy_transition.impulse_body_ratio
-            volume_confidence = min(energy_transition.volume_expansion / 3.0, 1.0)  # Cap at 3x
-            structure_quality = wave_structure.symmetry_score * wave_structure.expansion_potential
+            if direction == "LONG":
+                stop_loss = current_price * (1 - STOP_LOSS_PCT)
+                take_profit = current_price * (1 + TAKE_PROFIT_PCT)
+                wave_target = current_price * (1 + wave_energy.wave_length_score * 0.1)
+            else:
+                stop_loss = current_price * (1 + STOP_LOSS_PCT)
+                take_profit = current_price * (1 - TAKE_PROFIT_PCT)
+                wave_target = current_price * (1 - wave_energy.wave_length_score * 0.1)
             
-            # Calculate correction duration
-            correction_duration = energy_transition.first_impulse_candle_index - len(tf_5m) + 20
-            impulse_age = len(tf_5m) - energy_transition.first_impulse_candle_index - 1
+            # Calculate risk:reward
+            risk = abs(current_price - stop_loss) / current_price
+            reward = abs(take_profit - current_price) / current_price
+            risk_reward = reward / risk if risk > 0 else 0
             
-            # 6. Create signal
+            if risk_reward < MIN_RISK_REWARD:
+                return None
+            
+            # Calculate confidence scores
+            confidence_scores = [
+                market_direction.confidence,
+                wave_energy.energy_level,
+                strength_volume.strength_score,
+                indicators.ema_alignment,
+                market_direction.alignment_score
+            ]
+            
+            overall_confidence = float(np.mean(confidence_scores))
+            
+            if overall_confidence < MIN_CONFIDENCE:
+                return None
+            
+            # Calculate quality score
+            quality_components = [
+                overall_confidence * 0.3,
+                (risk_reward / 3) * 0.2,  # Normalize RR
+                wave_energy.compression_ratio * 0.2,
+                strength_volume.volume_score * 0.15,
+                indicators.ema_alignment * 0.15
+            ]
+            
+            quality_score = float(np.sum(quality_components))
+            
+            # Create signal
             signal_id = hashlib.md5(
-                f"{symbol}:{market_phase.bias_allowed}:{entry_price}:{time.time()}".encode()
-            ).hexdigest()
+                f"{symbol}:{direction}:{current_price}:{time.time()}".encode()
+            ).hexdigest()[:16]
             
-            signal = WaveSignal(
+            signal = TradeSignal(
                 signal_id=signal_id,
                 symbol=symbol,
-                side=market_phase.bias_allowed,
+                direction=direction,
+                timestamp=time.time(),
                 
-                entry_price=entry_price,
-                invalidation_price=invalidation_price,
-                expansion_target=expansion_target,
+                market_direction=market_direction,
+                wave_energy=wave_energy,
+                strength_volume=strength_volume,
+                indicators=indicators,
                 
-                market_phase=market_phase,
-                wave_structure=wave_structure,
-                energy_transition=energy_transition,
+                entry_price=float(current_price),
+                stop_loss=float(stop_loss),
+                take_profit=float(take_profit),
+                wave_target=float(wave_target),
                 
-                impulse_strength=impulse_strength,
-                volume_confidence=volume_confidence,
-                structure_quality=structure_quality,
+                overall_confidence=overall_confidence,
+                timeframe_alignment=market_direction.alignment_score,
+                risk_reward=float(risk_reward),
+                quality_score=quality_score,
                 
-                higher_timeframe="1H",
-                wave_timeframe="15M",
-                entry_timeframe="5M",
-                
-                correction_duration=correction_duration,
-                impulse_age=impulse_age,
-                signal_timestamp=time.time()
+                primary_timeframe="4H" if "4H" in multi_tf_data else "1H",
+                entry_timeframe="15M" if "15M" in multi_tf_data else "5M"
             )
             
-            # 7. Final quality check
-            if signal.trade_quality < 0.7:
-                log.debug(f"{symbol}: Quality too low ({signal.trade_quality:.2f})")
+            # Check risk management
+            if not self._check_risk_management(signal):
                 return None
             
-            # 8. Update statistics
-            self.trade_stats["quality_signals"] += 1
-            self.trade_stats["impulse_entries"] += 1
+            # Update stats
+            self.stats.signals_found += 1
             
-            # 9. Log the high-quality signal
-            log.info(f"🌊 WAVE-MOMENTUM SIGNAL: {symbol} {signal.side}")
-            log.info(f"   Phase: {market_phase.phase} ({market_phase.confidence:.1%})")
-            log.info(f"   Wave: {wave_structure.wave_type}, Length: {wave_structure.wave_length:.2f}")
-            log.info(f"   Transition: First impulse candle detected")
-            log.info(f"   Quality: {signal.trade_quality:.1%}")
-            log.info(f"   Target: {expansion_target/entry_price*100-100:+.1f}% expansion")
+            log.info(f"🎯 Signal: {symbol} {direction} "
+                    f"(Conf: {overall_confidence:.1%}, RR: {risk_reward:.2f}, "
+                    f"Quality: {quality_score:.1%})")
             
             return signal
             
         except Exception as e:
             log.error(f"Signal generation error for {symbol}: {e}")
             return None
-
-# ================ MAIN SCANNER SYSTEM ================
-class WaveMomentumScanner:
-    """Main scanner system for wave-momentum trading"""
     
-    def __init__(self):
-        self.trader = WaveMomentumTrader()
-        self.exchange = None
-        self.db = None
-        self.scan_cycle = 0
+    def _check_risk_management(self, signal: TradeSignal) -> bool:
+        """Check risk management rules"""
         
-    async def initialize(self):
-        """Initialize the scanner"""
-        log.info("=" * 70)
-        log.info("🌊 WAVE-MOMENTUM TRADING SYSTEM - ENERGY TRANSITION HUNTER")
-        log.info("=" * 70)
-        log.info("TRADER ROLE: Discretionary wave-energy specialist")
-        log.info("SPECIALTY: First expansion wave after correction")
-        log.info("PHILOSOPHY: Trade energy transitions, not predictions")
-        log.info("ASSET FOCUS: Low-price altcoins ($0-$10), inefficient markets")
-        log.info("TIMEFRAMES: 1H (permission), 15M (wave), 5M (entry)")
-        log.info("ENTRY RULE: First impulse candle ONLY after correction")
-        log.info("QUALITY FILTER: If unclear → NO SIGNAL")
-        log.info("=" * 70)
+        # Check cooldown after loss
+        if time.time() - self.last_loss_time < COOLDOWN_AFTER_LOSS:
+            log.debug("In cooldown after loss")
+            return False
         
-        # Initialize database
-        await self._init_database()
+        # Check max open positions
+        if len(self.positions) >= MAX_OPEN_POSITIONS:
+            log.debug(f"Max positions reached: {len(self.positions)}")
+            return False
         
-        # Initialize exchange
-        await self._init_exchange()
+        # Check daily loss limit
+        if self.stats.daily_loss_pct >= MAX_DAILY_LOSS_PCT:
+            log.warning(f"Daily loss limit reached: {self.stats.daily_loss_pct:.1f}%")
+            return False
         
-        # Send startup message
-        await self._send_startup_message()
+        # Check if already have position in this symbol
+        if signal.symbol in self.positions:
+            log.debug(f"Already have position in {signal.symbol}")
+            return False
+        
+        return True
     
-    async def _init_database(self):
-        """Initialize database for wave signals"""
+    # ========== TRADE EXECUTION ==========
+    
+    async def execute_trade(self, signal: TradeSignal, portfolio_value: float = 10000.0):
+        """Execute trade based on signal"""
+        
         try:
-            os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-            self.db = await aiosqlite.connect(DB_PATH)
+            # Calculate position size
+            position_size = self._calculate_position_size(signal, portfolio_value)
             
-            # Wave signals table
-            await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS wave_signals (
-                id TEXT PRIMARY KEY,
-                symbol TEXT NOT NULL,
-                side TEXT NOT NULL,
-                entry_price REAL NOT NULL,
-                invalidation_price REAL NOT NULL,
-                expansion_target REAL NOT NULL,
-                
-                market_phase TEXT NOT NULL,
-                phase_confidence REAL NOT NULL,
-                wave_type TEXT NOT NULL,
-                wave_length REAL NOT NULL,
-                expansion_potential REAL NOT NULL,
-                
-                impulse_strength REAL NOT NULL,
-                volume_confidence REAL NOT NULL,
-                structure_quality REAL NOT NULL,
-                trade_quality REAL NOT NULL,
-                
-                correction_duration INTEGER NOT NULL,
-                impulse_age INTEGER NOT NULL,
-                
-                status TEXT DEFAULT 'PENDING',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                
-                triggered_at TIMESTAMP,
-                trigger_price REAL,
-                
-                closed_at TIMESTAMP,
-                close_price REAL,
-                pnl_percent REAL,
-                close_reason TEXT,
-                
-                wave_win INTEGER DEFAULT 0
+            if position_size <= 0:
+                log.warning(f"Invalid position size for {signal.symbol}")
+                return False
+            
+            # Create position
+            position = Position(
+                signal=signal,
+                size=position_size,
+                entry_time=time.time(),
+                current_stop=signal.stop_loss,
+                highest_price=signal.entry_price if signal.direction == "LONG" else float('inf'),
+                lowest_price=signal.entry_price if signal.direction == "SHORT" else 0
             )
-            """)
             
-            # Performance table
-            await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS wave_performance (
-                date DATE PRIMARY KEY,
-                assets_scanned INTEGER,
-                phase_skipped INTEGER,
-                wave_structure_skipped INTEGER,
-                transition_skipped INTEGER,
-                quality_signals INTEGER,
-                impulse_entries INTEGER,
-                wave_wins INTEGER,
-                wave_losses INTEGER,
-                win_rate REAL,
-                avg_expansion REAL,
-                avg_quality REAL
-            )
-            """)
+            # Update signal
+            signal.status = "TRIGGERED"
+            signal.entry_time = time.time()
             
-            await self.db.commit()
+            # Store position
+            self.positions[signal.symbol] = position
+            self.signals[signal.signal_id] = signal
             
-            log.info("✅ Database initialized for wave trading")
+            # Save to database
+            await self._save_signal(signal)
             
-        except Exception as e:
-            log.error(f"Database error: {e}")
-            raise
-    
-    async def _init_exchange(self):
-        """Initialize exchange connection"""
-        try:
-            self.exchange = ccxt.okx({
-                "enableRateLimit": True,
-                "options": {"defaultType": "spot"},
-                "timeout": 20000,
-                "rateLimit": 50
-            })
+            # Update stats
+            self.stats.trades_executed += 1
             
-            # Test connection
-            ticker = await self.exchange.fetch_ticker("BTC/USDT")
-            log.info(f"✅ Exchange connected. BTC: ${ticker['last']:.2f}")
+            log.info(f"✅ Trade executed: {signal.symbol} {signal.direction} "
+                    f"@ {signal.entry_price:.6f}, Size: ${position_size:.2f}")
+            
+            # Send notification
+            await self._send_trade_notification(signal, position_size)
+            
+            return True
             
         except Exception as e:
-            log.error(f"Exchange error: {e}")
-            raise
+            log.error(f"Trade execution error: {e}")
+            return False
     
-    async def _send_startup_message(self):
-        """Send startup message to Telegram"""
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            log.warning("⚠️ Telegram credentials not set. Notifications will not be sent.")
-            return
+    def _calculate_position_size(self, signal: TradeSignal, portfolio_value: float) -> float:
+        """Calculate position size based on risk"""
+        risk_per_trade = portfolio_value * MAX_POSITION_SIZE
+        price_risk = abs(signal.entry_price - signal.stop_loss)
         
-        try:
-            message = f"""
-🌊 <b>WAVE-MOMENTUM TRADER ACTIVATED</b>
-
-<b>🎯 CORE PHILOSOPHY:</b>
-• Trade ENERGY TRANSITIONS, not predictions
-• First expansion wave after correction ONLY
-• If unclear → NO SIGNAL (discipline > frequency)
-
-<b>🧠 TIMEFRAME ROLES:</b>
-1️⃣ <b>1H (Permission):</b>
-‎   • Detect market phase only
-‎   • Set bias: LONG, SHORT, or SKIP
-‎   • NO entries here
-
-2️⃣ <b>15M (Wave Identification):</b>
-‎   • Detect correction completion
-‎   • Measure wave symmetry & compression
-‎   • Confirm expansion potential exists
-
-3️⃣ <b>5M (Execution):</b>
-‎   • Detect FIRST impulse candle
-‎   • Tight invalidation at EMA structure
-‎   • Exact entry timing
-
-<b>⚡ ENTRY CONDITIONS (ALL MUST BE TRUE):</b>
-• Correction complete or ending
-• First impulsive candle appears
-• Candle body shows dominance (>{MIN_BODY_DOMINANCE*100:.0f}%)
-• Volume expands on impulse (>{MIN_VOLUME_EXPANSION:.1f}x)
-• RSI turns with price
-• EMA holds structure during correction
-
-<b>🎯 ASSET SELECTION:</b>
-• Price: ${MAX_PRICE_USDT} maximum
-• Volume: ${MIN_VOLUME_USD:,.0f} - ${MAX_VOLUME_USD:,.0f}
-• Focus on low-price, inefficient altcoins
-
-<b>🚫 FORBIDDEN:</b>
-• Trading every breakout
-• Chasing price
-• Entering mid-wave
-• Fixed indicator thresholds
-• Forcing signals for frequency
-
-<b>🧠 TRADER MINDSET:</b>
-I am a wave-energy specialist hunting the first expansion after compression.
-I wait patiently for clear energy transitions.
-I enter early when momentum shifts.
-I exit during impulse continuation, not at reversals.
-
-#WaveMomentum #EnergyTransitions #FirstImpulse #QualityOverQuantity
-"""
-            
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(url, json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML"
-                })
-                
-            log.info("✅ Startup message sent to Telegram")
-                
-        except Exception as e:
-            log.error(f"Telegram startup error: {e}")
-    
-    async def fetch_timeframe_data(self, symbol: str) -> Dict[str, pd.DataFrame]:
-        """Fetch data for all timeframes"""
-        data = {}
+        if price_risk > 0:
+            position_size = risk_per_trade / price_risk * signal.entry_price
+            return min(position_size, risk_per_trade)  # Cap at risk amount
         
-        for tf_name, tf_config in TIMEFRAMES.items():
-            try:
-                tf = tf_config["tf"]
-                limit = tf_config["candles"]
-                
-                ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-                
-                if ohlcv and len(ohlcv) >= 20:
-                    df = pd.DataFrame(
-                        ohlcv,
-                        columns=["timestamp", "open", "high", "low", "close", "volume"]
-                    )
-                    
-                    # Convert to numeric
-                    for col in ["open", "high", "low", "close", "volume"]:
-                        df[col] = pd.to_numeric(df[col], errors='coerce')
-                    
-                    df = df.dropna()
-                    
-                    if len(df) >= 15:
-                        data[tf_name] = df
-                    
-            except Exception as e:
-                log.debug(f"{symbol} {tf_name}: {str(e)[:50]}")
-                continue
-        
-        return data
+        return 0.0
     
-    async def get_wave_assets(self) -> List[str]:
-        """Get assets for wave trading (low-price, inefficient)"""
-        try:
-            # Get all USDT pairs
-            markets = await self.exchange.fetch_markets()
-            all_symbols = [m['symbol'] for m in markets if m['quote'] == 'USDT']
-            
-            # Filter using trader's asset selection
-            selected = await self.trader.select_wave_assets(self.exchange, all_symbols)
-            
-            log.info(f"🌊 Selected {len(selected)} wave-trading assets")
-            return selected
-            
-        except Exception as e:
-            log.error(f"Error getting assets: {e}")
-            return []
-    
-    async def save_wave_signal(self, signal: WaveSignal) -> bool:
-        """Save wave signal to database"""
+    async def _save_signal(self, signal: TradeSignal):
+        """Save signal to database"""
         try:
             await self.db.execute("""
-                INSERT INTO wave_signals (
-                    id, symbol, side, entry_price, invalidation_price, expansion_target,
-                    market_phase, phase_confidence, wave_type, wave_length, expansion_potential,
-                    impulse_strength, volume_confidence, structure_quality, trade_quality,
-                    correction_duration, impulse_age
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO signals (
+                    id, symbol, direction, status,
+                    entry_price, stop_loss, take_profit, wave_target,
+                    confidence, risk_reward, quality_score,
+                    primary_tf, entry_tf
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 signal.signal_id,
                 signal.symbol,
-                signal.side,
+                signal.direction,
+                signal.status,
                 signal.entry_price,
-                signal.invalidation_price,
-                signal.expansion_target,
-                signal.market_phase.phase,
-                signal.market_phase.confidence,
-                signal.wave_structure.wave_type,
-                signal.wave_structure.wave_length,
-                signal.wave_structure.expansion_potential,
-                signal.impulse_strength,
-                signal.volume_confidence,
-                signal.structure_quality,
-                signal.trade_quality,
-                signal.correction_duration,
-                signal.impulse_age
+                signal.stop_loss,
+                signal.take_profit,
+                signal.wave_target,
+                signal.overall_confidence,
+                signal.risk_reward,
+                signal.quality_score,
+                signal.primary_timeframe,
+                signal.entry_timeframe
             ))
             
             await self.db.commit()
             
-            log.info(f"✅ Wave signal saved: {signal.symbol} (Quality: {signal.trade_quality:.1%})")
-            return True
-            
         except Exception as e:
-            log.error(f"Error saving wave signal: {e}")
-            return False
+            log.error(f"Error saving signal: {e}")
     
-    async def format_wave_message(self, signal: WaveSignal) -> str:
-        """Format wave signal for Telegram"""
-        side_emoji = "🟢" if signal.side == "LONG" else "🔴"
-        side_text = "شراء" if signal.side == "LONG" else "بيع"
-        
-        # Calculate expected expansion
-        expected_expansion = (signal.expansion_target / signal.entry_price - 1) * 100
-        
-        message = f"""
-{side_emoji} <b>إشارة موجة دفع - ENERGY TRANSITION</b> 🌊
-
-<b>{signal.symbol}</b> | {side_text}
-
-<b>🎯 فلسفة الدخول:</b>
-الموجة التصحيحية انتهت ← أول شمعة دفع ظهرت
-نصطاد انتقال الطاقة، لا نتوقع
-
-<b>📊 تحليل الموجة:</b>
-‎• المرحلة: {signal.market_phase.phase} ({signal.market_phase.confidence:.1%})
-‎• نوع الموجة: {signal.wave_structure.wave_type}
-‎• طول الموجة: {signal.wave_structure.wave_length:.2f}
-‎• إمكانية التوسع: {signal.wave_structure.expansion_potential:.1%}
-
-<b>⚡ انتقال الطاقة:</b>
-‎• أول شمعة دفع بعد {signal.correction_duration} شمعة تصحيح
-‎• عمر الدفع: {signal.impulse_age} شموع (مبكر جداً)
-‎• قوة الدفع: {signal.impulse_strength:.1%}
-‎• تأكيد الفوليوم: {signal.volume_confidence:.1%}
-
-<b>🎯 التنفيذ:</b>
-‎• سعر الدخول: <code>{signal.entry_price:.6f}</code>
-‎• مستوى الإبطال: <code>{signal.invalidation_price:.6f}</code>
-‎• هدف التوسع: <code>{signal.expansion_target:.6f}</code> ({expected_expansion:+.1f}%)
-
-<b>📈 جودة الصفقة:</b>
-‎• الجودة الكلية: {signal.trade_quality:.1%}
-‎• جودة الهيكل: {signal.structure_quality:.1%}
-‎• ثقة الفوليوم: {signal.volume_confidence:.1%}
-
-<b>🧠 عقلية الموجة:</b>
-انتقال الطاقة تم اكتشافه
-الدخول عند أول شمعة دفع
-الإبطال عند كسر هيكل الموجة
-الهدف هو توسع الموجة، ليس رقم ثابت
-
-<b>⚠️ ملاحظة التاجر:</b>
-هذه إشارة موجية عالية الجودة
-الدخول مبكر عند انتقال الطاقة
-لا مطاردة ← إذا فاتتك الموجة، انتظر الموجة القادمة
-
-#{side_text} #موجة_دفع #انتقال_طاقة #أول_شمعة #جودة_عالية
-"""
-        return message
+    # ========== POSITION MONITORING ==========
     
-    async def send_wave_alert(self, signal: WaveSignal):
-        """Send Telegram alert for wave signals"""
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            log.warning(f"⚠️ Telegram credentials missing. Skipping alert for {signal.symbol}")
-            return
-        
-        try:
-            message = await self.format_wave_message(signal)
-            
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(url, json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML"
-                })
-                
-            log.info(f"📤 Wave alert sent: {signal.symbol}")
-            
-        except Exception as e:
-            log.error(f"Telegram error: {e}")
-    
-    async def monitor_wave_positions(self):
-        """Monitor wave positions with energy-based exits"""
-        log.info("👀 Starting wave position monitoring...")
+    async def monitor_positions(self):
+        """Monitor and manage open positions"""
+        log.info("👀 Starting position monitoring...")
         
         while True:
             try:
-                # Get open wave positions
-                async with self.db.execute("""
-                    SELECT id, symbol, side, entry_price, invalidation_price, 
-                           expansion_target, trade_quality, wave_type
-                    FROM wave_signals 
-                    WHERE status = 'PENDING'
-                """) as cursor:
-                    positions = await cursor.fetchall()
+                if not self.positions:
+                    await asyncio.sleep(1)
+                    continue
                 
-                for pos_id, symbol, side, entry, invalidation, target, quality, wave_type in positions:
+                positions_to_remove = []
+                
+                for symbol, position in list(self.positions.items()):
                     try:
                         # Get current price
                         ticker = await self.exchange.fetch_ticker(symbol)
                         current_price = ticker['last']
                         
-                        # Check if price reached entry (wave entries are immediate)
-                        # For wave trading, we enter immediately at detection
-                        if abs(current_price - entry) / entry <= 0.01:  # Within 1%
-                            # Mark as triggered
-                            await self.db.execute("""
-                                UPDATE wave_signals SET 
-                                    status = 'TRIGGERED',
-                                    triggered_at = CURRENT_TIMESTAMP,
-                                    trigger_price = ?
-                                WHERE id = ?
-                            """, (current_price, pos_id))
-                            
-                            await self.db.commit()
-                            
-                            log.info(f"✅ Wave position triggered: {symbol} {side} @ {current_price:.4f}")
+                        # Update price extremes
+                        if position.signal.direction == "LONG":
+                            position.highest_price = max(position.highest_price, current_price)
+                            position.lowest_price = min(position.lowest_price, current_price)
+                        else:
+                            position.highest_price = min(position.highest_price, current_price)
+                            position.lowest_price = max(position.lowest_price, current_price)
                         
-                        # For triggered positions, check exit conditions
-                        async with self.db.execute("""
-                            SELECT id FROM wave_signals 
-                            WHERE id = ? AND status = 'TRIGGERED'
-                        """, (pos_id,)) as cursor:
-                            triggered = await cursor.fetchone()
+                        # Check exit conditions
+                        should_exit, exit_reason = self._check_exit_conditions(position, current_price)
                         
-                        if triggered:
-                            await self._check_wave_exit(
-                                pos_id, symbol, side, entry, invalidation, 
-                                target, current_price, quality, wave_type
-                            )
-                    
+                        if should_exit:
+                            await self._close_position(position, current_price, exit_reason)
+                            positions_to_remove.append(symbol)
+                        
+                        # Update trailing stop
+                        self._update_trailing_stop(position, current_price)
+                        
                     except Exception as e:
-                        log.error(f"Monitor error for {symbol}: {e}")
+                        log.error(f"Position monitoring error for {symbol}: {e}")
                         continue
                 
-                await asyncio.sleep(3)  # Check every 3 seconds
+                # Remove closed positions
+                for symbol in positions_to_remove:
+                    if symbol in self.positions:
+                        del self.positions[symbol]
+                
+                await asyncio.sleep(2)
                 
             except Exception as e:
                 log.error(f"Monitoring loop error: {e}")
                 await asyncio.sleep(5)
     
-    async def _check_wave_exit(self, pos_id: str, symbol: str, side: str, 
-                              entry: float, invalidation: float, target: float,
-                              current_price: float, quality: float, wave_type: str):
-        """Check exit conditions for wave trade"""
+    def _check_exit_conditions(self, position: Position, current_price: float) -> Tuple[bool, str]:
+        """Check if position should be exited"""
+        signal = position.signal
         
-        # Calculate P&L
-        if side == "LONG":
-            pnl_pct = ((current_price - entry) / entry) * 100
-            is_invalidated = current_price <= invalidation
-            is_target_reached = current_price >= target
+        if signal.direction == "LONG":
+            # Stop loss hit
+            if current_price <= position.current_stop:
+                return True, "STOP_LOSS"
+            
+            # Take profit hit
+            if current_price >= signal.take_profit:
+                return True, "TAKE_PROFIT"
+            
+            # Wave target hit
+            if current_price >= signal.wave_target:
+                return True, "WAVE_TARGET"
+            
+            # Time-based exit (4 hours max)
+            if time.time() - position.entry_time > 4 * 3600:
+                return True, "TIME_EXIT"
+            
         else:  # SHORT
-            pnl_pct = ((entry - current_price) / entry) * 100
-            is_invalidated = current_price >= invalidation
-            is_target_reached = current_price <= target
+            if current_price >= position.current_stop:
+                return True, "STOP_LOSS"
+            if current_price <= signal.take_profit:
+                return True, "TAKE_PROFIT"
+            if current_price <= signal.wave_target:
+                return True, "WAVE_TARGET"
+            if time.time() - position.entry_time > 4 * 3600:
+                return True, "TIME_EXIT"
         
-        # Energy-based exit logic
-        should_exit = False
-        close_reason = ""
-        is_wave_win = False
+        return False, ""
+    
+    def _update_trailing_stop(self, position: Position, current_price: float):
+        """Update trailing stop loss"""
+        signal = position.signal
         
-        # 1. Wave invalidation (structure broken)
-        if is_invalidated:
-            should_exit = True
-            close_reason = "WAVE_INVALIDATED"
-            is_wave_win = False
+        if signal.direction == "LONG":
+            # Calculate profit percentage
+            profit_pct = (current_price - signal.entry_price) / signal.entry_price
+            
+            # Activate trailing stop
+            if profit_pct >= TRAILING_STOP_ACTIVATE and not position.trailing_active:
+                position.trailing_active = True
+                log.info(f"🔄 Trailing stop activated for {signal.symbol}")
+            
+            # Update trailing stop
+            if position.trailing_active:
+                new_stop = current_price * (1 - TRAILING_STOP_DISTANCE)
+                if new_stop > position.current_stop:
+                    position.current_stop = new_stop
         
-        # 2. Expansion target reached (wave completed)
-        elif is_target_reached:
-            should_exit = True
-            close_reason = "EXPANSION_COMPLETE"
-            is_wave_win = True
-        
-        # 3. Momentum decay (energy fading)
-        elif abs(pnl_pct) > 1.0:  # Only check after some move
-            # Get recent data to check momentum
-            try:
-                ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe="5m", limit=10)
-                if len(ohlcv) >= 5:
-                    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
-                    
-                    # Check if momentum is fading
-                    recent_prices = df['close'].values
-                    if len(recent_prices) >= 3:
-                        # Simple momentum check
-                        momentum = abs(recent_prices[-1] - recent_prices[-3]) / recent_prices[-3] * 100
-                        entry_momentum = abs(target - entry) / entry * 100
-                        
-                        if momentum < entry_momentum * 0.3:  # Momentum faded to 30%
-                            should_exit = True
-                            close_reason = "MOMENTUM_DECAY"
-                            is_wave_win = pnl_pct > 0
-            except:
-                pass
-        
-        if should_exit:
+        else:  # SHORT
+            profit_pct = (signal.entry_price - current_price) / signal.entry_price
+            
+            if profit_pct >= TRAILING_STOP_ACTIVATE and not position.trailing_active:
+                position.trailing_active = True
+                log.info(f"🔄 Trailing stop activated for {signal.symbol}")
+            
+            if position.trailing_active:
+                new_stop = current_price * (1 + TRAILING_STOP_DISTANCE)
+                if new_stop < position.current_stop:
+                    position.current_stop = new_stop
+    
+    async def _close_position(self, position: Position, exit_price: float, reason: str):
+        """Close position and update statistics"""
+        try:
+            signal = position.signal
+            
+            # Calculate P&L
+            if signal.direction == "LONG":
+                pnl_pct = (exit_price - signal.entry_price) / signal.entry_price * 100
+            else:
+                pnl_pct = (signal.entry_price - exit_price) / signal.entry_price * 100
+            
+            # Update signal
+            signal.status = "CLOSED"
+            signal.exit_time = time.time()
+            signal.exit_price = exit_price
+            signal.pnl_pct = pnl_pct
+            signal.exit_reason = reason
+            
             # Update database
             await self.db.execute("""
-                UPDATE wave_signals SET 
-                    status = 'CLOSED',
+                UPDATE signals SET
+                    status = ?,
                     closed_at = CURRENT_TIMESTAMP,
-                    close_price = ?,
-                    pnl_percent = ?,
-                    close_reason = ?,
-                    wave_win = ?
+                    exit_price = ?,
+                    pnl_pct = ?,
+                    exit_reason = ?
                 WHERE id = ?
-            """, (current_price, pnl_pct, close_reason, 1 if is_wave_win else 0, pos_id))
+            """, ("CLOSED", exit_price, pnl_pct, reason, signal.signal_id))
             
             await self.db.commit()
             
-            # Send notification
-            await self._send_wave_exit_notification(
-                symbol, side, pnl_pct, close_reason, entry, current_price, quality
-            )
+            # Update statistics
+            self._update_performance_stats(pnl_pct)
             
-            log.info(f"🌊 Wave trade closed: {symbol} {close_reason} ({pnl_pct:+.2f}%)")
+            # Send notification
+            await self._send_exit_notification(signal, pnl_pct, reason)
+            
+            log.info(f"📤 Position closed: {signal.symbol} {reason} "
+                    f"({pnl_pct:+.2f}%)")
+            
+            # Update last loss time if it was a loss
+            if pnl_pct < 0:
+                self.last_loss_time = time.time()
+            
+        except Exception as e:
+            log.error(f"Error closing position: {e}")
     
-    async def _send_wave_exit_notification(self, symbol: str, side: str, pnl_pct: float,
-                                          close_reason: str, entry: float, 
-                                          close_price: float, quality: float):
-        """Send wave exit notification"""
+    def _update_performance_stats(self, pnl_pct: float):
+        """Update performance statistics"""
+        # Update daily P&L
+        self.stats.daily_pnl_pct += pnl_pct
+        
+        if pnl_pct < 0:
+            self.stats.daily_loss_pct += abs(pnl_pct)
+            self.stats.losing_trades += 1
+            if self.stats.is_winning_streak:
+                self.stats.current_streak = 1
+                self.stats.is_winning_streak = False
+            else:
+                self.stats.current_streak += 1
+                self.stats.max_consecutive_losses = max(
+                    self.stats.max_consecutive_losses, self.stats.current_streak
+                )
+        else:
+            self.stats.winning_trades += 1
+            if not self.stats.is_winning_streak:
+                self.stats.current_streak = 1
+                self.stats.is_winning_streak = True
+            else:
+                self.stats.current_streak += 1
+                self.stats.max_consecutive_wins = max(
+                    self.stats.max_consecutive_wins, self.stats.current_streak
+                )
+        
+        self.stats.total_pnl_pct += pnl_pct
+    
+    # ========== NOTIFICATIONS ==========
+    
+    async def _send_trade_notification(self, signal: TradeSignal, position_size: float):
+        """Send trade entry notification"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             return
         
         try:
-            side_text = "شراء" if side == "LONG" else "بيع"
-            pnl_formatted = f"+{pnl_pct:.2f}%" if pnl_pct > 0 else f"{pnl_pct:.2f}%"
+            side_emoji = "🟢" if signal.direction == "LONG" else "🔴"
+            side_text = "شراء" if signal.direction == "LONG" else "بيع"
             
-            # Determine emoji based on reason
-            if "COMPLETE" in close_reason:
-                emoji = "✅"
-                result_text = "اكتمال التوسع الموجي"
-            elif "INVALIDATED" in close_reason:
-                emoji = "❌"
-                result_text = "إبطال الموجة"
-            else:
-                emoji = "⚠️"
-                result_text = "ضعف الزخم"
+            # Calculate wave potential
+            wave_potential = abs(signal.wave_target - signal.entry_price) / signal.entry_price * 100
             
             message = f"""
-{emoji} <b>إغلاق صفقة موجة</b> 🌊
+{side_emoji} <b>إدخال صفقة - نظام التاجر الأساسي</b>
 
-<b>{symbol}</b> | {side_text}
+<b>{signal.symbol}</b> | {side_text}
 
-<b>📊 النتيجة:</b> {result_text}
-💰 <b>الأداء:</b> {pnl_formatted}
+<b>📊 التحليل:</b>
+1️⃣ <b>الاتجاه:</b> {signal.market_direction.primary_bias} ({signal.market_direction.confidence:.1%})
+2️⃣ <b>الموجة:</b> {signal.wave_energy.wave_type}/{signal.wave_energy.wave_stage}
+3️⃣ <b>القوة:</b> {signal.strength_volume.strength_score:.1%}
+4️⃣ <b>المؤشرات:</b> RSI={signal.indicators.rsi_position:.1f}, EMA={signal.indicators.ema_order}
 
-<b>🎯 تفاصيل الموجة:</b>
-‎• جودة الدخول: {quality:.1%}
-‎• سعر الدخول: <code>{entry:.6f}</code>
-‎• سعر الإغلاق: <code>{close_price:.6f}</code>
-‎• السبب: {close_reason}
+<b>⚡ التنفيذ:</b>
+‎• سعر الدخول: <code>{signal.entry_price:.6f}</code>
+‎• وقف الخسارة: <code>{signal.stop_loss:.6f}</code>
+‎• هدف الربح: <code>{signal.take_profit:.6f}</code>
+‎• الهدف الموجي: <code>{signal.wave_target:.6f}</code> ({wave_potential:+.1f}%)
+‎• حجم الصفقة: ${position_size:.2f}
 
-<b>🧠 فلسجة الموجة:</b>
-كل موجة لها بداية ونهاية
-نخرج عند اكتمال التوسع أو إبطال الهيكل
-نقبل النهاية الطبيعية للموجة
+<b>🎯 الجودة:</b>
+‎• الثقة الكلية: {signal.overall_confidence:.1%}
+‎• جودة الإشارة: {signal.quality_score:.1%}
+‎• نسبة المخاطرة: {signal.risk_reward:.2f}:1
 
-<b>🌊 استعداد للموجة القادمة...</b>
+<b>🧠 عقلية التاجر:</b>
+تم تحديد الاتجاه أولاً
+تم تأكيد القوة والفوليوم
+تم ضبط التوقيت بالمؤشرات
+تنفيذ عند تأكيد الدفع
 
-#{side_text} #إغلاق_موجة #{'ربح' if pnl_pct > 0 else 'خسارة'} #استمرارية_الطاقة
+#صفقة_جديدة #نظام_التاجر #{'شراء' if signal.direction == 'LONG' else 'بيع'}
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -1604,177 +1688,107 @@ I exit during impulse continuation, not at reversals.
                 await client.post(url, json={
                     "chat_id": TELEGRAM_CHAT_ID,
                     "text": message,
-                    "parse_mode": "HTML"
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True
+                })
+                
+        except Exception as e:
+            log.error(f"Trade notification error: {e}")
+    
+    async def _send_exit_notification(self, signal: TradeSignal, pnl_pct: float, reason: str):
+        """Send trade exit notification"""
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            return
+        
+        try:
+            side_emoji = "🟢" if signal.direction == "LONG" else "🔴"
+            side_text = "شراء" if signal.direction == "LONG" else "بيع"
+            
+            # Determine result emoji
+            if pnl_pct > 0:
+                result_emoji = "💰"
+                result_text = f"ربح +{pnl_pct:.2f}%"
+            else:
+                result_emoji = "⚠️"
+                result_text = f"خسارة {pnl_pct:.2f}%"
+            
+            # Reason mapping
+            reason_map = {
+                "STOP_LOSS": "وقف الخسارة",
+                "TAKE_PROFIT": "هدف الربح",
+                "WAVE_TARGET": "الهدف الموجي",
+                "TIME_EXIT": "انتهاء الوقت"
+            }
+            
+            reason_text = reason_map.get(reason, reason)
+            
+            message = f"""
+{result_emoji} <b>إغلاق صفقة</b>
+
+<b>{signal.symbol}</b> | {side_text}
+
+<b>📊 النتيجة:</b> {result_text}
+<b>🎯 السبب:</b> {reason_text}
+
+<b>📈 الإحصائيات:</b>
+‎• سعر الدخول: <code>{signal.entry_price:.6f}</code>
+‎• سعر الخروج: <code>{signal.exit_price:.6f}</code>
+‎• المدة: {int((signal.exit_time - signal.entry_time) / 60)} دقيقة
+
+<b>🧠 العبرة:</b>
+كل صفقة لها بداية ونهاية
+الأهم هو استمرارية النظام
+الصبر على النتائج الإجمالية
+
+#إغلاق_صفقة #{'ربح' if pnl_pct > 0 else 'خسارة'} #{reason_text.replace(' ', '_')}
+"""
+            
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(url, json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": message,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True
                 })
                 
         except Exception as e:
             log.error(f"Exit notification error: {e}")
     
-    async def wave_scanning(self):
-        """Main wave scanning loop"""
-        log.info("🚀 Starting wave-momentum scanning...")
-        
-        # FALLBACK ASSETS in case selection fails
-        FALLBACK_SYMBOLS = [
-            "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT",
-            "ADA/USDT", "AVAX/USDT", "DOT/USDT", "DOGE/USDT", "MATIC/USDT",
-            "SHIB/USDT", "TRX/USDT", "LINK/USDT", "UNI/USDT", "ATOM/USDT"
-        ]
-        
-        while True:
-            try:
-                self.scan_cycle += 1
-                start_time = time.time()
-                
-                log.info(f"🌊 Wave scan cycle #{self.scan_cycle}")
-                
-                # Get wave assets
-                assets = await self.get_wave_assets()
-                
-                # Use fallback if no assets found
-                if not assets:
-                    log.warning("No wave assets found, using fallback symbols")
-                    assets = FALLBACK_SYMBOLS
-                
-                log.info(f"Scanning {len(assets)} assets for wave opportunities")
-                
-                signals_found = 0
-                
-                # Scan for wave opportunities
-                for symbol in assets[:30]:  # Limit to 30 for speed
-                    try:
-                        # Skip if already has active signal
-                        if symbol in self.trader.active_signals:
-                            continue
-                        
-                        # Fetch multi-timeframe data
-                        multi_tf_data = await self.fetch_timeframe_data(symbol)
-                        
-                        # Check if we have all required timeframes
-                        required_tfs = ["1H", "15M", "5M"]
-                        if not all(tf in multi_tf_data for tf in required_tfs):
-                            continue
-                        
-                        # Generate wave signal
-                        signal = self.trader.generate_wave_signal(multi_tf_data, symbol)
-                        
-                        if signal:
-                            # Save and send
-                            saved = await self.save_wave_signal(signal)
-                            
-                            if saved:
-                                await self.send_wave_alert(signal)
-                                signals_found += 1
-                                
-                                # Track active signal
-                                self.trader.active_signals[signal.symbol] = signal.signal_id
-                        
-                        # Brief pause between assets
-                        await asyncio.sleep(0.05)
-                        
-                    except Exception as e:
-                        log.debug(f"Asset scan error {symbol}: {str(e)[:50]}")
-                        continue
-                
-                # Update statistics
-                self.trader.trade_stats["assets_scanned"] += len(assets)
-                
-                # Log statistics
-                stats = self.trader.trade_stats
-                active_count = len(self.trader.active_signals)
-                
-                log.info(f"🌊 Wave stats: Found {signals_found}, Active: {active_count}")
-                log.info(f"   Skipped: Phase={stats['phase_skipped']}, "
-                        f"Wave={stats['wave_structure_skipped']}, "
-                        f"Transition={stats['transition_skipped']}")
-                log.info(f"   Quality signals: {stats['quality_signals']}")
-                
-                scan_duration = time.time() - start_time
-                log.info(f"Wave scan #{self.scan_cycle}: {signals_found} signals in {scan_duration:.2f}s")
-                
-                # Wait for next scan (wave trading needs patience)
-                wait_time = max(5, 15 - scan_duration)  # 15s cycle
-                log.info(f"Next wave hunt in {wait_time:.1f}s...")
-                await asyncio.sleep(wait_time)
-                
-            except Exception as e:
-                log.error(f"Wave scanning error: {e}")
-                await asyncio.sleep(10)
+    # ========== UTILITY METHODS ==========
     
-    async def run(self):
-        """Run the wave scanner"""
-        try:
-            await self.initialize()
-            
-            # Run both loops
-            await asyncio.gather(
-                self.wave_scanning(),
-                self.monitor_wave_positions()
-            )
-            
-        except KeyboardInterrupt:
-            log.info("🌊 Wave-momentum scanner stopped by user")
-            await self._send_final_wave_stats()
-            
-        except Exception as e:
-            log.error(f"Scanner crashed: {e}")
-            
-        finally:
-            await self.cleanup()
+    def _default_wave_energy(self) -> WaveEnergy:
+        return WaveEnergy(
+            wave_type="UNKNOWN",
+            wave_stage="UNKNOWN",
+            wave_length_score=0.5,
+            energy_level=0.5,
+            compression_ratio=0.5,
+            momentum_gradient=0.0,
+            volume_profile=0.5,
+            candle_consistency=0.5
+        )
     
-    async def _send_final_wave_stats(self):
-        """Send final wave statistics"""
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            return
-        
-        try:
-            stats = self.trader.trade_stats
-            
-            message = f"""
-🌊 <b>إحصائيات نهائية - نظام الموجة الدافعة</b>
-
-<b>📊 أداء المسح:</b>
-‎• دورات المسح: {self.scan_cycle}
-‎• الأصول الممسوحة: {stats['assets_scanned']}
-‎• إشارات الجودة: {stats['quality_signals']}
-
-<b>🚫 عمليات التخطي (دقة النظام):</b>
-‎• تخطي المرحلة: {stats['phase_skipped']}
-‎• تخطي هيكل الموجة: {stats['wave_structure_skipped']}
-‎• تخطي انتقال الطاقة: {stats['transition_skipped']}
-
-<b>🎯 فلسفة محققة:</b>
-• تداول انتقالات الطاقة فقط
-• أول موجة دفع بعد تصحيح
-• إذا غير واضح ← لا إشارة
-• الجودة فوق الكمية
-
-<b>🧠 عقلية الموجة المحققة:</b>
-كنت صياد موجات
-انتظرت انتقالات الطاقة
-دخلت عند أول شمعة دفع
-خرجت عند اكتمال التوسع
-
-<b>✅ النظام التزم بـ:</b>
-• 1H للإذن فقط
-• 15M لهيكل الموجة
-• 5M للدخول
-• دخول عند أول شمعة دفع
-• إبطال عند كسر الهيكل
-
-#إحصائيات_الموجة #تداول_الطاقة #نظام_موجة #عقلية_محترف
-"""
-            
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(url, json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML"
-                })
-                
-        except Exception as e:
-            log.error(f"Final stats error: {e}")
+    def _default_strength_volume(self) -> StrengthVolume:
+        return StrengthVolume(
+            strength_score=0.5,
+            volume_score=0.5,
+            market_participation=0.5,
+            body_dominance=0.5,
+            volume_expansion=1.0,
+            bid_ask_balance=0.0
+        )
+    
+    def _default_indicators(self) -> IndicatorAlignment:
+        return IndicatorAlignment(
+            rsi_position=50.0,
+            rsi_momentum=0.0,
+            ema_alignment=0.5,
+            volume_trend=0.0,
+            ema_order="MIXED",
+            price_vs_ema="BETWEEN",
+            macd_signal="NEUTRAL"
+        )
     
     async def cleanup(self):
         """Cleanup resources"""
@@ -1790,11 +1804,308 @@ I exit during impulse continuation, not at reversals.
         except Exception as e:
             log.error(f"Cleanup error: {e}")
 
-# ================ MAIN ================
+# ================ MAIN SCANNER ================
+class TraderCoreScanner:
+    """Main scanner system"""
+    
+    def __init__(self):
+        self.engine = TraderCoreEngine()
+        self.is_running = False
+        self.portfolio_value = 10000.0  # Default portfolio value
+    
+    async def initialize(self):
+        """Initialize scanner"""
+        log.info("=" * 70)
+        log.info("🎯 TRADER'S CORE LOGIC SYSTEM - INITIALIZING")
+        log.info("=" * 70)
+        log.info("STEP 1: Watch all timeframes → Determine direction")
+        log.info("STEP 2: Wave length → Estimate potential")
+        log.info("STEP 3: Strength + Volume → Confirm move")
+        log.info("STEP 4: Indicators → Fine-tune timing")
+        log.info("STEP 5: Decide direction → Execute")
+        log.info("=" * 70)
+        log.info(f"Exchange: {EXCHANGE_NAME}")
+        log.info(f"Max Positions: {MAX_OPEN_POSITIONS}")
+        log.info(f"Risk per Trade: {MAX_POSITION_SIZE*100:.1f}%")
+        log.info(f"Min Confidence: {MIN_CONFIDENCE:.0%}")
+        log.info(f"Min Risk:Reward: {MIN_RISK_REWARD:.1f}:1")
+        log.info("=" * 70)
+        
+        await self.engine.initialize()
+        
+        # Send startup notification
+        await self._send_startup_notification()
+    
+    async def _send_startup_notification(self):
+        """Send startup notification"""
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            return
+        
+        try:
+            message = f"""
+🚀 <b>نظام التاجر الأساسي - التشغيل</b>
+
+<b>🎯 الفلسفة:</b>
+1. شاهد جميع الفريمات ← حدد الاتجاه
+2. حلل طول الموجة ← قدر الإمكانية
+3. تأكد من القوة والفوليوم ← تحقق من حقيقة الحركة
+4. راجع المؤشرات ← اضبط التوقيت
+5. اتخذ القرار ← نفذ
+
+<b>⚙️ الإعدادات:</b>
+• البورصة: {EXCHANGE_NAME}
+• الحد الأقصى للصفقات المفتوحة: {MAX_OPEN_POSITIONS}
+• المخاطرة لكل صفقة: {MAX_POSITION_SIZE*100:.1f}%
+• الحد الأدنى للثقة: {MIN_CONFIDENCE:.0%}
+• الحد الأدنى للمخاطرة: {MIN_RISK_REWARD:.1f}:1
+
+<b>🧠 عقلية التاجر:</b>
+أنا صياد طاقة، لا أنتظر انتقالات
+أحدد الاتجاه أولاً، ثم أدخل عند تأكيد الدفع
+الجودة فوق الكمية، النظام فوق العاطفة
+
+<b>✅ النظام جاهز للعمل...</b>
+
+#تشغيل_النظام #تاجر_أساسي #عقلية_محترف
+"""
+            
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(url, json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": message,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True
+                })
+                
+        except Exception as e:
+            log.error(f"Startup notification error: {e}")
+    
+    async def scan_cycle(self):
+        """Execute a single scan cycle"""
+        try:
+            # Get symbols to scan
+            symbols = await self.engine.get_trading_symbols()
+            
+            if not symbols:
+                log.warning("No symbols to scan")
+                return
+            
+            log.info(f"🔍 Scanning {len(symbols)} symbols")
+            
+            # Scan symbols in batches
+            batch_size = 5
+            for i in range(0, len(symbols), batch_size):
+                batch = symbols[i:i + batch_size]
+                
+                tasks = []
+                for symbol in batch:
+                    task = self._scan_symbol(symbol)
+                    tasks.append(task)
+                
+                await asyncio.gather(*tasks, return_exceptions=True)
+                await asyncio.sleep(0.5)  # Rate limiting
+            
+            # Log statistics
+            self._log_scan_stats()
+            
+        except Exception as e:
+            log.error(f"Scan cycle error: {e}")
+    
+    async def _scan_symbol(self, symbol: str):
+        """Scan a single symbol"""
+        try:
+            # Skip if already in position
+            if symbol in self.engine.positions:
+                return
+            
+            # Fetch data
+            multi_tf_data = await self.engine.fetch_multi_tf_data(symbol)
+            
+            if not multi_tf_data or len(multi_tf_data) < 3:
+                return
+            
+            # Generate signal
+            signal = await self.engine.generate_trade_signal(symbol, multi_tf_data)
+            
+            if signal:
+                # Execute trade
+                await self.engine.execute_trade(signal, self.portfolio_value)
+                
+        except Exception as e:
+            log.debug(f"Symbol scan error {symbol}: {str(e)[:50]}")
+    
+    def _log_scan_stats(self):
+        """Log scanning statistics"""
+        stats = self.engine.stats
+        positions = len(self.engine.positions)
+        
+        log.info(f"📊 Scan Stats: Total={stats.total_scans}, "
+                f"Signals={stats.signals_found}, "
+                f"Trades={stats.trades_executed}, "
+                f"Positions={positions}")
+        
+        if stats.trades_executed > 0:
+            win_rate = stats.winning_trades / stats.trades_executed * 100
+            log.info(f"   Performance: Win Rate={win_rate:.1f}%, "
+                    f"Total P&L={stats.total_pnl_pct:.2f}%, "
+                    f"Daily={stats.daily_pnl_pct:.2f}%")
+    
+    async def run(self):
+        """Main run loop"""
+        try:
+            await self.initialize()
+            self.is_running = True
+            
+            log.info("🚀 Starting Trader's Core Logic System")
+            
+            # Start monitoring in background
+            monitoring_task = asyncio.create_task(self.engine.monitor_positions())
+            
+            # Main scanning loop
+            scan_count = 0
+            while self.is_running:
+                try:
+                    scan_count += 1
+                    log.info(f"🔄 Scan cycle #{scan_count}")
+                    
+                    await self.scan_cycle()
+                    
+                    # Wait for next scan
+                    log.info(f"⏳ Next scan in {SCAN_INTERVAL} seconds...")
+                    await asyncio.sleep(SCAN_INTERVAL)
+                    
+                except KeyboardInterrupt:
+                    log.info("⏸️ Scanner paused by user")
+                    self.is_running = False
+                    break
+                except Exception as e:
+                    log.error(f"Scan loop error: {e}")
+                    await asyncio.sleep(5)
+            
+            # Wait for monitoring to finish
+            monitoring_task.cancel()
+            try:
+                await monitoring_task
+            except asyncio.CancelledError:
+                pass
+            
+            await self.shutdown()
+            
+        except Exception as e:
+            log.error(f"Scanner error: {e}")
+            await self.shutdown()
+    
+    async def shutdown(self):
+        """Shutdown scanner"""
+        log.info("🛑 Shutting down Trader's Core Logic System")
+        
+        # Close all open positions
+        await self._close_all_positions()
+        
+        # Send final statistics
+        await self._send_final_stats()
+        
+        # Cleanup
+        await self.engine.cleanup()
+        
+        log.info("✅ Scanner shut down successfully")
+    
+    async def _close_all_positions(self):
+        """Close all open positions"""
+        if not self.engine.positions:
+            return
+        
+        log.info(f"🔒 Closing {len(self.engine.positions)} open positions")
+        
+        for symbol, position in list(self.engine.positions.items()):
+            try:
+                # Get current price
+                ticker = await self.engine.exchange.fetch_ticker(symbol)
+                current_price = ticker['last']
+                
+                # Close position
+                await self.engine._close_position(position, current_price, "SHUTDOWN")
+                
+            except Exception as e:
+                log.error(f"Error closing position {symbol}: {e}")
+    
+    async def _send_final_stats(self):
+        """Send final statistics"""
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            return
+        
+        try:
+            stats = self.engine.stats
+            
+            if stats.trades_executed > 0:
+                win_rate = stats.winning_trades / stats.trades_executed * 100
+                avg_pnl = stats.total_pnl_pct / stats.trades_executed if stats.trades_executed > 0 else 0
+            else:
+                win_rate = 0
+                avg_pnl = 0
+            
+            message = f"""
+📊 <b>إحصائيات نهائية - نظام التاجر الأساسي</b>
+
+<b>🎯 الأداء:</b>
+‎• إجمالي الصفقات: {stats.trades_executed}
+‎• الصفقات الرابحة: {stats.winning_trades}
+‎• الصفقات الخاسرة: {stats.losing_trades}
+‎• نسبة الربح: {win_rate:.1f}%
+‎• متوسط الربح/الصفقة: {avg_pnl:+.2f}%
+‎• إجمالي الربح: {stats.total_pnl_pct:+.2f}%
+
+<b>📈 المسح:</b>
+‎• دورات المسح: {stats.total_scans}
+‎• الإشارات المكتشفة: {stats.signals_found}
+‎• الصفقات المنفذة: {stats.trades_executed}
+
+<b>🔥 السلاسل:</b>
+‎• أطول سلسلة رابحة: {stats.max_consecutive_wins}
+‎• أطول سلسلة خاسرة: {stats.max_consecutive_losses}
+
+<b>🧠 التقييم:</b>
+النظام نفذ فلسفة التاجر الأساسي
+حدد الاتجاه أولاً، ثم نفذ عند التأكيد
+الحفاظ على الجودة فوق الكمية
+
+<b>✅ إغلاق النظام...</b>
+
+#إحصائيات #تاجر_أساسي #نهاية_الجلسة
+"""
+            
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(url, json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": message,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True
+                })
+                
+        except Exception as e:
+            log.error(f"Final stats error: {e}")
+
+# ================ MAIN ENTRY POINT ================
 async def main():
     """Main function"""
-    scanner = WaveMomentumScanner()
-    await scanner.run()
+    scanner = TraderCoreScanner()
+    
+    try:
+        await scanner.run()
+    except KeyboardInterrupt:
+        log.info("\n👋 Scanner stopped by user")
+    except Exception as e:
+        log.error(f"Main error: {e}")
+        traceback.print_exc()
+    finally:
+        log.info("🎯 Trader's Core Logic System terminated")
 
 if __name__ == "__main__":
+    # Set event loop policy for Windows compatibility
+    if os.name == 'nt':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
+    # Run the scanner
     asyncio.run(main())
