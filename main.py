@@ -40,15 +40,9 @@ SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))  # Longer interval for HTF f
 TOP_N = int(os.getenv("TOP_N", 60))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 5))
 
-# PROBABILITY SCORE THRESHOLDS (Environment Variable Controlled)
-MIN_TOTAL_SCORE = float(os.getenv("MIN_TOTAL_SCORE", 1.5))
-MIN_COMPONENT_SCORE = float(os.getenv("MIN_COMPONENT_SCORE", 0.5))
-
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger("romeopt_v2")
-log.info(f"Probability thresholds: MIN_TOTAL_SCORE={MIN_TOTAL_SCORE}, MIN_COMPONENT_SCORE={MIN_COMPONENT_SCORE}")
-
 db_lock = asyncio.Lock()
 db_conn = None
 
@@ -132,50 +126,13 @@ class ProbabilityScore:
     
     @property
     def acceptable(self) -> bool:
-        """Accept if total >= MIN_TOTAL_SCORE and all components > MIN_COMPONENT_SCORE"""
-        return (self.total_score >= MIN_TOTAL_SCORE and 
-                all([self.htf_alignment >= MIN_COMPONENT_SCORE,
-                     self.liquidity_quality >= MIN_COMPONENT_SCORE,
-                     self.sweep_strength >= MIN_COMPONENT_SCORE,
-                     self.structure_clarity >= MIN_COMPONENT_SCORE,
-                     self.entry_precision >= MIN_COMPONENT_SCORE]))
-    
-    @property
-    def grade(self) -> str:
-        """Grade setup based on total score"""
-        if self.total_score >= 4.0:
-            return "A+"
-        elif self.total_score >= 3.5:
-            return "A"
-        elif self.total_score >= 3.0:
-            return "B"
-        elif self.total_score >= 2.5:
-            return "C"
-        elif self.total_score >= 2.0:
-            return "D"
-        else:
-            return "F"
-    
-    @property
-    def components_status(self) -> Dict[str, str]:
-        """Get status of each component"""
-        status = {}
-        for name, value in [
-            ("HTF Alignment", self.htf_alignment),
-            ("Liquidity Quality", self.liquidity_quality),
-            ("Sweep Strength", self.sweep_strength),
-            ("Structure Clarity", self.structure_clarity),
-            ("Entry Precision", self.entry_precision)
-        ]:
-            if value >= 0.8:
-                status[name] = "Excellent"
-            elif value >= 0.6:
-                status[name] = "Good"
-            elif value >= MIN_COMPONENT_SCORE:
-                status[name] = "Acceptable"
-            else:
-                status[name] = "Weak"
-        return status
+        """Accept if total >= 0.5 and all components > 0.2"""
+        return (self.total_score >= 0.5 and 
+                all([self.htf_alignment >= 0.2,
+                     self.liquidity_quality >= 0.2,
+                     self.sweep_strength >= 0.2,
+                     self.structure_clarity >= 0.2,
+                     self.entry_precision >= 0.2]))
 
 # ---------------- TELEGRAM ----------------
 async def send_telegram(msg: str, parse_mode="HTML"):
@@ -260,7 +217,6 @@ async def init_db():
             prob_structure_clarity REAL,
             prob_entry_precision REAL,
             prob_total_score REAL,
-            prob_grade TEXT,
             prob_acceptable BOOLEAN,
             
             -- Entry Details
@@ -364,7 +320,7 @@ async def analyze_htf_bias(exchange, symbol: str) -> HTFContext:
         # Check for swing low
         if (low_i < df_htf["low"].iloc[i-1] and 
             low_i < df_htf["low"].iloc[i-2] and
-            low_i < df_ltf["low"].iloc[i+1] and
+            low_i < df_htf["low"].iloc[i+1] and
             low_i < df_htf["low"].iloc[i+2]):
             swing_lows.append({
                 "price": float(low_i),
@@ -1249,10 +1205,10 @@ async def scan_symbol_full(exchange, symbol: str) -> Optional[Dict]:
     )
     
     if not probability.acceptable:
-        log.debug(f"  {symbol}: Probability too low ({probability.total_score:.2f}/5, min={MIN_TOTAL_SCORE})")
+        log.debug(f"  {symbol}: Probability too low ({probability.total_score:.2f}/5)")
         return None
     
-    log.info(f"✅ {symbol}: {probability.grade} Setup detected! Score: {probability.total_score:.2f}/5 (Thresholds: total≥{MIN_TOTAL_SCORE}, components≥{MIN_COMPONENT_SCORE})")
+    log.info(f"✅ {symbol}: A+ Setup detected! Score: {probability.total_score:.2f}/5")
     
     # --- COMPILE FINAL SETUP ---
     setup = {
@@ -1315,9 +1271,7 @@ async def scan_symbol_full(exchange, symbol: str) -> Optional[Dict]:
             "structure_clarity": probability.structure_clarity,
             "entry_precision": probability.entry_precision,
             "total_score": probability.total_score,
-            "grade": probability.grade,
-            "acceptable": probability.acceptable,
-            "components_status": probability.components_status
+            "acceptable": probability.acceptable
         }
     }
     
@@ -1336,19 +1290,16 @@ async def send_setup_alert(setup: Dict):
     reward_tp1 = abs(tp1 - entry)
     rr_ratio = reward_tp1 / risk if risk > 0 else 0
     
-    # Get probability info
-    prob = setup["probability"]
-    
     # Format message
     msg = f"""
-🔥 <b>ROMEOTPT {prob['grade']} SETUP CONFIRMED</b>
+🔥 <b>ROMEOTPT A+ SETUP CONFIRMED</b>
 
 <b>Symbol:</b> {setup['symbol']}
 <b>Side:</b> {setup['side']}
 <b>Entry:</b> {setup['entry_price']:.8f}
 <b>Current:</b> {setup['current_price']:.8f}
 
-<b>Probability Score:</b> {prob['total_score']:.2f}/5.0 (Grade: {prob['grade']})
+<b>Probability Score:</b> {setup['probability']['total_score']:.2f}/5.0
 <b>RR Ratio:</b> {rr_ratio:.2f}:1
 
 🎯 <b>Targets:</b>
@@ -1367,13 +1318,11 @@ Risk: {setup['risk_amount']:.8f} ({setup['sl_distance_pct']:.2f}%)
 • Entry: {setup['entry_type']}
 
 ✅ <b>Probability Components:</b>
-HTF Alignment: {prob['htf_alignment']:.2f} ({prob['components_status'].get('HTF Alignment', 'Unknown')})
-Liquidity Quality: {prob['liquidity_quality']:.2f} ({prob['components_status'].get('Liquidity Quality', 'Unknown')})
-Sweep Strength: {prob['sweep_strength']:.2f} ({prob['components_status'].get('Sweep Strength', 'Unknown')})
-Structure Clarity: {prob['structure_clarity']:.2f} ({prob['components_status'].get('Structure Clarity', 'Unknown')})
-Entry Precision: {prob['entry_precision']:.2f} ({prob['components_status'].get('Entry Precision', 'Unknown')})
-
-<b>Thresholds Used:</b> Total ≥ {MIN_TOTAL_SCORE}, Components ≥ {MIN_COMPONENT_SCORE}
+HTF Alignment: {setup['probability']['htf_alignment']:.2f}
+Liquidity Quality: {setup['probability']['liquidity_quality']:.2f}
+Sweep Strength: {setup['probability']['sweep_strength']:.2f}
+Structure Clarity: {setup['probability']['structure_clarity']:.2f}
+Entry Precision: {setup['probability']['entry_precision']:.2f}
 
 <i>Detected: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}</i>
 """
@@ -1394,7 +1343,7 @@ Entry Precision: {prob['entry_precision']:.2f} ({prob['components_status'].get('
                 :sl_price, :sl_invalidation_type, :risk_amount, :sl_distance_pct,
                 :tp1_price, :tp1_type, :tp2_price, :tp2_type, :tp3_price, :tp3_type,
                 :prob_htf_alignment, :prob_liquidity_quality, :prob_sweep_strength,
-                :prob_structure_clarity, :prob_entry_precision, :prob_total_score, :prob_grade, :prob_acceptable,
+                :prob_structure_clarity, :prob_entry_precision, :prob_total_score, :prob_acceptable,
                 :current_price, 'DETECTED', ''
             )
         """, {
@@ -1439,7 +1388,6 @@ Entry Precision: {prob['entry_precision']:.2f} ({prob['components_status'].get('
             "prob_structure_clarity": float(setup["probability"]["structure_clarity"]),
             "prob_entry_precision": float(setup["probability"]["entry_precision"]),
             "prob_total_score": float(setup["probability"]["total_score"]),
-            "prob_grade": setup["probability"]["grade"],
             "prob_acceptable": bool(setup["probability"]["acceptable"]),
             "current_price": float(setup["current_price"])
         })
@@ -1449,8 +1397,7 @@ Entry Precision: {prob['entry_precision']:.2f} ({prob['components_status'].get('
 async def scanner_main(exchange):
     """Main scanning loop"""
     
-    await send_telegram(f"🚀 ROMEOTPT v2 Scanner Started - 8-Step Exact Match")
-    await send_telegram(f"📊 Probability Thresholds: MIN_TOTAL_SCORE={MIN_TOTAL_SCORE}, MIN_COMPONENT_SCORE={MIN_COMPONENT_SCORE}")
+    await send_telegram("🚀 ROMEOTPT v2 Scanner Started - 8-Step Exact Match")
     await send_telegram("Step 1: HTF Bias → 2: Liquidity Map → 3: Sweep → 4: Structure → 5: Entry → 6: SL → 7: TP → 8: Probability")
     
     while True:
@@ -1463,7 +1410,7 @@ async def scanner_main(exchange):
             usdt_pairs.sort(key=lambda x: x[1], reverse=True)
             top_pairs = usdt_pairs[:TOP_N]
             
-            log.info(f"📊 Scanning {len(top_pairs)} symbols with thresholds: total≥{MIN_TOTAL_SCORE}, components≥{MIN_COMPONENT_SCORE}...")
+            log.info(f"📊 Scanning {len(top_pairs)} symbols...")
             
             setups_found = 0
             for symbol, volume in top_pairs:
@@ -1479,7 +1426,7 @@ async def scanner_main(exchange):
                     continue
             
             if setups_found > 0:
-                log.info(f"✅ Found {setups_found} setups (Grade {setup['probability']['grade']} or higher)")
+                log.info(f"✅ Found {setups_found} A+ setups")
             else:
                 log.info("⏳ No setups found this scan")
             
@@ -1493,46 +1440,17 @@ app = FastAPI()
 
 @app.get("/health")
 async def health():
-    return {
-        "status": "healthy", 
-        "scanner": "ROMEOTPT v2",
-        "probability_thresholds": {
-            "min_total_score": MIN_TOTAL_SCORE,
-            "min_component_score": MIN_COMPONENT_SCORE
-        }
-    }
+    return {"status": "healthy", "scanner": "ROMEOTPT v2"}
 
 @app.get("/setups")
-async def get_setups(
-    limit: int = 20, 
-    min_score: Optional[float] = None,
-    grade: Optional[str] = None
-):
-    # Use default min_score if not provided
-    if min_score is None:
-        min_score = MIN_TOTAL_SCORE
-    
+async def get_setups(limit: int = 20, min_score: float = 3.5):
     async with db_lock:
-        query = """SELECT * FROM signals WHERE prob_total_score >= ?"""
-        params = [min_score]
-        
-        if grade:
-            # Map grade to score range
-            grade_ranges = {
-                "A+": 4.0,
-                "A": 3.5,
-                "B": 3.0,
-                "C": 2.5,
-                "D": 2.0
-            }
-            if grade in grade_ranges:
-                query += " AND prob_total_score >= ?"
-                params.append(grade_ranges[grade])
-        
-        query += " ORDER BY timestamp DESC LIMIT ?"
-        params.append(limit)
-        
-        async with db_conn.execute(query, params) as cursor:
+        async with db_conn.execute(
+            """SELECT * FROM signals 
+               WHERE prob_total_score >= ? 
+               ORDER BY timestamp DESC LIMIT ?""",
+            (min_score, limit)
+        ) as cursor:
             columns = [description[0] for description in cursor.description]
             rows = await cursor.fetchall()
         
@@ -1551,14 +1469,7 @@ async def get_setups(
                         pass
             setups.append(setup)
         
-        return {
-            "setups": setups, 
-            "count": len(setups),
-            "thresholds": {
-                "min_total_score": min_score,
-                "min_component_score": MIN_COMPONENT_SCORE
-            }
-        }
+        return {"setups": setups, "count": len(setups)}
 
 # ---------------- MAIN ----------------
 async def main():
@@ -1578,22 +1489,9 @@ async def main():
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="ROMEOTPT v2 Scanner with adjustable probability thresholds")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--http", action="store_true", help="Run HTTP server")
-    parser.add_argument("--min-total", type=float, default=None, help=f"Override MIN_TOTAL_SCORE (default: {MIN_TOTAL_SCORE})")
-    parser.add_argument("--min-component", type=float, default=None, help=f"Override MIN_COMPONENT_SCORE (default: {MIN_COMPONENT_SCORE})")
     args = parser.parse_args()
-    
-    # Override thresholds if provided
-    if args.min_total is not None:
-        global MIN_TOTAL_SCORE
-        MIN_TOTAL_SCORE = args.min_total
-        log.info(f"Overriding MIN_TOTAL_SCORE to {MIN_TOTAL_SCORE}")
-    
-    if args.min_component is not None:
-        global MIN_COMPONENT_SCORE
-        MIN_COMPONENT_SCORE = args.min_component
-        log.info(f"Overriding MIN_COMPONENT_SCORE to {MIN_COMPONENT_SCORE}")
     
     if args.http:
         uvicorn.run(app, host="0.0.0.0", port=8000)
