@@ -60,9 +60,9 @@ TARGET_RANGE_PCT = (2.0, 6.0)  # 2-6% target range
 MIN_RISK_REWARD = 2.0  # 2:1 minimum
 
 # Strength thresholds (strict)
-MIN_CANDLE_SPEED = 0.7  # Fast candles only
-MIN_BODY_DOMINANCE = 0.6  # Body must dominate wick
-MIN_VOLUME_EXPANSION = 1.8  # 80% volume increase on impulse
+MIN_CANDLE_SPEED = 0.4  # Fast candles only
+MIN_BODY_DOMINANCE = 0.5  # Body must dominate wick
+MIN_VOLUME_EXPANSION = 15  # 80% volume increase on impulse
 
 # RSI zones (confirmation only)
 RSI_PERIOD = 14
