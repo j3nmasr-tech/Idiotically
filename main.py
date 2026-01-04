@@ -30,11 +30,11 @@ DB_PATH = "/app/data/trader_framework.db"
 
 EXCHANGE = "okx"
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
-TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 30))
-MIN_VOLUME_USD = 1000000
+TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 100))
+MIN_VOLUME_USD = 100000
 
 # Risk Management
-MAX_POSITIONS = 5
+MAX_POSITIONS = 200
 MAX_STOP_LOSS_PCT = 1.5
 MIN_TARGET_PCT = 2.0
 MIN_RISK_REWARD = 2.0
