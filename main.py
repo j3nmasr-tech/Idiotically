@@ -127,22 +127,27 @@ class TradeSignal:
 # ================ DATA VALIDATION ================
 def validate_dataframe(df) -> bool:
     """Check if DataFrame is valid for analysis"""
-    if df is None:
-        return False
-    if isinstance(df, pd.DataFrame):
+    try:
+        if df is None:
+            return False
+        if not isinstance(df, pd.DataFrame):
+            return False
         if df.empty:
             return False
         if len(df) < 20:  # Minimum data points
             return False
         # Check for required columns
         required_cols = ['open', 'high', 'low', 'close', 'volume']
-        if not all(col in df.columns for col in required_cols):
-            return False
+        for col in required_cols:
+            if col not in df.columns:
+                return False
         # Check for NaN values
-        if df[required_cols].isnull().any().any():
-            return False
+        for col in required_cols:
+            if df[col].isnull().any():
+                return False
         return True
-    return False
+    except Exception:
+        return False
 
 # ================ TOOL 1: MULTI-TF AGREEMENT ================
 def analyze_multi_timeframe_agreement(multi_tf_data: Dict[str, pd.DataFrame]) -> str:
@@ -391,7 +396,7 @@ class DirectionEngine:
         
         # Primary timeframe for most analysis
         primary_df = multi_tf_data.get("15M") or multi_tf_data.get("5M")
-        if not validate_dataframe(primary_df):
+        if primary_df is None or not validate_dataframe(primary_df):
             log.warning("❌ No primary timeframe data")
             return DirectionAnalysis("NO_TRADE", {}, 0.0)
         
@@ -504,7 +509,7 @@ class DirectionEngine:
 def detect_market_state(df: pd.DataFrame) -> MarketState:
     """Determine market state for entry type selection"""
     try:
-        if not validate_dataframe(df):
+        if df is None or not validate_dataframe(df):
             return MarketState("FAST_MARKET", 0.0, 0.0, False)
         
         # Calculate ATR for volatility
@@ -573,7 +578,7 @@ class PriceEntryEngine:
     def check_pullback_entry(self, df: pd.DataFrame, direction: str) -> Tuple[bool, Dict]:
         """Entry Type 1: Pullback in Direction"""
         try:
-            if not validate_dataframe(df):
+            if df is None or not validate_dataframe(df):
                 return False, {}
             
             current = df.iloc[-1]
@@ -595,14 +600,15 @@ class PriceEntryEngine:
                 # Check for weak previous candles (pullback)
                 weak_previous = False
                 for i in range(-4, -1):  # Check last 3 candles before current
-                    candle = df.iloc[i]
-                    body = abs(candle['close'] - candle['open'])
-                    high_low = candle['high'] - candle['low']
-                    if high_low > 0:
-                        body_ratio = body / high_low
-                        if body_ratio < 0.4:  # Small body = weak
-                            weak_previous = True
-                            break
+                    if i < 0:  # Handle negative indexing
+                        candle = df.iloc[i]
+                        body = abs(candle['close'] - candle['open'])
+                        high_low = candle['high'] - candle['low']
+                        if high_low > 0:
+                            body_ratio = body / high_low
+                            if body_ratio < 0.4:  # Small body = weak
+                                weak_previous = True
+                                break
                 
                 # Current candle should be strong bullish
                 strong_bullish = (
@@ -635,14 +641,15 @@ class PriceEntryEngine:
                 # Check for weak previous candles (pullback)
                 weak_previous = False
                 for i in range(-4, -1):
-                    candle = df.iloc[i]
-                    body = abs(candle['close'] - candle['open'])
-                    high_low = candle['high'] - candle['low']
-                    if high_low > 0:
-                        body_ratio = body / high_low
-                        if body_ratio < 0.4:
-                            weak_previous = True
-                            break
+                    if i < 0:
+                        candle = df.iloc[i]
+                        body = abs(candle['close'] - candle['open'])
+                        high_low = candle['high'] - candle['low']
+                        if high_low > 0:
+                            body_ratio = body / high_low
+                            if body_ratio < 0.4:
+                                weak_previous = True
+                                break
                 
                 # Current candle should be strong bearish
                 strong_bearish = (
@@ -677,7 +684,7 @@ class PriceEntryEngine:
     def check_breakout_entry(self, df: pd.DataFrame, direction: str) -> Tuple[bool, Dict]:
         """Entry Type 2: Continuation Break"""
         try:
-            if not validate_dataframe(df):
+            if df is None or not validate_dataframe(df):
                 return False, {}
             
             current = df.iloc[-1]
@@ -769,7 +776,7 @@ class PriceEntryEngine:
     def check_stophunt_entry(self, df: pd.DataFrame, direction: str) -> Tuple[bool, Dict]:
         """Entry Type 3: Re-entry After Stop Hunt"""
         try:
-            if not validate_dataframe(df):
+            if df is None or not validate_dataframe(df):
                 return False, {}
             
             current = df.iloc[-1]
@@ -872,7 +879,7 @@ class PriceEntryEngine:
     def find_entry(self, df: pd.DataFrame, direction: str, market_state: MarketState) -> Optional[PriceEntry]:
         """Find price-only entry based on market state"""
         try:
-            if not validate_dataframe(df):
+            if df is None or not validate_dataframe(df):
                 return None
                 
             log.info(f"🎯 Looking for {direction} entries (Market: {market_state.state})...")
@@ -1249,7 +1256,16 @@ Phase 2 → Price Entry (NO indicators, pure price behavior)
             
             # Check if we have enough data
             required_tfs = ["1H", "15M", "5M"]
-            if not all(tf in multi_tf_data and validate_dataframe(multi_tf_data[tf]) for tf in required_tfs):
+            has_required_data = True
+            for tf in required_tfs:
+                if tf not in multi_tf_data:
+                    has_required_data = False
+                    break
+                if not validate_dataframe(multi_tf_data[tf]):
+                    has_required_data = False
+                    break
+            
+            if not has_required_data:
                 log.debug(f"{symbol}: Missing required timeframes")
                 return None
             
@@ -1264,7 +1280,7 @@ Phase 2 → Price Entry (NO indicators, pure price behavior)
             
             # ===== PHASE 2: MARKET STATE =====
             primary_df = multi_tf_data.get("5M") or multi_tf_data.get("3M")
-            if not validate_dataframe(primary_df):
+            if primary_df is None or not validate_dataframe(primary_df):
                 return None
             
             market_state = detect_market_state(primary_df)
@@ -1277,7 +1293,7 @@ Phase 2 → Price Entry (NO indicators, pure price behavior)
             
             # Use 3M or 1M for entry timing
             entry_df = multi_tf_data.get("3M") or multi_tf_data.get("1M")
-            if not validate_dataframe(entry_df):
+            if entry_df is None or not validate_dataframe(entry_df):
                 log.warning("❌ No entry timeframe data")
                 return None
             
