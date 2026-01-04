@@ -35,9 +35,6 @@ MIN_VOLUME_USD = 100000
 
 # Risk Management
 MAX_POSITIONS = 200
-MAX_STOP_LOSS_PCT = 1.5
-MIN_TARGET_PCT = 2.0
-MIN_RISK_REWARD = 2.0
 
 # Timeframes
 TIMEFRAMES = {
@@ -62,15 +59,22 @@ log = logging.getLogger("trader_framework")
 def safe_get_value(series, index=-1, default=np.nan):
     """Safely get value from pandas Series"""
     try:
-        if series is None or series.empty or len(series) <= abs(index):
+        if series is None:
             return default
-        value = series.iloc[index]
-        return value if not pd.isna(value) else default
+        if isinstance(series, pd.Series):
+            if series.empty or len(series) <= abs(index):
+                return default
+            value = series.iloc[index]
+            return value if not pd.isna(value) else default
+        elif isinstance(series, (int, float, np.number)):
+            return float(series)
+        else:
+            return default
     except Exception:
         return default
 
 def safe_dataframe_check(df):
-    """Safely check if DataFrame is valid - FIXED VERSION"""
+    """Safely check if DataFrame is valid"""
     try:
         # Check if df is None
         if df is None:
@@ -104,7 +108,7 @@ class SimpleIndicators:
     @staticmethod
     def EMA(prices: pd.Series, period: int) -> pd.Series:
         try:
-            if prices is None or prices.empty:
+            if prices is None or prices.empty or len(prices) < period:
                 return pd.Series(dtype=float)
             return prices.ewm(span=period, adjust=False).mean()
         except Exception:
@@ -127,7 +131,7 @@ class SimpleIndicators:
     def ATR(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
         try:
             if (high is None or high.empty or low is None or low.empty or 
-                close is None or close.empty):
+                close is None or close.empty or len(high) < period):
                 return pd.Series(dtype=float)
             tr1 = high - low
             tr2 = abs(high - close.shift())
@@ -445,15 +449,20 @@ class PriceEntryEngine:
             if not safe_dataframe_check(df) or len(df) < 2:
                 return 0.0
             
-            current_close = safe_get_value(df['close'], -1)
-            current_open = safe_get_value(df['open'], -1)
-            prev_close = safe_get_value(df['close'], -2)
-            prev_open = safe_get_value(df['open'], -2)
-            prev_high = safe_get_value(df['high'], -2)
-            prev_low = safe_get_value(df['low'], -2)
-            
-            if any(np.isnan(v) for v in [current_close, current_open, prev_close, prev_open, prev_high, prev_low]):
+            # Safely get values - FIXED: use df['close'].iloc[-1] directly with proper checks
+            if len(df) < 2:
                 return 0.0
+                
+            current_row = df.iloc[-1]
+            prev_row = df.iloc[-2]
+            
+            # Extract values with explicit type conversion
+            current_close = float(current_row['close'])
+            current_open = float(current_row['open'])
+            prev_close = float(prev_row['close'])
+            prev_open = float(prev_row['open'])
+            prev_high = float(prev_row['high'])
+            prev_low = float(prev_row['low'])
             
             midpoint = (prev_high + prev_low) / 2
             
@@ -462,16 +471,17 @@ class PriceEntryEngine:
                 if (prev_close < prev_open and  # Bearish
                     current_close > current_open and  # Bullish
                     current_close > midpoint):  # Above midpoint
-                    return float(current_close)
+                    return current_close
             else:  # SHORT
                 # Bearish candle after bullish candles
                 if (prev_close > prev_open and  # Bullish
                     current_close < current_open and  # Bearish
                     current_close < midpoint):  # Below midpoint
-                    return float(current_close)
+                    return current_close
             
             return 0.0
-        except Exception:
+        except Exception as e:
+            log.debug(f"Pullback entry error: {e}")
             return 0.0
     
     def _check_breakout_entry(self, df: pd.DataFrame, direction: str) -> float:
@@ -480,36 +490,39 @@ class PriceEntryEngine:
             if not safe_dataframe_check(df) or len(df) < 6:
                 return 0.0
             
-            current_close = safe_get_value(df['close'], -1)
-            current_volume = safe_get_value(df['volume'], -1)
-            prev_high = safe_get_value(df['high'], -2)
-            prev_low = safe_get_value(df['low'], -2)
+            current_row = df.iloc[-1]
+            prev_row = df.iloc[-2]
+            
+            # Extract values with explicit type conversion
+            current_close = float(current_row['close'])
+            current_volume = float(current_row['volume'])
+            prev_high = float(prev_row['high'])
+            prev_low = float(prev_row['low'])
             
             # Calculate average volume of last 5 candles (excluding current)
-            volume_values = []
-            for i in range(2, 7):  # Positions -2 through -6
-                vol = safe_get_value(df['volume'], -i)
-                if not np.isnan(vol):
+            if len(df) >= 7:
+                volume_values = []
+                for i in range(2, 7):  # Positions -2 through -6
+                    vol = float(df.iloc[-i]['volume'])
                     volume_values.append(vol)
-            
-            avg_volume = np.mean(volume_values) if volume_values else current_volume
-            
-            if any(np.isnan(v) for v in [current_close, current_volume, prev_high, prev_low]):
-                return 0.0
+                avg_volume = np.mean(volume_values) if volume_values else current_volume
+            else:
+                avg_volume = current_volume
             
             if direction == "LONG":
                 # Break above previous high with volume
                 if (current_close > prev_high and
                     current_volume > avg_volume * 1.2):
-                    return float(current_close)
+                    return current_close
             else:  # SHORT
                 # Break below previous low with volume
                 if (current_close < prev_low and
                     current_volume > avg_volume * 1.2):
-                    return float(current_close)
+                    return current_close
             
             return 0.0
-        except Exception:
+        except Exception as e:
+            log.debug(f"Breakout entry error: {e}")
             return 0.0
     
     def _check_stophunt_entry(self, df: pd.DataFrame, direction: str) -> float:
@@ -518,14 +531,15 @@ class PriceEntryEngine:
             if not safe_dataframe_check(df) or len(df) < 2:
                 return 0.0
             
-            current_close = safe_get_value(df['close'], -1)
-            prev_close = safe_get_value(df['close'], -2)
-            prev_open = safe_get_value(df['open'], -2)
-            prev_high = safe_get_value(df['high'], -2)
-            prev_low = safe_get_value(df['low'], -2)
+            current_row = df.iloc[-1]
+            prev_row = df.iloc[-2]
             
-            if any(np.isnan(v) for v in [current_close, prev_close, prev_open, prev_high, prev_low]):
-                return 0.0
+            # Extract values with explicit type conversion
+            current_close = float(current_row['close'])
+            prev_close = float(prev_row['close'])
+            prev_open = float(prev_row['open'])
+            prev_high = float(prev_row['high'])
+            prev_low = float(prev_row['low'])
             
             if direction == "LONG":
                 # Bearish wick rejected, bullish recovery
@@ -535,7 +549,7 @@ class PriceEntryEngine:
                 if (prev_low < prev_min and  # Bearish wick
                     current_close > prev_close and  # Recovery
                     current_close > midpoint):  # Above midpoint
-                    return float(current_close)
+                    return current_close
             else:  # SHORT
                 # Bullish wick rejected, bearish recovery
                 prev_max = max(prev_open, prev_close)
@@ -544,10 +558,11 @@ class PriceEntryEngine:
                 if (prev_high > prev_max and  # Bullish wick
                     current_close < prev_close and  # Recovery
                     current_close < midpoint):  # Below midpoint
-                    return float(current_close)
+                    return current_close
             
             return 0.0
-        except Exception:
+        except Exception as e:
+            log.debug(f"Stophunt entry error: {e}")
             return 0.0
 
 # ================ 3. EXIT ENGINE (MOMENTUM FAILURE) ================
@@ -559,14 +574,12 @@ class MomentumExitEngine:
         if not safe_dataframe_check(df):
             return None
         
-        current_price = safe_get_value(df['close'], -1)
-        if np.isnan(current_price):
-            return None
+        current_price = float(df['close'].iloc[-1])
         
         # Check momentum failure
         momentum_failed = self._check_momentum_failure(df, position.direction)
         if momentum_failed:
-            return self._create_exit_signal(position, float(current_price))
+            return self._create_exit_signal(position, current_price)
         
         return None
     
@@ -581,11 +594,9 @@ class MomentumExitEngine:
             bullish_count = 0
             
             for i in range(1, 4):  # Positions -1, -2, -3
-                close_val = safe_get_value(df['close'], -i)
-                open_val = safe_get_value(df['open'], -i)
-                
-                if np.isnan(close_val) or np.isnan(open_val):
-                    continue
+                row = df.iloc[-i]
+                close_val = float(row['close'])
+                open_val = float(row['open'])
                 
                 if close_val < open_val:
                     bearish_count += 1
