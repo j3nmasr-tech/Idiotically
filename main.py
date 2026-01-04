@@ -22,7 +22,6 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 import json
-import math
 
 # ================ CONFIGURATION ================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -86,16 +85,6 @@ class TechnicalIndicators:
         tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
         atr = tr.rolling(window=period).mean()
         return atr
-    
-    @staticmethod
-    def rolling_mean(series: pd.Series, period: int) -> pd.Series:
-        """Rolling mean"""
-        return series.rolling(window=period).mean()
-    
-    @staticmethod
-    def rolling_std(series: pd.Series, period: int) -> pd.Series:
-        """Rolling standard deviation"""
-        return series.rolling(window=period).std()
 
 # ================ DATA STRUCTURES ================
 @dataclass
@@ -135,6 +124,26 @@ class TradeSignal:
     risk_reward: float
     conditions_met: List[str]
 
+# ================ DATA VALIDATION ================
+def validate_dataframe(df) -> bool:
+    """Check if DataFrame is valid for analysis"""
+    if df is None:
+        return False
+    if isinstance(df, pd.DataFrame):
+        if df.empty:
+            return False
+        if len(df) < 20:  # Minimum data points
+            return False
+        # Check for required columns
+        required_cols = ['open', 'high', 'low', 'close', 'volume']
+        if not all(col in df.columns for col in required_cols):
+            return False
+        # Check for NaN values
+        if df[required_cols].isnull().any().any():
+            return False
+        return True
+    return False
+
 # ================ TOOL 1: MULTI-TF AGREEMENT ================
 def analyze_multi_timeframe_agreement(multi_tf_data: Dict[str, pd.DataFrame]) -> str:
     """
@@ -144,7 +153,7 @@ def analyze_multi_timeframe_agreement(multi_tf_data: Dict[str, pd.DataFrame]) ->
     directions = []
     
     for tf_name, df in multi_tf_data.items():
-        if df is None or len(df) < 50:
+        if not validate_dataframe(df):
             continue
             
         try:
@@ -171,10 +180,6 @@ def analyze_multi_timeframe_agreement(multi_tf_data: Dict[str, pd.DataFrame]) ->
     if not directions:
         return "NEUTRAL"
     
-    # Count votes
-    long_votes = sum(1 for _, d in directions if d == "LONG")
-    short_votes = sum(1 for _, d in directions if d == "SHORT")
-    
     # Strong agreement needed (all major timeframes)
     major_tfs = ["1H", "15M", "5M"]
     major_directions = [d for tf, d in directions if tf in major_tfs]
@@ -194,10 +199,13 @@ def analyze_wave_length(df: pd.DataFrame) -> bool:
     "Is the current wave strong and impulsive?"
     """
     try:
-        if df is None or len(df) < 20:
+        if not validate_dataframe(df):
             return False
         
         # Use last 10 candles for wave analysis
+        if len(df) < 20:
+            return False
+            
         recent = df.iloc[-10:]
         
         # Check for impulse move (last 5 candles)
@@ -230,7 +238,7 @@ def analyze_momentum_strength(df: pd.DataFrame) -> bool:
     "Real القوة, not indicator-only"
     """
     try:
-        if df is None or len(df) < 20:
+        if not validate_dataframe(df):
             return False
         
         # Current candle body strength
@@ -264,7 +272,7 @@ def analyze_volume_participation(df: pd.DataFrame) -> bool:
     "No volume → no belief in direction"
     """
     try:
-        if df is None or len(df) < 30:
+        if not validate_dataframe(df):
             return False
         
         # Recent volume vs average
@@ -288,7 +296,7 @@ def analyze_rsi_regime(df: pd.DataFrame, target_direction: str) -> bool:
     Above 50 = bullish regime, Below 50 = bearish regime
     """
     try:
-        if df is None or len(df) < 20:
+        if not validate_dataframe(df):
             return False
         
         rsi = TechnicalIndicators.RSI(df['close'], 14).iloc[-1]
@@ -314,7 +322,7 @@ def analyze_ema_structure(df: pd.DataFrame, target_direction: str) -> bool:
     "EMA is trend structure, not entry"
     """
     try:
-        if df is None or len(df) < 50:
+        if not validate_dataframe(df):
             return False
         
         ema20 = TechnicalIndicators.EMA(df['close'], 20).iloc[-1]
@@ -341,7 +349,7 @@ def analyze_volatility_tradability(df: pd.DataFrame) -> bool:
     "Low VOL = fake signals = chop"
     """
     try:
-        if df is None or len(df) < 30:
+        if not validate_dataframe(df):
             return False
         
         atr = TechnicalIndicators.ATR(df['high'], df['low'], df['close'], 14)
@@ -383,7 +391,7 @@ class DirectionEngine:
         
         # Primary timeframe for most analysis
         primary_df = multi_tf_data.get("15M") or multi_tf_data.get("5M")
-        if primary_df is None:
+        if not validate_dataframe(primary_df):
             log.warning("❌ No primary timeframe data")
             return DirectionAnalysis("NO_TRADE", {}, 0.0)
         
@@ -496,7 +504,7 @@ class DirectionEngine:
 def detect_market_state(df: pd.DataFrame) -> MarketState:
     """Determine market state for entry type selection"""
     try:
-        if df is None or len(df) < 30:
+        if not validate_dataframe(df):
             return MarketState("FAST_MARKET", 0.0, 0.0, False)
         
         # Calculate ATR for volatility
@@ -565,7 +573,7 @@ class PriceEntryEngine:
     def check_pullback_entry(self, df: pd.DataFrame, direction: str) -> Tuple[bool, Dict]:
         """Entry Type 1: Pullback in Direction"""
         try:
-            if df is None or len(df) < 10:
+            if not validate_dataframe(df):
                 return False, {}
             
             current = df.iloc[-1]
@@ -669,7 +677,7 @@ class PriceEntryEngine:
     def check_breakout_entry(self, df: pd.DataFrame, direction: str) -> Tuple[bool, Dict]:
         """Entry Type 2: Continuation Break"""
         try:
-            if df is None or len(df) < 10:
+            if not validate_dataframe(df):
                 return False, {}
             
             current = df.iloc[-1]
@@ -761,7 +769,7 @@ class PriceEntryEngine:
     def check_stophunt_entry(self, df: pd.DataFrame, direction: str) -> Tuple[bool, Dict]:
         """Entry Type 3: Re-entry After Stop Hunt"""
         try:
-            if df is None or len(df) < 5:
+            if not validate_dataframe(df):
                 return False, {}
             
             current = df.iloc[-1]
@@ -864,6 +872,9 @@ class PriceEntryEngine:
     def find_entry(self, df: pd.DataFrame, direction: str, market_state: MarketState) -> Optional[PriceEntry]:
         """Find price-only entry based on market state"""
         try:
+            if not validate_dataframe(df):
+                return None
+                
             log.info(f"🎯 Looking for {direction} entries (Market: {market_state.state})...")
             
             entry_found = False
@@ -1238,7 +1249,7 @@ Phase 2 → Price Entry (NO indicators, pure price behavior)
             
             # Check if we have enough data
             required_tfs = ["1H", "15M", "5M"]
-            if not all(tf in multi_tf_data for tf in required_tfs):
+            if not all(tf in multi_tf_data and validate_dataframe(multi_tf_data[tf]) for tf in required_tfs):
                 log.debug(f"{symbol}: Missing required timeframes")
                 return None
             
@@ -1253,7 +1264,7 @@ Phase 2 → Price Entry (NO indicators, pure price behavior)
             
             # ===== PHASE 2: MARKET STATE =====
             primary_df = multi_tf_data.get("5M") or multi_tf_data.get("3M")
-            if primary_df is None:
+            if not validate_dataframe(primary_df):
                 return None
             
             market_state = detect_market_state(primary_df)
@@ -1266,7 +1277,7 @@ Phase 2 → Price Entry (NO indicators, pure price behavior)
             
             # Use 3M or 1M for entry timing
             entry_df = multi_tf_data.get("3M") or multi_tf_data.get("1M")
-            if entry_df is None:
+            if not validate_dataframe(entry_df):
                 log.warning("❌ No entry timeframe data")
                 return None
             
@@ -1757,58 +1768,11 @@ Phase 2 → Price Entry (NO indicators, pure price behavior)
         except Exception as e:
             log.error(f"Cleanup error: {e}")
 
-# ================ SIMPLE HTTP HEALTH CHECK ================
-async def http_health_check():
-    """Simple HTTP server for health checks"""
-    import socket
-    from concurrent.futures import ThreadPoolExecutor
-    
-    def handle_client(client_socket):
-        try:
-            request = client_socket.recv(1024).decode('utf-8')
-            
-            # Simple response
-            response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"
-            response += json.dumps({
-                "status": "running",
-                "service": "Complete Trader System",
-                "timestamp": time.time()
-            })
-            
-            client_socket.send(response.encode('utf-8'))
-        except:
-            pass
-        finally:
-            client_socket.close()
-    
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.bind(('0.0.0.0', 8080))
-    server.listen(5)
-    server.setblocking(False)
-    
-    log.info("🌐 HTTP health check server started on port 8080")
-    
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        while True:
-            try:
-                client, addr = server.accept()
-                executor.submit(handle_client, client)
-            except BlockingIOError:
-                await asyncio.sleep(0.1)
-            except Exception as e:
-                log.error(f"HTTP server error: {e}")
-                await asyncio.sleep(1)
-
 # ================ MAIN ================
 async def main():
     """Main function"""
     # Create and run system
     system = CompleteTraderSystem()
-    
-    # Start HTTP health check in background
-    health_task = asyncio.create_task(http_health_check())
-    
-    # Run the main system
     await system.run()
 
 if __name__ == "__main__":
