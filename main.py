@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-🧠 COMPLETE TRADER SYSTEM
+🧠 COMPLETE TRADER SYSTEM - NO TA-LIB REQUIRED
 Professional Discretionary Trading Engine
 7-Tool Direction Analysis + 3 Price-Only Entry Types
 Real Trader Mind 1:1 Translation
@@ -18,11 +18,11 @@ import httpx
 import ccxt.async_support as ccxt
 import pandas as pd
 import numpy as np
-import talib
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
 import json
+import math
 
 # ================ CONFIGURATION ================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -32,7 +32,7 @@ DB_PATH = "/app/data/trader_system.db"
 # Exchange configuration
 EXCHANGE = "okx"
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))  # 10 seconds
-TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 80))
+TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 50))
 MIN_VOLUME_USD = 1000000  # $1M minimum volume
 
 # Risk Management
@@ -57,6 +57,45 @@ logging.basicConfig(
     datefmt='%H:%M:%S'
 )
 log = logging.getLogger("trader_system")
+
+# ================ TECHNICAL INDICATORS (NO TA-LIB) ================
+class TechnicalIndicators:
+    """Pure Python technical indicators - No TA-Lib required"""
+    
+    @staticmethod
+    def EMA(prices: pd.Series, period: int) -> pd.Series:
+        """Exponential Moving Average"""
+        return prices.ewm(span=period, adjust=False).mean()
+    
+    @staticmethod
+    def RSI(prices: pd.Series, period: int = 14) -> pd.Series:
+        """Relative Strength Index"""
+        delta = prices.diff()
+        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
+    
+    @staticmethod
+    def ATR(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+        """Average True Range"""
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=period).mean()
+        return atr
+    
+    @staticmethod
+    def rolling_mean(series: pd.Series, period: int) -> pd.Series:
+        """Rolling mean"""
+        return series.rolling(window=period).mean()
+    
+    @staticmethod
+    def rolling_std(series: pd.Series, period: int) -> pd.Series:
+        """Rolling standard deviation"""
+        return series.rolling(window=period).std()
 
 # ================ DATA STRUCTURES ================
 @dataclass
@@ -109,9 +148,10 @@ def analyze_multi_timeframe_agreement(multi_tf_data: Dict[str, pd.DataFrame]) ->
             continue
             
         try:
-            ema20 = talib.EMA(df['close'], timeperiod=20).iloc[-1]
-            ema50 = talib.EMA(df['close'], timeperiod=50).iloc[-1]
-            rsi = talib.RSI(df['close'], timeperiod=14).iloc[-1]
+            # Use our own EMA function
+            ema20 = TechnicalIndicators.EMA(df['close'], 20).iloc[-1]
+            ema50 = TechnicalIndicators.EMA(df['close'], 50).iloc[-1]
+            rsi = TechnicalIndicators.RSI(df['close'], 14).iloc[-1]
             
             if np.isnan(ema20) or np.isnan(ema50) or np.isnan(rsi):
                 continue
@@ -198,13 +238,13 @@ def analyze_momentum_strength(df: pd.DataFrame) -> bool:
         body = abs(current['close'] - current['open'])
         
         # ATR for volatility context
-        atr = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14).iloc[-1]
+        atr = TechnicalIndicators.ATR(df['high'], df['low'], df['close'], 14).iloc[-1]
         
         if atr <= 0 or np.isnan(atr):
             return False
         
         # RSI for momentum
-        rsi = talib.RSI(df['close'], timeperiod=14).iloc[-1]
+        rsi = TechnicalIndicators.RSI(df['close'], 14).iloc[-1]
         
         if np.isnan(rsi):
             return False
@@ -251,7 +291,7 @@ def analyze_rsi_regime(df: pd.DataFrame, target_direction: str) -> bool:
         if df is None or len(df) < 20:
             return False
         
-        rsi = talib.RSI(df['close'], timeperiod=14).iloc[-1]
+        rsi = TechnicalIndicators.RSI(df['close'], 14).iloc[-1]
         
         if np.isnan(rsi):
             return False
@@ -277,8 +317,8 @@ def analyze_ema_structure(df: pd.DataFrame, target_direction: str) -> bool:
         if df is None or len(df) < 50:
             return False
         
-        ema20 = talib.EMA(df['close'], timeperiod=20).iloc[-1]
-        ema50 = talib.EMA(df['close'], timeperiod=50).iloc[-1]
+        ema20 = TechnicalIndicators.EMA(df['close'], 20).iloc[-1]
+        ema50 = TechnicalIndicators.EMA(df['close'], 50).iloc[-1]
         
         if np.isnan(ema20) or np.isnan(ema50):
             return False
@@ -304,7 +344,7 @@ def analyze_volatility_tradability(df: pd.DataFrame) -> bool:
         if df is None or len(df) < 30:
             return False
         
-        atr = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14)
+        atr = TechnicalIndicators.ATR(df['high'], df['low'], df['close'], 14)
         current_atr = atr.iloc[-1]
         avg_atr = atr.iloc[-20:].mean()
         
@@ -460,7 +500,7 @@ def detect_market_state(df: pd.DataFrame) -> MarketState:
             return MarketState("FAST_MARKET", 0.0, 0.0, False)
         
         # Calculate ATR for volatility
-        atr = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14)
+        atr = TechnicalIndicators.ATR(df['high'], df['low'], df['close'], 14)
         current_atr = atr.iloc[-1]
         avg_atr = atr.iloc[-20:].mean()
         
@@ -470,7 +510,7 @@ def detect_market_state(df: pd.DataFrame) -> MarketState:
             volatility_ratio = current_atr / avg_atr
         
         # Calculate trend strength from EMA slope
-        ema20 = talib.EMA(df['close'], timeperiod=20)
+        ema20 = TechnicalIndicators.EMA(df['close'], 20)
         if len(ema20) >= 10:
             ema_slope = (ema20.iloc[-1] - ema20.iloc[-10]) / ema20.iloc[-10] * 100
         else:
@@ -532,7 +572,7 @@ class PriceEntryEngine:
             prev = df.iloc[-2]
             
             # Calculate EMA20
-            ema20 = talib.EMA(df['close'], timeperiod=20).iloc[-1]
+            ema20 = TechnicalIndicators.EMA(df['close'], 20).iloc[-1]
             
             if np.isnan(ema20):
                 return False, {}
@@ -748,7 +788,7 @@ class PriceEntryEngine:
                 volume_climax = prev['volume'] > df['volume'].iloc[-5:-1].mean() * 1.5
                 
                 # Reclaim of EMA20
-                ema20 = talib.EMA(df['close'], timeperiod=20).iloc[-1]
+                ema20 = TechnicalIndicators.EMA(df['close'], 20).iloc[-1]
                 reclaim = current['close'] > ema20
                 
                 entry_valid = (
@@ -792,7 +832,7 @@ class PriceEntryEngine:
                 volume_climax = prev['volume'] > df['volume'].iloc[-5:-1].mean() * 1.5
                 
                 # Reclaim of EMA20
-                ema20 = talib.EMA(df['close'], timeperiod=20).iloc[-1]
+                ema20 = TechnicalIndicators.EMA(df['close'], 20).iloc[-1]
                 reclaim = current['close'] < ema20
                 
                 entry_valid = (
@@ -892,7 +932,7 @@ class PriceEntryEngine:
             entry_price = entry_details.get("entry_price", df['close'].iloc[-1])
             
             # Dynamic stop loss based on ATR
-            atr = talib.ATR(df['high'], df['low'], df['close'], timeperiod=14).iloc[-1]
+            atr = TechnicalIndicators.ATR(df['high'], df['low'], df['close'], 14).iloc[-1]
             stop_distance = min(atr * 1.5, entry_price * MAX_STOP_LOSS_PCT / 100)
             
             if direction == "LONG":
@@ -954,7 +994,7 @@ class CompleteTraderSystem:
     async def initialize(self):
         """Initialize the system"""
         log.info("=" * 70)
-        log.info("🧠 COMPLETE TRADER SYSTEM")
+        log.info("🧠 COMPLETE TRADER SYSTEM (NO TA-LIB REQUIRED)")
         log.info("7-Tool Direction Analysis + 3 Price-Only Entry Types")
         log.info("=" * 70)
         log.info("PHASE 1: DIRECTION (7 tools must ALL agree)")
@@ -1717,11 +1757,58 @@ Phase 2 → Price Entry (NO indicators, pure price behavior)
         except Exception as e:
             log.error(f"Cleanup error: {e}")
 
+# ================ SIMPLE HTTP HEALTH CHECK ================
+async def http_health_check():
+    """Simple HTTP server for health checks"""
+    import socket
+    from concurrent.futures import ThreadPoolExecutor
+    
+    def handle_client(client_socket):
+        try:
+            request = client_socket.recv(1024).decode('utf-8')
+            
+            # Simple response
+            response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"
+            response += json.dumps({
+                "status": "running",
+                "service": "Complete Trader System",
+                "timestamp": time.time()
+            })
+            
+            client_socket.send(response.encode('utf-8'))
+        except:
+            pass
+        finally:
+            client_socket.close()
+    
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(('0.0.0.0', 8080))
+    server.listen(5)
+    server.setblocking(False)
+    
+    log.info("🌐 HTTP health check server started on port 8080")
+    
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        while True:
+            try:
+                client, addr = server.accept()
+                executor.submit(handle_client, client)
+            except BlockingIOError:
+                await asyncio.sleep(0.1)
+            except Exception as e:
+                log.error(f"HTTP server error: {e}")
+                await asyncio.sleep(1)
+
 # ================ MAIN ================
 async def main():
     """Main function"""
     # Create and run system
     system = CompleteTraderSystem()
+    
+    # Start HTTP health check in background
+    health_task = asyncio.create_task(http_health_check())
+    
+    # Run the main system
     await system.run()
 
 if __name__ == "__main__":
