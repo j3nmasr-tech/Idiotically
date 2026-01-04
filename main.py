@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-🎯 TRADER'S FRAMEWORK - ULTIMATE FIX
-Fixed: DataFrame boolean ambiguity in data extraction
+🎯 TRADER'S FRAMEWORK - COMPLETE FIXED VERSION
+With Telegram notifications and database fixes
 """
 
 import os
@@ -22,8 +22,8 @@ from dataclasses import dataclass
 import json
 
 # ================ CONFIGURATION ================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 DB_PATH = "/app/data/trader_framework.db"
 
 EXCHANGE = "okx"
@@ -53,11 +53,49 @@ logging.basicConfig(
 )
 log = logging.getLogger("trader_framework")
 
-# ================ ULTIMATE DATA EXTRACTION FIX ================
+# ================ TELEGRAM NOTIFICATION ================
+class TelegramNotifier:
+    """Send notifications to Telegram"""
+    
+    def __init__(self, token: str, chat_id: str):
+        self.token = token
+        self.chat_id = chat_id
+        self.client = httpx.AsyncClient(timeout=10.0)
+        self.enabled = bool(token and chat_id)
+        
+        if self.enabled:
+            log.info(f"✅ Telegram notifications enabled for chat: {chat_id}")
+        else:
+            log.warning("⚠️ Telegram notifications disabled - missing token or chat ID")
+    
+    async def send_message(self, message: str):
+        """Send message to Telegram"""
+        if not self.enabled:
+            return False
+        
+        try:
+            url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+            payload = {
+                "chat_id": self.chat_id,
+                "text": message,
+                "parse_mode": "HTML"
+            }
+            
+            response = await self.client.post(url, json=payload)
+            return response.status_code == 200
+            
+        except Exception as e:
+            log.error(f"Telegram send error: {e}")
+            return False
+    
+    async def close(self):
+        """Close the HTTP client"""
+        await self.client.aclose()
+
+# ================ DATA EXTRACTION FUNCTIONS ================
 def extract_float_safe(value, default=0.0):
-    """Safely extract a float value - ALWAYS returns a float, never a DataFrame/Series"""
+    """Safely extract a float value - ALWAYS returns a float"""
     try:
-        # Handle None
         if value is None:
             return default
         
@@ -72,79 +110,50 @@ def extract_float_safe(value, default=0.0):
         if isinstance(value, np.generic):
             return float(value)
         
-        # Handle pandas Series (check if it's a Series with one element)
+        # Handle pandas Series
         if isinstance(value, pd.Series):
             if value.empty:
                 return default
-            # If Series has only one element, extract it
-            if len(value) == 1:
-                scalar = value.iloc[0]
-                return extract_float_safe(scalar, default)
-            else:
-                # Multiple elements - this shouldn't happen, take the last one
-                scalar = value.iloc[-1]
-                return extract_float_safe(scalar, default)
+            scalar = value.iloc[-1]
+            return extract_float_safe(scalar, default)
         
-        # Handle pandas DataFrame (this should not happen)
+        # Handle pandas DataFrame
         if isinstance(value, pd.DataFrame):
-            log.warning(f"DataFrame passed to extract_float_safe: shape={value.shape}")
             if value.empty:
                 return default
-            # Take the last value of first column
             scalar = value.iloc[-1, 0]
             return extract_float_safe(scalar, default)
         
-        # Handle numpy array
-        if isinstance(value, np.ndarray):
-            if value.size == 0:
-                return default
-            scalar = value.flat[-1]
-            return extract_float_safe(scalar, default)
-        
-        # Now try to convert to float
+        # Try to convert to float
         try:
             result = float(value)
-            # Check for special float values
             if np.isnan(result) or np.isinf(result):
                 return default
             return result
         except (ValueError, TypeError):
             return default
             
-    except Exception as e:
-        log.debug(f"extract_float_safe error: {e}")
+    except Exception:
         return default
 
 def get_dataframe_value_safe(df, column, index=-1, default=0.0):
-    """Safely get value from DataFrame column - ULTIMATE FIX"""
+    """Safely get value from DataFrame column"""
     try:
-        # Check if df is actually a DataFrame
-        if not isinstance(df, pd.DataFrame):
+        if not isinstance(df, pd.DataFrame) or df.empty or column not in df.columns:
             return default
         
-        if df.empty:
-            return default
-        
-        if column not in df.columns:
-            return default
-        
-        # Check index bounds
         actual_index = index if index >= 0 else len(df) + index
         if actual_index < 0 or actual_index >= len(df):
             return default
         
-        # Get the value
         value = df[column].iloc[actual_index]
-        
-        # Extract float safely
         return extract_float_safe(value, default)
         
-    except Exception as e:
-        log.debug(f"get_dataframe_value_safe error: {e}")
+    except Exception:
         return default
 
 def is_valid_dataframe_simple(df, min_rows=20):
-    """Simple check if DataFrame is valid - returns boolean ONLY"""
+    """Simple check if DataFrame is valid"""
     try:
         return bool(
             df is not None and
@@ -334,9 +343,7 @@ class DirectionScanner:
             if not is_valid_dataframe_simple(df, 20):
                 return False
             
-            # Impulse move (last 5 candles)
             impulse = get_dataframe_value_safe(df, 'high', -1) - get_dataframe_value_safe(df, 'low', -5)
-            # Pullback (previous 5 candles)
             pullback = abs(get_dataframe_value_safe(df, 'high', -5) - get_dataframe_value_safe(df, 'low', -10))
             
             if pullback > 0:
@@ -379,7 +386,6 @@ class DirectionScanner:
             
             recent_volume = get_dataframe_value_safe(df, 'volume', -1)
             
-            # Get last 20 volumes
             if len(df) >= 20:
                 volumes = []
                 for i in range(1, 21):
@@ -444,7 +450,6 @@ class DirectionScanner:
             if atr_series.empty:
                 return False
             
-            # Get last 20 ATR values
             atr_values = []
             for i in range(1, 21):
                 val = extract_float_safe(atr_series.iloc[-i] if len(atr_series) >= i else 0)
@@ -477,7 +482,6 @@ class PriceEntryEngine:
             
             log.info(f"🔍 Looking for {direction.direction} entry on {direction.symbol}")
             
-            # Try different entry types
             entry_types = [
                 ("PULLBACK", self._check_pullback_entry),
                 ("BREAKOUT", self._check_breakout_entry),
@@ -487,7 +491,6 @@ class PriceEntryEngine:
             for entry_type, check_func in entry_types:
                 try:
                     entry_price = check_func(df, direction.direction)
-                    # Check if we have a valid entry price
                     if entry_price is not None and entry_price > 0:
                         log.info(f"✅ ENTRY: {direction.symbol} {direction.direction} @ {entry_price:.4f}")
                         log.info(f"   Type: {entry_type}")
@@ -516,7 +519,6 @@ class PriceEntryEngine:
             if not is_valid_dataframe_simple(df, 2):
                 return None
             
-            # Extract values as floats
             current_close = get_dataframe_value_safe(df, 'close', -1)
             current_open = get_dataframe_value_safe(df, 'open', -1)
             prev_close = get_dataframe_value_safe(df, 'close', -2)
@@ -524,15 +526,12 @@ class PriceEntryEngine:
             prev_high = get_dataframe_value_safe(df, 'high', -2)
             prev_low = get_dataframe_value_safe(df, 'low', -2)
             
-            # Check if we have valid values
             if current_close <= 0 or current_open <= 0 or prev_close <= 0 or prev_open <= 0:
                 return None
             
-            # Calculate midpoint of previous candle's range
             midpoint = (prev_high + prev_low) / 2
             
             if direction == "LONG":
-                # Need: Previous candle bearish AND current candle bullish AND closing above midpoint
                 prev_bearish = prev_close < prev_open
                 current_bullish = current_close > current_open
                 above_midpoint = current_close > midpoint
@@ -541,7 +540,6 @@ class PriceEntryEngine:
                     return float(current_close)
                     
             else:  # SHORT
-                # Need: Previous candle bullish AND current candle bearish AND closing below midpoint
                 prev_bullish = prev_close > prev_open
                 current_bearish = current_close < current_open
                 below_midpoint = current_close < midpoint
@@ -566,25 +564,21 @@ class PriceEntryEngine:
             prev_high = get_dataframe_value_safe(df, 'high', -2)
             prev_low = get_dataframe_value_safe(df, 'low', -2)
             
-            # Calculate average volume of last 5 candles (excluding current)
             volume_values = []
-            for i in range(2, 7):  # Positions -2 through -6
+            for i in range(2, 7):
                 vol = get_dataframe_value_safe(df, 'volume', -i)
                 if vol > 0:
                     volume_values.append(vol)
             
             avg_volume = np.mean(volume_values) if volume_values else current_volume
             
-            # Check for valid values
             if current_close <= 0 or current_volume <= 0:
                 return None
             
             if direction == "LONG":
-                # Break above previous high with volume surge
                 if current_close > prev_high and current_volume > avg_volume * 1.2:
                     return float(current_close)
             else:  # SHORT
-                # Break below previous low with volume surge
                 if current_close < prev_low and current_volume > avg_volume * 1.2:
                     return float(current_close)
             
@@ -606,7 +600,6 @@ class PriceEntryEngine:
             prev_high = get_dataframe_value_safe(df, 'high', -2)
             prev_low = get_dataframe_value_safe(df, 'low', -2)
             
-            # Check for valid values
             if current_close <= 0 or prev_close <= 0 or prev_open <= 0:
                 return None
             
@@ -615,7 +608,6 @@ class PriceEntryEngine:
             midpoint = (prev_open + prev_close) / 2
             
             if direction == "LONG":
-                # Previous candle had a long lower wick (stop hunt), now recovering
                 had_wick = prev_low < prev_min - (prev_max - prev_min) * 0.3
                 recovering = current_close > prev_close and current_close > midpoint
                 
@@ -623,7 +615,6 @@ class PriceEntryEngine:
                     return float(current_close)
                     
             else:  # SHORT
-                # Previous candle had a long upper wick (stop hunt), now declining
                 had_wick = prev_high > prev_max + (prev_max - prev_min) * 0.3
                 declining = current_close < prev_close and current_close < midpoint
                 
@@ -649,7 +640,6 @@ class MomentumExitEngine:
         if current_price <= 0:
             return None
         
-        # Check momentum failure
         momentum_failed = self._check_momentum_failure(df, position.direction)
         if momentum_failed:
             return self._create_exit_signal(position, float(current_price))
@@ -662,11 +652,10 @@ class MomentumExitEngine:
             if not is_valid_dataframe_simple(df, 3):
                 return False
             
-            # Check last 3 candles
             bearish_count = 0
             bullish_count = 0
             
-            for i in range(1, 4):  # Positions -1, -2, -3
+            for i in range(1, 4):
                 close_val = get_dataframe_value_safe(df, 'close', -i)
                 open_val = get_dataframe_value_safe(df, 'open', -i)
                 
@@ -679,10 +668,8 @@ class MomentumExitEngine:
                     bullish_count += 1
             
             if direction == "LONG":
-                # Momentum failure: consecutive bearish candles
                 return bearish_count >= 2
             else:  # SHORT
-                # Momentum failure: consecutive bullish candles
                 return bullish_count >= 2
                 
         except Exception:
@@ -690,7 +677,6 @@ class MomentumExitEngine:
     
     def _create_exit_signal(self, position: EntrySignal, exit_price: float) -> ExitSignal:
         """Create exit signal"""
-        # Calculate P&L
         if position.direction == "LONG":
             pnl_percent = ((exit_price - position.entry_price) / position.entry_price) * 100
         else:
@@ -718,12 +704,13 @@ class TraderFramework:
         self.exit_engine = MomentumExitEngine()
         self.exchange = None
         self.db = None
+        self.telegram = None
         self.active_positions = {}  # symbol: EntrySignal
     
     async def initialize(self):
         """Initialize the framework"""
         log.info("=" * 70)
-        log.info("🎯 TRADER'S FRAMEWORK - ULTIMATE FIX")
+        log.info("🎯 TRADER'S FRAMEWORK - WITH TELEGRAM")
         log.info("=" * 70)
         log.info("1. Direction filter = scanner (3/7 tools minimum)")
         log.info("2. Entry = price behavior (3 types)")
@@ -732,12 +719,20 @@ class TraderFramework:
         
         await self._init_database()
         await self._init_exchange()
+        self._init_telegram()
+    
+    def _init_telegram(self):
+        """Initialize Telegram notifier"""
+        self.telegram = TelegramNotifier(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
     
     async def _init_database(self):
-        """Initialize database"""
+        """Initialize database - FIXED SCHEMA"""
         try:
             os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
             self.db = await aiosqlite.connect(DB_PATH)
+            
+            # DROP and recreate table with correct schema
+            await self.db.execute("DROP TABLE IF EXISTS trades")
             
             await self.db.execute("""
             CREATE TABLE IF NOT EXISTS trades (
@@ -758,7 +753,7 @@ class TraderFramework:
             """)
             
             await self.db.commit()
-            log.info("✅ Database initialized")
+            log.info("✅ Database initialized with correct schema")
             
         except Exception as e:
             log.error(f"Database error: {e}")
@@ -773,7 +768,6 @@ class TraderFramework:
                 "timeout": 20000
             })
             
-            # Try to fetch a ticker to test connection
             ticker = await self.exchange.fetch_ticker("BTC/USDT")
             log.info(f"✅ Exchange connected. BTC: ${ticker['last']:.2f}")
             
@@ -796,11 +790,9 @@ class TraderFramework:
                         columns=["timestamp", "open", "high", "low", "close", "volume"]
                     )
                     
-                    # Convert to numeric
                     for col in ["open", "high", "low", "close", "volume"]:
                         df[col] = pd.to_numeric(df[col], errors='coerce')
                     
-                    # Drop any rows with NaN values
                     df = df.dropna()
                     
                     if len(df) >= 15:
@@ -824,13 +816,18 @@ class TraderFramework:
                     if volume and volume >= MIN_VOLUME_USD:
                         pairs.append(symbol)
             
-            # Sort by volume and take top N
             pairs.sort(key=lambda x: tickers[x].get('quoteVolume', 0) or 0, reverse=True)
             return pairs[:TOP_N_VOLUME]
             
         except Exception as e:
             log.error(f"Error getting pairs: {e}")
             return []
+    
+    async def send_telegram_notification(self, title: str, message: str):
+        """Send notification to Telegram"""
+        if self.telegram:
+            full_message = f"<b>{title}</b>\n{message}"
+            await self.telegram.send_message(full_message)
     
     async def scan_loop(self):
         """Main scanning loop for direction signals"""
@@ -845,7 +842,6 @@ class TraderFramework:
                 
                 log.info(f"\n📊 Scan Cycle #{cycle}")
                 
-                # Get pairs
                 pairs = await self.get_active_pairs()
                 if not pairs:
                     await asyncio.sleep(SCAN_INTERVAL)
@@ -853,26 +849,19 @@ class TraderFramework:
                 
                 log.info(f"Scanning {len(pairs)} pairs for direction")
                 
-                # Scan each pair
                 for symbol in pairs:
-                    # Skip if already in position
                     if symbol in self.active_positions:
                         continue
                     
                     try:
-                        # Fetch data
                         data = await self.fetch_data(symbol)
                         
-                        # Check if we have required timeframes
                         if not all(tf in data for tf in ["1H", "15M", "5M"]):
                             continue
                         
-                        # 1. DIRECTION FILTER (Scanner)
                         direction = self.scanner.scan_direction(symbol, data)
                         
                         if direction:
-                            # 2. ENTRY (Price behavior)
-                            # FIX: Get entry DataFrame without using OR operator
                             entry_df = data.get("5M")
                             if entry_df is None:
                                 entry_df = data.get("3M")
@@ -881,15 +870,23 @@ class TraderFramework:
                                 entry = self.entry_engine.find_entry(entry_df, direction)
                                 
                                 if entry and len(self.active_positions) < MAX_POSITIONS:
-                                    # Save position
                                     self.active_positions[symbol] = entry
                                     
-                                    # Save to database
                                     await self.save_position(entry, direction)
+                                    
+                                    # Send Telegram notification
+                                    telegram_msg = (
+                                        f"Symbol: {entry.symbol}\n"
+                                        f"Direction: {entry.direction}\n"
+                                        f"Entry: {entry.entry_price:.4f}\n"
+                                        f"Type: {entry.entry_type}\n"
+                                        f"Strength: {direction.strength:.1%}\n"
+                                        f"Tools: {len(direction.tools_passed)}/7"
+                                    )
+                                    await self.send_telegram_notification("✅ POSITION OPENED", telegram_msg)
                                     
                                     log.info(f"✅ POSITION OPENED: {symbol} {entry.direction}")
                         
-                        # Small delay between pairs
                         await asyncio.sleep(0.1)
                         
                     except Exception as e:
@@ -914,12 +911,9 @@ class TraderFramework:
         
         while True:
             try:
-                # Check each active position
                 for symbol, position in list(self.active_positions.items()):
                     try:
-                        # Fetch current data
                         data = await self.fetch_data(symbol)
-                        # FIX: Get DataFrame without using OR operator
                         df = data.get("5M")
                         if df is None:
                             df = data.get("3M")
@@ -927,15 +921,22 @@ class TraderFramework:
                         if not is_valid_dataframe_simple(df, 3):
                             continue
                         
-                        # 3. EXIT (Momentum failure)
                         exit_signal = self.exit_engine.check_exit(df, position)
                         
                         if exit_signal:
-                            # Remove from active positions
                             del self.active_positions[symbol]
                             
-                            # Update database
                             await self.update_position_exit(exit_signal)
+                            
+                            # Send Telegram notification
+                            telegram_msg = (
+                                f"Symbol: {exit_signal.symbol}\n"
+                                f"Direction: {exit_signal.direction}\n"
+                                f"Exit: {exit_signal.exit_price:.4f}\n"
+                                f"Reason: {exit_signal.exit_reason}\n"
+                                f"P&L: {exit_signal.pnl_percent:+.2f}%"
+                            )
+                            await self.send_telegram_notification("📤 POSITION CLOSED", telegram_msg)
                             
                             log.info(f"📤 POSITION CLOSED: {symbol} {exit_signal.exit_reason}")
                     
@@ -943,10 +944,7 @@ class TraderFramework:
                         log.error(f"Monitor error for {symbol}: {str(e)[:100]}")
                         continue
                 
-                # Clean up old positions
                 await self.cleanup_positions()
-                
-                # Wait before next check
                 await asyncio.sleep(5)
                 
             except Exception as e:
@@ -1007,12 +1005,11 @@ class TraderFramework:
     async def cleanup_positions(self):
         """Clean up old positions"""
         try:
-            # Remove positions older than 24 hours
             old_positions = []
             current_time = time.time()
             
             for symbol, position in self.active_positions.items():
-                if current_time - position.timestamp > 86400:  # 24 hours
+                if current_time - position.timestamp > 86400:
                     old_positions.append(symbol)
             
             for symbol in old_positions:
@@ -1027,7 +1024,6 @@ class TraderFramework:
         try:
             await self.initialize()
             
-            # Run both loops concurrently
             await asyncio.gather(
                 self.scan_loop(),
                 self.monitor_loop()
@@ -1048,6 +1044,9 @@ class TraderFramework:
             
             if self.db:
                 await self.db.close()
+            
+            if self.telegram:
+                await self.telegram.close()
                 
         except Exception as e:
             log.error(f"Cleanup error: {e}")
