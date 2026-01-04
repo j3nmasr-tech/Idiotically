@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-🎯 TRADER'S FRAMEWORK - SIMPLIFIED
-1. Direction filter = scanner (3/7 tools)
-2. Entry = price behavior (3 types)
-3. Exit = momentum failure
+🎯 TRADER'S FRAMEWORK - FIXED VERSION
+Fixed: DataFrame boolean ambiguity error
+Fixed: Pullback entry logic
+Fixed: Data extraction issues
 """
 
 import os
@@ -55,54 +55,68 @@ logging.basicConfig(
 )
 log = logging.getLogger("trader_framework")
 
-# ================ DATA EXTRACTION FUNCTIONS ================
-def extract_float(value):
-    """Extract float from any pandas/numpy type"""
+# ================ FIXED DATA EXTRACTION FUNCTIONS ================
+def extract_float(value, default=0.0):
+    """Extract float from any pandas/numpy type - FIXED VERSION"""
     try:
         if pd.isna(value):
-            return np.nan
+            return default
         if isinstance(value, (pd.Series, pd.DataFrame)):
             if value.empty:
-                return np.nan
+                return default
             # Take the first/last value depending on context
-            val = value.iloc[-1] if isinstance(value, pd.Series) else value.iloc[-1, 0]
-            return float(val) if not pd.isna(val) else np.nan
+            if isinstance(value, pd.Series):
+                val = value.iloc[-1] if len(value) > 0 else default
+            else:
+                val = value.iloc[-1, 0] if value.shape[0] > 0 and value.shape[1] > 0 else default
+            return float(val) if not pd.isna(val) else default
         elif isinstance(value, (int, float, np.number)):
             return float(value)
         else:
             # Try to convert to float
             return float(value)
     except Exception:
-        return np.nan
+        return default
 
-def get_dataframe_value(df, column, index=-1, default=np.nan):
-    """Safely get value from DataFrame column"""
+def get_dataframe_value(df, column, index=-1, default=0.0):
+    """Safely get value from DataFrame column - FIXED VERSION"""
     try:
         if df is None or df.empty or column not in df.columns:
             return default
         if len(df) <= abs(index):
             return default
         value = df[column].iloc[index]
-        return extract_float(value)
+        return extract_float(value, default)
     except Exception:
         return default
 
 def is_valid_dataframe(df, min_rows=20):
-    """Check if DataFrame is valid"""
+    """Check if DataFrame is valid - FIXED: Returns boolean only"""
     try:
+        # Check if df is None
         if df is None:
             return False
+        
+        # Check if it's actually a DataFrame
         if not isinstance(df, pd.DataFrame):
             return False
+        
+        # Check if empty
         if df.empty:
             return False
+        
+        # Check minimum rows
         if len(df) < min_rows:
             return False
+        
+        # Check required columns
         required = ['open', 'high', 'low', 'close', 'volume']
         for col in required:
             if col not in df.columns:
                 return False
-        return True
+        
+        return True  # MUST return boolean!
+        
     except Exception:
         return False
 
@@ -187,10 +201,12 @@ class DirectionScanner:
         self.scan_count += 1
         
         # Tool 1: Multi-Timeframe Agreement (MANDATORY - must pass)
-        mtf_ok = self._check_mtf_agreement(multi_tf_data)
-        if not mtf_ok[0]:
+        mtf_result = self._check_mtf_agreement(multi_tf_data)
+        mtf_ok = mtf_result[0]
+        direction = mtf_result[1]
+        
+        if not mtf_ok:
             return None
-        direction = mtf_ok[1]
         
         # Primary timeframe for other tools
         primary_df = multi_tf_data.get("15M")
@@ -250,11 +266,11 @@ class DirectionScanner:
                 ema50 = SimpleIndicators.EMA(df['close'], 50)
                 rsi = SimpleIndicators.RSI(df['close'], 14)
                 
-                ema20_val = extract_float(ema20.iloc[-1] if not ema20.empty else np.nan)
-                ema50_val = extract_float(ema50.iloc[-1] if not ema50.empty else np.nan)
-                rsi_val = extract_float(rsi.iloc[-1] if not rsi.empty else np.nan)
+                ema20_val = extract_float(ema20.iloc[-1] if not ema20.empty else 0)
+                ema50_val = extract_float(ema50.iloc[-1] if not ema50.empty else 0)
+                rsi_val = extract_float(rsi.iloc[-1] if not rsi.empty else 50)
                 
-                if np.isnan(ema20_val) or np.isnan(ema50_val) or np.isnan(rsi_val):
+                if ema20_val == 0 or ema50_val == 0 or rsi_val == 50:
                     continue
                 
                 if ema20_val > ema50_val and rsi_val > 50:
@@ -284,9 +300,9 @@ class DirectionScanner:
             # Pullback (previous 5 candles)
             pullback = abs(get_dataframe_value(df, 'high', -5) - get_dataframe_value(df, 'low', -10))
             
-            if pullback > 0 and not np.isnan(pullback):
+            if pullback > 0:
                 return impulse > pullback * 1.5
-            return impulse > 0 and not np.isnan(impulse)
+            return impulse > 0
             
         except Exception:
             return False
@@ -302,12 +318,12 @@ class DirectionScanner:
             body = abs(current_close - current_open)
             
             atr_series = SimpleIndicators.ATR(df['high'], df['low'], df['close'], 14)
-            atr = extract_float(atr_series.iloc[-1] if not atr_series.empty else np.nan)
+            atr = extract_float(atr_series.iloc[-1] if not atr_series.empty else 0)
             
             rsi_series = SimpleIndicators.RSI(df['close'], 14)
-            rsi = extract_float(rsi_series.iloc[-1] if not rsi_series.empty else np.nan)
+            rsi = extract_float(rsi_series.iloc[-1] if not rsi_series.empty else 50)
             
-            if np.isnan(atr) or atr <= 0 or np.isnan(rsi):
+            if atr <= 0:
                 return False
             
             body_strength = body / atr
@@ -326,15 +342,18 @@ class DirectionScanner:
             
             # Get last 20 volumes
             if len(df) >= 20:
-                volumes = [get_dataframe_value(df, 'volume', -i) for i in range(1, 21)]
-                valid_volumes = [v for v in volumes if not np.isnan(v)]
-                avg_volume = np.mean(valid_volumes) if valid_volumes else recent_volume
+                volumes = []
+                for i in range(1, 21):
+                    vol = get_dataframe_value(df, 'volume', -i)
+                    if vol > 0:
+                        volumes.append(vol)
+                avg_volume = np.mean(volumes) if volumes else recent_volume
             else:
                 avg_volume = recent_volume
             
-            if avg_volume > 0 and not np.isnan(avg_volume):
+            if avg_volume > 0:
                 return recent_volume > avg_volume * 1.2
-            return recent_volume > 0 and not np.isnan(recent_volume)
+            return recent_volume > 0
             
         except Exception:
             return False
@@ -346,10 +365,7 @@ class DirectionScanner:
                 return False
             
             rsi_series = SimpleIndicators.RSI(df['close'], 14)
-            rsi = extract_float(rsi_series.iloc[-1] if not rsi_series.empty else np.nan)
-            
-            if np.isnan(rsi):
-                return False
+            rsi = extract_float(rsi_series.iloc[-1] if not rsi_series.empty else 50)
             
             if direction == "LONG":
                 return rsi > 50
@@ -368,11 +384,8 @@ class DirectionScanner:
             ema20_series = SimpleIndicators.EMA(df['close'], 20)
             ema50_series = SimpleIndicators.EMA(df['close'], 50)
             
-            ema20 = extract_float(ema20_series.iloc[-1] if not ema20_series.empty else np.nan)
-            ema50 = extract_float(ema50_series.iloc[-1] if not ema50_series.empty else np.nan)
-            
-            if np.isnan(ema20) or np.isnan(ema50):
-                return False
+            ema20 = extract_float(ema20_series.iloc[-1] if not ema20_series.empty else 0)
+            ema50 = extract_float(ema50_series.iloc[-1] if not ema50_series.empty else 0)
             
             if direction == "LONG":
                 return ema20 > ema50
@@ -395,17 +408,17 @@ class DirectionScanner:
             # Get last 20 ATR values
             atr_values = []
             for i in range(1, 21):
-                val = extract_float(atr_series.iloc[-i] if len(atr_series) >= i else np.nan)
-                if not np.isnan(val):
+                val = extract_float(atr_series.iloc[-i] if len(atr_series) >= i else 0)
+                if val > 0:
                     atr_values.append(val)
             
             if not atr_values:
                 return False
             
-            current_atr = extract_float(atr_series.iloc[-1] if not atr_series.empty else np.nan)
+            current_atr = extract_float(atr_series.iloc[-1] if not atr_series.empty else 0)
             avg_atr = np.mean(atr_values)
             
-            if np.isnan(current_atr) or np.isnan(avg_atr) or avg_atr == 0:
+            if avg_atr == 0:
                 return False
             
             return current_atr > avg_atr * 0.7
@@ -413,12 +426,13 @@ class DirectionScanner:
         except Exception:
             return False
 
-# ================ 2. ENTRY ENGINE (PRICE BEHAVIOR) ================
+# ================ 2. ENTRY ENGINE (PRICE BEHAVIOR) - FIXED ================
 class PriceEntryEngine:
     """Entry based on pure price behavior - NO indicators"""
     
     def find_entry(self, df: pd.DataFrame, direction: DirectionSignal) -> Optional[EntrySignal]:
-        """Find entry based on price behavior"""
+        """Find entry based on price behavior - FIXED VERSION"""
+        # Explicit boolean check
         if not is_valid_dataframe(df, 10):
             return None
         
@@ -434,7 +448,8 @@ class PriceEntryEngine:
         for entry_type, check_func in entry_types:
             try:
                 entry_price = check_func(df, direction.direction)
-                if entry_price > 0:
+                # Check if we have a valid entry price
+                if entry_price is not None and entry_price > 0:
                     log.info(f"✅ ENTRY: {direction.symbol} {direction.direction} @ {entry_price:.4f}")
                     log.info(f"   Type: {entry_type}")
                     log.info(f"   Strength: {direction.strength:.1%}, Tools: {len(direction.tools_passed)}/7")
@@ -452,13 +467,13 @@ class PriceEntryEngine:
         
         return None
     
-    def _check_pullback_entry(self, df: pd.DataFrame, direction: str) -> float:
+    def _check_pullback_entry(self, df: pd.DataFrame, direction: str) -> Optional[float]:
         """Pullback entry after move - FIXED VERSION"""
         try:
             if not is_valid_dataframe(df, 2):
-                return 0.0
+                return None
             
-            # Extract values as floats immediately
+            # Extract values as floats
             current_close = get_dataframe_value(df, 'close', -1)
             current_open = get_dataframe_value(df, 'open', -1)
             prev_close = get_dataframe_value(df, 'close', -2)
@@ -466,33 +481,43 @@ class PriceEntryEngine:
             prev_high = get_dataframe_value(df, 'high', -2)
             prev_low = get_dataframe_value(df, 'low', -2)
             
-            # Check for NaN values
-            if any(np.isnan(v) for v in [current_close, current_open, prev_close, prev_open, prev_high, prev_low]):
-                return 0.0
+            # Check if we have valid values
+            if current_close <= 0 or current_open <= 0 or prev_close <= 0 or prev_open <= 0:
+                return None
             
+            # Calculate midpoint of previous candle's range
             midpoint = (prev_high + prev_low) / 2
             
             if direction == "LONG":
-                # Bullish candle after bearish candles
-                if prev_close < prev_open and current_close > current_open and current_close > midpoint:
+                # Need: Previous candle bearish AND current candle bullish AND closing above midpoint
+                prev_bearish = prev_close < prev_open
+                current_bullish = current_close > current_open
+                above_midpoint = current_close > midpoint
+                
+                if prev_bearish and current_bullish and above_midpoint:
                     return float(current_close)
+                    
             else:  # SHORT
-                # Bearish candle after bullish candles
-                if prev_close > prev_open and current_close < current_open and current_close < midpoint:
+                # Need: Previous candle bullish AND current candle bearish AND closing below midpoint
+                prev_bullish = prev_close > prev_open
+                current_bearish = current_close < current_open
+                below_midpoint = current_close < midpoint
+                
+                if prev_bullish and current_bearish and below_midpoint:
                     return float(current_close)
             
-            return 0.0
+            return None
+            
         except Exception as e:
             log.debug(f"Pullback entry error: {e}")
-            return 0.0
+            return None
     
-    def _check_breakout_entry(self, df: pd.DataFrame, direction: str) -> float:
+    def _check_breakout_entry(self, df: pd.DataFrame, direction: str) -> Optional[float]:
         """Breakout entry from compression"""
         try:
             if not is_valid_dataframe(df, 6):
-                return 0.0
+                return None
             
-            # Extract values as floats immediately
             current_close = get_dataframe_value(df, 'close', -1)
             current_volume = get_dataframe_value(df, 'volume', -1)
             prev_high = get_dataframe_value(df, 'high', -2)
@@ -502,77 +527,83 @@ class PriceEntryEngine:
             volume_values = []
             for i in range(2, 7):  # Positions -2 through -6
                 vol = get_dataframe_value(df, 'volume', -i)
-                if not np.isnan(vol):
+                if vol > 0:
                     volume_values.append(vol)
             
             avg_volume = np.mean(volume_values) if volume_values else current_volume
             
-            # Check for NaN values
-            if any(np.isnan(v) for v in [current_close, current_volume, prev_high, prev_low]):
-                return 0.0
+            # Check for valid values
+            if current_close <= 0 or current_volume <= 0:
+                return None
             
             if direction == "LONG":
-                # Break above previous high with volume
+                # Break above previous high with volume surge
                 if current_close > prev_high and current_volume > avg_volume * 1.2:
                     return float(current_close)
             else:  # SHORT
-                # Break below previous low with volume
+                # Break below previous low with volume surge
                 if current_close < prev_low and current_volume > avg_volume * 1.2:
                     return float(current_close)
             
-            return 0.0
+            return None
+            
         except Exception as e:
             log.debug(f"Breakout entry error: {e}")
-            return 0.0
+            return None
     
-    def _check_stophunt_entry(self, df: pd.DataFrame, direction: str) -> float:
+    def _check_stophunt_entry(self, df: pd.DataFrame, direction: str) -> Optional[float]:
         """Re-entry after stop hunt"""
         try:
             if not is_valid_dataframe(df, 2):
-                return 0.0
+                return None
             
-            # Extract values as floats immediately
             current_close = get_dataframe_value(df, 'close', -1)
             prev_close = get_dataframe_value(df, 'close', -2)
             prev_open = get_dataframe_value(df, 'open', -2)
             prev_high = get_dataframe_value(df, 'high', -2)
             prev_low = get_dataframe_value(df, 'low', -2)
             
-            # Check for NaN values
-            if any(np.isnan(v) for v in [current_close, prev_close, prev_open, prev_high, prev_low]):
-                return 0.0
+            # Check for valid values
+            if current_close <= 0 or prev_close <= 0 or prev_open <= 0:
+                return None
+            
+            prev_min = min(prev_open, prev_close)
+            prev_max = max(prev_open, prev_close)
+            midpoint = (prev_open + prev_close) / 2
             
             if direction == "LONG":
-                # Bearish wick rejected, bullish recovery
-                prev_min = min(prev_open, prev_close)
-                midpoint = (prev_open + prev_close) / 2
+                # Previous candle had a long lower wick (stop hunt), now recovering
+                had_wick = prev_low < prev_min - (prev_max - prev_min) * 0.3
+                recovering = current_close > prev_close and current_close > midpoint
                 
-                if prev_low < prev_min and current_close > prev_close and current_close > midpoint:
+                if had_wick and recovering:
                     return float(current_close)
+                    
             else:  # SHORT
-                # Bullish wick rejected, bearish recovery
-                prev_max = max(prev_open, prev_close)
-                midpoint = (prev_open + prev_close) / 2
+                # Previous candle had a long upper wick (stop hunt), now declining
+                had_wick = prev_high > prev_max + (prev_max - prev_min) * 0.3
+                declining = current_close < prev_close and current_close < midpoint
                 
-                if prev_high > prev_max and current_close < prev_close and current_close < midpoint:
+                if had_wick and declining:
                     return float(current_close)
             
-            return 0.0
+            return None
+            
         except Exception as e:
             log.debug(f"Stophunt entry error: {e}")
-            return 0.0
+            return None
 
-# ================ 3. EXIT ENGINE (MOMENTUM FAILURE) ================
+# ================ 3. EXIT ENGINE (MOMENTUM FAILURE) - FIXED ================
 class MomentumExitEngine:
     """Exit based on momentum failure"""
     
     def check_exit(self, df: pd.DataFrame, position: EntrySignal) -> Optional[ExitSignal]:
-        """Check for exit signals"""
+        """Check for exit signals - FIXED VERSION"""
         if not is_valid_dataframe(df, 3):
             return None
         
         current_price = get_dataframe_value(df, 'close', -1)
-        if np.isnan(current_price):
+        if current_price <= 0:
             return None
         
         # Check momentum failure
@@ -583,7 +614,7 @@ class MomentumExitEngine:
         return None
     
     def _check_momentum_failure(self, df: pd.DataFrame, direction: str) -> bool:
-        """Check for momentum failure"""
+        """Check for momentum failure - FIXED VERSION"""
         try:
             if not is_valid_dataframe(df, 3):
                 return False
@@ -596,7 +627,7 @@ class MomentumExitEngine:
                 close_val = get_dataframe_value(df, 'close', -i)
                 open_val = get_dataframe_value(df, 'open', -i)
                 
-                if np.isnan(close_val) or np.isnan(open_val):
+                if close_val <= 0 or open_val <= 0:
                     continue
                 
                 if close_val < open_val:
@@ -649,7 +680,7 @@ class TraderFramework:
     async def initialize(self):
         """Initialize the framework"""
         log.info("=" * 70)
-        log.info("🎯 TRADER'S FRAMEWORK")
+        log.info("🎯 TRADER'S FRAMEWORK - FIXED VERSION")
         log.info("=" * 70)
         log.info("1. Direction filter = scanner (3/7 tools minimum)")
         log.info("2. Entry = price behavior (3 types)")
@@ -699,6 +730,7 @@ class TraderFramework:
                 "timeout": 20000
             })
             
+            # Try to fetch a ticker to test connection
             ticker = await self.exchange.fetch_ticker("BTC/USDT")
             log.info(f"✅ Exchange connected. BTC: ${ticker['last']:.2f}")
             
@@ -721,9 +753,11 @@ class TraderFramework:
                         columns=["timestamp", "open", "high", "low", "close", "volume"]
                     )
                     
+                    # Convert to numeric
                     for col in ["open", "high", "low", "close", "volume"]:
                         df[col] = pd.to_numeric(df[col], errors='coerce')
                     
+                    # Drop any rows with NaN values
                     df = df.dropna()
                     
                     if len(df) >= 15:
@@ -812,7 +846,7 @@ class TraderFramework:
                         await asyncio.sleep(0.1)
                         
                     except Exception as e:
-                        log.error(f"Error scanning {symbol}: {e}")
+                        log.error(f"Error scanning {symbol}: {str(e)[:100]}")
                         continue
                 
                 scan_time = time.time() - start_time
@@ -856,7 +890,7 @@ class TraderFramework:
                             log.info(f"📤 POSITION CLOSED: {symbol} {exit_signal.exit_reason}")
                     
                     except Exception as e:
-                        log.error(f"Monitor error for {symbol}: {e}")
+                        log.error(f"Monitor error for {symbol}: {str(e)[:100]}")
                         continue
                 
                 # Clean up old positions
