@@ -3,7 +3,7 @@
 
 """
 🎯 TRADER'S FRAMEWORK - SIMPLIFIED
-1. Direction filter = scanner (7 tools)
+1. Direction filter = scanner (3/7 tools)
 2. Entry = price behavior (3 types)
 3. Exit = momentum failure
 """
@@ -30,8 +30,8 @@ DB_PATH = "/app/data/trader_framework.db"
 
 EXCHANGE = "okx"
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
-TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 100))
-MIN_VOLUME_USD = 100000
+TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 30))
+MIN_VOLUME_USD = 1000000
 
 # Risk Management
 MAX_POSITIONS = 5
@@ -47,6 +47,9 @@ TIMEFRAMES = {
     "3M": "3m"     # Trigger
 }
 
+# Scanner settings
+MIN_TOOLS_AGREE = 3  # Only need 3 out of 7 tools to agree
+
 # ================ LOGGING ================
 logging.basicConfig(
     level=logging.INFO,
@@ -57,43 +60,55 @@ log = logging.getLogger("trader_framework")
 
 # ================ SAFE DATA ================
 def is_valid_df(df) -> bool:
-    """Safe DataFrame validation"""
-    if df is None:
-        return False
-    if not isinstance(df, pd.DataFrame):
-        return False
-    if df.empty:
-        return False
-    if len(df) < 20:
-        return False
-    required = ['open', 'high', 'low', 'close', 'volume']
-    for col in required:
-        if col not in df.columns:
+    """Safe DataFrame validation - FIXED VERSION"""
+    try:
+        if df is None:
             return False
-    return True
+        if not isinstance(df, pd.DataFrame):
+            return False
+        if df.empty:
+            return False
+        if len(df) < 20:
+            return False
+        required = ['open', 'high', 'low', 'close', 'volume']
+        for col in required:
+            if col not in df.columns:
+                return False
+        return True
+    except Exception:
+        return False
 
 # ================ SIMPLE INDICATORS ================
 class SimpleIndicators:
     
     @staticmethod
     def EMA(prices: pd.Series, period: int) -> pd.Series:
-        return prices.ewm(span=period, adjust=False).mean()
+        try:
+            return prices.ewm(span=period, adjust=False).mean()
+        except Exception:
+            return pd.Series([np.nan] * len(prices), index=prices.index)
     
     @staticmethod
     def RSI(prices: pd.Series, period: int = 14) -> pd.Series:
-        delta = prices.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
-        return 100 - (100 / (1 + rs))
+        try:
+            delta = prices.diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+            rs = gain / loss
+            return 100 - (100 / (1 + rs))
+        except Exception:
+            return pd.Series([np.nan] * len(prices), index=prices.index)
     
     @staticmethod
     def ATR(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-        tr1 = high - low
-        tr2 = abs(high - close.shift())
-        tr3 = abs(low - close.shift())
-        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-        return tr.rolling(window=period).mean()
+        try:
+            tr1 = high - low
+            tr2 = abs(high - close.shift())
+            tr3 = abs(low - close.shift())
+            tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+            return tr.rolling(window=period).mean()
+        except Exception:
+            return pd.Series([np.nan] * len(high), index=high.index)
 
 # ================ DATA STRUCTURES ================
 @dataclass
@@ -101,7 +116,8 @@ class DirectionSignal:
     """Output of the 7-tool scanner"""
     symbol: str
     direction: str  # "LONG" or "SHORT"
-    strength: float  # 0-1
+    strength: float  # 0-1 (percentage of tools that agree)
+    tools_passed: List[str]  # Which tools passed
     timestamp: float
     
 @dataclass
@@ -125,17 +141,17 @@ class ExitSignal:
 
 # ================ 1. DIRECTION FILTER (SCANNER) ================
 class DirectionScanner:
-    """7-tool direction filter - ALL must agree"""
+    """7-tool direction filter - MINIMUM 3 TOOLS MUST AGREE"""
     
     def __init__(self):
         self.scan_count = 0
         self.directions_found = 0
     
     def scan_direction(self, symbol: str, multi_tf_data: Dict[str, pd.DataFrame]) -> Optional[DirectionSignal]:
-        """Scan for direction using 7 tools"""
+        """Scan for direction using 7 tools - need minimum 3 to agree"""
         self.scan_count += 1
         
-        # Tool 1: Multi-Timeframe Agreement
+        # Tool 1: Multi-Timeframe Agreement (MANDATORY - must pass)
         mtf_ok = self._check_mtf_agreement(multi_tf_data)
         if not mtf_ok[0]:
             return None
@@ -146,7 +162,7 @@ class DirectionScanner:
         if not is_valid_df(primary_df):
             return None
         
-        # Tools 2-7
+        # Check tools 2-7
         tools = [
             ("Wave Length", self._check_wave_length(primary_df)),
             ("Momentum Strength", self._check_momentum_strength(primary_df)),
@@ -156,28 +172,36 @@ class DirectionScanner:
             ("Volatility Tradability", self._check_volatility_tradability(primary_df))
         ]
         
-        # Check if ALL tools agree
-        failed_tools = [name for name, result in tools if not result]
+        # Count how many tools agree
+        passed_tools = [name for name, result in tools if result]
         
-        if failed_tools:
-            log.debug(f"{symbol}: Tools failed - {failed_tools}")
+        # Need minimum 3 tools to agree (including MTF agreement = tool 1)
+        total_passed = len(passed_tools) + 1  # +1 for MTF agreement
+        
+        if total_passed < MIN_TOOLS_AGREE:
+            log.debug(f"{symbol}: Only {total_passed}/{MIN_TOOLS_AGREE} tools agree")
             return None
         
-        # All tools agree - direction confirmed
-        self.directions_found += 1
-        strength = 0.9  # High confidence when all agree
+        # Calculate strength based on percentage of tools that agree
+        strength = total_passed / 7.0  # 7 total tools
         
-        log.info(f"🎯 DIRECTION FOUND: {symbol} {direction} (Strength: {strength:.1%})")
+        # All required tools passed - direction confirmed
+        self.directions_found += 1
+        
+        log.info(f"🎯 DIRECTION FOUND: {symbol} {direction}")
+        log.info(f"   Tools passed: {total_passed}/7 (Strength: {strength:.1%})")
+        log.info(f"   Details: MTF + {', '.join(passed_tools)}")
         
         return DirectionSignal(
             symbol=symbol,
             direction=direction,
             strength=strength,
+            tools_passed=["Multi-Timeframe"] + passed_tools,
             timestamp=time.time()
         )
     
     def _check_mtf_agreement(self, multi_tf_data: Dict[str, pd.DataFrame]) -> Tuple[bool, str]:
-        """Tool 1: Multi-Timeframe Agreement"""
+        """Tool 1: Multi-Timeframe Agreement (MANDATORY)"""
         directions = []
         
         for tf_name in ["1H", "15M", "5M"]:
@@ -186,16 +210,23 @@ class DirectionScanner:
                 continue
             
             try:
-                ema20 = SimpleIndicators.EMA(df['close'], 20).iloc[-1]
-                ema50 = SimpleIndicators.EMA(df['close'], 50).iloc[-1]
-                rsi = SimpleIndicators.RSI(df['close'], 14).iloc[-1]
+                ema20 = SimpleIndicators.EMA(df['close'], 20)
+                ema50 = SimpleIndicators.EMA(df['close'], 50)
+                rsi = SimpleIndicators.RSI(df['close'], 14)
                 
-                if np.isnan(ema20) or np.isnan(ema50) or np.isnan(rsi):
+                if ema20.empty or ema50.empty or rsi.empty:
+                    continue
+                    
+                ema20_val = ema20.iloc[-1]
+                ema50_val = ema50.iloc[-1]
+                rsi_val = rsi.iloc[-1]
+                
+                if np.isnan(ema20_val) or np.isnan(ema50_val) or np.isnan(rsi_val):
                     continue
                 
-                if ema20 > ema50 and rsi > 50:
+                if ema20_val > ema50_val and rsi_val > 50:
                     directions.append("LONG")
-                elif ema20 < ema50 and rsi < 50:
+                elif ema20_val < ema50_val and rsi_val < 50:
                     directions.append("SHORT")
                     
             except Exception:
@@ -233,10 +264,18 @@ class DirectionScanner:
             current = df.iloc[-1]
             body = abs(current['close'] - current['open'])
             
-            atr = SimpleIndicators.ATR(df['high'], df['low'], df['close'], 14).iloc[-1]
-            rsi = SimpleIndicators.RSI(df['close'], 14).iloc[-1]
+            atr_series = SimpleIndicators.ATR(df['high'], df['low'], df['close'], 14)
+            if atr_series.empty:
+                return False
+                
+            atr = atr_series.iloc[-1]
+            rsi_series = SimpleIndicators.RSI(df['close'], 14)
+            if rsi_series.empty:
+                return False
+                
+            rsi = rsi_series.iloc[-1]
             
-            if atr <= 0 or np.isnan(atr) or np.isnan(rsi):
+            if np.isnan(atr) or atr <= 0 or np.isnan(rsi):
                 return False
             
             body_strength = body / atr
@@ -261,7 +300,11 @@ class DirectionScanner:
     def _check_rsi_regime(self, df: pd.DataFrame, direction: str) -> bool:
         """Tool 5: RSI Regime"""
         try:
-            rsi = SimpleIndicators.RSI(df['close'], 14).iloc[-1]
+            rsi_series = SimpleIndicators.RSI(df['close'], 14)
+            if rsi_series.empty:
+                return False
+                
+            rsi = rsi_series.iloc[-1]
             
             if np.isnan(rsi):
                 return False
@@ -277,8 +320,14 @@ class DirectionScanner:
     def _check_ema_structure(self, df: pd.DataFrame, direction: str) -> bool:
         """Tool 6: EMA Structure"""
         try:
-            ema20 = SimpleIndicators.EMA(df['close'], 20).iloc[-1]
-            ema50 = SimpleIndicators.EMA(df['close'], 50).iloc[-1]
+            ema20_series = SimpleIndicators.EMA(df['close'], 20)
+            ema50_series = SimpleIndicators.EMA(df['close'], 50)
+            
+            if ema20_series.empty or ema50_series.empty:
+                return False
+                
+            ema20 = ema20_series.iloc[-1]
+            ema50 = ema50_series.iloc[-1]
             
             if np.isnan(ema20) or np.isnan(ema50):
                 return False
@@ -294,9 +343,12 @@ class DirectionScanner:
     def _check_volatility_tradability(self, df: pd.DataFrame) -> bool:
         """Tool 7: Volatility Tradability"""
         try:
-            atr = SimpleIndicators.ATR(df['high'], df['low'], df['close'], 14)
-            current_atr = atr.iloc[-1]
-            avg_atr = atr.iloc[-20:].mean()
+            atr_series = SimpleIndicators.ATR(df['high'], df['low'], df['close'], 14)
+            if atr_series.empty:
+                return False
+                
+            current_atr = atr_series.iloc[-1]
+            avg_atr = atr_series.iloc[-20:].mean()
             
             if np.isnan(current_atr) or np.isnan(avg_atr) or avg_atr == 0:
                 return False
@@ -329,6 +381,7 @@ class PriceEntryEngine:
             if entry_price > 0:
                 log.info(f"✅ ENTRY: {direction.symbol} {direction.direction} @ {entry_price:.4f}")
                 log.info(f"   Type: {entry_type}")
+                log.info(f"   Strength: {direction.strength:.1%}, Tools: {len(direction.tools_passed)}/7")
                 
                 return EntrySignal(
                     symbol=direction.symbol,
@@ -351,13 +404,13 @@ class PriceEntryEngine:
                 if (prev['close'] < prev['open'] and  # Bearish
                     current['close'] > current['open'] and  # Bullish
                     current['close'] > (prev['high'] + prev['low']) / 2):  # Above midpoint
-                    return current['close']
+                    return float(current['close'])
             else:  # SHORT
                 # Bearish candle after bullish candles
                 if (prev['close'] > prev['open'] and  # Bullish
                     current['close'] < current['open'] and  # Bearish
                     current['close'] < (prev['high'] + prev['low']) / 2):  # Below midpoint
-                    return current['close']
+                    return float(current['close'])
             
             return 0.0
         except Exception:
@@ -373,12 +426,12 @@ class PriceEntryEngine:
                 # Break above previous high with volume
                 if (current['close'] > prev['high'] and
                     current['volume'] > df['volume'].iloc[-5:-1].mean() * 1.2):
-                    return current['close']
+                    return float(current['close'])
             else:  # SHORT
                 # Break below previous low with volume
                 if (current['close'] < prev['low'] and
                     current['volume'] > df['volume'].iloc[-5:-1].mean() * 1.2):
-                    return current['close']
+                    return float(current['close'])
             
             return 0.0
         except Exception:
@@ -395,13 +448,13 @@ class PriceEntryEngine:
                 if (prev['low'] < min(prev['open'], prev['close']) and  # Bearish wick
                     current['close'] > prev['close'] and  # Recovery
                     current['close'] > (prev['open'] + prev['close']) / 2):  # Above midpoint
-                    return current['close']
+                    return float(current['close'])
             else:  # SHORT
                 # Bullish wick rejected, bearish recovery
                 if (prev['high'] > max(prev['open'], prev['close']) and  # Bullish wick
                     current['close'] < prev['close'] and  # Recovery
                     current['close'] < (prev['open'] + prev['close']) / 2):  # Below midpoint
-                    return current['close']
+                    return float(current['close'])
             
             return 0.0
         except Exception:
@@ -416,7 +469,7 @@ class MomentumExitEngine:
         if not is_valid_df(df):
             return None
         
-        current_price = df['close'].iloc[-1]
+        current_price = float(df['close'].iloc[-1])
         
         # Check momentum failure
         momentum_failed = self._check_momentum_failure(df, position.direction)
@@ -482,7 +535,7 @@ class TraderFramework:
         log.info("=" * 70)
         log.info("🎯 TRADER'S FRAMEWORK")
         log.info("=" * 70)
-        log.info("1. Direction filter = scanner (7 tools)")
+        log.info("1. Direction filter = scanner (3/7 tools minimum)")
         log.info("2. Entry = price behavior (3 types)")
         log.info("3. Exit = momentum failure")
         log.info("=" * 70)
@@ -506,6 +559,8 @@ class TraderFramework:
                 exit_price REAL,
                 exit_reason TEXT,
                 pnl_percent REAL,
+                strength REAL,
+                tools_passed TEXT,
                 status TEXT DEFAULT 'PENDING',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 exited_at TIMESTAMP
@@ -558,7 +613,8 @@ class TraderFramework:
                     if len(df) >= 15:
                         data[tf_name] = df
                         
-            except Exception:
+            except Exception as e:
+                log.debug(f"Failed to fetch {tf_name} data for {symbol}: {e}")
                 continue
         
         return data
@@ -572,11 +628,11 @@ class TraderFramework:
             for symbol in tickers:
                 if symbol.endswith('/USDT'):
                     volume = tickers[symbol].get('quoteVolume', 0)
-                    if volume >= MIN_VOLUME_USD:
+                    if volume and volume >= MIN_VOLUME_USD:
                         pairs.append(symbol)
             
             # Sort by volume and take top N
-            pairs.sort(key=lambda x: tickers[x].get('quoteVolume', 0), reverse=True)
+            pairs.sort(key=lambda x: tickers[x].get('quoteVolume', 0) or 0, reverse=True)
             return pairs[:TOP_N_VOLUME]
             
         except Exception as e:
@@ -610,33 +666,38 @@ class TraderFramework:
                     if symbol in self.active_positions:
                         continue
                     
-                    # Fetch data
-                    data = await self.fetch_data(symbol)
-                    
-                    # Check if we have required timeframes
-                    if not all(tf in data for tf in ["1H", "15M", "5M"]):
+                    try:
+                        # Fetch data
+                        data = await self.fetch_data(symbol)
+                        
+                        # Check if we have required timeframes
+                        if not all(tf in data for tf in ["1H", "15M", "5M"]):
+                            continue
+                        
+                        # 1. DIRECTION FILTER (Scanner)
+                        direction = self.scanner.scan_direction(symbol, data)
+                        
+                        if direction:
+                            # 2. ENTRY (Price behavior)
+                            entry_df = data.get("5M") or data.get("3M")
+                            if is_valid_df(entry_df):
+                                entry = self.entry_engine.find_entry(entry_df, direction)
+                                
+                                if entry and len(self.active_positions) < MAX_POSITIONS:
+                                    # Save position
+                                    self.active_positions[symbol] = entry
+                                    
+                                    # Save to database
+                                    await self.save_position(entry, direction)
+                                    
+                                    log.info(f"✅ POSITION OPENED: {symbol} {entry.direction}")
+                        
+                        # Small delay between pairs
+                        await asyncio.sleep(0.1)
+                        
+                    except Exception as e:
+                        log.error(f"Error scanning {symbol}: {e}")
                         continue
-                    
-                    # 1. DIRECTION FILTER (Scanner)
-                    direction = self.scanner.scan_direction(symbol, data)
-                    
-                    if direction:
-                        # 2. ENTRY (Price behavior)
-                        entry_df = data.get("5M") or data.get("3M")
-                        if is_valid_df(entry_df):
-                            entry = self.entry_engine.find_entry(entry_df, direction)
-                            
-                            if entry and len(self.active_positions) < MAX_POSITIONS:
-                                # Save position
-                                self.active_positions[symbol] = entry
-                                
-                                # Save to database
-                                await self.save_position(entry)
-                                
-                                log.info(f"✅ POSITION OPENED: {symbol} {entry.direction}")
-                    
-                    # Small delay between pairs
-                    await asyncio.sleep(0.05)
                 
                 scan_time = time.time() - start_time
                 wait_time = max(1, SCAN_INTERVAL - scan_time)
@@ -692,23 +753,27 @@ class TraderFramework:
                 log.error(f"Monitor loop error: {e}")
                 await asyncio.sleep(10)
     
-    async def save_position(self, entry: EntrySignal):
+    async def save_position(self, entry: EntrySignal, direction: DirectionSignal):
         """Save position to database"""
         try:
             trade_id = hashlib.md5(
                 f"{entry.symbol}:{entry.direction}:{entry.entry_price}:{entry.timestamp}".encode()
             ).hexdigest()
             
+            tools_str = ", ".join(direction.tools_passed)
+            
             await self.db.execute("""
                 INSERT INTO trades (id, symbol, direction, entry_type,
-                                  entry_price, status)
-                VALUES (?, ?, ?, ?, ?, 'ACTIVE')
+                                  entry_price, strength, tools_passed, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
             """, (
                 trade_id,
                 entry.symbol,
                 entry.direction,
                 entry.entry_type,
-                entry.entry_price
+                entry.entry_price,
+                direction.strength,
+                tools_str
             ))
             
             await self.db.commit()
