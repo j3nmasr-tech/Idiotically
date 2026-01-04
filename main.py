@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-🧠 COMPLETE TRADER SYSTEM - BULLETPROOF
+🧠 COMPLETE TRADER SYSTEM - ULTRA ROBUST VERSION
 Professional Discretionary Trading Engine
 7-Tool Direction Analysis + 3 Price-Only Entry Types
 """
@@ -56,51 +56,58 @@ logging.basicConfig(
 )
 log = logging.getLogger("trader_system")
 
-# ================ SAFE DATA HANDLING ================
-class SafeData:
-    """Safe data handling to avoid DataFrame truth value errors"""
+# ================ ULTRA SAFE DATA HANDLING ================
+def is_valid_df(df) -> bool:
+    """ULTRA SAFE DataFrame validation - NO truth value checks EVER"""
+    if df is None:
+        return False
     
-    @staticmethod
-    def is_valid_dataframe(df) -> bool:
-        """Completely safe DataFrame validation - NO truth value checks"""
-        try:
-            # Check if it's actually a DataFrame
-            if not isinstance(df, pd.DataFrame):
-                return False
-            
-            # Check if it's empty
-            if df.empty:
-                return False
-            
-            # Check length
-            if len(df) < 20:
-                return False
-            
-            # Check required columns
-            required = ['open', 'high', 'low', 'close', 'volume']
-            for col in required:
-                if col not in df.columns:
-                    return False
-            
-            # Check for NaN
-            for col in required:
-                series = df[col]
-                if series.isnull().any():
-                    return False
-            
-            return True
-        except Exception:
+    # Check type first
+    if not isinstance(df, pd.DataFrame):
+        return False
+    
+    # Check if empty
+    try:
+        if df.empty:
             return False
+    except Exception:
+        return False
     
-    @staticmethod
-    def get_last_value(df, column, default=0):
-        """Safely get last value from DataFrame column"""
-        try:
-            if SafeData.is_valid_dataframe(df):
-                return df[column].iloc[-1]
-            return default
-        except Exception:
-            return default
+    # Check length
+    try:
+        if len(df) < 20:
+            return False
+    except Exception:
+        return False
+    
+    # Check required columns
+    required = ['open', 'high', 'low', 'close', 'volume']
+    try:
+        for col in required:
+            if col not in df.columns:
+                return False
+    except Exception:
+        return False
+    
+    # Check for NaN
+    try:
+        for col in required:
+            series = df[col]
+            if series.isnull().any():
+                return False
+    except Exception:
+        return False
+    
+    return True
+
+def safe_get(df, column, index=-1, default=0):
+    """Safely get value from DataFrame"""
+    try:
+        if is_valid_df(df):
+            return df[column].iloc[index]
+        return default
+    except Exception:
+        return default
 
 # ================ TECHNICAL INDICATORS ================
 class TechnicalIndicators:
@@ -165,7 +172,7 @@ def analyze_multi_timeframe_agreement(multi_tf_data: Dict[str, pd.DataFrame]) ->
     directions = []
     
     for tf_name, df in multi_tf_data.items():
-        if not SafeData.is_valid_dataframe(df):
+        if not is_valid_df(df):
             continue
             
         try:
@@ -205,7 +212,7 @@ def analyze_multi_timeframe_agreement(multi_tf_data: Dict[str, pd.DataFrame]) ->
 # ================ TOOL 2: WAVE LENGTH ================
 def analyze_wave_length(df: pd.DataFrame) -> bool:
     try:
-        if not SafeData.is_valid_dataframe(df):
+        if not is_valid_df(df):
             return False
         
         if len(df) < 20:
@@ -236,7 +243,7 @@ def analyze_wave_length(df: pd.DataFrame) -> bool:
 # ================ TOOL 3: MOMENTUM STRENGTH ================
 def analyze_momentum_strength(df: pd.DataFrame) -> bool:
     try:
-        if not SafeData.is_valid_dataframe(df):
+        if not is_valid_df(df):
             return False
         
         current = df.iloc[-1]
@@ -261,7 +268,7 @@ def analyze_momentum_strength(df: pd.DataFrame) -> bool:
 # ================ TOOL 4: VOLUME PARTICIPATION ================
 def analyze_volume_participation(df: pd.DataFrame) -> bool:
     try:
-        if not SafeData.is_valid_dataframe(df):
+        if not is_valid_df(df):
             return False
         
         recent_volume = df['volume'].iloc[-1]
@@ -279,7 +286,7 @@ def analyze_volume_participation(df: pd.DataFrame) -> bool:
 # ================ TOOL 5: RSI REGIME ================
 def analyze_rsi_regime(df: pd.DataFrame, target_direction: str) -> bool:
     try:
-        if not SafeData.is_valid_dataframe(df):
+        if not is_valid_df(df):
             return False
         
         rsi = TechnicalIndicators.RSI(df['close'], 14).iloc[-1]
@@ -300,7 +307,7 @@ def analyze_rsi_regime(df: pd.DataFrame, target_direction: str) -> bool:
 # ================ TOOL 6: EMA STRUCTURE ================
 def analyze_ema_structure(df: pd.DataFrame, target_direction: str) -> bool:
     try:
-        if not SafeData.is_valid_dataframe(df):
+        if not is_valid_df(df):
             return False
         
         ema20 = TechnicalIndicators.EMA(df['close'], 20).iloc[-1]
@@ -322,7 +329,7 @@ def analyze_ema_structure(df: pd.DataFrame, target_direction: str) -> bool:
 # ================ TOOL 7: VOLATILITY TRADABILITY ================
 def analyze_volatility_tradability(df: pd.DataFrame) -> bool:
     try:
-        if not SafeData.is_valid_dataframe(df):
+        if not is_valid_df(df):
             return False
         
         atr = TechnicalIndicators.ATR(df['high'], df['low'], df['close'], 14)
@@ -354,9 +361,14 @@ class DirectionEngine:
         
         log.info(f"🧠 Direction Analysis #{self.analysis_count}")
         
-        # Primary timeframe
-        primary_df = multi_tf_data.get("15M") or multi_tf_data.get("5M")
-        if primary_df is None or not SafeData.is_valid_dataframe(primary_df):
+        # Primary timeframe - NO "if df" checks!
+        primary_df = None
+        if "15M" in multi_tf_data:
+            primary_df = multi_tf_data["15M"]
+        elif "5M" in multi_tf_data:
+            primary_df = multi_tf_data["5M"]
+        
+        if not is_valid_df(primary_df):
             log.warning("❌ No primary timeframe data")
             return DirectionAnalysis("NO_TRADE", {}, 0.0)
         
@@ -444,7 +456,7 @@ class DirectionEngine:
 # ================ MARKET STATE DETECTION ================
 def detect_market_state(df: pd.DataFrame) -> MarketState:
     try:
-        if df is None or not SafeData.is_valid_dataframe(df):
+        if not is_valid_df(df):
             return MarketState("FAST_MARKET", 0.0, 0.0, False)
         
         atr = TechnicalIndicators.ATR(df['high'], df['low'], df['close'], 14)
@@ -509,7 +521,7 @@ class PriceEntryEngine:
     
     def check_pullback_entry(self, df: pd.DataFrame, direction: str) -> Tuple[bool, Dict]:
         try:
-            if df is None or not SafeData.is_valid_dataframe(df):
+            if not is_valid_df(df):
                 return False, {}
             
             current = df.iloc[-1]
@@ -605,7 +617,7 @@ class PriceEntryEngine:
     
     def check_breakout_entry(self, df: pd.DataFrame, direction: str) -> Tuple[bool, Dict]:
         try:
-            if df is None or not SafeData.is_valid_dataframe(df):
+            if not is_valid_df(df):
                 return False, {}
             
             current = df.iloc[-1]
@@ -683,7 +695,7 @@ class PriceEntryEngine:
     
     def check_stophunt_entry(self, df: pd.DataFrame, direction: str) -> Tuple[bool, Dict]:
         try:
-            if df is None or not SafeData.is_valid_dataframe(df):
+            if not is_valid_df(df):
                 return False, {}
             
             current = df.iloc[-1]
@@ -770,7 +782,7 @@ class PriceEntryEngine:
     
     def find_entry(self, df: pd.DataFrame, direction: str, market_state: MarketState) -> Optional[PriceEntry]:
         try:
-            if df is None or not SafeData.is_valid_dataframe(df):
+            if not is_valid_df(df):
                 return None
                 
             log.info(f"🎯 Looking for {direction} entries (Market: {market_state.state})...")
@@ -841,7 +853,7 @@ class PriceEntryEngine:
             if direction == "LONG":
                 stop_loss = entry_price - stop_distance
                 take_profit = entry_price + (stop_distance * MIN_RISK_REWARD)
-            else:  # SHORT
+            else:
                 stop_loss = entry_price + stop_distance
                 take_profit = entry_price - (stop_distance * MIN_RISK_REWARD)
             
@@ -893,7 +905,7 @@ class CompleteTraderSystem:
     
     async def initialize(self):
         log.info("=" * 70)
-        log.info("🧠 COMPLETE TRADER SYSTEM")
+        log.info("🧠 COMPLETE TRADER SYSTEM - ULTRA ROBUST")
         log.info("=" * 70)
         
         await self._init_database()
@@ -981,10 +993,6 @@ Phase 2 → Price Entry (NO indicators, pure price behavior)
 • <b>BREAKOUT</b> → Fast markets  
 • <b>STOPHUNT</b> → Volatile spikes
 
-<b>⏰ SCANNING:</b>
-• Interval: {SCAN_INTERVAL}s
-• Top {TOP_N_VOLUME} pairs
-
 ✅ <b>System is now live and scanning for trades</b>
 """
             
@@ -1068,14 +1076,17 @@ Phase 2 → Price Entry (NO indicators, pure price behavior)
             # Fetch data
             multi_tf_data = await self.fetch_timeframe_data(symbol)
             
-            # Check if we have enough data
+            # Check if we have enough data - NO "if df" checks!
             required_tfs = ["1H", "15M", "5M"]
             has_required_data = True
+            
             for tf in required_tfs:
                 if tf not in multi_tf_data:
                     has_required_data = False
                     break
-                if not SafeData.is_valid_dataframe(multi_tf_data[tf]):
+                
+                df = multi_tf_data[tf]
+                if not is_valid_df(df):
                     has_required_data = False
                     break
             
@@ -1093,8 +1104,13 @@ Phase 2 → Price Entry (NO indicators, pure price behavior)
             log.info(f"✅ DIRECTION LOCKED: {direction_analysis.direction}")
             
             # ===== PHASE 2: MARKET STATE =====
-            primary_df = multi_tf_data.get("5M") or multi_tf_data.get("3M")
-            if primary_df is None or not SafeData.is_valid_dataframe(primary_df):
+            primary_df = None
+            if "5M" in multi_tf_data:
+                primary_df = multi_tf_data["5M"]
+            elif "3M" in multi_tf_data:
+                primary_df = multi_tf_data["3M"]
+            
+            if not is_valid_df(primary_df):
                 return None
             
             market_state = detect_market_state(primary_df)
@@ -1103,8 +1119,13 @@ Phase 2 → Price Entry (NO indicators, pure price behavior)
             # ===== PHASE 3: PRICE ENTRY =====
             log.info(f"\n🎯 SWITCHING TO PRICE-ONLY MODE")
             
-            entry_df = multi_tf_data.get("3M") or multi_tf_data.get("1M")
-            if entry_df is None or not SafeData.is_valid_dataframe(entry_df):
+            entry_df = None
+            if "3M" in multi_tf_data:
+                entry_df = multi_tf_data["3M"]
+            elif "1M" in multi_tf_data:
+                entry_df = multi_tf_data["1M"]
+            
+            if not is_valid_df(entry_df):
                 log.warning("❌ No entry timeframe data")
                 return None
             
@@ -1114,7 +1135,7 @@ Phase 2 → Price Entry (NO indicators, pure price behavior)
                 market_state
             )
             
-            if not price_entry:
+            if price_entry is None:
                 log.info(f"❌ No price entry for {symbol}")
                 return None
             
@@ -1234,7 +1255,6 @@ Phase 2 → Price Entry (NO indicators, pure price behavior)
 
 <b>⚡ نوع الدخول:</b>
 ‎• النوع: {entry_text}
-‎• التقلب: {signal.market_state.volatility:.2f}x
 
 <b>🔧 التنفيذ:</b>
 ‎• سعر الدخول: <code>{signal.entry.entry_price:.6f}</code>
@@ -1389,7 +1409,7 @@ Phase 2 → Price Entry (NO indicators, pure price behavior)
                         
                         signal = await self.analyze_symbol(symbol)
                         
-                        if signal:
+                        if signal is not None:
                             signals_found += 1
                         
                         await asyncio.sleep(0.05)
