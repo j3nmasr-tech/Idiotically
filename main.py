@@ -43,7 +43,7 @@ REJECTION_CONFIG = {
     "rsi_long_zone": (40, 50),      # RSI 40-50 for LONG entries
     "rsi_short_zone": (50, 60),     # RSI 50-60 for SHORT entries
     "ema_distance_threshold": 0.5,  # 0.5% from EMA for rejection
-    "min_rejection_strength": 0.6,  # Minimum rejection strength score
+    "min_rejection_strength": 0.2,  # Minimum rejection strength score
 }
 
 # Timeframes for REACTION TRADING
@@ -866,7 +866,7 @@ class RejectionBasedScanner:
             market_strength = self.analyze_market_strength(tf_15m)
             
             # CRITICAL: No strength → no trade
-            if market_strength.strength_score < 0.4:
+            if market_strength.strength_score < 0.2:
                 self.daily_stats["no_strength"] += 1
                 log.debug(f"{symbol}: No market strength ({market_strength.strength_score:.2f})")
                 return None
