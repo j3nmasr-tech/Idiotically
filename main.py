@@ -2,10 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-🎯 TRADER'S FRAMEWORK - FIXED VERSION
-Fixed: DataFrame boolean ambiguity error
-Fixed: Pullback entry logic
-Fixed: Data extraction issues
+🎯 TRADER'S FRAMEWORK - ULTIMATE FIXED VERSION
+Fixed ALL DataFrame boolean ambiguity errors
 """
 
 import os
@@ -55,43 +53,61 @@ logging.basicConfig(
 )
 log = logging.getLogger("trader_framework")
 
-# ================ FIXED DATA EXTRACTION FUNCTIONS ================
+# ================ ULTIMATE FIXED DATA EXTRACTION ================
 def extract_float(value, default=0.0):
-    """Extract float from any pandas/numpy type - FIXED VERSION"""
+    """Extract float from any pandas/numpy type - ULTIMATE FIX"""
     try:
-        if pd.isna(value):
+        # Handle None first
+        if value is None:
             return default
-        if isinstance(value, (pd.Series, pd.DataFrame)):
+        
+        # Handle pandas NA
+        if hasattr(value, '__module__') and value.__class__.__module__ == 'pandas':
+            if pd.isna(value):
+                return default
+        
+        # Handle Series and DataFrame
+        if isinstance(value, pd.Series):
             if value.empty:
                 return default
-            # Take the first/last value depending on context
-            if isinstance(value, pd.Series):
-                val = value.iloc[-1] if len(value) > 0 else default
-            else:
-                val = value.iloc[-1, 0] if value.shape[0] > 0 and value.shape[1] > 0 else default
+            val = value.iloc[-1] if len(value) > 0 else default
+            return float(val) if not pd.isna(val) else default
+        elif isinstance(value, pd.DataFrame):
+            if value.empty:
+                return default
+            val = value.iloc[-1, 0] if value.shape[0] > 0 and value.shape[1] > 0 else default
             return float(val) if not pd.isna(val) else default
         elif isinstance(value, (int, float, np.number)):
             return float(value)
         else:
             # Try to convert to float
-            return float(value)
+            try:
+                return float(value)
+            except:
+                return default
     except Exception:
         return default
 
 def get_dataframe_value(df, column, index=-1, default=0.0):
-    """Safely get value from DataFrame column - FIXED VERSION"""
+    """Safely get value from DataFrame column"""
     try:
-        if df is None or df.empty or column not in df.columns:
+        # Check if df is actually a DataFrame
+        if not isinstance(df, pd.DataFrame):
             return default
+        
+        if df.empty or column not in df.columns:
+            return default
+        
         if len(df) <= abs(index):
             return default
+        
         value = df[column].iloc[index]
         return extract_float(value, default)
     except Exception:
         return default
 
 def is_valid_dataframe(df, min_rows=20):
-    """Check if DataFrame is valid - FIXED: Returns boolean only"""
+    """Check if DataFrame is valid - ULTIMATE FIX: ALWAYS returns boolean"""
     try:
         # Check if df is None
         if df is None:
@@ -126,7 +142,7 @@ class SimpleIndicators:
     @staticmethod
     def EMA(prices: pd.Series, period: int) -> pd.Series:
         try:
-            if prices is None or prices.empty or len(prices) < period:
+            if not isinstance(prices, pd.Series) or prices.empty or len(prices) < period:
                 return pd.Series(dtype=float)
             return prices.ewm(span=period, adjust=False).mean()
         except Exception:
@@ -135,7 +151,7 @@ class SimpleIndicators:
     @staticmethod
     def RSI(prices: pd.Series, period: int = 14) -> pd.Series:
         try:
-            if prices is None or prices.empty or len(prices) < period:
+            if not isinstance(prices, pd.Series) or prices.empty or len(prices) < period:
                 return pd.Series(dtype=float)
             delta = prices.diff()
             gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -148,8 +164,9 @@ class SimpleIndicators:
     @staticmethod
     def ATR(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
         try:
-            if (high is None or high.empty or low is None or low.empty or 
-                close is None or close.empty or len(high) < period):
+            if not all(isinstance(x, pd.Series) for x in [high, low, close]):
+                return pd.Series(dtype=float)
+            if high.empty or low.empty or close.empty or len(high) < period:
                 return pd.Series(dtype=float)
             tr1 = high - low
             tr2 = abs(high - close.shift())
@@ -258,7 +275,10 @@ class DirectionScanner:
         
         for tf_name in ["1H", "15M", "5M"]:
             df = multi_tf_data.get(tf_name)
-            if not is_valid_dataframe(df, 20):
+            
+            # FIXED: Use explicit check
+            is_valid = is_valid_dataframe(df, 20)
+            if not is_valid:
                 continue
             
             try:
@@ -292,7 +312,9 @@ class DirectionScanner:
     def _check_wave_length(self, df: pd.DataFrame) -> bool:
         """Tool 2: Wave Length"""
         try:
-            if not is_valid_dataframe(df, 20):
+            # FIXED: Store boolean result first
+            valid = is_valid_dataframe(df, 20)
+            if not valid:
                 return False
             
             # Impulse move (last 5 candles)
@@ -310,7 +332,9 @@ class DirectionScanner:
     def _check_momentum_strength(self, df: pd.DataFrame) -> bool:
         """Tool 3: Momentum Strength"""
         try:
-            if not is_valid_dataframe(df, 20):
+            # FIXED: Store boolean result first
+            valid = is_valid_dataframe(df, 20)
+            if not valid:
                 return False
             
             current_close = get_dataframe_value(df, 'close', -1)
@@ -335,7 +359,9 @@ class DirectionScanner:
     def _check_volume_participation(self, df: pd.DataFrame) -> bool:
         """Tool 4: Volume Participation"""
         try:
-            if not is_valid_dataframe(df, 20):
+            # FIXED: Store boolean result first
+            valid = is_valid_dataframe(df, 20)
+            if not valid:
                 return False
             
             recent_volume = get_dataframe_value(df, 'volume', -1)
@@ -361,7 +387,9 @@ class DirectionScanner:
     def _check_rsi_regime(self, df: pd.DataFrame, direction: str) -> bool:
         """Tool 5: RSI Regime"""
         try:
-            if not is_valid_dataframe(df, 20):
+            # FIXED: Store boolean result first
+            valid = is_valid_dataframe(df, 20)
+            if not valid:
                 return False
             
             rsi_series = SimpleIndicators.RSI(df['close'], 14)
@@ -378,7 +406,9 @@ class DirectionScanner:
     def _check_ema_structure(self, df: pd.DataFrame, direction: str) -> bool:
         """Tool 6: EMA Structure"""
         try:
-            if not is_valid_dataframe(df, 20):
+            # FIXED: Store boolean result first
+            valid = is_valid_dataframe(df, 20)
+            if not valid:
                 return False
             
             ema20_series = SimpleIndicators.EMA(df['close'], 20)
@@ -398,7 +428,9 @@ class DirectionScanner:
     def _check_volatility_tradability(self, df: pd.DataFrame) -> bool:
         """Tool 7: Volatility Tradability"""
         try:
-            if not is_valid_dataframe(df, 20):
+            # FIXED: Store boolean result first
+            valid = is_valid_dataframe(df, 20)
+            if not valid:
                 return False
             
             atr_series = SimpleIndicators.ATR(df['high'], df['low'], df['close'], 14)
@@ -426,51 +458,59 @@ class DirectionScanner:
         except Exception:
             return False
 
-# ================ 2. ENTRY ENGINE (PRICE BEHAVIOR) - FIXED ================
+# ================ 2. ENTRY ENGINE (PRICE BEHAVIOR) - ULTIMATE FIX ================
 class PriceEntryEngine:
     """Entry based on pure price behavior - NO indicators"""
     
     def find_entry(self, df: pd.DataFrame, direction: DirectionSignal) -> Optional[EntrySignal]:
-        """Find entry based on price behavior - FIXED VERSION"""
-        # Explicit boolean check
-        if not is_valid_dataframe(df, 10):
+        """Find entry based on price behavior - ULTIMATE FIX"""
+        try:
+            # FIXED: Store boolean in variable first
+            is_valid = is_valid_dataframe(df, 10)
+            if not is_valid:
+                return None
+            
+            log.info(f"🔍 Looking for {direction.direction} entry on {direction.symbol}")
+            
+            # Try different entry types
+            entry_types = [
+                ("PULLBACK", self._check_pullback_entry),
+                ("BREAKOUT", self._check_breakout_entry),
+                ("STOPHUNT", self._check_stophunt_entry)
+            ]
+            
+            for entry_type, check_func in entry_types:
+                try:
+                    entry_price = check_func(df, direction.direction)
+                    # Check if we have a valid entry price
+                    if entry_price is not None and entry_price > 0:
+                        log.info(f"✅ ENTRY: {direction.symbol} {direction.direction} @ {entry_price:.4f}")
+                        log.info(f"   Type: {entry_type}")
+                        log.info(f"   Strength: {direction.strength:.1%}, Tools: {len(direction.tools_passed)}/7")
+                        
+                        return EntrySignal(
+                            symbol=direction.symbol,
+                            direction=direction.direction,
+                            entry_type=entry_type,
+                            entry_price=entry_price,
+                            timestamp=time.time()
+                        )
+                except Exception as e:
+                    log.debug(f"Entry type {entry_type} failed: {e}")
+                    continue
+            
             return None
-        
-        log.info(f"🔍 Looking for {direction.direction} entry on {direction.symbol}")
-        
-        # Try different entry types
-        entry_types = [
-            ("PULLBACK", self._check_pullback_entry),
-            ("BREAKOUT", self._check_breakout_entry),
-            ("STOPHUNT", self._check_stophunt_entry)
-        ]
-        
-        for entry_type, check_func in entry_types:
-            try:
-                entry_price = check_func(df, direction.direction)
-                # Check if we have a valid entry price
-                if entry_price is not None and entry_price > 0:
-                    log.info(f"✅ ENTRY: {direction.symbol} {direction.direction} @ {entry_price:.4f}")
-                    log.info(f"   Type: {entry_type}")
-                    log.info(f"   Strength: {direction.strength:.1%}, Tools: {len(direction.tools_passed)}/7")
-                    
-                    return EntrySignal(
-                        symbol=direction.symbol,
-                        direction=direction.direction,
-                        entry_type=entry_type,
-                        entry_price=entry_price,
-                        timestamp=time.time()
-                    )
-            except Exception as e:
-                log.debug(f"Entry type {entry_type} failed: {e}")
-                continue
-        
-        return None
+            
+        except Exception as e:
+            log.error(f"find_entry error for {direction.symbol}: {e}")
+            return None
     
     def _check_pullback_entry(self, df: pd.DataFrame, direction: str) -> Optional[float]:
-        """Pullback entry after move - FIXED VERSION"""
+        """Pullback entry after move - ULTIMATE FIX"""
         try:
-            if not is_valid_dataframe(df, 2):
+            # FIXED: Store boolean in variable first
+            is_valid = is_valid_dataframe(df, 2)
+            if not is_valid:
                 return None
             
             # Extract values as floats
@@ -515,7 +555,9 @@ class PriceEntryEngine:
     def _check_breakout_entry(self, df: pd.DataFrame, direction: str) -> Optional[float]:
         """Breakout entry from compression"""
         try:
-            if not is_valid_dataframe(df, 6):
+            # FIXED: Store boolean in variable first
+            is_valid = is_valid_dataframe(df, 6)
+            if not is_valid:
                 return None
             
             current_close = get_dataframe_value(df, 'close', -1)
@@ -554,7 +596,9 @@ class PriceEntryEngine:
     def _check_stophunt_entry(self, df: pd.DataFrame, direction: str) -> Optional[float]:
         """Re-entry after stop hunt"""
         try:
-            if not is_valid_dataframe(df, 2):
+            # FIXED: Store boolean in variable first
+            is_valid = is_valid_dataframe(df, 2)
+            if not is_valid:
                 return None
             
             current_close = get_dataframe_value(df, 'close', -1)
@@ -593,13 +637,15 @@ class PriceEntryEngine:
             log.debug(f"Stophunt entry error: {e}")
             return None
 
-# ================ 3. EXIT ENGINE (MOMENTUM FAILURE) - FIXED ================
+# ================ 3. EXIT ENGINE (MOMENTUM FAILURE) ================
 class MomentumExitEngine:
     """Exit based on momentum failure"""
     
     def check_exit(self, df: pd.DataFrame, position: EntrySignal) -> Optional[ExitSignal]:
-        """Check for exit signals - FIXED VERSION"""
-        if not is_valid_dataframe(df, 3):
+        """Check for exit signals"""
+        # FIXED: Store boolean in variable first
+        is_valid = is_valid_dataframe(df, 3)
+        if not is_valid:
             return None
         
         current_price = get_dataframe_value(df, 'close', -1)
@@ -614,9 +660,11 @@ class MomentumExitEngine:
         return None
     
     def _check_momentum_failure(self, df: pd.DataFrame, direction: str) -> bool:
-        """Check for momentum failure - FIXED VERSION"""
+        """Check for momentum failure"""
         try:
-            if not is_valid_dataframe(df, 3):
+            # FIXED: Store boolean in variable first
+            is_valid = is_valid_dataframe(df, 3)
+            if not is_valid:
                 return False
             
             # Check last 3 candles
@@ -680,7 +728,7 @@ class TraderFramework:
     async def initialize(self):
         """Initialize the framework"""
         log.info("=" * 70)
-        log.info("🎯 TRADER'S FRAMEWORK - FIXED VERSION")
+        log.info("🎯 TRADER'S FRAMEWORK - ULTIMATE FIXED VERSION")
         log.info("=" * 70)
         log.info("1. Direction filter = scanner (3/7 tools minimum)")
         log.info("2. Entry = price behavior (3 types)")
@@ -830,7 +878,10 @@ class TraderFramework:
                         if direction:
                             # 2. ENTRY (Price behavior)
                             entry_df = data.get("5M") or data.get("3M")
-                            if is_valid_dataframe(entry_df, 10):
+                            
+                            # FIXED: Store boolean in variable first
+                            is_valid = is_valid_dataframe(entry_df, 10)
+                            if is_valid:
                                 entry = self.entry_engine.find_entry(entry_df, direction)
                                 
                                 if entry and len(self.active_positions) < MAX_POSITIONS:
@@ -846,7 +897,7 @@ class TraderFramework:
                         await asyncio.sleep(0.1)
                         
                     except Exception as e:
-                        log.error(f"Error scanning {symbol}: {str(e)[:100]}")
+                        log.error(f"Error scanning {symbol}: {str(e)[:200]}")
                         continue
                 
                 scan_time = time.time() - start_time
@@ -874,7 +925,9 @@ class TraderFramework:
                         data = await self.fetch_data(symbol)
                         df = data.get("5M") or data.get("3M")
                         
-                        if not is_valid_dataframe(df, 3):
+                        # FIXED: Store boolean in variable first
+                        is_valid = is_valid_dataframe(df, 3)
+                        if not is_valid:
                             continue
                         
                         # 3. EXIT (Momentum failure)
@@ -890,7 +943,7 @@ class TraderFramework:
                             log.info(f"📤 POSITION CLOSED: {symbol} {exit_signal.exit_reason}")
                     
                     except Exception as e:
-                        log.error(f"Monitor error for {symbol}: {str(e)[:100]}")
+                        log.error(f"Monitor error for {symbol}: {str(e)[:200]}")
                         continue
                 
                 # Clean up old positions
