@@ -45,6 +45,36 @@ log = logging.getLogger("romeopt_v2")
 db_lock = asyncio.Lock()
 db_conn = None
 
+# ---------------- DEBUGGING ----------------
+DEBUG_MODE = True
+last_activity_time = time.time()
+watchdog_interval = 30  # seconds
+
+async def watchdog():
+    """Watchdog to detect and recover from freezing"""
+    global last_activity_time
+    
+    while True:
+        await asyncio.sleep(watchdog_interval)
+        
+        time_since_last_activity = time.time() - last_activity_time
+        if time_since_last_activity > watchdog_interval * 2:
+            log.error(f"⚠️ WATCHDOG: No activity for {time_since_last_activity:.1f}s! Potential freeze detected.")
+            
+            # Try to send a debug message
+            try:
+                await send_telegram(f"⚠️ Scanner watchdog detected potential freeze after {time_since_last_activity:.1f}s of inactivity")
+            except:
+                pass
+            
+            # Reset activity time
+            last_activity_time = time.time()
+
+def update_activity():
+    """Update last activity timestamp"""
+    global last_activity_time
+    last_activity_time = time.time()
+
 # ---------------- DATA STRUCTURES ----------------
 @dataclass
 class HTFContext:
@@ -145,13 +175,14 @@ async def send_telegram(msg: str, parse_mode="HTML"):
         return
     
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         try:
             await client.post(url, json={
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": msg,
                 "parse_mode": parse_mode
             })
+            update_activity()
         except Exception as e:
             log.warning(f"Telegram send failed: {e}")
 
@@ -264,6 +295,7 @@ async def init_db():
     global db_conn
     db_conn = await aiosqlite.connect(DB_PATH)
     await db_conn.execute("PRAGMA journal_mode=WAL;")
+    await db_conn.execute("PRAGMA busy_timeout=5000;")
     
     # Create signals table with step-by-step tracking
     await db_conn.execute("""
@@ -420,17 +452,6 @@ async def create_position_from_setup(setup: Dict, signal_id: int) -> int:
         position_id = (await cursor.fetchone())[0]
         await db_conn.commit()
         
-        # Log initial position update
-        await log_position_update(
-            position_id,
-            setup['current_price'],
-            setup['entry_price'],
-            setup['sl_price'],
-            setup['tp1_price'],
-            setup['tp2_price'],
-            setup['tp3_price']
-        )
-        
         return position_id
 
 async def log_position_update(position_id: int, current_price: float,
@@ -540,12 +561,18 @@ def calculate_time_in_trade(entry_time_str: str) -> str:
         return "Unknown"
 
 # ---------------- POSITION MONITORING ----------------
-async def monitor_positions(exchange):
-    """Monitor active positions for SL/TP hits"""
-    log.info("Starting position monitor...")
+async def monitor_positions_lightweight():
+    """Lightweight position monitor - runs less frequently"""
+    log.info("Starting lightweight position monitor...")
+    
+    # Start with a delay to let scanner initialize
+    await asyncio.sleep(60)
     
     while True:
         try:
+            update_activity()
+            log.debug("Position monitor cycle starting...")
+            
             # Get all active positions
             async with db_lock:
                 cursor = await db_conn.execute("""
@@ -553,38 +580,36 @@ async def monitor_positions(exchange):
                            sl_price, tp1_price, tp2_price, tp3_price, entry_time
                     FROM positions 
                     WHERE status = 'ACTIVE'
+                    LIMIT 10  # Limit to 10 positions at a time
                 """)
                 active_positions = await cursor.fetchall()
             
             if not active_positions:
+                log.debug("No active positions to monitor")
                 await asyncio.sleep(MONITOR_INTERVAL)
                 continue
             
-            log.debug(f"Monitoring {len(active_positions)} active positions")
+            log.info(f"Monitoring {len(active_positions)} active positions")
+            
+            # Create a temporary exchange instance for monitoring
+            monitor_exchange = ccxt.okx({
+                "enableRateLimit": True,
+                "options": {"defaultType": "spot"}
+            })
             
             for position in active_positions:
-                (position_id, signal_id, symbol, side, entry_price, 
-                 sl_price, tp1_price, tp2_price, tp3_price, entry_time) = position
-                
                 try:
+                    await asyncio.sleep(0)  # Yield control
+                    
+                    (position_id, signal_id, symbol, side, entry_price, 
+                     sl_price, tp1_price, tp2_price, tp3_price, entry_time) = position
+                    
                     # Fetch current price
-                    ticker = await exchange.fetch_ticker(symbol)
+                    ticker = await monitor_exchange.fetch_ticker(symbol)
                     current_price = ticker.get('last', 0)
                     
                     if not current_price or current_price <= 0:
-                        log.warning(f"Invalid price for {symbol}: {current_price}")
                         continue
-                    
-                    # Log position update
-                    await log_position_update(
-                        position_id,
-                        current_price,
-                        entry_price,
-                        sl_price,
-                        tp1_price,
-                        tp2_price,
-                        tp3_price
-                    )
                     
                     # Check for SL/TP hits
                     sl_hit = False
@@ -622,16 +647,8 @@ async def monitor_positions(exchange):
                             exit_price = current_price
                     
                     # Handle exit if any level hit
-                    if sl_hit:
-                        exit_type = 'SL'
-                        await close_position(position_id, exit_price, exit_type)
-                        await send_position_closure_alert(
-                            symbol, side, entry_price, exit_price, 
-                            exit_type, entry_time, position_id
-                        )
-                    
-                    elif tp_hit_level:
-                        exit_type = tp_hit_level
+                    if sl_hit or tp_hit_level:
+                        exit_type = 'SL' if sl_hit else tp_hit_level
                         await close_position(position_id, exit_price, exit_type)
                         await send_position_closure_alert(
                             symbol, side, entry_price, exit_price, 
@@ -653,14 +670,15 @@ async def monitor_positions(exchange):
                 except Exception as e:
                     log.error(f"Error monitoring position {position_id} ({symbol}): {e}")
                     continue
-                
-                # Small delay between symbol checks
-                await asyncio.sleep(0.5)
-        
+            
+            # Close the monitor exchange
+            await monitor_exchange.close()
+            
         except Exception as e:
             log.error(f"Position monitoring error: {e}")
         
         # Wait for next monitoring cycle
+        log.debug(f"Position monitor sleeping for {MONITOR_INTERVAL}s")
         await asyncio.sleep(MONITOR_INTERVAL)
 
 async def send_position_closure_alert(symbol: str, side: str, entry_price: float,
@@ -709,10 +727,6 @@ async def send_position_closure_alert(symbol: str, side: str, entry_price: float
 """
     
     await send_telegram(msg)
-    
-    # Also send a brief update to the scanner channel
-    brief_msg = f"{emoji} {symbol} {side} closed at {exit_type} ({pnl_percent:+.2f}%)"
-    await send_telegram(brief_msg)
 
 # ---------------- OHLCV UTILS ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit: int = 200):
@@ -1630,7 +1644,7 @@ Entry Precision: {setup['probability']['entry_precision']:.2f}
     
     await send_telegram(msg)
     
-    # Save to database
+    # Save to database WITHOUT creating position immediately
     async with db_lock:
         cursor = await db_conn.execute("""
             INSERT INTO signals (
@@ -1707,23 +1721,29 @@ Entry Precision: {setup['probability']['entry_precision']:.2f}
         })
         await db_conn.commit()
         
-        # Get the signal ID
+        # Get the signal ID for potential later use
         signal_id = cursor.lastrowid
         
-        # Create position for monitoring
-        position_id = await create_position_from_setup(setup, signal_id)
-        
-        log.info(f"Created position {position_id} for {setup['symbol']}")
+        # OPTIONAL: Create position for monitoring (commented out for now)
+        # position_id = await create_position_from_setup(setup, signal_id)
+        # log.info(f"Created position {position_id} for {setup['symbol']}")
 
 # ---------------- MAIN SCANNER ----------------
 async def scanner_main(exchange):
     """Main scanning loop"""
     
     await send_telegram("🚀 ROMEOTPT v2 Scanner Started - Score-Only Mode")
-    await send_telegram("ℹ️ Position monitoring enabled with SL/TP alerts")
+    await send_telegram("ℹ️ Scanner running without position monitoring")
+    
+    cycle_count = 0
     
     while True:
+        cycle_count += 1
+        update_activity()
+        
         try:
+            log.info(f"🔄 Scan cycle #{cycle_count} starting...")
+            
             # Get top volume pairs
             tickers = await exchange.fetch_tickers()
             usdt_pairs = [(s, v.get("quoteVolume", 0)) 
@@ -1735,9 +1755,16 @@ async def scanner_main(exchange):
             log.info(f"📊 Scanning {len(top_pairs)} symbols...")
             
             setups_found = 0
+            symbols_scanned = 0
+            
             for symbol, volume in top_pairs:
                 try:
+                    # Yield control to prevent freezing
+                    await asyncio.sleep(0.01)
+                    
                     setup = await scan_symbol_full(exchange, symbol)
+                    symbols_scanned += 1
+                    
                     if setup:
                         # Check deduplication
                         if await should_send_alert(setup):
@@ -1748,32 +1775,52 @@ async def scanner_main(exchange):
                                 log.debug(f"  {symbol}: Setup too similar to recent one, skipping alert")
                         else:
                             log.debug(f"  {symbol}: Setup in cooldown")
-                        
-                        # Rate limiting
-                        await asyncio.sleep(1)
+                    
+                    # Small delay between symbols
+                    await asyncio.sleep(0.05)
+                    
                 except Exception as e:
                     log.error(f"Error scanning {symbol}: {e}")
                     continue
             
+            log.info(f"✅ Scan #{cycle_count} complete: Scanned {symbols_scanned}/{len(top_pairs)} symbols, found {setups_found} setups")
+            
             if setups_found > 0:
-                log.info(f"✅ Found {setups_found} new setups")
+                log.info(f"🎯 Found {setups_found} new setups in cycle #{cycle_count}")
             else:
-                log.info("⏳ No new setups found this scan")
+                log.info(f"⏳ No new setups found in cycle #{cycle_count}")
             
         except Exception as e:
-            log.exception(f"Scanner error: {e}")
+            log.exception(f"Scanner error in cycle #{cycle_count}: {e}")
+            # Send debug alert
+            try:
+                await send_telegram(f"⚠️ Scanner error in cycle #{cycle_count}: {str(e)[:100]}...")
+            except:
+                pass
         
-        await asyncio.sleep(SCAN_INTERVAL)
+        # Calculate sleep time with debug
+        log.info(f"😴 Sleeping for {SCAN_INTERVAL} seconds before next scan...")
+        update_activity()
+        
+        # Sleep in chunks to allow watchdog to detect freezing
+        sleep_remaining = SCAN_INTERVAL
+        while sleep_remaining > 0:
+            chunk = min(5, sleep_remaining)  # Sleep in 5-second chunks
+            await asyncio.sleep(chunk)
+            sleep_remaining -= chunk
+            update_activity()
 
 # ---------------- FASTAPI ----------------
 app = FastAPI()
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "scanner": "ROMEOTPT v2 Score-Only"}
+    update_activity()
+    return {"status": "healthy", "scanner": "ROMEOTPT v2 Score-Only", "last_activity": last_activity_time}
 
 @app.get("/setups")
 async def get_setups(limit: int = 20, min_score: float = 1.5):
+    update_activity()
     async with db_lock:
         async with db_conn.execute(
             """SELECT * FROM signals 
@@ -1803,6 +1850,7 @@ async def get_setups(limit: int = 20, min_score: float = 1.5):
 
 @app.get("/positions")
 async def get_positions(status: str = "ACTIVE", limit: int = 50):
+    update_activity()
     async with db_lock:
         if status.upper() == "ALL":
             query = """SELECT p.*, s.timestamp as signal_time, 
@@ -1850,7 +1898,7 @@ async def get_positions(status: str = "ACTIVE", limit: int = 50):
 
 @app.post("/positions/{position_id}/close")
 async def close_position_manual(position_id: int, price: Optional[float] = None):
-    """Manually close a position"""
+    update_activity()
     try:
         # Get position details
         async with db_lock:
@@ -1898,6 +1946,8 @@ async def cleanup_old_data():
     """Clean up old data to prevent database bloat"""
     while True:
         try:
+            update_activity()
+            
             # Clean old signals (older than 30 days)
             cutoff_30d = (datetime.datetime.utcnow() - datetime.timedelta(days=30)).isoformat()
             async with db_lock:
@@ -1941,10 +1991,15 @@ async def cleanup_old_data():
 async def main():
     global db_conn
     
+    log.info("🚀 Starting ROMEOTPT v2 Scanner with watchdog...")
+    
     # Initialize
     await init_db()
     
-    # Start cleanup task
+    # Start watchdog
+    watchdog_task = asyncio.create_task(watchdog())
+    
+    # Start cleanup task (optional)
     cleanup_task = asyncio.create_task(cleanup_old_data())
     
     # Create exchange
@@ -1953,19 +2008,20 @@ async def main():
         "options": {"defaultType": "spot"}
     })
     
-    # Start position monitoring
-    monitor_task = asyncio.create_task(monitor_positions(exchange))
-    
-    # Start scanner
+    # Start scanner (NO position monitoring for now)
     try:
         await scanner_main(exchange)
     except KeyboardInterrupt:
         log.info("Shutting down ROMEOTPT v2 scanner...")
+    except Exception as e:
+        log.error(f"Fatal error in scanner: {e}")
+        await send_telegram(f"🚨 ROMEOTPT Scanner crashed: {str(e)}")
     finally:
-        monitor_task.cancel()
+        watchdog_task.cancel()
         cleanup_task.cancel()
         if db_conn:
             await db_conn.close()
+        await exchange.close()
 
 if __name__ == "__main__":
     import argparse
@@ -1974,7 +2030,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     if args.http:
-        # Start scanner in background thread
+        # Start scanner in background
         import threading
         def run_scanner():
             asyncio.run(main())
