@@ -42,8 +42,8 @@ MIN_RISK_REWARD = 1.0        # Minimum 1:1 risk/reward (fixed 3:3)
 REJECTION_CONFIG = {
     "rsi_long_zone": (40, 50),      # RSI 40-50 for LONG entries
     "rsi_short_zone": (50, 60),     # RSI 50-60 for SHORT entries
-    "ema_distance_threshold": 0.5,  # 0.5% from EMA for rejection
-    "min_rejection_strength": 0.2,  # Minimum rejection strength score
+    "ema_distance_threshold": 1.5,  # 0.5% from EMA for rejection
+    "min_rejection_strength": 0.1,  # Minimum rejection strength score
 }
 
 # Timeframes for REACTION TRADING
