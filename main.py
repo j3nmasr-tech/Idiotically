@@ -33,8 +33,8 @@ SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 5))   # 5 seconds - ULTRA FAST FO
 TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 100))   # Scan many pairs
 MIN_VOLUME_USD = 500000  # $500K minimum - more opportunities
 
-# Trading parameters - DYNAMIC SL/TP BASED ON MARKET STRUCTURE
-MIN_RISK_REWARD = 1.0        # Minimum 1.5:1 risk/reward for dynamic SL/TP
+# Trading parameters - NEAREST LEVELS ONLY (NO R:R BASED)
+MIN_TP_DISTANCE_PCT = 0.3  # Minimum 0.3% distance for TP
 
 # Rejection scanning
 REJECTION_CONFIG = {
@@ -1033,69 +1033,41 @@ class RejectionBasedScanner:
                                 break
                         
                         if is_swing and high > entry_price:
-                            # Calculate distance and ensure reasonable reward
-                            distance = high - entry_price
-                            risk = entry_price - stop_loss
-                            
-                            if risk > 0:
-                                rr_ratio = distance / risk
-                                
-                                # Must provide at least minimum R:R
-                                if rr_ratio >= MIN_RISK_REWARD:
-                                    # Check if this swing is still valid (not broken)
-                                    recent_highs = df['high'].values[i+1:]
-                                    if len(recent_highs) == 0 or max(recent_highs) <= high:
-                                        swing_highs.append({
-                                            'price': high,
-                                            'distance': distance,
-                                            'rr_ratio': rr_ratio,
-                                            'position': i,
-                                            'timeframe': tf_name
-                                        })
+                            # Check if this swing is still valid (not broken)
+                            recent_highs = df['high'].values[i+1:]
+                            if len(recent_highs) == 0 or max(recent_highs) <= high:
+                                distance = high - entry_price
+                                swing_highs.append({
+                                    'price': high,
+                                    'distance': distance,
+                                    'position': i,
+                                    'timeframe': tf_name
+                                })
                     
                     if not swing_highs:
                         continue
                     
-                    # Sort by distance (closest first, but with R:R weighting)
-                    swing_highs.sort(key=lambda x: (x['distance'], -x['rr_ratio']))
+                    # Sort by distance (NEAREST FIRST)
+                    swing_highs.sort(key=lambda x: x['distance'])
                     
-                    # Get the best swing high for this timeframe
-                    best_swing = swing_highs[0]
-                    swing_price = best_swing['price']
-                    
-                    # Adjust based on RSI (if overbought, closer target)
-                    rsi_factor = 1.0
-                    if current_rsi > 60:
-                        rsi_factor = 0.8  # Take profits earlier
-                    elif current_rsi < 40:
-                        rsi_factor = 1.2  # Let profits run more
-                    
-                    adjusted_distance = best_swing['distance'] * rsi_factor
-                    adjusted_price = entry_price + adjusted_distance
-                    
-                    # Ensure adjusted price doesn't exceed swing high
-                    if adjusted_price > swing_price:
-                        adjusted_price = swing_price
-                    
-                    # Weight by timeframe (30M gets priority)
-                    timeframe_weight = 1.0
-                    if tf_name == "30M":
-                        timeframe_weight = 1.3
-                    elif tf_name == "15M":
-                        timeframe_weight = 1.0
-                    
-                    # Adjust price based on timeframe weight
-                    adjusted_price = adjusted_price * (1 - (timeframe_weight - 1) * 0.001)
-                    
-                    all_targets.append({
-                        'price': adjusted_price,
-                        'original_price': swing_price,
-                        'distance': best_swing['distance'],
-                        'rr_ratio': best_swing['rr_ratio'],
-                        'timeframe': tf_name,
-                        'weight': timeframe_weight
-                    })
-                    
+                    # Take the NEAREST valid swing high
+                    for swing in swing_highs:
+                        swing_price = swing['price']
+                        
+                        # Basic minimum distance check (at least 0.3%)
+                        if swing['distance'] / entry_price > MIN_TP_DISTANCE_PCT / 100:
+                            # Add small buffer
+                            tp_price = swing_price * 0.998
+                            
+                            all_targets.append({
+                                'price': tp_price,
+                                'original_price': swing_price,
+                                'distance': swing['distance'],
+                                'timeframe': tf_name,
+                                'weight': 1.3 if tf_name == "30M" else 1.0
+                            })
+                            break  # Only take nearest from this timeframe
+                        
                 else:  # SHORT
                     # For SHORT: look for nearest swing LOW below entry
                     swing_lows = []
@@ -1115,85 +1087,50 @@ class RejectionBasedScanner:
                                 break
                         
                         if is_swing and low < entry_price:
-                            # Calculate distance and ensure reasonable reward
-                            distance = entry_price - low
-                            risk = stop_loss - entry_price
-                            
-                            if risk > 0:
-                                rr_ratio = distance / risk
-                                
-                                # Must provide at least minimum R:R
-                                if rr_ratio >= MIN_RISK_REWARD:
-                                    # Check if this swing is still valid (not broken)
-                                    recent_lows = df['low'].values[i+1:]
-                                    if len(recent_lows) == 0 or min(recent_lows) >= low:
-                                        swing_lows.append({
-                                            'price': low,
-                                            'distance': distance,
-                                            'rr_ratio': rr_ratio,
-                                            'position': i,
-                                            'timeframe': tf_name
-                                        })
+                            # Check if this swing is still valid (not broken)
+                            recent_lows = df['low'].values[i+1:]
+                            if len(recent_lows) == 0 or min(recent_lows) >= low:
+                                distance = entry_price - low
+                                swing_lows.append({
+                                    'price': low,
+                                    'distance': distance,
+                                    'position': i,
+                                    'timeframe': tf_name
+                                })
                     
                     if not swing_lows:
                         continue
                     
-                    # Sort by distance (closest first, but with R:R weighting)
-                    swing_lows.sort(key=lambda x: (x['distance'], -x['rr_ratio']))
+                    # Sort by distance (NEAREST FIRST)
+                    swing_lows.sort(key=lambda x: x['distance'])
                     
-                    # Get the best swing low for this timeframe
-                    best_swing = swing_lows[0]
-                    swing_price = best_swing['price']
-                    
-                    # Adjust based on RSI (if oversold, closer target)
-                    rsi_factor = 1.0
-                    if current_rsi < 40:
-                        rsi_factor = 0.8  # Take profits earlier
-                    elif current_rsi > 60:
-                        rsi_factor = 1.2  # Let profits run more
-                    
-                    adjusted_distance = best_swing['distance'] * rsi_factor
-                    adjusted_price = entry_price - adjusted_distance
-                    
-                    # Ensure adjusted price doesn't go below swing low
-                    if adjusted_price < swing_price:
-                        adjusted_price = swing_price
-                    
-                    # Weight by timeframe (30M gets priority)
-                    timeframe_weight = 1.0
-                    if tf_name == "30M":
-                        timeframe_weight = 1.3
-                    elif tf_name == "15M":
-                        timeframe_weight = 1.0
-                    
-                    # Adjust price based on timeframe weight
-                    adjusted_price = adjusted_price * (1 + (timeframe_weight - 1) * 0.001)
-                    
-                    all_targets.append({
-                        'price': adjusted_price,
-                        'original_price': swing_price,
-                        'distance': best_swing['distance'],
-                        'rr_ratio': best_swing['rr_ratio'],
-                        'timeframe': tf_name,
-                        'weight': timeframe_weight
-                    })
+                    # Take the NEAREST valid swing low
+                    for swing in swing_lows:
+                        swing_price = swing['price']
+                        
+                        # Basic minimum distance check (at least 0.3%)
+                        if swing['distance'] / entry_price > MIN_TP_DISTANCE_PCT / 100:
+                            # Add small buffer
+                            tp_price = swing_price * 1.002
+                            
+                            all_targets.append({
+                                'price': tp_price,
+                                'original_price': swing_price,
+                                'distance': swing['distance'],
+                                'timeframe': tf_name,
+                                'weight': 1.3 if tf_name == "30M" else 1.0
+                            })
+                            break  # Only take nearest from this timeframe
             
             if not all_targets:
                 return None
             
-            # Sort targets by weight (30M first) then R:R ratio
-            all_targets.sort(key=lambda x: (-x['weight'], -x['rr_ratio']))
+            # Choose NEAREST across all timeframes (prioritize 30M if similar)
+            all_targets.sort(key=lambda x: (-x['weight'], x['distance']))
             
-            # Get the best target (30M priority, best R:R)
             best_target = all_targets[0]
             
-            # Add small buffer
-            if side == "LONG":
-                tp_price = best_target['price'] * 0.998
-            else:  # SHORT
-                tp_price = best_target['price'] * 1.002
-            
-            return tp_price, "SWING_HIGH_LOW", best_target['timeframe']
+            return best_target['price'], "SWING_HIGH_LOW", best_target['timeframe']
                 
         except Exception as e:
             log.error(f"Swing TP analysis error: {e}")
@@ -1205,7 +1142,6 @@ class RejectionBasedScanner:
         """
         Find nearest liquidity pool for take profit (PRIMARY METHOD)
         Uses 15M and 30M ONLY
-        Based on order book clusters, volume nodes, and market structure
         Returns (tp_price, source, timeframe) or None if no valid target found
         """
         try:
@@ -1224,10 +1160,10 @@ class RejectionBasedScanner:
                     continue
                 
                 if side == "LONG":
-                    # For LONG: look for resistance levels (liquidity above)
+                    # For LONG: look for nearest resistance level (liquidity above)
                     resistance_levels = []
                     
-                    # 1. Recent swing highs (last 80 candles)
+                    # 1. Recent swing highs (last 80 candles) - NEAREST ONLY
                     for i in range(20, len(df) - 20):
                         high = df['high'].iloc[i]
                         
@@ -1239,19 +1175,19 @@ class RejectionBasedScanner:
                                 break
                         
                         if is_swing and high > entry_price:
-                            # Calculate volume at this level
-                            volume_at_level = df['volume'].iloc[max(0, i-3):min(len(df), i+4)].sum()
-                            resistance_levels.append({
-                                'price': high,
-                                'volume': volume_at_level,
-                                'distance': high - entry_price,
-                                'timeframe': tf_name,
-                                'type': 'swing_high'
-                            })
+                            # Check if this swing is still valid (not broken)
+                            recent_highs = df['high'].values[i+1:]
+                            if len(recent_highs) == 0 or max(recent_highs) <= high:
+                                distance = high - entry_price
+                                resistance_levels.append({
+                                    'price': high,
+                                    'distance': distance,
+                                    'timeframe': tf_name,
+                                    'type': 'swing_high'
+                                })
                     
-                    # 2. High volume nodes (clusters)
+                    # 2. High volume nodes (clusters) - NEAREST ONLY
                     price_bins = np.linspace(df['low'].min(), df['high'].max(), 25)
-                    volume_profile = []
                     
                     for i in range(len(price_bins) - 1):
                         low_bound = price_bins[i]
@@ -1262,73 +1198,44 @@ class RejectionBasedScanner:
                         if mask.any():
                             volume_in_range = df.loc[mask, 'volume'].sum()
                             mid_price = (low_bound + high_bound) / 2
-                            if mid_price > entry_price:
-                                volume_profile.append({
+                            
+                            # Only consider if significant volume AND above entry
+                            if mid_price > entry_price and volume_in_range > df['volume'].mean() * 0.5:
+                                distance = mid_price - entry_price
+                                resistance_levels.append({
                                     'price': mid_price,
-                                    'volume': volume_in_range,
-                                    'distance': mid_price - entry_price,
+                                    'distance': distance,
                                     'timeframe': tf_name,
-                                    'type': 'volume_node'
+                                    'type': 'volume_node',
+                                    'volume': volume_in_range
                                 })
                     
-                    # Combine all potential targets
-                    all_potential_targets = resistance_levels + volume_profile
-                    
-                    if not all_potential_targets:
-                        continue
-                    
-                    # Filter targets that provide good risk/reward
-                    risk = entry_price - stop_loss
-                    valid_targets = []
-                    
-                    for target in all_potential_targets:
-                        reward = target['price'] - entry_price
-                        if reward > 0:
-                            rr_ratio = reward / risk
-                            # Must provide at least minimum R:R
-                            if rr_ratio >= MIN_RISK_REWARD:
-                                # Adjust based on RSI (if overbought, closer target)
-                                rsi_factor = 1.0
-                                if current_rsi > 60:
-                                    rsi_factor = 0.8  # Take profits earlier
-                                elif current_rsi < 40:
-                                    rsi_factor = 1.2  # Let profits run more
+                    # Combine and sort by distance (NEAREST FIRST)
+                    if resistance_levels:
+                        resistance_levels.sort(key=lambda x: x['distance'])
+                        
+                        # Take the NEAREST valid resistance
+                        for target in resistance_levels:
+                            # Basic safety check - at least minimum distance
+                            if target['distance'] / entry_price > MIN_TP_DISTANCE_PCT / 100:
+                                # Add small buffer below the level
+                                tp_price = target['price'] * 0.998
                                 
-                                adjusted_distance = target['distance'] * rsi_factor
-                                adjusted_price = entry_price + adjusted_distance
-                                
-                                # Weight by timeframe (30M gets priority)
-                                timeframe_weight = 1.0
-                                if target['timeframe'] == "30M":
-                                    timeframe_weight = 1.3
-                                elif target['timeframe'] == "15M":
-                                    timeframe_weight = 1.0
-                                
-                                # Adjust price based on timeframe weight
-                                adjusted_price = adjusted_price * (1 - (timeframe_weight - 1) * 0.001)
-                                
-                                valid_targets.append({
-                                    'price': adjusted_price,
+                                all_targets.append({
+                                    'price': tp_price,
                                     'original_price': target['price'],
-                                    'rr_ratio': rr_ratio,
-                                    'volume': target.get('volume', 0),
                                     'distance': target['distance'],
-                                    'timeframe': target['timeframe'],
+                                    'timeframe': tf_name,
                                     'type': target.get('type', 'unknown'),
-                                    'weight': timeframe_weight
+                                    'weight': 1.3 if tf_name == "30M" else 1.0
                                 })
-                    
-                    if valid_targets:
-                        # Select best target for this timeframe: balance between R:R and volume confirmation
-                        valid_targets.sort(key=lambda x: x['rr_ratio'] * np.log1p(x['volume']), reverse=True)
-                        best_target_tf = valid_targets[0]
-                        all_targets.append(best_target_tf)
+                                break  # Take only the NEAREST from this timeframe
                     
                 else:  # SHORT
-                    # For SHORT: look for support levels (liquidity below)
+                    # For SHORT: look for nearest support level (liquidity below)
                     support_levels = []
                     
-                    # 1. Recent swing lows (last 80 candles)
+                    # 1. Recent swing lows (last 80 candles) - NEAREST ONLY
                     for i in range(20, len(df) - 20):
                         low = df['low'].iloc[i]
                         
@@ -1340,19 +1247,19 @@ class RejectionBasedScanner:
                                 break
                         
                         if is_swing and low < entry_price:
-                            # Calculate volume at this level
-                            volume_at_level = df['volume'].iloc[max(0, i-3):min(len(df), i+4)].sum()
-                            support_levels.append({
-                                'price': low,
-                                'volume': volume_at_level,
-                                'distance': entry_price - low,
-                                'timeframe': tf_name,
-                                'type': 'swing_low'
-                            })
+                            # Check if this swing is still valid (not broken)
+                            recent_lows = df['low'].values[i+1:]
+                            if len(recent_lows) == 0 or min(recent_lows) >= low:
+                                distance = entry_price - low
+                                support_levels.append({
+                                    'price': low,
+                                    'distance': distance,
+                                    'timeframe': tf_name,
+                                    'type': 'swing_low'
+                                })
                     
-                    # 2. High volume nodes (clusters)
+                    # 2. High volume nodes (clusters) - NEAREST ONLY
                     price_bins = np.linspace(df['low'].min(), df['high'].max(), 25)
-                    volume_profile = []
                     
                     for i in range(len(price_bins) - 1):
                         low_bound = price_bins[i]
@@ -1363,84 +1270,48 @@ class RejectionBasedScanner:
                         if mask.any():
                             volume_in_range = df.loc[mask, 'volume'].sum()
                             mid_price = (low_bound + high_bound) / 2
-                            if mid_price < entry_price:
-                                volume_profile.append({
+                            
+                            # Only consider if significant volume AND below entry
+                            if mid_price < entry_price and volume_in_range > df['volume'].mean() * 0.5:
+                                distance = entry_price - mid_price
+                                support_levels.append({
                                     'price': mid_price,
-                                    'volume': volume_in_range,
-                                    'distance': entry_price - mid_price,
+                                    'distance': distance,
                                     'timeframe': tf_name,
-                                    'type': 'volume_node'
+                                    'type': 'volume_node',
+                                    'volume': volume_in_range
                                 })
                     
-                    # Combine all potential targets
-                    all_potential_targets = support_levels + volume_profile
-                    
-                    if not all_potential_targets:
-                        continue
-                    
-                    # Filter targets that provide good risk/reward
-                    risk = stop_loss - entry_price
-                    valid_targets = []
-                    
-                    for target in all_potential_targets:
-                        reward = entry_price - target['price']
-                        if reward > 0:
-                            rr_ratio = reward / risk
-                            # Must provide at least minimum R:R
-                            if rr_ratio >= MIN_RISK_REWARD:
-                                # Adjust based on RSI (if oversold, closer target)
-                                rsi_factor = 1.0
-                                if current_rsi < 40:
-                                    rsi_factor = 0.8  # Take profits earlier
-                                elif current_rsi > 60:
-                                    rsi_factor = 1.2  # Let profits run more
+                    # Combine and sort by distance (NEAREST FIRST)
+                    if support_levels:
+                        support_levels.sort(key=lambda x: x['distance'])
+                        
+                        # Take the NEAREST valid support
+                        for target in support_levels:
+                            # Basic safety check - at least minimum distance
+                            if target['distance'] / entry_price > MIN_TP_DISTANCE_PCT / 100:
+                                # Add small buffer above the level
+                                tp_price = target['price'] * 1.002
                                 
-                                adjusted_distance = target['distance'] * rsi_factor
-                                adjusted_price = entry_price - adjusted_distance
-                                
-                                # Weight by timeframe (30M gets priority)
-                                timeframe_weight = 1.0
-                                if target['timeframe'] == "30M":
-                                    timeframe_weight = 1.3
-                                elif target['timeframe'] == "15M":
-                                    timeframe_weight = 1.0
-                                
-                                # Adjust price based on timeframe weight
-                                adjusted_price = adjusted_price * (1 + (timeframe_weight - 1) * 0.001)
-                                
-                                valid_targets.append({
-                                    'price': adjusted_price,
+                                all_targets.append({
+                                    'price': tp_price,
                                     'original_price': target['price'],
-                                    'rr_ratio': rr_ratio,
-                                    'volume': target.get('volume', 0),
                                     'distance': target['distance'],
-                                    'timeframe': target['timeframe'],
+                                    'timeframe': tf_name,
                                     'type': target.get('type', 'unknown'),
-                                    'weight': timeframe_weight
+                                    'weight': 1.3 if tf_name == "30M" else 1.0
                                 })
-                    
-                    if valid_targets:
-                        # Select best target for this timeframe: balance between R:R and volume confirmation
-                        valid_targets.sort(key=lambda x: x['rr_ratio'] * np.log1p(x['volume']), reverse=True)
-                        best_target_tf = valid_targets[0]
-                        all_targets.append(best_target_tf)
+                                break  # Take only the NEAREST from this timeframe
             
             if not all_targets:
                 return None
             
-            # Sort all targets by weight (30M first) then combined score
-            all_targets.sort(key=lambda x: (-x['weight'], -(x['rr_ratio'] * np.log1p(x['volume']))))
+            # Choose NEAREST across all timeframes (but prioritize 30M if similar distance)
+            all_targets.sort(key=lambda x: (-x['weight'], x['distance']))
             
-            # Get the best target across all timeframes
             best_target = all_targets[0]
             
-            # Add small buffer
-            if side == "LONG":
-                tp_price = best_target['price'] * 0.998
-            else:  # SHORT
-                tp_price = best_target['price'] * 1.002
-            
-            return tp_price, "LIQUIDITY_POOL", best_target['timeframe']
+            return best_target['price'], "LIQUIDITY_POOL", best_target['timeframe']
                 
         except Exception as e:
             log.error(f"Liquidity pool analysis error: {e}")
@@ -1451,15 +1322,12 @@ class RejectionBasedScanner:
                                         current_rsi: float) -> Tuple[Optional[float], Optional[float], Optional[str], Optional[str]]:
         """
         Calculate dynamic stop loss and take profit using 15M and 30M ONLY
-        Returns (stop_loss, take_profit, tp_source, tp_timeframe) or (None, None, None, None) if no valid levels found
+        Returns (stop_loss, take_profit, tp_source, tp_timeframe)
         
-        TP Priority:
-        1. Primary: Nearest liquidity pool (15M/30M ONLY)
-        2. Fallback: Nearest swing high/low (15M/30M ONLY)
-        3. Minimum: At least MIN_RISK_REWARD:1 ratio
+        NEW LOGIC: Always choose NEAREST valid levels
         """
         try:
-            # Find nearest swing for stop loss using 15M and 30M ONLY
+            # 1. Find nearest swing for stop loss (unchanged - already uses nearest)
             stop_loss = self.find_nearest_swing_low_multi_tf(
                 multi_tf_data=multi_tf_data,
                 side=side,
@@ -1471,24 +1339,12 @@ class RejectionBasedScanner:
                 log.debug(f"No valid swing found for {side} stop loss across 15M/30M")
                 return None, None, None, None
             
-            # Calculate risk
-            if side == "LONG":
-                risk = entry_price - stop_loss
-                if risk <= 0:
-                    log.debug(f"Invalid risk calculation for LONG: entry={entry_price}, SL={stop_loss}")
-                    return None, None, None, None
-            else:  # SHORT
-                risk = stop_loss - entry_price
-                if risk <= 0:
-                    log.debug(f"Invalid risk calculation for SHORT: entry={entry_price}, SL={stop_loss}")
-                    return None, None, None, None
-            
-            # === IMPROVED TP LOGIC WITH SOURCE TRACKING ===
+            # 2. Find nearest TP using new NEAREST-ONLY logic
             take_profit = None
             tp_source = None
             tp_timeframe = None
             
-            # 1. FIRST TRY: Find liquidity pool target using 15M/30M ONLY (PRIMARY METHOD)
+            # Try liquidity pool first (NEAREST only)
             result = self.find_liquidity_pool_target_multi_tf(
                 multi_tf_data=multi_tf_data,
                 side=side,
@@ -1499,11 +1355,11 @@ class RejectionBasedScanner:
             
             if result:
                 take_profit, tp_source, tp_timeframe = result
-                log.info(f"✅ Using LIQUIDITY_POOL as TP (from {tp_timeframe}) for {side}")
+                log.info(f"✅ Using NEAREST LIQUIDITY_POOL as TP (from {tp_timeframe}) for {side}")
             
-            # 2. SECOND TRY: If no liquidity pool found, use swing high/low from 15M/30M ONLY (FALLBACK METHOD)
+            # Fallback to swing if no liquidity pool
             if take_profit is None:
-                log.debug(f"No valid liquidity pool found for {side} across 15M/30M, trying swing high/low...")
+                log.debug(f"No valid liquidity pool found for {side}, trying nearest swing...")
                 result = self.find_nearest_swing_tp_multi_tf(
                     multi_tf_data=multi_tf_data,
                     side=side,
@@ -1514,47 +1370,28 @@ class RejectionBasedScanner:
                 
                 if result:
                     take_profit, tp_source, tp_timeframe = result
-                    log.info(f"✅ Using SWING_HIGH_LOW as TP (from {tp_timeframe}) for {side}")
+                    log.info(f"✅ Using NEAREST SWING_HIGH_LOW as TP (from {tp_timeframe}) for {side}")
             
             if take_profit is None:
                 log.debug(f"No valid take profit level found for {side} across 15M/30M")
                 return None, None, None, None
             
-            # Calculate reward and risk/reward ratio
+            # 3. Calculate final distance and log
             if side == "LONG":
-                reward = take_profit - entry_price
+                distance_pct = (take_profit - entry_price) / entry_price * 100
+                risk = entry_price - stop_loss
             else:  # SHORT
-                reward = entry_price - take_profit
+                distance_pct = (entry_price - take_profit) / entry_price * 100
+                risk = stop_loss - entry_price
             
-            if reward <= 0:
-                log.debug(f"Invalid reward calculation: entry={entry_price}, TP={take_profit}")
-                return None, None, None, None
+            if risk > 0:
+                risk_reward = abs(take_profit - entry_price) / risk
+            else:
+                risk_reward = 0
             
-            rr_ratio = reward / risk
+            log.info(f"✅ Dynamic SL/TP (NEAREST): SL={stop_loss:.6f}, TP={take_profit:.6f}")
+            log.info(f"   Distance: {distance_pct:.1f}%, R:R={risk_reward:.2f}:1, Source={tp_source}, TF={tp_timeframe}")
             
-            # Check minimum risk/reward
-            if rr_ratio < MIN_RISK_REWARD:
-                log.debug(f"Insufficient risk/reward: {rr_ratio:.2f}:1 (minimum: {MIN_RISK_REWARD}:1)")
-                return None, None, None, None
-            
-            # Additional safety checks
-            if side == "LONG":
-                if stop_loss >= entry_price * 0.99:  # SL too close (less than 1%)
-                    log.debug(f"Stop loss too close for LONG: {stop_loss/entry_price:.3%}")
-                    return None, None, None, None
-                if take_profit <= entry_price * 1.01:  # TP too close (less than 1%)
-                    log.debug(f"Take profit too close for LONG: {take_profit/entry_price:.3%}")
-                    return None, None, None, None
-            else:  # SHORT
-                if stop_loss <= entry_price * 1.01:  # SL too close (less than 1%)
-                    log.debug(f"Stop loss too close for SHORT: {stop_loss/entry_price:.3%}")
-                    return None, None, None, None
-                if take_profit >= entry_price * 0.99:  # TP too close (less than 1%)
-                    log.debug(f"Take profit too close for SHORT: {take_profit/entry_price:.3%}")
-                    return None, None, None, None
-            
-            log.info(f"Dynamic SL/TP calculated: SL={stop_loss:.6f}, TP={take_profit:.6f}, "
-                    f"Source={tp_source}, TF={tp_timeframe}, R:R={rr_ratio:.2f}:1")
             return stop_loss, take_profit, tp_source, tp_timeframe
             
         except Exception as e:
@@ -1683,7 +1520,7 @@ class RejectionBasedScanner:
                 log.debug(f"{symbol}: No clear rejection candle")
                 return None
             
-            # 11. Calculate DYNAMIC SL/TP using 15M/30M ONLY with SOURCE TRACKING
+            # 11. Calculate DYNAMIC SL/TP using 15M/30M ONLY with NEAREST-ONLY logic
             zone_price = best_zone.price_level
             
             # Entry at rejection zone
@@ -1692,7 +1529,7 @@ class RejectionBasedScanner:
             else:  # SHORT
                 entry_price = zone_price * 0.999  # 0.1% below resistance
             
-            # Calculate dynamic SL/TP with source tracking
+            # Calculate dynamic SL/TP with source tracking (NEAREST ONLY)
             stop_loss, take_profit, tp_source, tp_timeframe = self.calculate_dynamic_sl_tp_multi_tf(
                 multi_tf_data=multi_tf_data,
                 side=side,
@@ -1705,7 +1542,7 @@ class RejectionBasedScanner:
                 log.debug(f"{symbol}: No valid dynamic SL/TP levels found across 15M/30M")
                 return None
             
-            # Calculate Risk/Reward
+            # Calculate Risk/Reward (for logging only, not for selection)
             if side == "LONG":
                 risk = entry_price - stop_loss
                 reward = take_profit - entry_price
@@ -1718,11 +1555,6 @@ class RejectionBasedScanner:
                 return None
             
             risk_reward = reward / risk
-            
-            # Minimum R:R check
-            if risk_reward < MIN_RISK_REWARD:
-                log.debug(f"{symbol}: R:R too low ({risk_reward:.1f}:1)")
-                return None
             
             # Calculate expected move percentage
             if side == "LONG":
@@ -1793,7 +1625,7 @@ class RejectionBasedScanner:
             
             log.info(f"🎯 REJECTION SIGNAL: {symbol} {side} @ {entry_price:.4f}")
             log.info(f"   Zone: {best_zone.zone_type}, Strength: {rejection_strength:.2f}")
-            log.info(f"   RSI: {current_rsi:.1f}, Dynamic R:R: {risk_reward:.2f}:1")
+            log.info(f"   RSI: {current_rsi:.1f}, TP Distance: {expected_move_pct:.1f}%")
             log.info(f"   SL: {stop_loss:.4f} ({abs(entry_price-stop_loss)/entry_price*100:.1f}%)")
             log.info(f"   TP: {take_profit:.4f} ({abs(take_profit-entry_price)/entry_price*100:.1f}%)")
             log.info(f"   TP Source: {tp_source} (from {tp_timeframe})")
@@ -2007,9 +1839,10 @@ class RejectionScanner:
         log.info("TIME FRAMES: 30M/15M (SL/TP ONLY), 5M/3M/1M (entries)")
         log.info("REJECTION ZONES: EMA, Range, Failed breaks only")
         log.info("RSI ZONES: 40-50 (LONG), 50-60 (SHORT)")
-        log.info("🎯 STOP LOSS: Nearest Swing Low/High (15M/30M ONLY)")
-        log.info("🎯 TAKE PROFIT: Primary: Liquidity Pool (15M/30M ONLY) | Fallback: Swing High/Low")
-        log.info(f"🎯 MINIMUM R:R: {MIN_RISK_REWARD}:1")
+        log.info("🎯 <u>STOP LOSS: Nearest Swing Low/High (15M/30M ONLY)</u>")
+        log.info("🎯 <u>TAKE PROFIT: Nearest Level Only (NO R:R SELECTION)</u>")
+        log.info("🎯 TP PRIORITY: 1) Nearest Liquidity Pool 2) Nearest Swing High/Low")
+        log.info(f"🎯 MINIMUM TP DISTANCE: {MIN_TP_DISTANCE_PCT}%")
         log.info("🛑 STRICT RULE: NEVER use 1H/5M/3M/1M for SL/TP - ALWAYS use 15M/30M ONLY")
         log.info("DEDUPLICATION: ONE TRADE PER SYMBOL")
         log.info("TP SOURCE TRACKING: Shows source (Liquidity Pool/Swing) and timeframe (30M/15M)")
@@ -2209,9 +2042,10 @@ class RejectionScanner:
 <b>🎯 <u>إدارة المخاطر المحسنة:</u></b>
 <u>🛑 <b>قاعدة صارمة: لا تستخدم 1H/5M/3M/1M أبداً لوقف الخسارة/هدف الربح</b></u>
 ‎• <b>وقف الخسارة: أقرب قاع تأرجح (15M/30M فقط)</b>
-‎• <b>هدف الربح: <u>أولاً</u> أقرب بركة سيولة (15M/30M فقط)</b>
-‎• <b>هدف الربح: <u>ثانياً</u> أقرب قمة تأرجح (15M/30M فقط)</b>
-‎• <b>نسبة الربح/المخاطرة: ديناميكية (الحد الأدنى {MIN_RISK_REWARD}:1)</b>
+‎• <b>هدف الربح: أقرب مستوى فقط (لا يعتمد على نسبة الربح/المخاطرة)</b>
+‎• <b>أولاً: أقرب بركة سيولة (15M/30M فقط)</b>
+‎• <b>ثانياً: أقرب قمة/قاع تأرجح (15M/30M فقط)</b>
+‎• <b>الحد الأدنى للمسافة: {MIN_TP_DISTANCE_PCT}%</b>
 
 <b>🎯 <u>تتبع مصدر هدف الربح (جديد):</u></b>
 ‎• كل إشارة تظهر مصدر الـ TP والـ TF المستخدم
@@ -2232,7 +2066,7 @@ class RejectionScanner:
 ‎القوة والفوليوم يحددان القرار
 ‎والرفض هو الزناد
 
-‎#متداول_تفاعلي #تخصص_الرفض #صفقة_واحدة #15M_30M_فقط #تتبع_مصدر_TP
+‎#متداول_تفاعلي #تخصص_الرفض #صفقة_واحدة #15M_30M_فقط #أقرب_مستوى_فقط
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -2470,11 +2304,13 @@ class RejectionScanner:
 <b>🎯 <u>مصدر هدف الربح:</u></b>
 ‎• <b>المصدر:</b> {tp_source_text}
 ‎• <b>الإطار الزمني:</b> {signal.tp_timeframe}
+‎• <b>المنطق:</b> أقرب مستوى فقط (لا يعتمد على نسبة الربح/المخاطرة)
 
 <u><b>⚡ إعدادات الصفقة:</b></u>
 <u>🛑 <b>قاعدة صارمة: لا تستخدم 1H/5M/3M/1M أبداً</b></u>
 ‎• وقف الخسارة: أقرب قاع تأرجح (15M/30M فقط)
-‎• هدف الربح: أولاً بركة سيولة، ثانياً قمة تأرجح (15M/30M فقط)
+‎• هدف الربح: أقرب مستوى فقط (أولاً بركة سيولة، ثانياً قمة تأرجح)
+‎• الحد الأدنى للمسافة: {MIN_TP_DISTANCE_PCT}%
 
 <b>🛡️ نظام التكرار:</b>
 ‎• نظام: <b>صفقة واحدة لكل عملة</b>
@@ -2482,10 +2318,10 @@ class RejectionScanner:
 
 <b>⚠️ ملاحظة التاجر:</b>
 ‎الدخول عند الرفض فقط
-‎نسبة الربح/الخسارة ديناميكية
+‎أقرب مستوى للهدف (لا نسب)
 ‎نقبل الخسائر - نصطاد التوسع
 
-#{side_text} #رفض #{"دعم" if signal.side == "LONG" else "مقاومة"} #صفقة_واحدة #15M_30M_فقط #مصدر_{tp_source_text.replace(' ', '_')} #إطار_{signal.tp_timeframe}
+#{side_text} #رفض #{"دعم" if signal.side == "LONG" else "مقاومة"} #صفقة_واحدة #15M_30M_فقط #أقرب_مستوى #مصدر_{tp_source_text.replace(' ', '_')} #إطار_{signal.tp_timeframe}
 """
         return message
     
@@ -2510,9 +2346,10 @@ class RejectionScanner:
 <u><b>⚡ إعدادات الصفقة:</b></u>
 <u>🛑 <b>قاعدة صارمة: لا تستخدم 1H/5M/3M/1M أبداً</b></u>
 ‎• وقف الخسارة: <b>أقرب قاع تأرجح (15M/30M فقط)</b>
-‎• هدف الربح: <b>أولاً: أقرب بركة سيولة (15M/30M فقط)</b>
-‎• هدف الربح: <b>ثانياً: أقرب قمة تأرجح (15M/30M فقط)</b>
-‎• نسبة الربح/الخسارة: <b>ديناميكية</b>
+‎• هدف الربح: <b>أقرب مستوى فقط (لا يعتمد على نسبة الربح/المخاطرة)</b>
+‎• أولاً: أقرب بركة سيولة (15M/30M فقط)
+‎• ثانياً: أقرب قمة تأرجح (15M/30M فقط)
+‎• الحد الأدنى: {MIN_TP_DISTANCE_PCT}% مسافة
 
 <b>🧠 عقلية التاجر:</b>
 ‎• دخول مبكر عند أول رفض
@@ -2528,7 +2365,7 @@ class RejectionScanner:
 ‎يتم متابعة الصفقة تلقائياً.
 ‎ستصلك إشعار عند الوصول لوقف الخسارة أو هدف الربح.
 
-#{side_text} #تنفيذ_رفض #متابعة #لا_إشارات_جديدة #15M_30M_فقط
+#{side_text} #تنفيذ_رفض #متابعة #لا_إشارات_جديدة #15M_30M_فقط #أقرب_مستوى
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -2596,7 +2433,7 @@ class RejectionScanner:
 
 <u><b>🎯 طريقة التحديد:</b></u>
 ‎• وقف الخسارة: أقرب قاع تأرجح (15M/30M فقط)
-‎• هدف الربح: أولاً بركة سيولة، ثانياً قمة تأرجح (15M/30M فقط)
+‎• هدف الربح: أقرب مستوى فقط (أولاً بركة سيولة، ثانياً قمة تأرجح)
 
 <b>🧠 عقلية التاجر:</b>
 {mindset}
@@ -2607,7 +2444,7 @@ class RejectionScanner:
 ✅ <b>مسموح الآن</b> بإرسال إشارات جديدة لـ {symbol}
 ‎يمكن للماسح الضوئي البحث عن رفض جديد لهذه العملة
 
-#{side_text} #إغلاق_رفض #{"ربح" if close_reason == "TP_HIT" else "خسارة"} #مسموح_إشارات_جديدة #15M_30M_فقط
+#{side_text} #إغلاق_رفض #{"ربح" if close_reason == "TP_HIT" else "خسارة"} #مسموح_إشارات_جديدة #15M_30M_فقط #أقرب_مستوى
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -2795,7 +2632,7 @@ class RejectionScanner:
                 self.scan_cycle += 1
                 start_time = time.time()
                 
-                log.info(f"🔄 Scan cycle #{self.scan_cycle} (Rejection hunting - Dynamic SL/TP from 15M/30M ONLY)")
+                log.info(f"🔄 Scan cycle #{self.scan_cycle} (Rejection hunting - NEAREST levels only)")
                 
                 # Get active pairs
                 pairs = await self.get_active_pairs()
@@ -2931,9 +2768,10 @@ class RejectionScanner:
 <u><b>🎯 إدارة المخاطر المحسنة:</b></u>
 <u>🛑 <b>قاعدة صارمة: لا تستخدم 1H/5M/3M/1M أبداً</b></u>
 ‎• وقف الخسارة: <b>أقرب قاع تأرجح (15M/30M فقط)</b>
-‎• هدف الربح: <b>أولاً: أقرب بركة سيولة (15M/30M فقط)</b>
-‎• هدف الربح: <b>ثانياً: أقرب قمة تأرجح (15M/30M فقط)</b>
-‎• نسبة الربح/الخسارة: <b>ديناميكية (الحد الأدنى {MIN_RISK_REWARD}:1)</b>
+‎• هدف الربح: <b>أقرب مستوى فقط (لا يعتمد على نسبة الربح/المخاطرة)</b>
+‎• أولاً: أقرب بركة سيولة (15M/30M فقط)
+‎• ثانياً: أقرب قمة تأرجح (15M/30M فقط)
+‎• الحد الأدنى للمسافة: {MIN_TP_DISTANCE_PCT}%
 
 <b>🎯 <u>تتبع مصدر هدف الربح:</u></b>
 ‎• <b>كل إشارة تظهر مصدر الـ TP والـ TF المستخدم</b>
@@ -2955,8 +2793,8 @@ class RejectionScanner:
 
 <u><b>🎯 إستراتيجية إدارة المخاطر:</b></u>
 ‎• وقف الخسارة: ديناميكي (أقرب قاع تأرجح - 15M/30M فقط)
-‎• هدف الربح: ديناميكي (أولاً بركة سيولة، ثانياً قمة تأرجح - 15M/30M فقط)
-‎• نسبة: ديناميكية (الحد الأدنى {MIN_RISK_REWARD}:1)
+‎• هدف الربح: ديناميكي (أقرب مستوى فقط - لا نسب)
+‎• الحد الأدنى: {MIN_TP_DISTANCE_PCT}% مسافة
 
 ‎تم الالتزام بـ:
 ‎• الدخول عند الرفض فقط
@@ -2965,9 +2803,10 @@ class RejectionScanner:
 ‎• قبول الخسائر
 ‎• صيد التوسع
 <u>‎• <b>لا تستخدم 1H/5M/3M/1M أبداً لوقف الخسارة/هدف الربح</b></u>
+<u>‎• <b>أقرب مستوى فقط (لا يعتمد على نسبة الربح/المخاطرة)</b></u>
 <u>‎• <b>تتبع مصدر هدف الربح والإطار الزمني (30M/15M فقط)</b></u>
 
-‎#إحصائيات_الرفض #متداول_تفاعلي #صفقة_واحدة #15M_30M_فقط #تتبع_مصدر_TP
+‎#إحصائيات_الرفض #متداول_تفاعلي #صفقة_واحدة #15M_30M_فقط #أقرب_مستوى_فقط
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -3032,18 +2871,20 @@ async def start_http_server(scanner, port=8000):
                         "stop_loss": "Nearest Swing Low/High (15M/30M ONLY)",
                         "take_profit_primary": "Nearest Liquidity Pool (15M/30M ONLY)",
                         "take_profit_fallback": "Nearest Swing High/Low (15M/30M ONLY)",
+                        "selection_logic": "NEAREST LEVELS ONLY (NO R:R SELECTION)",
+                        "min_tp_distance": f"{MIN_TP_DISTANCE_PCT}%",
                         "tp_source_tracking": "ENABLED - Shows source and timeframe for each TP",
                         "strict_rule": "NEVER use 1H/5M/3M/1M for SL/TP",
-                        "min_risk_reward": MIN_RISK_REWARD,
-                        "strategy": "Dynamic SL/TP with 15M/30M analysis only"
+                        "strategy": "Dynamic SL/TP with 15M/30M analysis only - Nearest levels only"
                     },
                     "trader_mindset": {
                         "role": "Discretionary reaction trader",
                         "specialty": "Wave-length awareness + Strength analysis + Rejection entries",
                         "philosophy": "Wave length sets context, Strength & volume make decision, Rejection pulls trigger",
                         "entry_rule": "Trade ONLY at rejection zones",
-                        "frequency": "High frequency + dynamic risk management",
-                        "tp_tracking": "TP Source and Timeframe (30M/15M) visible in all signals"
+                        "frequency": "High frequency + nearest level targeting",
+                        "tp_tracking": "TP Source and Timeframe (30M/15M) visible in all signals",
+                        "tp_selection": "NEAREST ONLY - No risk/reward ratio consideration"
                     },
                     "telegram": {
                         "configured": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID),
@@ -3066,10 +2907,11 @@ async def start_http_server(scanner, port=8000):
                     "rejection_zones": "Trade ONLY at rejection zones (EMA, Range, Failed breaks)",
                     "entry_conditions": "RSI zones (40-50 LONG, 50-60 SHORT) + Volume confirmation",
                     "entry_philosophy": "Enter on first strong rejection candle, early entries are intentional",
-                    "risk_management": "Dynamic SL (Nearest Swing - 15M/30M ONLY) + Dynamic TP (Liquidity Pool + Swing Fallback - 15M/30M ONLY)",
+                    "risk_management": "Dynamic SL (Nearest Swing - 15M/30M ONLY) + Dynamic TP (NEAREST LEVELS ONLY)",
+                    "tp_selection_logic": "NEAREST ONLY - No R:R ratio consideration. Priority: 1) Liquidity Pool 2) Swing High/Low",
                     "tp_source_tracking": "Each signal shows TP source (Liquidity Pool/Swing) and timeframe (30M/15M)",
                     "strict_rule": "NEVER use 1H/5M/3M/1M for SL/TP - ALWAYS use 15M/30M",
-                    "frequency_rule": "High frequency + dynamic payoff",
+                    "frequency_rule": "High frequency + nearest level payoff",
                     "mindset": "Reaction trader, rejection specialist, not prediction-based, comfortable being wrong"
                 }, indent=2)
             
