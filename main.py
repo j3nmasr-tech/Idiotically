@@ -2039,59 +2039,71 @@ class RejectionScanner:
         await self._send_startup_message()
     
     async def _init_database(self):
-        """Initialize database"""
+        """Initialize database with schema migrations"""
         try:
             os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
             self.db = await aiosqlite.connect(DB_PATH)
             
-            # Rejection signals table with TP source columns
-            await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS rejection_signals (
-                id TEXT PRIMARY KEY,
-                symbol TEXT NOT NULL,
-                side TEXT NOT NULL,
-                entry_price REAL NOT NULL,
-                stop_loss REAL NOT NULL,
-                take_profit REAL NOT NULL,
-                
-                -- TP SOURCE TRACKING (NEW)
-                tp_source TEXT,
-                tp_timeframe TEXT,
-                
-                wave_length TEXT NOT NULL,
-                wave_maturity REAL NOT NULL,
-                expansion_speed REAL NOT NULL,
-                structure_type TEXT NOT NULL,
-                
-                candle_speed REAL NOT NULL,
-                distance_ratio REAL NOT NULL,
-                ema_angle REAL NOT NULL,
-                volume_participation REAL NOT NULL,
-                strength_score REAL NOT NULL,
-                
-                zone_type TEXT NOT NULL,
-                rejection_strength REAL NOT NULL,
-                rsi_at_entry REAL NOT NULL,
-                rejection_type TEXT NOT NULL,
-                trigger_candle TEXT NOT NULL,
-                
-                risk_reward REAL NOT NULL,
-                expected_move REAL NOT NULL,
-                timeframe_used TEXT NOT NULL,
-                
-                conditions_met TEXT,
-                status TEXT DEFAULT 'PENDING',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                
-                triggered_at TIMESTAMP,
-                trigger_price REAL,
-                
-                closed_at TIMESTAMP,
-                close_price REAL,
-                pnl_percent REAL,
-                close_reason TEXT
-            )
-            """)
+            # Check if table exists
+            async with self.db.execute("""
+                SELECT name FROM sqlite_master 
+                WHERE type='table' AND name='rejection_signals'
+            """) as cursor:
+                table_exists = await cursor.fetchone()
+            
+            if not table_exists:
+                # Create new table with all columns
+                await self.db.execute("""
+                CREATE TABLE rejection_signals (
+                    id TEXT PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    entry_price REAL NOT NULL,
+                    stop_loss REAL NOT NULL,
+                    take_profit REAL NOT NULL,
+                    
+                    -- TP SOURCE TRACKING
+                    tp_source TEXT,
+                    tp_timeframe TEXT,
+                    
+                    wave_length TEXT NOT NULL,
+                    wave_maturity REAL NOT NULL,
+                    expansion_speed REAL NOT NULL,
+                    structure_type TEXT NOT NULL,
+                    
+                    candle_speed REAL NOT NULL,
+                    distance_ratio REAL NOT NULL,
+                    ema_angle REAL NOT NULL,
+                    volume_participation REAL NOT NULL,
+                    strength_score REAL NOT NULL,
+                    
+                    zone_type TEXT NOT NULL,
+                    rejection_strength REAL NOT NULL,
+                    rsi_at_entry REAL NOT NULL,
+                    rejection_type TEXT NOT NULL,
+                    trigger_candle TEXT NOT NULL,
+                    
+                    risk_reward REAL NOT NULL,
+                    expected_move REAL NOT NULL,
+                    timeframe_used TEXT NOT NULL,
+                    
+                    conditions_met TEXT,
+                    status TEXT DEFAULT 'PENDING',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    
+                    triggered_at TIMESTAMP,
+                    trigger_price REAL,
+                    
+                    closed_at TIMESTAMP,
+                    close_price REAL,
+                    pnl_percent REAL,
+                    close_reason TEXT
+                )
+                """)
+                log.info("✅ Created rejection_signals table with TP source tracking")
+            else:
+                # Table exists, check and add missing columns
+                await self._migrate_database()
             
             # Performance table
             await self.db.execute("""
@@ -2106,7 +2118,7 @@ class RejectionScanner:
                 avg_win REAL,
                 avg_loss REAL,
                 total_pnl REAL,
-                tp_source_stats TEXT  -- JSON with TP source statistics
+                tp_source_stats TEXT
             )
             """)
             
@@ -2117,6 +2129,39 @@ class RejectionScanner:
         except Exception as e:
             log.error(f"Database error: {e}")
             raise
+    
+    async def _migrate_database(self):
+        """Migrate database schema to add new columns"""
+        try:
+            # Get existing columns
+            async with self.db.execute("PRAGMA table_info(rejection_signals)") as cursor:
+                columns = await cursor.fetchall()
+                column_names = [col[1] for col in columns]
+            
+            # Add missing columns
+            missing_columns = []
+            
+            if 'tp_source' not in column_names:
+                missing_columns.append('tp_source')
+            
+            if 'tp_timeframe' not in column_names:
+                missing_columns.append('tp_timeframe')
+            
+            # Add missing columns
+            for column in missing_columns:
+                if column == 'tp_source':
+                    await self.db.execute("ALTER TABLE rejection_signals ADD COLUMN tp_source TEXT")
+                    log.info(f"✅ Added {column} column")
+                elif column == 'tp_timeframe':
+                    await self.db.execute("ALTER TABLE rejection_signals ADD COLUMN tp_timeframe TEXT")
+                    log.info(f"✅ Added {column} column")
+            
+            if missing_columns:
+                await self.db.commit()
+                log.info(f"✅ Database migrated: Added {len(missing_columns)} columns")
+            
+        except Exception as e:
+            log.error(f"Database migration error: {e}")
     
     async def _init_exchange(self):
         """Initialize exchange connection"""
@@ -2452,7 +2497,7 @@ class RejectionScanner:
 <b>⚠️ ملاحظة التاجر:</b>
 ‎الدخول عند الرفض فقط
 ‎نسبة الربح/الخسارة ديناميكية
-‎نقبل الخسائر - نصطاد التوسع
+‎نقبل الخسائر - نصطاح التوسع
 
 #{side_text} #رفض #{"دعم" if signal.side == "LONG" else "مقاومة"} #صفقة_واحدة #أقرب_قاع_تأرجح #بركة_السيولة #15M_30M_1H_فقط #مصدر_{tp_source_text.replace(' ', '_')} #إطار_{signal.tp_timeframe}
 """
@@ -2623,15 +2668,28 @@ class RejectionScanner:
         """Monitor and close positions with trade-based deduplication"""
         log.info("👀 Starting position monitoring with Telegram notifications...")
         
+        # Give database migration a moment to complete
+        await asyncio.sleep(2)
+        
         while True:
             try:
-                # Get ALL open positions (both pending and triggered)
-                async with self.db.execute("""
-                    SELECT id, symbol, side, entry_price, stop_loss, take_profit, status, tp_source, tp_timeframe
-                    FROM rejection_signals 
-                    WHERE status IN ('PENDING', 'TRIGGERED')
-                """) as cursor:
-                    positions = await cursor.fetchall()
+                # Check if database has been migrated
+                try:
+                    async with self.db.execute("""
+                        SELECT id, symbol, side, entry_price, stop_loss, take_profit, status, 
+                               COALESCE(tp_source, 'UNKNOWN') as tp_source, 
+                               COALESCE(tp_timeframe, 'UNKNOWN') as tp_timeframe
+                        FROM rejection_signals 
+                        WHERE status IN ('PENDING', 'TRIGGERED')
+                    """) as cursor:
+                        positions = await cursor.fetchall()
+                except Exception as db_error:
+                    if 'no such column' in str(db_error):
+                        log.warning("Database columns not migrated yet, waiting...")
+                        await asyncio.sleep(5)
+                        continue
+                    else:
+                        raise db_error
                 
                 if positions:
                     log.debug(f"📊 Monitoring {len(positions)} open positions")
