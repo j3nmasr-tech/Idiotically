@@ -114,6 +114,10 @@ class RejectionSignal:
     stop_loss: float
     take_profit: float
     
+    # TP SOURCE TRACKING - NEW
+    tp_source: str            # "LIQUIDITY_POOL" or "SWING_HIGH_LOW"
+    tp_timeframe: str         # "1H", "30M", or "15M"
+    
     # Analysis context
     wave_context: WaveContext
     market_strength: MarketStrength
@@ -994,11 +998,11 @@ class RejectionBasedScanner:
     
     def find_nearest_swing_tp_multi_tf(self, multi_tf_data: Dict[str, pd.DataFrame], side: str, 
                                        entry_price: float, stop_loss: float, 
-                                       current_rsi: float) -> Optional[float]:
+                                       current_rsi: float) -> Optional[Tuple[float, str, str]]:
         """
         Find nearest swing high/low for take profit (FALLBACK METHOD)
         Uses multiple higher timeframes (15M, 30M, 1H)
-        Returns take profit price or None if no valid swing found
+        Returns (tp_price, source, timeframe) or None if no valid swing found
         """
         try:
             # Define which timeframes to use for TP analysis (HIGHER TIMEFRAMES ONLY)
@@ -1194,9 +1198,11 @@ class RejectionBasedScanner:
             
             # Add small buffer
             if side == "LONG":
-                return best_target['price'] * 0.998
+                tp_price = best_target['price'] * 0.998
             else:  # SHORT
-                return best_target['price'] * 1.002
+                tp_price = best_target['price'] * 1.002
+            
+            return tp_price, "SWING_HIGH_LOW", best_target['timeframe']
                 
         except Exception as e:
             log.error(f"Multi-timeframe swing TP analysis error: {e}")
@@ -1204,11 +1210,12 @@ class RejectionBasedScanner:
     
     def find_liquidity_pool_target_multi_tf(self, multi_tf_data: Dict[str, pd.DataFrame], side: str, 
                                             entry_price: float, stop_loss: float, 
-                                            current_rsi: float) -> Optional[float]:
+                                            current_rsi: float) -> Optional[Tuple[float, str, str]]:
         """
         Find nearest liquidity pool for take profit (PRIMARY METHOD)
         Uses multiple higher timeframes (15M, 30M, 1H)
         Based on order book clusters, volume nodes, and market structure
+        Returns (tp_price, source, timeframe) or None if no valid target found
         """
         try:
             # Define which timeframes to use for liquidity analysis (HIGHER TIMEFRAMES ONLY)
@@ -1442,9 +1449,11 @@ class RejectionBasedScanner:
             
             # Add small buffer
             if side == "LONG":
-                return best_target['price'] * 0.998
+                tp_price = best_target['price'] * 0.998
             else:  # SHORT
-                return best_target['price'] * 1.002
+                tp_price = best_target['price'] * 1.002
+            
+            return tp_price, "LIQUIDITY_POOL", best_target['timeframe']
                 
         except Exception as e:
             log.error(f"Multi-timeframe liquidity pool analysis error: {e}")
@@ -1452,10 +1461,10 @@ class RejectionBasedScanner:
     
     def calculate_dynamic_sl_tp_multi_tf(self, multi_tf_data: Dict[str, pd.DataFrame], side: str, 
                                         entry_price: float, zone_price: float, 
-                                        current_rsi: float) -> Tuple[Optional[float], Optional[float]]:
+                                        current_rsi: float) -> Tuple[Optional[float], Optional[float], Optional[str], Optional[str]]:
         """
         Calculate dynamic stop loss and take profit using multiple higher timeframes
-        Returns (stop_loss, take_profit) or (None, None) if no valid levels found
+        Returns (stop_loss, take_profit, tp_source, tp_timeframe) or (None, None, None, None) if no valid levels found
         
         TP Priority:
         1. Primary: Nearest liquidity pool (15M/30M/1H)
@@ -1473,25 +1482,27 @@ class RejectionBasedScanner:
             
             if stop_loss is None:
                 log.debug(f"No valid swing found for {side} stop loss across higher timeframes")
-                return None, None
+                return None, None, None, None
             
             # Calculate risk
             if side == "LONG":
                 risk = entry_price - stop_loss
                 if risk <= 0:
                     log.debug(f"Invalid risk calculation for LONG: entry={entry_price}, SL={stop_loss}")
-                    return None, None
+                    return None, None, None, None
             else:  # SHORT
                 risk = stop_loss - entry_price
                 if risk <= 0:
                     log.debug(f"Invalid risk calculation for SHORT: entry={entry_price}, SL={stop_loss}")
-                    return None, None
+                    return None, None, None, None
             
-            # === NEW IMPROVED TP LOGIC USING MULTIPLE HIGHER TIMEFRAMES ===
+            # === IMPROVED TP LOGIC WITH SOURCE TRACKING ===
             take_profit = None
+            tp_source = None
+            tp_timeframe = None
             
             # 1. FIRST TRY: Find liquidity pool target using higher timeframes (PRIMARY METHOD)
-            take_profit = self.find_liquidity_pool_target_multi_tf(
+            result = self.find_liquidity_pool_target_multi_tf(
                 multi_tf_data=multi_tf_data,
                 side=side,
                 entry_price=entry_price,
@@ -1499,10 +1510,14 @@ class RejectionBasedScanner:
                 current_rsi=current_rsi
             )
             
+            if result:
+                take_profit, tp_source, tp_timeframe = result
+                log.info(f"✅ Using LIQUIDITY_POOL as TP (from {tp_timeframe}) for {side}")
+            
             # 2. SECOND TRY: If no liquidity pool found, use swing high/low from higher timeframes (FALLBACK METHOD)
             if take_profit is None:
                 log.debug(f"No valid liquidity pool found for {side} across higher timeframes, trying swing high/low...")
-                take_profit = self.find_nearest_swing_tp_multi_tf(
+                result = self.find_nearest_swing_tp_multi_tf(
                     multi_tf_data=multi_tf_data,
                     side=side,
                     entry_price=entry_price,
@@ -1510,12 +1525,13 @@ class RejectionBasedScanner:
                     current_rsi=current_rsi
                 )
                 
-                if take_profit is not None:
-                    log.info(f"✅ Using swing high/low as TP (fallback method) for {side} across higher timeframes")
+                if result:
+                    take_profit, tp_source, tp_timeframe = result
+                    log.info(f"✅ Using SWING_HIGH_LOW as TP (from {tp_timeframe}) for {side}")
             
             if take_profit is None:
                 log.debug(f"No valid take profit level found for {side} across higher timeframes")
-                return None, None
+                return None, None, None, None
             
             # Calculate reward and risk/reward ratio
             if side == "LONG":
@@ -1525,37 +1541,38 @@ class RejectionBasedScanner:
             
             if reward <= 0:
                 log.debug(f"Invalid reward calculation: entry={entry_price}, TP={take_profit}")
-                return None, None
+                return None, None, None, None
             
             rr_ratio = reward / risk
             
             # Check minimum risk/reward
             if rr_ratio < MIN_RISK_REWARD:
                 log.debug(f"Insufficient risk/reward: {rr_ratio:.2f}:1 (minimum: {MIN_RISK_REWARD}:1)")
-                return None, None
+                return None, None, None, None
             
             # Additional safety checks
             if side == "LONG":
                 if stop_loss >= entry_price * 0.99:  # SL too close (less than 1%)
                     log.debug(f"Stop loss too close for LONG: {stop_loss/entry_price:.3%}")
-                    return None, None
+                    return None, None, None, None
                 if take_profit <= entry_price * 1.01:  # TP too close (less than 1%)
                     log.debug(f"Take profit too close for LONG: {take_profit/entry_price:.3%}")
-                    return None, None
+                    return None, None, None, None
             else:  # SHORT
                 if stop_loss <= entry_price * 1.01:  # SL too close (less than 1%)
                     log.debug(f"Stop loss too close for SHORT: {stop_loss/entry_price:.3%}")
-                    return None, None
+                    return None, None, None, None
                 if take_profit >= entry_price * 0.99:  # TP too close (less than 1%)
                     log.debug(f"Take profit too close for SHORT: {take_profit/entry_price:.3%}")
-                    return None, None
+                    return None, None, None, None
             
-            log.info(f"Dynamic SL/TP calculated using higher timeframes: SL={stop_loss:.6f}, TP={take_profit:.6f}, R:R={rr_ratio:.2f}:1")
-            return stop_loss, take_profit
+            log.info(f"Dynamic SL/TP calculated: SL={stop_loss:.6f}, TP={take_profit:.6f}, "
+                    f"Source={tp_source}, TF={tp_timeframe}, R:R={rr_ratio:.2f}:1")
+            return stop_loss, take_profit, tp_source, tp_timeframe
             
         except Exception as e:
             log.error(f"Dynamic SL/TP calculation error: {e}")
-            return None, None
+            return None, None, None, None
     
     # ========== REJECTION SIGNAL GENERATION ==========
     
@@ -1680,7 +1697,7 @@ class RejectionBasedScanner:
                 log.debug(f"{symbol}: No clear rejection candle")
                 return None
             
-            # 11. Calculate DYNAMIC SL/TP using MULTIPLE HIGHER TIMEFRAMES
+            # 11. Calculate DYNAMIC SL/TP using MULTIPLE HIGHER TIMEFRAMES with SOURCE TRACKING
             zone_price = best_zone.price_level
             
             # Entry at rejection zone
@@ -1689,8 +1706,8 @@ class RejectionBasedScanner:
             else:  # SHORT
                 entry_price = zone_price * 0.999  # 0.1% below resistance
             
-            # Calculate dynamic SL/TP using higher timeframes
-            stop_loss, take_profit = self.calculate_dynamic_sl_tp_multi_tf(
+            # Calculate dynamic SL/TP with source tracking
+            stop_loss, take_profit, tp_source, tp_timeframe = self.calculate_dynamic_sl_tp_multi_tf(
                 multi_tf_data=multi_tf_data,
                 side=side,
                 entry_price=entry_price,
@@ -1698,7 +1715,7 @@ class RejectionBasedScanner:
                 current_rsi=current_rsi
             )
             
-            if stop_loss is None or take_profit is None:
+            if stop_loss is None or take_profit is None or tp_source is None or tp_timeframe is None:
                 log.debug(f"{symbol}: No valid dynamic SL/TP levels found across higher timeframes")
                 return None
             
@@ -1746,7 +1763,7 @@ class RejectionBasedScanner:
                 f"{symbol}:{side}:{entry_price:.8f}:{time.time()}:{best_zone.zone_type}".encode()
             ).hexdigest()
             
-            # 15. Create final signal
+            # 15. Create final signal with TP source info
             signal = RejectionSignal(
                 signal_id=signal_id,
                 symbol=symbol,
@@ -1755,6 +1772,10 @@ class RejectionBasedScanner:
                 entry_price=entry_price,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
+                
+                # TP SOURCE TRACKING
+                tp_source=tp_source,
+                tp_timeframe=tp_timeframe,
                 
                 wave_context=wave_context,
                 market_strength=market_strength,
@@ -1789,8 +1810,8 @@ class RejectionBasedScanner:
             log.info(f"   RSI: {current_rsi:.1f}, Dynamic R:R: {risk_reward:.2f}:1")
             log.info(f"   SL: {stop_loss:.4f} ({abs(entry_price-stop_loss)/entry_price*100:.1f}%)")
             log.info(f"   TP: {take_profit:.4f} ({abs(take_profit-entry_price)/entry_price*100:.1f}%)")
+            log.info(f"   TP Source: {tp_source} (from {tp_timeframe})")
             log.info(f"   Wave: {wave_context.wave_length}, Maturity: {wave_context.wave_maturity:.1%}")
-            log.info(f"   SL/TP Timeframes: 15M/30M/1H (Higher Timeframes Only)")
             
             return signal
             
@@ -2005,6 +2026,7 @@ class RejectionScanner:
         log.info(f"🎯 MINIMUM R:R: {MIN_RISK_REWARD}:1")
         log.info("🛑 STRICT RULE: NEVER use 3M/5M for SL/TP - ALWAYS use 15M/30M/1H")
         log.info("DEDUPLICATION: ONE TRADE PER SYMBOL")
+        log.info("TP SOURCE TRACKING: Shows source (Liquidity Pool/Swing) and timeframe (1H/30M/15M)")
         log.info("=" * 70)
         
         # Initialize database
@@ -2022,7 +2044,7 @@ class RejectionScanner:
             os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
             self.db = await aiosqlite.connect(DB_PATH)
             
-            # Rejection signals table
+            # Rejection signals table with TP source columns
             await self.db.execute("""
             CREATE TABLE IF NOT EXISTS rejection_signals (
                 id TEXT PRIMARY KEY,
@@ -2031,6 +2053,10 @@ class RejectionScanner:
                 entry_price REAL NOT NULL,
                 stop_loss REAL NOT NULL,
                 take_profit REAL NOT NULL,
+                
+                -- TP SOURCE TRACKING (NEW)
+                tp_source TEXT,
+                tp_timeframe TEXT,
                 
                 wave_length TEXT NOT NULL,
                 wave_maturity REAL NOT NULL,
@@ -2079,13 +2105,14 @@ class RejectionScanner:
                 win_rate REAL,
                 avg_win REAL,
                 avg_loss REAL,
-                total_pnl REAL
+                total_pnl REAL,
+                tp_source_stats TEXT  -- JSON with TP source statistics
             )
             """)
             
             await self.db.commit()
             
-            log.info("✅ Database initialized")
+            log.info("✅ Database initialized with TP source tracking")
             
         except Exception as e:
             log.error(f"Database error: {e}")
@@ -2155,6 +2182,11 @@ class RejectionScanner:
 ‎• <b>هدف الربح: <u>ثانياً</u> أقرب قمة تأرجح (15M/30M/1H فقط)</b>
 ‎• <b>نسبة الربح/المخاطرة: ديناميكية (الحد الأدنى {MIN_RISK_REWARD}:1)</b>
 
+<b>🎯 <u>تتبع مصدر هدف الربح (جديد):</u></b>
+‎• كل إشارة تظهر مصدر الـ TP والـ TF المستخدم
+‎• <b>المصدر:</b> بركة سيولة أو قمة/قاع تأرجح
+‎• <b>الإطار الزمني:</b> 1H أو 30M أو 15M
+
 <b>🛡️ نظام التكرار:</b>
 • <b>صفقة واحدة لكل عملة فقط</b>
 ‎• إشارات جديدة فقط بعد إغلاق الصفقة السابقة
@@ -2169,7 +2201,7 @@ class RejectionScanner:
 ‎القوة والفوليوم يحددان القرار
 ‎والرفض هو الزناد
 
-‎#متداول_تفاعلي #تخصص_الرفض #صفقة_واحدة #أقرب_قاع_تأرجح #بركة_السيولة #15M_30M_1H_فقط
+‎#متداول_تفاعلي #تخصص_الرفض #صفقة_واحدة #أقرب_قاع_تأرجح #بركة_السيولة #15M_30M_1H_فقط #تتبع_مصدر_TP
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -2261,16 +2293,17 @@ class RejectionScanner:
     async def save_signal(self, signal: RejectionSignal) -> bool:
         """Save signal to database"""
         try:
-            # Insert signal
+            # Insert signal with TP source info
             await self.db.execute("""
                 INSERT INTO rejection_signals (
                     id, symbol, side, entry_price, stop_loss, take_profit,
+                    tp_source, tp_timeframe,
                     wave_length, wave_maturity, expansion_speed, structure_type,
                     candle_speed, distance_ratio, ema_angle, volume_participation, strength_score,
                     zone_type, rejection_strength, rsi_at_entry, rejection_type, trigger_candle,
                     risk_reward, expected_move, timeframe_used,
                     conditions_met
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 signal.signal_id,
                 signal.symbol,
@@ -2278,6 +2311,11 @@ class RejectionScanner:
                 signal.entry_price,
                 signal.stop_loss,
                 signal.take_profit,
+                
+                # TP SOURCE INFO
+                signal.tp_source,
+                signal.tp_timeframe,
+                
                 signal.wave_context.wave_length,
                 signal.wave_context.wave_maturity,
                 signal.wave_context.expansion_speed,
@@ -2300,7 +2338,7 @@ class RejectionScanner:
             
             await self.db.commit()
             
-            log.info(f"✅ Rejection signal saved: {signal.symbol}")
+            log.info(f"✅ Rejection signal saved: {signal.symbol} (TP Source: {signal.tp_source} @ {signal.tp_timeframe})")
             return True
             
         except Exception as e:
@@ -2308,7 +2346,7 @@ class RejectionScanner:
             return False
     
     async def format_signal_message(self, signal: RejectionSignal) -> str:
-        """Format signal for Telegram"""
+        """Format signal for Telegram with TP source"""
         side_emoji = "🟢" if signal.side == "LONG" else "🔴"
         side_text = "شراء" if signal.side == "LONG" else "بيع"
         
@@ -2357,6 +2395,14 @@ class RejectionScanner:
         
         rejection_text = rejection_translation.get(signal.rejection_type, signal.rejection_type)
         
+        # TP SOURCE TRANSLATION
+        tp_source_translation = {
+            "LIQUIDITY_POOL": "بركة سيولة",
+            "SWING_HIGH_LOW": "قمة/قاع تأرجح"
+        }
+        
+        tp_source_text = tp_source_translation.get(signal.tp_source, signal.tp_source)
+        
         message = f"""
 {side_emoji} <b>إشارة رفض</b> ⚡
 
@@ -2390,11 +2436,14 @@ class RejectionScanner:
 ‎• هدف الربح: <code>{signal.take_profit:.6f}</code> ({target_pct:.1f}%)
 ‎• نسبة الربح/المخاطرة: {signal.risk_reward:.2f}:1
 
-<u><b>🎯 طريقة التحديد المحسنة:</b></u>
+<b>🎯 <u>مصدر هدف الربح:</u></b>
+‎• <b>المصدر:</b> {tp_source_text}
+‎• <b>الإطار الزمني:</b> {signal.tp_timeframe}
+
+<u><b>⚡ إعدادات الصفقة:</b></u>
 <u>🛑 <b>قاعدة صارمة: لا تستخدم 3M/5M أبداً</b></u>
-‎• <b>وقف الخسارة:</b> أقرب قاع تأرجح (15M/30M/1H فقط)
-‎• <b>هدف الربح:</b> <u>أولاً</u> أقرب بركة سيولة (15M/30M/1H فقط)
-‎• <b>هدف الربح:</b> <u>ثانياً</u> أقرب قمة تأرجح (15M/30M/1H فقط)
+‎• وقف الخسارة: أقرب قاع تأرجح (15M/30M/1H فقط)
+‎• هدف الربح: أولاً بركة سيولة، ثانياً قمة تأرجح (15M/30M/1H فقط)
 
 <b>🛡️ نظام التكرار:</b>
 ‎• نظام: <b>صفقة واحدة لكل عملة</b>
@@ -2405,7 +2454,7 @@ class RejectionScanner:
 ‎نسبة الربح/الخسارة ديناميكية
 ‎نقبل الخسائر - نصطاد التوسع
 
-#{side_text} #رفض #{"دعم" if signal.side == "LONG" else "مقاومة"} #صفقة_واحدة #أقرب_قاع_تأرجح #بركة_السيولة #15M_30M_1H_فقط
+#{side_text} #رفض #{"دعم" if signal.side == "LONG" else "مقاومة"} #صفقة_واحدة #أقرب_قاع_تأرجح #بركة_السيولة #15M_30M_1H_فقط #مصدر_{tp_source_text.replace(' ', '_')} #إطار_{signal.tp_timeframe}
 """
         return message
     
@@ -2549,7 +2598,7 @@ class RejectionScanner:
             log.error(f"Close notification error: {e}")
     
     async def send_telegram_alert(self, signal: RejectionSignal):
-        """Send Telegram alert"""
+        """Send Telegram alert with TP source info"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             log.warning(f"⚠️ Telegram credentials missing. Skipping alert for {signal.symbol}")
             return
@@ -2565,7 +2614,7 @@ class RejectionScanner:
                     "parse_mode": "HTML"
                 })
                 
-            log.info(f"📤 Telegram rejection alert sent: {signal.symbol}")
+            log.info(f"📤 Telegram rejection alert sent: {signal.symbol} (TP Source: {signal.tp_source} @ {signal.tp_timeframe})")
             
         except Exception as e:
             log.error(f"Telegram error: {e}")
@@ -2578,7 +2627,7 @@ class RejectionScanner:
             try:
                 # Get ALL open positions (both pending and triggered)
                 async with self.db.execute("""
-                    SELECT id, symbol, side, entry_price, stop_loss, take_profit, status
+                    SELECT id, symbol, side, entry_price, stop_loss, take_profit, status, tp_source, tp_timeframe
                     FROM rejection_signals 
                     WHERE status IN ('PENDING', 'TRIGGERED')
                 """) as cursor:
@@ -2587,7 +2636,7 @@ class RejectionScanner:
                 if positions:
                     log.debug(f"📊 Monitoring {len(positions)} open positions")
                 
-                for pos_id, symbol, side, entry, sl, tp, status in positions:
+                for pos_id, symbol, side, entry, sl, tp, status, tp_source, tp_timeframe in positions:
                     try:
                         # Get current price
                         ticker = await self.exchange.fetch_ticker(symbol)
@@ -2842,6 +2891,11 @@ class RejectionScanner:
 ‎• هدف الربح: <b>ثانياً: أقرب قمة تأرجح (15M/30M/1H فقط)</b>
 ‎• نسبة الربح/الخسارة: <b>ديناميكية (الحد الأدنى {MIN_RISK_REWARD}:1)</b>
 
+<b>🎯 <u>تتبع مصدر هدف الربح:</u></b>
+‎• <b>كل إشارة تظهر مصدر الـ TP والـ TF المستخدم</b>
+‎• المصدر: بركة سيولة أو قمة/قاع تأرجح
+‎• الإطار الزمني: 1H أو 30M أو 15M
+
 <b>🚫 أسباب الفلترة:</b>
 ‎• مفلتر (تكرار): {stats.get('rejections_filtered', 0)} ({filtered_pct:.1f}%)
 ‎• بدون قوة كافية: {stats.get('no_strength', 0)} ({no_strength_pct:.1f}%)
@@ -2867,8 +2921,9 @@ class RejectionScanner:
 ‎• قبول الخسائر
 ‎• صيد التوسع
 <u>‎• <b>لا تستخدم 3M/5M أبداً لوقف الخسارة/هدف الربح</b></u>
+<u>‎• <b>تتبع مصدر هدف الربح والإطار الزمني</b></u>
 
-‎#إحصائيات_الرفض #متداول_تفاعلي #صفقة_واحدة #أقرب_قاع_تأرجح #بركة_السيولة #15M_30M_1H_فقط
+‎#إحصائيات_الرفض #متداول_تفاعلي #صفقة_واحدة #أقرب_قاع_تأرجح #بركة_السيولة #15M_30M_1H_فقط #تتبع_مصدر_TP
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -2933,20 +2988,23 @@ async def start_http_server(scanner, port=8000):
                         "stop_loss": "Nearest Swing Low/High (15M/30M/1H ONLY)",
                         "take_profit_primary": "Nearest Liquidity Pool (15M/30M/1H ONLY)",
                         "take_profit_fallback": "Nearest Swing High/Low (15M/30M/1H ONLY)",
+                        "tp_source_tracking": "ENABLED - Shows source and timeframe for each TP",
                         "strict_rule": "NEVER use 3M/5M for SL/TP",
                         "min_risk_reward": MIN_RISK_REWARD,
-                        "strategy": "Dynamic SL/TP with multi-timeframe analysis"
+                        "strategy": "Dynamic SL/TP with multi-timeframe analysis and source tracking"
                     },
                     "trader_mindset": {
                         "role": "Discretionary reaction trader",
                         "specialty": "Wave-length awareness + Strength analysis + Rejection entries",
                         "philosophy": "Wave length sets context, Strength & volume make decision, Rejection pulls trigger",
                         "entry_rule": "Trade ONLY at rejection zones",
-                        "frequency": "High frequency + dynamic risk management"
+                        "frequency": "High frequency + dynamic risk management",
+                        "tp_tracking": "TP Source and Timeframe visible in all signals"
                     },
                     "telegram": {
                         "configured": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID),
-                        "notifications": "Signal + Entry + TP/SL alerts"
+                        "notifications": "Signal + Entry + TP/SL alerts",
+                        "tp_info": "TP Source and Timeframe included in all messages"
                     }
                 }, indent=2)
             
@@ -2965,6 +3023,7 @@ async def start_http_server(scanner, port=8000):
                     "entry_conditions": "RSI zones (40-50 LONG, 50-60 SHORT) + Volume confirmation",
                     "entry_philosophy": "Enter on first strong rejection candle, early entries are intentional",
                     "risk_management": "Dynamic SL (Nearest Swing - 15M/30M/1H ONLY) + Dynamic TP (Liquidity Pool + Swing Fallback - 15M/30M/1H ONLY)",
+                    "tp_source_tracking": "Each signal shows TP source (Liquidity Pool/Swing) and timeframe (1H/30M/15M)",
                     "strict_rule": "NEVER use 3M/5M for SL/TP - ALWAYS use 15M/30M/1H",
                     "frequency_rule": "High frequency + dynamic payoff",
                     "mindset": "Reaction trader, rejection specialist, not prediction-based, comfortable being wrong"
@@ -2976,6 +3035,7 @@ async def start_http_server(scanner, port=8000):
                     async with scanner.db.execute("""
                         SELECT symbol, side, entry_price, zone_type, rejection_type,
                                rejection_strength, risk_reward, expected_move, 
+                               tp_source, tp_timeframe,  -- TP SOURCE INFO
                                created_at, status, close_reason, pnl_percent
                         FROM rejection_signals 
                         ORDER BY created_at DESC 
