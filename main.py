@@ -34,7 +34,7 @@ TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 100))   # Scan many pairs
 MIN_VOLUME_USD = 500000  # $500K minimum - more opportunities
 
 # Trading parameters - DYNAMIC SL/TP BASED ON MARKET STRUCTURE
-MIN_RISK_REWARD = 1.5        # Minimum 1.5:1 risk/reward for dynamic SL/TP
+MIN_RISK_REWARD = 1.0        # Minimum 1.5:1 risk/reward for dynamic SL/TP
 
 # Rejection scanning
 REJECTION_CONFIG = {
