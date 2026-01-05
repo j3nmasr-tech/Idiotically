@@ -1,3417 +1,1320 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-🔥 REJECTION-BASED HIGH-FREQUENCY SCANNER
-Professional discretionary trading system
-Wave-length awareness + Strength analysis + Rejection entries
-TRADER MINDSET: Reaction-based, rejection specialist
+ROMEOTPT SCANNER v2 - Score-Only Implementation
+Only total probability score matters - all steps are optional
 """
 
 import os
 import time
 import asyncio
 import logging
-import hashlib
+import datetime
+import json
 import aiosqlite
 import httpx
 import ccxt.async_support as ccxt
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from fastapi import FastAPI
+import uvicorn
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
-import json
+from collections import defaultdict
 
-# ================ HIGH-FREQUENCY CONFIG ================
+# ---------------- CONFIG ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-DB_PATH = "/app/data/rejection_scanner.db"
+DB_PATH = "/app/data/romeopt_v2.db"
 
-# Ultra high-frequency scanning - REACTION TRADING
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 5))   # 5 seconds - ULTRA FAST FOR REJECTIONS
-TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 100))   # Scan many pairs
-MIN_VOLUME_USD = 500000  # $500K minimum - more opportunities
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))
+TOP_N = int(os.getenv("TOP_N", 6))
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 5))
 
-# Trading parameters - NEAREST LEVELS ONLY (NO R:R BASED)
-MIN_TP_DISTANCE_PCT = 0.3  # Minimum 0.3% distance for TP
+# ---------------- LOGGING ----------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
+log = logging.getLogger("romeopt_v2")
+db_lock = asyncio.Lock()
+db_conn = None
 
-# Rejection scanning
-REJECTION_CONFIG = {
-    "rsi_long_zone": (40, 50),      # RSI 40-50 for LONG entries
-    "rsi_short_zone": (50, 60),     # RSI 50-60 for SHORT entries
-    "ema_distance_threshold": 0.5,  # 0.5% from EMA for rejection
-    "min_rejection_strength": 0.2,  # Minimum rejection strength score
-    "min_higher_tf_alignment": 1,   # Minimum higher TF alignment count
-}
-
-# Timeframes for REACTION TRADING - UPDATED: Only 15M and 30M for SL/TP
-TIMEFRAMES = {
-    "30M": "30m",    # SL/TP ANALYSIS ONLY
-    "15M": "15m",    # Strength and structure + SL/TP ANALYSIS
-    "5M": "5m",      # Primary rejection analysis
-    "3M": "3m",      # Fast trigger (MAIN)
-    "1M": "1m"       # Entry timing (ULTRA FAST)
-}
-
-# EMA periods for rejection detection
-EMA_PERIODS = {
-    "fast": 9,
-    "medium": 21,
-    "slow": 50
-}
-
-# RSI settings for rejection zones
-RSI_PERIOD = 14
-RSI_OVERBOUGHT = 70
-RSI_OVERSOLD = 30
-
-# ================ DATA STRUCTURES ================
+# ---------------- DATA STRUCTURES ----------------
 @dataclass
-class WaveContext:
-    """Wave length and maturity context - NO WAVE COUNTING"""
-    wave_length: str           # SHORT, MEDIUM, EXTENDED
-    wave_maturity: float       # 0-1 (0=early, 1=exhausted)
-    expansion_speed: float     # 0-1 (slow to fast)
-    structure_type: str        # IMPULSIVE, CORRECTIVE, COMPRESSION
-    context_side: str          # BULLISH_CONTEXT, BEARISH_CONTEXT, NEUTRAL
+class HTFContext:
+    """Step 1: HTF Bias output"""
+    bias: str  # "BULLISH", "BEARISH", "RANGING"
+    range_high: float
+    range_low: float
+    range_mid: float
+    premium_discount: str  # "PREMIUM", "DISCOUNT", "MIDDLE"
+    liquidity_zones: List[Dict]  # HTF liquidity levels
+    structure: List[Dict]  # Swing highs/lows
+    skip_reason: Optional[str] = None
+    valid: bool = False
 
 @dataclass
-class MarketStrength:
-    """Market strength analysis"""
-    candle_speed: float        # 0-1 (slow to fast)
-    distance_ratio: float      # Distance traveled / time
-    ema_angle: float           # EMA slope angle in degrees
-    volume_participation: float # 0-1 volume participation
-    strength_score: float      # 0-1 overall strength
-    
-    # Interpretation flags
-    is_continuation: bool      # Strong move + strong volume
-    is_rejection_setup: bool   # Strong move + weak volume
-    is_absorption: bool        # Weak move + rising volume
-    is_compression: bool       # Flat price + compression
+class LiquidityMap:
+    """Step 2: Liquidity Map output"""
+    from_liquidity: List[Dict]  # Liquidity being moved FROM
+    to_liquidity: List[Dict]    # Liquidity targets TO move to
+    has_clear_target: bool = False
 
 @dataclass
-class RejectionZone:
-    """Key rejection area analysis"""
-    zone_type: str             # EMA_SUPPORT, EMA_RESISTANCE, RANGE_LOW, RANGE_HIGH, 
-                               # FAILED_BREAKDOWN, FAILED_BREAKOUT, DEMAND, SUPPLY
-    price_level: float
-    strength: float            # 0-1 rejection strength
-    volume_confirmation: bool  # Volume spike at rejection
-    rsi_position: str          # IN_ZONE, OVEREXTENDED, NEUTRAL
-    is_active: bool           # Currently being rejected
+class SweepAnalysis:
+    """Step 3: Liquidity Sweep output"""
+    type: str  # "HIGH_SWEEP", "LOW_SWEEP", "NONE"
+    candle_index: int
+    swept_price: float
+    previous_extreme: float
+    impulsive: bool  # Body > wicks
+    fake_sweep: bool = False
+    strength: float = 0.0  # 0-1 score
 
 @dataclass
-class MarketContext:
-    """Market context analysis"""
-    can_trade: bool            # Whether trading is allowed
-    reasons: List[str]         # Reasons for trading decision
-    trend_strength: str        # STRONG, WEAK, NEUTRAL
-    higher_tf_alignment: int   # Number of higher TFs aligned (0-2)
-    volume_health: str         # HEALTHY, LOW, VERY_LOW
+class StructureShift:
+    """Step 4: Structure Check output"""
+    type: str  # "CHoCH" (reversal), "BOS" (continuation), "NONE"
+    confirmed: bool
+    candle_index: int
+    description: str = ""
 
 @dataclass
-class RejectionSignal:
-    """Rejection-based trade signal"""
-    signal_id: str
-    symbol: str
-    side: str                  # LONG, SHORT
-    
-    # Price levels - DYNAMIC SL/TP
-    entry_price: float
-    stop_loss: float
-    take_profit: float
-    
-    # TP SOURCE TRACKING - NEW
-    tp_source: str            # "LIQUIDITY_POOL" or "SWING_HIGH_LOW"
-    tp_timeframe: str         # "30M" or "15M" ONLY
-    
-    # Analysis context
-    wave_context: WaveContext
-    market_strength: MarketStrength
-    rejection_zone: RejectionZone
-    market_context: MarketContext  # NEW: Market context
-    
-    # Entry triggers
-    rejection_type: str        # EMA_REJECTION, RANGE_REJECTION, FAILED_BREAKOUT
-    trigger_candle: str        # REJECTION_CANDLE, WICK_CONFIRMATION, MOMENTUM_SHIFT
-    rsi_at_entry: float
-    
-    # Metrics
-    rejection_strength: float  # 0-1 how strong the rejection is
-    risk_reward: float         # Dynamic based on market structure
-    expected_move_pct: float   # Dynamic based on market structure
-    
-    # Timing
-    timeframe_used: str        # Which TF triggered entry
-    signal_timestamp: float
-    conditions_met: List[str]  # Which rejection conditions triggered
+class EntryZone:
+    """Step 5: Entry Zone output"""
+    type: str  # "ORDER_BLOCK", "FAIR_VALUE_GAP", "DISCOUNT", "PREMIUM"
+    price: float
+    low: float
+    high: float
+    aligns_with_htf: bool
+    candle_reaction: bool = False
 
-# ================ PROFESSIONAL LOGGING ================
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s | %(levelname)8s | %(name)s | %(message)s',
-    datefmt='%H:%M:%S'
-)
-log = logging.getLogger("rejection_scanner")
+@dataclass
+class RiskManagement:
+    """Step 6: Risk/SL output"""
+    sl_price: float
+    invalidation_type: str  # "SWEEP", "ORDER_BLOCK", "STRUCTURE"
+    risk_amount: float
+    sl_to_entry_distance: float
 
-# ================ CORE REJECTION ENGINE ================
-class RejectionBasedScanner:
-    """High-frequency rejection scanner - REACTION TRADING"""
-    
-    class SignalDeduplicator:
-        """Prevents duplicate signal generation - TRADE-BASED"""
-        
-        def __init__(self):
-            self.active_signals = {}  # symbol: signal_id (only one active per symbol)
-            self.signal_status = {}   # signal_id: {"symbol", "side", "price", "status"}
-        
-        def should_generate_signal(self, symbol: str, side: str, price: float) -> bool:
-            """Check if we should generate a new signal - TRADE-BASED"""
-            
-            # Check if symbol already has an active signal
-            if symbol in self.active_signals:
-                signal_id = self.active_signals[symbol]
-                
-                # Check signal status
-                if signal_id in self.signal_status:
-                    status = self.signal_status[signal_id].get("status", "UNKNOWN")
-                    
-                    # Only allow new signal if previous is CLOSED
-                    if status != "CLOSED":
-                        log.debug(f"{symbol}: Active {side} signal exists (status: {status})")
-                        return False
-            
-            return True
-        
-        def register_signal(self, signal: RejectionSignal):
-            """Register a new signal"""
-            symbol = signal.symbol
-            
-            # Remove any previous active signal for this symbol
-            if symbol in self.active_signals:
-                old_signal_id = self.active_signals[symbol]
-                if old_signal_id in self.signal_status:
-                    del self.signal_status[old_signal_id]
-            
-            # Register new signal as PENDING
-            self.active_signals[symbol] = signal.signal_id
-            self.signal_status[signal.signal_id] = {
-                "symbol": symbol,
-                "side": signal.side,
-                "price": signal.entry_price,
-                "status": "PENDING",
-                "timestamp": signal.signal_timestamp
-            }
-            
-            log.debug(f"Registered rejection signal {signal.signal_id[:8]} for {symbol}")
-        
-        def update_signal_status(self, signal_id: str, status: str):
-            """Update signal status (PENDING → TRIGGERED → CLOSED)"""
-            if signal_id in self.signal_status:
-                self.signal_status[signal_id]["status"] = status
-                log.debug(f"Signal {signal_id[:8]} status updated to {status}")
-                
-                # If CLOSED, mark as ready for new signals
-                if status == "CLOSED":
-                    symbol = self.signal_status[signal_id]["symbol"]
-                    log.info(f"✅ Signal {signal_id[:8]} for {symbol} CLOSED - Ready for new rejections")
-        
-        def remove_closed_signals(self):
-            """Clean up closed signals to free memory"""
-            current_time = time.time()
-            closed_signal_ids = []
-            
-            for signal_id, data in list(self.signal_status.items()):
-                if data.get("status") == "CLOSED":
-                    # Remove if closed more than 1 hour ago
-                    if current_time - data.get("timestamp", 0) > 3600:
-                        closed_signal_ids.append(signal_id)
-            
-            for signal_id in closed_signal_ids:
-                symbol = self.signal_status[signal_id]["symbol"]
-                
-                # Only remove from active_signals if it's the current one
-                if self.active_signals.get(symbol) == signal_id:
-                    del self.active_signals[symbol]
-                
-                del self.signal_status[signal_id]
-                log.debug(f"Cleaned up closed signal {signal_id[:8]} for {symbol}")
-    
-    def __init__(self):
-        self.daily_stats = {
-            "rejections_found": 0,
-            "long_rejections": 0,
-            "short_rejections": 0,
-            "pairs_scanned": 0,
-            "rejections_filtered": 0,
-            "no_strength": 0,
-            "no_rejection_zone": 0,
-            "no_higher_tf_alignment": 0,
-            "bad_market_context": 0,
-            "no_confirmed_entry": 0
-        }
-        self.deduplicator = self.SignalDeduplicator()
-        self.active_signal_ids = set()
-        self.tickers = {}  # Cache for ticker data
-    
-    # ========== WAVE LENGTH ANALYSIS (CONTEXT ONLY) ==========
-    
-    def analyze_wave_context(self, df_15m: pd.DataFrame, df_5m: pd.DataFrame) -> WaveContext:
-        """
-        Analyze wave length and maturity - NO WAVE COUNTING
-        Determine context only
-        """
-        try:
-            if df_15m is None or df_5m is None:
-                return self._get_default_wave_context()
-            
-            if len(df_15m) < 20 or len(df_5m) < 30:
-                return self._get_default_wave_context()
-            
-            # 1. Analyze wave length on 15M
-            wave_length, wave_maturity = self._analyze_wave_length(df_15m)
-            
-            # 2. Analyze expansion speed on 5M
-            expansion_speed = self._analyze_expansion_speed(df_5m)
-            
-            # 3. Determine structure type
-            structure_type = self._determine_structure(df_5m)
-            
-            # 4. Determine context side (not trade direction, just context)
-            context_side = self._determine_context_side(df_15m, df_5m)
-            
-            return WaveContext(
-                wave_length=wave_length,
-                wave_maturity=wave_maturity,
-                expansion_speed=expansion_speed,
-                structure_type=structure_type,
-                context_side=context_side
-            )
-            
-        except Exception as e:
-            log.error(f"Wave context error: {e}")
-            return self._get_default_wave_context()
-    
-    def _analyze_wave_length(self, df: pd.DataFrame) -> Tuple[str, float]:
-        """Analyze wave length and maturity"""
-        try:
-            if len(df) < 30:
-                return "MEDIUM", 0.5
-            
-            # Get recent price move
-            recent_prices = df['close'].values[-30:]
-            
-            # Calculate total move length
-            total_move = abs(recent_prices[-1] - recent_prices[0])
-            avg_candle_size = np.mean(np.abs(np.diff(recent_prices)))
-            
-            if avg_candle_size == 0:
-                return "MEDIUM", 0.5
-            
-            # Wave length classification
-            move_ratio = total_move / avg_candle_size
-            
-            if move_ratio < 15:
-                wave_length = "SHORT"
-            elif move_ratio < 30:
-                wave_length = "MEDIUM"
-            else:
-                wave_length = "EXTENDED"
-            
-            # Wave maturity (0=early, 1=exhausted)
-            # Based on distance from moving average and volatility
-            ma_20 = np.mean(recent_prices[-20:])
-            current_price = recent_prices[-1]
-            volatility = np.std(recent_prices[-20:])
-            
-            if volatility > 0:
-                distance_pct = abs(current_price - ma_20) / ma_20 * 100
-                volatility_pct = volatility / ma_20 * 100
-                
-                # Normalize maturity
-                wave_maturity = min(distance_pct / (volatility_pct * 2), 1.0)
-            else:
-                wave_maturity = 0.5
-            
-            return wave_length, wave_maturity
-            
-        except Exception as e:
-            return "MEDIUM", 0.5
-    
-    def _analyze_expansion_speed(self, df: pd.DataFrame) -> float:
-        """Analyze expansion speed (0=slow, 1=fast)"""
-        try:
-            if len(df) < 10:
-                return 0.5
-            
-            # Calculate candle speeds (absolute percentage changes)
-            candles = df.iloc[-10:]
-            candle_speeds = []
-            
-            for i in range(len(candles)):
-                candle = candles.iloc[i]
-                candle_range = candle['high'] - candle['low']
-                if candle['close'] != 0:
-                    speed = candle_range / candle['close'] * 100
-                    candle_speeds.append(speed)
-            
-            if not candle_speeds:
-                return 0.5
-            
-            avg_speed = np.mean(candle_speeds)
-            max_speed = np.max(candle_speeds)
-            
-            # Normalize to 0-1
-            expansion_speed = min(avg_speed / 5.0, 1.0)  # 5% avg range = max speed
-            
-            return expansion_speed
-            
-        except Exception as e:
-            return 0.5
-    
-    def _determine_structure(self, df: pd.DataFrame) -> str:
-        """Determine market structure type"""
-        try:
-            if len(df) < 20:
-                return "COMPRESSION"
-            
-            prices = df['close'].values[-20:]
-            highs = df['high'].values[-20:]
-            lows = df['low'].values[-20:]
-            
-            # Check for impulsive moves
-            price_change = prices[-1] - prices[0]
-            price_change_pct = abs(price_change) / prices[0] * 100
-            
-            # Check for compression
-            range_ratio = (np.max(highs) - np.min(lows)) / prices[0] * 100
-            
-            if price_change_pct > 3 and range_ratio > 5:
-                return "IMPULSIVE"
-            elif range_ratio < 2:
-                return "COMPRESSION"
-            else:
-                return "CORRECTIVE"
-                
-        except Exception as e:
-            return "COMPRESSION"
-    
-    def _determine_context_side(self, df_15m: pd.DataFrame, df_5m: pd.DataFrame) -> str:
-        """Determine context side (not trade direction)"""
-        try:
-            # Use 15M for broader context
-            if len(df_15m) < 10:
-                return "NEUTRAL"
-            
-            # Simple slope analysis
-            prices_15m = df_15m['close'].values[-10:]
-            x = np.arange(len(prices_15m))
-            slope_15m, _ = np.polyfit(x, prices_15m, 1)
-            
-            # Use 5M for recent bias
-            prices_5m = df_5m['close'].values[-5:]
-            slope_5m, _ = np.polyfit(np.arange(len(prices_5m)), prices_5m, 1)
-            
-            # Combine with weights
-            total_slope = (slope_15m * 0.7 + slope_5m * 0.3)
-            
-            if total_slope > 0.001:
-                return "BULLISH_CONTEXT"
-            elif total_slope < -0.001:
-                return "BEARISH_CONTEXT"
-            else:
-                return "NEUTRAL"
-                
-        except Exception as e:
-            return "NEUTRAL"
-    
-    def _get_default_wave_context(self) -> WaveContext:
-        return WaveContext(
-            wave_length="MEDIUM",
-            wave_maturity=0.5,
-            expansion_speed=0.5,
-            structure_type="COMPRESSION",
-            context_side="NEUTRAL"
-        )
-    
-    # ========== MARKET STRENGTH ANALYSIS ==========
-    
-    def analyze_market_strength(self, df: pd.DataFrame) -> MarketStrength:
-        """
-        Analyze market strength using:
-        - Candle speed
-        - Distance traveled
-        - EMA angle
-        - Volume participation
-        """
-        try:
-            if df is None or len(df) < 20:
-                return self._get_default_market_strength()
-            
-            # 1. Candle speed analysis
-            candle_speed = self._calculate_candle_speed(df)
-            
-            # 2. Distance traveled vs time
-            distance_ratio = self._calculate_distance_ratio(df)
-            
-            # 3. EMA angle analysis
-            ema_angle = self._calculate_ema_angle(df)
-            
-            # 4. Volume participation
-            volume_participation = self._calculate_volume_participation(df)
-            
-            # 5. Strength score
-            strength_score = self._calculate_strength_score(
-                candle_speed, distance_ratio, ema_angle, volume_participation
-            )
-            
-            # 6. Interpret strength patterns
-            is_continuation, is_rejection_setup, is_absorption, is_compression = \
-                self._interpret_strength_patterns(df, candle_speed, volume_participation)
-            
-            return MarketStrength(
-                candle_speed=candle_speed,
-                distance_ratio=distance_ratio,
-                ema_angle=ema_angle,
-                volume_participation=volume_participation,
-                strength_score=strength_score,
-                is_continuation=is_continuation,
-                is_rejection_setup=is_rejection_setup,
-                is_absorption=is_absorption,
-                is_compression=is_compression
-            )
-            
-        except Exception as e:
-            log.error(f"Market strength error: {e}")
-            return self._get_default_market_strength()
-    
-    def _calculate_candle_speed(self, df: pd.DataFrame) -> float:
-        """Calculate average candle speed"""
-        try:
-            if len(df) < 5:
-                return 0.5
-            
-            candles = df.iloc[-5:]
-            speeds = []
-            
-            for _, candle in candles.iterrows():
-                candle_range = candle['high'] - candle['low']
-                if candle['close'] > 0:
-                    speed = candle_range / candle['close'] * 100
-                    speeds.append(speed)
-            
-            if not speeds:
-                return 0.5
-            
-            avg_speed = np.mean(speeds)
-            # Normalize: 0.5% = 0.5, 1% = 0.75, 2% = 1.0
-            return min(avg_speed / 2.0, 1.0)
-            
-        except Exception as e:
-            return 0.5
-    
-    def _calculate_distance_ratio(self, df: pd.DataFrame) -> float:
-        """Calculate distance traveled vs time ratio"""
-        try:
-            if len(df) < 10:
-                return 0.5
-            
-            prices = df['close'].values[-10:]
-            total_distance = abs(prices[-1] - prices[0])
-            
-            if prices[0] > 0:
-                distance_pct = total_distance / prices[0] * 100
-                # Normalize: 5% move in 10 candles = 1.0
-                return min(distance_pct / 5.0, 1.0)
-            
-            return 0.5
-            
-        except Exception as e:
-            return 0.5
-    
-    def _calculate_ema_angle(self, df: pd.DataFrame) -> float:
-        """Calculate EMA angle/slope"""
-        try:
-            if len(df) < 20:
-                return 0.0
-            
-            # Calculate fast EMA
-            ema_fast = df['close'].ewm(span=EMA_PERIODS['fast'], adjust=False).mean()
-            ema_values = ema_fast.values[-10:]
-            
-            if len(ema_values) < 5:
-                return 0.0
-            
-            # Calculate slope
-            x = np.arange(len(ema_values))
-            slope, _ = np.polyfit(x, ema_values, 1)
-            
-            # Normalize slope to angle-like metric
-            avg_price = np.mean(ema_values)
-            if avg_price > 0:
-                angle_metric = abs(slope / avg_price * 1000)  # Scale for sensitivity
-                return min(angle_metric, 1.0)
-            
-            return 0.0
-            
-        except Exception as e:
-            return 0.0
-    
-    def _calculate_volume_participation(self, df: pd.DataFrame) -> float:
-        """Calculate volume participation ratio"""
-        try:
-            if len(df) < 20:
-                return 0.5
-            
-            recent_volume = df['volume'].values[-5:].mean()
-            avg_volume = df['volume'].values[-20:].mean()
-            
-            if avg_volume > 0:
-                ratio = recent_volume / avg_volume
-                # Normalize: 1.0 = average, 1.5 = 0.75, 2.0 = 1.0, 0.5 = 0.25
-                if ratio >= 1.0:
-                    return min((ratio - 1.0) * 2, 1.0)  # 1.0→0, 1.5→1.0
-                else:
-                    return max((ratio - 1.0) * 2, 0.0)  # 0.5→0, 1.0→0
-            
-            return 0.5
-            
-        except Exception as e:
-            return 0.5
-    
-    def _calculate_strength_score(self, candle_speed: float, distance_ratio: float, 
-                                 ema_angle: float, volume_participation: float) -> float:
-        """Calculate overall strength score"""
-        # Weighted average with volume being most important
-        weights = [0.2, 0.2, 0.2, 0.4]  # candle_speed, distance, ema_angle, volume
-        factors = [candle_speed, distance_ratio, ema_angle, volume_participation]
-        
-        return np.average(factors, weights=weights)
-    
-    def _interpret_strength_patterns(self, df: pd.DataFrame, candle_speed: float, 
-                                    volume_participation: float) -> Tuple[bool, bool, bool, bool]:
-        """Interpret strength patterns"""
-        try:
-            if len(df) < 10:
-                return False, False, False, False
-            
-            # Get price action
-            price_change = df['close'].iloc[-1] - df['close'].iloc[-5]
-            price_change_pct = abs(price_change) / df['close'].iloc[-5] * 100
-            
-            # Determine patterns
-            is_continuation = (candle_speed > 0.7 and volume_participation > 0.7 and 
-                              price_change_pct > 1.0)
-            
-            is_rejection_setup = (candle_speed > 0.7 and volume_participation < 0.3 and 
-                                 price_change_pct > 1.0)
-            
-            is_absorption = (candle_speed < 0.3 and volume_participation > 0.7)
-            
-            # Check for compression (low range, low volume)
-            recent_high = df['high'].values[-5:].max()
-            recent_low = df['low'].values[-5:].min()
-            range_pct = (recent_high - recent_low) / recent_low * 100
-            
-            is_compression = (range_pct < 1.0 and volume_participation < 0.5)
-            
-            return is_continuation, is_rejection_setup, is_absorption, is_compression
-            
-        except Exception as e:
-            return False, False, False, False
-    
-    def _get_default_market_strength(self) -> MarketStrength:
-        return MarketStrength(
-            candle_speed=0.5,
-            distance_ratio=0.5,
-            ema_angle=0.0,
-            volume_participation=0.5,
-            strength_score=0.5,
-            is_continuation=False,
-            is_rejection_setup=False,
-            is_absorption=False,
-            is_compression=False
-        )
-    
-    # ========== REJECTION ZONE ANALYSIS ==========
-    
-    def find_rejection_zones(self, df: pd.DataFrame, current_price: float, 
-                            rsi_value: float, emas: Dict[str, float]) -> List[RejectionZone]:
-        """
-        Find all active rejection zones
-        """
-        zones = []
-        
-        try:
-            if df is None or len(df) < 20:
-                return zones
-            
-            # 1. EMA rejection zones
-            ema_zones = self._find_ema_rejection_zones(current_price, emas)
-            zones.extend(ema_zones)
-            
-            # 2. Range rejection zones
-            range_zones = self._find_range_rejection_zones(df, current_price)
-            zones.extend(range_zones)
-            
-            # 3. Failed breakout/breakdown zones
-            failed_zones = self._find_failed_break_zones(df, current_price)
-            zones.extend(failed_zones)
-            
-            # 4. RSI position analysis for each zone
-            for zone in zones:
-                zone.rsi_position = self._analyze_rsi_position(rsi_value, zone.zone_type)
-            
-            # Filter to active zones only
-            active_zones = [z for z in zones if z.is_active]
-            
-            return active_zones
-            
-        except Exception as e:
-            log.error(f"Rejection zone error: {e}")
-            return []
-    
-    def _find_ema_rejection_zones(self, current_price: float, emas: Dict[str, float]) -> List[RejectionZone]:
-        """Find EMA rejection zones"""
-        zones = []
-        
-        try:
-            # Check each EMA for rejection
-            for ema_name, ema_value in emas.items():
-                if ema_value == 0:
-                    continue
-                
-                distance_pct = abs(current_price - ema_value) / ema_value * 100
-                
-                # Check if price is near EMA (within threshold)
-                if distance_pct <= REJECTION_CONFIG["ema_distance_threshold"]:
-                    # Determine if it's support or resistance
-                    if current_price > ema_value:
-                        # Price above EMA - potential support
-                        zone_type = "EMA_SUPPORT"
-                        is_active = True
-                    else:
-                        # Price below EMA - potential resistance
-                        zone_type = "EMA_RESISTANCE"
-                        is_active = True
-                    
-                    # Calculate rejection strength based on EMA importance
-                    if ema_name == "fast":
-                        strength = 0.7
-                    elif ema_name == "medium":
-                        strength = 0.8
-                    else:  # slow
-                        strength = 0.9
-                    
-                    zones.append(RejectionZone(
-                        zone_type=zone_type,
-                        price_level=ema_value,
-                        strength=strength,
-                        volume_confirmation=False,  # Will be checked later
-                        rsi_position="IN_ZONE",
-                        is_active=is_active
-                    ))
-            
-            return zones
-            
-        except Exception as e:
-            return []
-    
-    def _find_range_rejection_zones(self, df: pd.DataFrame, current_price: float) -> List[RejectionZone]:
-        """Find range high/low rejection zones"""
-        zones = []
-        
-        try:
-            if len(df) < 20:
-                return zones
-            
-            # Recent range (last 20 candles)
-            recent_high = df['high'].values[-20:].max()
-            recent_low = df['low'].values[-20:].min()
-            range_mid = (recent_high + recent_low) / 2
-            
-            # Check range high
-            high_distance_pct = abs(current_price - recent_high) / recent_high * 100
-            if high_distance_pct <= 0.3:  # Very close to range high
-                zones.append(RejectionZone(
-                    zone_type="RANGE_HIGH",
-                    price_level=recent_high,
-                    strength=0.8,
-                    volume_confirmation=False,
-                    rsi_position="IN_ZONE",
-                    is_active=True
-                ))
-            
-            # Check range low
-            low_distance_pct = abs(current_price - recent_low) / recent_low * 100
-            if low_distance_pct <= 0.3:  # Very close to range low
-                zones.append(RejectionZone(
-                    zone_type="RANGE_LOW",
-                    price_level=recent_low,
-                    strength=0.8,
-                    volume_confirmation=False,
-                    rsi_position="IN_ZONE",
-                    is_active=True
-                ))
-            
-            return zones
-            
-        except Exception as e:
-            return []
-    
-    def _find_failed_break_zones(self, df: pd.DataFrame, current_price: float) -> List[RejectionZone]:
-        """Find failed breakout/breakdown zones"""
-        zones = []
-        
-        try:
-            if len(df) < 10:
-                return zones
-            
-            # Check for recent failed breakouts
-            recent_high = df['high'].values[-5:].max()
-            prev_high = df['high'].values[-10:-5].max()
-            
-            # Failed breakout (price tried to break high but failed)
-            if current_price < recent_high and recent_high > prev_high * 1.005:  # 0.5% attempt
-                # Check if price rejected from the high
-                if any(df['close'].values[-5:] < recent_high * 0.995):  # Rejected by 0.5%
-                    zones.append(RejectionZone(
-                        zone_type="FAILED_BREAKOUT",
-                        price_level=recent_high,
-                        strength=0.85,
-                        volume_confirmation=False,
-                        rsi_position="IN_ZONE",
-                        is_active=True
-                    ))
-            
-            # Check for recent failed breakdowns
-            recent_low = df['low'].values[-5:].min()
-            prev_low = df['low'].values[-10:-5].min()
-            
-            # Failed breakdown (price tried to break low but failed)
-            if current_price > recent_low and recent_low < prev_low * 0.995:  # 0.5% attempt
-                # Check if price rejected from the low
-                if any(df['close'].values[-5:] > recent_low * 1.005):  # Rejected by 0.5%
-                    zones.append(RejectionZone(
-                        zone_type="FAILED_BREAKDOWN",
-                        price_level=recent_low,
-                        strength=0.85,
-                        volume_confirmation=False,
-                        rsi_position="IN_ZONE",
-                        is_active=True
-                    ))
-            
-            return zones
-            
-        except Exception as e:
-            return []
-    
-    def _analyze_rsi_position(self, rsi_value: float, zone_type: str) -> str:
-        """Analyze RSI position relative to zone"""
-        # Check if RSI is in rejection zones
-        if "SUPPORT" in zone_type or "LOW" in zone_type or "BREAKDOWN" in zone_type:
-            # For LONG setups, we want RSI in 40-50 zone
-            if REJECTION_CONFIG["rsi_long_zone"][0] <= rsi_value <= REJECTION_CONFIG["rsi_long_zone"][1]:
-                return "IN_ZONE"
-            elif rsi_value < 30:
-                return "OVEREXTENDED"
-            else:
-                return "NEUTRAL"
-        
-        elif "RESISTANCE" in zone_type or "HIGH" in zone_type or "BREAKOUT" in zone_type:
-            # For SHORT setups, we want RSI in 50-60 zone
-            if REJECTION_CONFIG["rsi_short_zone"][0] <= rsi_value <= REJECTION_CONFIG["rsi_short_zone"][1]:
-                return "IN_ZONE"
-            elif rsi_value > 70:
-                return "OVEREXTENDED"
-            else:
-                return "NEUTRAL"
-        
-        return "NEUTRAL"
-    
-    # ========== CRITICAL IMPROVEMENT #1: CONFIRMED ENTRY SYSTEM ==========
-    
-    def _get_confirmed_entry_price(self, df: pd.DataFrame, side: str, zone: RejectionZone) -> Optional[Tuple[float, str, str]]:
-        """
-        Wait for confirmation candle to close BEYOND the rejection zone
-        Returns (entry_price, rejection_type, trigger_candle) or None
-        """
-        try:
-            if len(df) < 3:
-                return None
-            
-            current_candle = df.iloc[-1]
-            prev_candle = df.iloc[-2]
-            prev_prev_candle = df.iloc[-3] if len(df) >= 3 else None
-            
-            if side == "LONG":
-                # LONG: We need price to have rejected FROM BELOW and now confirming ABOVE
-                
-                # Pattern 1: Wick rejection followed by bullish confirmation
-                if (prev_candle['low'] < zone.price_level and 
-                    prev_candle['close'] > zone.price_level and
-                    current_candle['close'] > prev_candle['close'] and
-                    current_candle['close'] > zone.price_level * 1.002):
-                    # Wick rejection with bullish follow-through
-                    return current_candle['close'], "WICK_REJECTION", "BULLISH_CONFIRMATION"
-                
-                # Pattern 2: Double bottom rejection
-                if (prev_prev_candle is not None and
-                    prev_prev_candle['low'] < zone.price_level and
-                    prev_candle['low'] < zone.price_level and
-                    prev_candle['close'] > zone.price_level and
-                    current_candle['close'] > prev_candle['close'] and
-                    current_candle['close'] > zone.price_level * 1.003):
-                    return current_candle['close'], "DOUBLE_BOTTOM", "BREAKOUT_CONFIRMATION"
-                
-                # Pattern 3: Hammer formation at support
-                if (prev_candle['low'] < zone.price_level and
-                    prev_candle['close'] > prev_candle['open'] and  # Bullish candle
-                    (prev_candle['close'] - prev_candle['low']) > 2 * (prev_candle['open'] - prev_candle['low']) and  # Long lower wick
-                    current_candle['close'] > prev_candle['close'] and
-                    current_candle['close'] > zone.price_level * 1.001):
-                    return current_candle['close'], "HAMMER_REJECTION", "FOLLOW_THROUGH"
-                
-                # Pattern 4: Simple break and retest
-                if (current_candle['low'] > zone.price_level * 0.999 and  # Respecting support
-                    current_candle['close'] > current_candle['open'] and  # Bullish candle
-                    current_candle['close'] > zone.price_level * 1.002):  # Clear break
-                    return current_candle['close'], "BREAKOUT", "BULLISH_BREAK"
-                
-            else:  # SHORT
-                # SHORT: We need price to have rejected FROM ABOVE and now confirming BELOW
-                
-                # Pattern 1: Wick rejection followed by bearish confirmation
-                if (prev_candle['high'] > zone.price_level and 
-                    prev_candle['close'] < zone.price_level and
-                    current_candle['close'] < prev_candle['close'] and
-                    current_candle['close'] < zone.price_level * 0.998):
-                    # Wick rejection with bearish follow-through
-                    return current_candle['close'], "WICK_REJECTION", "BEARISH_CONFIRMATION"
-                
-                # Pattern 2: Double top rejection
-                if (prev_prev_candle is not None and
-                    prev_prev_candle['high'] > zone.price_level and
-                    prev_candle['high'] > zone.price_level and
-                    prev_candle['close'] < zone.price_level and
-                    current_candle['close'] < prev_candle['close'] and
-                    current_candle['close'] < zone.price_level * 0.997):
-                    return current_candle['close'], "DOUBLE_TOP", "BREAKDOWN_CONFIRMATION"
-                
-                # Pattern 3: Shooting star at resistance
-                if (prev_candle['high'] > zone.price_level and
-                    prev_candle['close'] < prev_candle['open'] and  # Bearish candle
-                    (prev_candle['high'] - prev_candle['close']) > 2 * (prev_candle['close'] - prev_candle['low']) and  # Long upper wick
-                    current_candle['close'] < prev_candle['close'] and
-                    current_candle['close'] < zone.price_level * 0.999):
-                    return current_candle['close'], "SHOOTING_STAR", "FOLLOW_THROUGH"
-                
-                # Pattern 4: Simple breakdown and retest
-                if (current_candle['high'] < zone.price_level * 1.001 and  # Respecting resistance
-                    current_candle['close'] < current_candle['open'] and  # Bearish candle
-                    current_candle['close'] < zone.price_level * 0.998):  # Clear breakdown
-                    return current_candle['close'], "BREAKDOWN", "BEARISH_BREAK"
-            
-            return None
-            
-        except Exception as e:
-            log.error(f"Confirmed entry error: {e}")
-            return None
-    
-    # ========== CRITICAL IMPROVEMENT #2: MULTI-TIMEFRAME ALIGNMENT ==========
-    
-    def check_higher_tf_alignment(self, multi_tf_data: Dict[str, pd.DataFrame], side: str) -> Tuple[bool, int, List[str]]:
-        """
-        Check if 15M and 30M timeframes support the trade direction
-        Returns (is_aligned, alignment_count, reasons)
-        """
-        try:
-            alignment_count = 0
-            reasons = []
-            
-            for tf_name in ["15M", "30M"]:
-                if tf_name not in multi_tf_data:
-                    reasons.append(f"No {tf_name} data")
-                    continue
-                    
-                df = multi_tf_data[tf_name]
-                if len(df) < 20:
-                    reasons.append(f"Insufficient {tf_name} data")
-                    continue
-                
-                current_price = df['close'].iloc[-1]
-                
-                # Calculate EMAs for this timeframe
-                ema_fast = df['close'].ewm(span=9, adjust=False).mean().iloc[-1]
-                ema_medium = df['close'].ewm(span=21, adjust=False).mean().iloc[-1]
-                ema_slow = df['close'].ewm(span=50, adjust=False).mean().iloc[-1]
-                
-                # Calculate simple trend using price position relative to EMAs
-                price_above_fast = current_price > ema_fast
-                price_above_medium = current_price > ema_medium
-                price_above_slow = current_price > ema_slow
-                
-                fast_above_medium = ema_fast > ema_medium
-                medium_above_slow = ema_medium > ema_slow
-                
-                if side == "LONG":
-                    # For LONG: We want bullish alignment (price above EMAs, EMAs bullish stacked)
-                    bullish_score = 0
-                    
-                    if price_above_fast:
-                        bullish_score += 1
-                    if price_above_medium:
-                        bullish_score += 1
-                    if price_above_slow:
-                        bullish_score += 1
-                    if fast_above_medium:
-                        bullish_score += 1
-                    if medium_above_slow:
-                        bullish_score += 1
-                    
-                    # Also check if price is making higher highs/lows
-                    if len(df) >= 10:
-                        recent_highs = df['high'].values[-5:]
-                        recent_lows = df['low'].values[-5:]
-                        
-                        if recent_highs[-1] > recent_highs[0] and recent_lows[-1] > recent_lows[0]:
-                            bullish_score += 2  # Strong uptrend
-                    
-                    if bullish_score >= 4:  # Strong alignment
-                        alignment_count += 1
-                        reasons.append(f"{tf_name}: Strong bullish alignment (score: {bullish_score})")
-                    elif bullish_score >= 3:  # Moderate alignment
-                        alignment_count += 1
-                        reasons.append(f"{tf_name}: Moderate bullish alignment (score: {bullish_score})")
-                    else:
-                        reasons.append(f"{tf_name}: Weak bullish alignment (score: {bullish_score})")
-                
-                else:  # SHORT
-                    # For SHORT: We want bearish alignment (price below EMAs, EMAs bearish stacked)
-                    bearish_score = 0
-                    
-                    if not price_above_fast:
-                        bearish_score += 1
-                    if not price_above_medium:
-                        bearish_score += 1
-                    if not price_above_slow:
-                        bearish_score += 1
-                    if not fast_above_medium:
-                        bearish_score += 1
-                    if not medium_above_slow:
-                        bearish_score += 1
-                    
-                    # Also check if price is making lower highs/lows
-                    if len(df) >= 10:
-                        recent_highs = df['high'].values[-5:]
-                        recent_lows = df['low'].values[-5:]
-                        
-                        if recent_highs[-1] < recent_highs[0] and recent_lows[-1] < recent_lows[0]:
-                            bearish_score += 2  # Strong downtrend
-                    
-                    if bearish_score >= 4:  # Strong alignment
-                        alignment_count += 1
-                        reasons.append(f"{tf_name}: Strong bearish alignment (score: {bearish_score})")
-                    elif bearish_score >= 3:  # Moderate alignment
-                        alignment_count += 1
-                        reasons.append(f"{tf_name}: Moderate bearish alignment (score: {bearish_score})")
-                    else:
-                        reasons.append(f"{tf_name}: Weak bearish alignment (score: {bearish_score})")
-            
-            is_aligned = alignment_count >= REJECTION_CONFIG["min_higher_tf_alignment"]
-            return is_aligned, alignment_count, reasons
-            
-        except Exception as e:
-            log.error(f"Higher TF alignment error: {e}")
-            return False, 0, [f"Error: {str(e)[:50]}"]
-    
-    # ========== CRITICAL IMPROVEMENT #3: VOLUME-WEIGHTED REJECTION STRENGTH ==========
-    
-    def _calculate_rejection_strength(self, zone: RejectionZone, strength: MarketStrength, 
-                                     wave: WaveContext, rsi: float, df_3m: pd.DataFrame) -> float:
-        """Calculate overall rejection strength score with volume analysis"""
-        factors = []
-        weights = []
-        
-        # 1. Zone strength (20%)
-        factors.append(zone.strength)
-        weights.append(0.2)
-        
-        # 2. Market strength (20%)
-        factors.append(strength.strength_score)
-        weights.append(0.2)
-        
-        # 3. Wave context (15%)
-        if wave.structure_type == "CORRECTIVE":
-            wave_score = 0.8
-        elif wave.structure_type == "COMPRESSION":
-            wave_score = 0.7
-        else:
-            wave_score = 0.5
-        
-        wave_score *= (1 - wave.wave_maturity * 0.5)  # Reduce if too mature
-        factors.append(wave_score)
-        weights.append(0.15)
-        
-        # 4. RSI position (15%)
-        if zone.rsi_position == "IN_ZONE":
-            rsi_score = 0.9
-        elif zone.rsi_position == "OVEREXTENDED":
-            rsi_score = 0.3
-        else:
-            rsi_score = 0.5
-        factors.append(rsi_score)
-        weights.append(0.15)
-        
-        # 5. **VOLUME CONFIRMATION SCORE (30% - MOST IMPORTANT)**
-        volume_score = self._calculate_volume_rejection_score(df_3m, zone)
-        factors.append(volume_score)
-        weights.append(0.3)
-        
-        return np.average(factors, weights=weights)
-    
-    def _calculate_volume_rejection_score(self, df: pd.DataFrame, zone: RejectionZone) -> float:
-        """Calculate volume-based rejection score"""
-        try:
-            if len(df) < 10:
-                return 0.5
-            
-            # Get recent candles around rejection
-            recent_candles = df.iloc[-5:]
-            
-            # 1. Volume spike at rejection
-            rejection_volume = recent_candles['volume'].iloc[-2:].mean()
-            prior_volume = recent_candles['volume'].iloc[-5:-2].mean()
-            
-            volume_spike_score = 0.5
-            if prior_volume > 0:
-                volume_ratio = rejection_volume / prior_volume
-                if volume_ratio >= 2.0:
-                    volume_spike_score = 1.0
-                elif volume_ratio >= 1.5:
-                    volume_spike_score = 0.8
-                elif volume_ratio >= 1.2:
-                    volume_spike_score = 0.6
-                else:
-                    volume_spike_score = 0.3
-            
-            # 2. Volume pattern (decreasing into rejection is good, increasing is bad)
-            volume_trend = np.polyfit(range(len(recent_candles)), recent_candles['volume'].values, 1)[0]
-            if volume_trend < 0:  # Decreasing volume into level = absorption
-                volume_pattern_score = 0.8
-            elif volume_trend > 0:  # Increasing volume = potential churning
-                volume_pattern_score = 0.4
-            else:
-                volume_pattern_score = 0.6
-            
-            # 3. Candle size vs volume ratio (smart money vs retail)
-            recent_ranges = (recent_candles['high'] - recent_candles['low']).abs()
-            avg_range = recent_ranges.mean() if len(recent_ranges) > 0 else 0
-            last_range = recent_ranges.iloc[-1] if len(recent_ranges) > 0 else 0
-            
-            candle_volume_score = 0.5
-            if avg_range > 0:
-                range_ratio = last_range / avg_range
-                if range_ratio > 1.5 and volume_ratio > 1.5:
-                    # Large range with high volume = strong rejection
-                    candle_volume_score = 0.9
-                elif range_ratio < 0.7 and volume_ratio > 1.5:
-                    # Small range with high volume = absorption/churning
-                    candle_volume_score = 0.7
-                elif range_ratio > 1.5 and volume_ratio < 0.8:
-                    # Large range with low volume = fake move
-                    candle_volume_score = 0.3
-                else:
-                    candle_volume_score = 0.5
-            
-            # 4. Volume climax detection (exhaustion)
-            if len(df) >= 20:
-                historical_volume = df['volume'].values[-20:]
-                current_volume = df['volume'].iloc[-1]
-                
-                if current_volume > np.percentile(historical_volume, 90):
-                    # Very high volume = potential climax
-                    climax_score = 0.7  # Good for rejection, but could be exhaustion
-                elif current_volume < np.percentile(historical_volume, 30):
-                    # Very low volume = no conviction
-                    climax_score = 0.3
-                else:
-                    climax_score = 0.5
-            else:
-                climax_score = 0.5
-            
-            # Weighted average of all volume factors
-            final_score = (
-                volume_spike_score * 0.3 +
-                volume_pattern_score * 0.25 +
-                candle_volume_score * 0.25 +
-                climax_score * 0.2
-            )
-            
-            return min(max(final_score, 0), 1)  # Ensure 0-1 range
-            
-        except Exception as e:
-            log.debug(f"Volume score error: {e}")
-            return 0.5
-    
-    # ========== CRITICAL IMPROVEMENT #5: MARKET CONTEXT FILTERS ==========
-    
-    def check_market_context(self, multi_tf_data: Dict[str, pd.DataFrame], symbol: str, side: str) -> MarketContext:
-        """
-        Check broader market context before trading
-        Returns MarketContext object
-        """
-        context = MarketContext(
-            can_trade=True,
-            reasons=[],
-            trend_strength="NEUTRAL",
-            higher_tf_alignment=0,
-            volume_health="HEALTHY"
-        )
-        
-        try:
-            # 1. Check higher timeframe alignment (already calculated separately)
-            is_aligned, alignment_count, alignment_reasons = self.check_higher_tf_alignment(multi_tf_data, side)
-            context.higher_tf_alignment = alignment_count
-            
-            if not is_aligned:
-                context.can_trade = False
-                context.reasons.extend(alignment_reasons)
-                self.daily_stats["no_higher_tf_alignment"] += 1
-                log.debug(f"{symbol}: No higher TF alignment for {side}")
-                return context
-            
-            context.reasons.extend([r for r in alignment_reasons if "alignment" in r])
-            
-            # 2. Check volume health across timeframes
-            volume_issues = []
-            for tf_name in ["15M", "30M"]:
-                if tf_name in multi_tf_data:
-                    df = multi_tf_data[tf_name]
-                    if len(df) >= 50:
-                        recent_volume = df['volume'].iloc[-5:].mean()
-                        avg_volume = df['volume'].iloc[-50:].mean()
-                        
-                        if avg_volume > 0:
-                            volume_ratio = recent_volume / avg_volume
-                            if volume_ratio < 0.3:
-                                volume_issues.append(f"{tf_name}: Very low volume ({volume_ratio:.1%})")
-                                context.volume_health = "VERY_LOW"
-                            elif volume_ratio < 0.6:
-                                volume_issues.append(f"{tf_name}: Low volume ({volume_ratio:.1%})")
-                                context.volume_health = "LOW"
-            
-            if volume_issues:
-                context.reasons.extend(volume_issues)
-                # Don't reject for low volume alone, but note it
-            
-            # 3. Check for extreme volatility (avoid whipsaws)
-            volatility_issues = []
-            for tf_name in ["15M", "30M"]:
-                if tf_name in multi_tf_data:
-                    df = multi_tf_data[tf_name]
-                    if len(df) >= 20:
-                        # Calculate ATR (simplified)
-                        high_low = df['high'] - df['low']
-                        atr = high_low.rolling(14).mean().iloc[-1]
-                        current_range = df['high'].iloc[-1] - df['low'].iloc[-1]
-                        
-                        if atr > 0:
-                            range_atr_ratio = current_range / atr
-                            if range_atr_ratio > 3.0:
-                                volatility_issues.append(f"{tf_name}: Extreme volatility (range/ATR: {range_atr_ratio:.1f})")
-                                context.can_trade = False
-            
-            if volatility_issues:
-                context.reasons.extend(volatility_issues)
-                self.daily_stats["bad_market_context"] += 1
-            
-            # 4. Check for trend strength consistency
-            trend_scores = []
-            for tf_name in ["15M", "30M"]:
-                if tf_name in multi_tf_data:
-                    df = multi_tf_data[tf_name]
-                    if len(df) >= 30:
-                        # Simple trend detection using moving averages
-                        sma_20 = df['close'].rolling(20).mean().iloc[-1]
-                        sma_50 = df['close'].rolling(50).mean().iloc[-1]
-                        current_price = df['close'].iloc[-1]
-                        
-                        if side == "LONG":
-                            # For LONG: Want bullish trend
-                            if current_price > sma_20 > sma_50:
-                                trend_scores.append(2)  # Strong bullish
-                            elif current_price > sma_20:
-                                trend_scores.append(1)  # Mild bullish
-                            else:
-                                trend_scores.append(0)  # Not bullish
-                        else:  # SHORT
-                            # For SHORT: Want bearish trend
-                            if current_price < sma_20 < sma_50:
-                                trend_scores.append(2)  # Strong bearish
-                            elif current_price < sma_20:
-                                trend_scores.append(1)  # Mild bearish
-                            else:
-                                trend_scores.append(0)  # Not bearish
-            
-            if trend_scores:
-                avg_trend_score = np.mean(trend_scores)
-                if avg_trend_score >= 1.5:
-                    context.trend_strength = "STRONG"
-                elif avg_trend_score >= 0.8:
-                    context.trend_strength = "MODERATE"
-                else:
-                    context.trend_strength = "WEAK"
-                    context.reasons.append(f"Weak trend alignment (score: {avg_trend_score:.1f})")
-            
-            # 5. Check for recent large moves (avoid chasing)
-            for tf_name in ["15M"]:
-                if tf_name in multi_tf_data:
-                    df = multi_tf_data[tf_name]
-                    if len(df) >= 10:
-                        recent_move = abs(df['close'].iloc[-1] - df['close'].iloc[-10]) / df['close'].iloc[-10] * 100
-                        if recent_move > 5.0:  # 5% move in last 10 candles
-                            context.reasons.append(f"Large recent move on {tf_name}: {recent_move:.1f}%")
-                            # Still allow trading, but note it
-            
-            return context
-            
-        except Exception as e:
-            log.error(f"Market context error: {e}")
-            context.can_trade = False
-            context.reasons.append(f"Error: {str(e)[:50]}")
-            return context
-    
-    # ========== DYNAMIC SL/TP METHODS (USING 15M, 30M ONLY) ==========
-    
-    def find_nearest_swing_low_multi_tf(self, multi_tf_data: Dict[str, pd.DataFrame], 
-                                        side: str, entry_price: float, zone_price: float) -> Optional[float]:
-        """
-        Find nearest significant swing low for LONG or swing high for SHORT
-        Uses 15M and 30M ONLY for SL/TP
-        Returns the best swing level across timeframes
-        """
-        try:
-            # Define which timeframes to use for swing analysis (15M and 30M ONLY)
-            swing_tfs = ["15M", "30M"]
-            
-            all_swings = []
-            
-            for tf_name in swing_tfs:
-                if tf_name not in multi_tf_data:
-                    continue
-                    
-                df = multi_tf_data[tf_name]
-                
-                if len(df) < 50:
-                    continue
-                
-                if side == "LONG":
-                    # For LONG: look for recent swing lows BELOW current price
-                    swing_lows = []
-                    
-                    # Scan last 50 candles for swing lows
-                    for i in range(5, len(df) - 5):
-                        low = df['low'].iloc[i]
-                        
-                        # Check if this is a swing low (lower than 5 candles on each side)
-                        is_swing = True
-                        for j in range(1, 6):
-                            if low >= df['low'].iloc[i-j]:
-                                is_swing = False
-                                break
-                            if low >= df['low'].iloc[i+j]:
-                                is_swing = False
-                                break
-                        
-                        if is_swing:
-                            # Only consider swing lows BELOW entry zone with reasonable distance
-                            if low < zone_price * 0.98:  # At least 2% below
-                                swing_lows.append({
-                                    'price': low,
-                                    'position': i,
-                                    'distance': zone_price - low,
-                                    'timeframe': tf_name,
-                                    'candles_ago': len(df) - i - 1
-                                })
-                    
-                    if not swing_lows:
-                        continue
-                    
-                    # Sort by distance (closest first)
-                    swing_lows.sort(key=lambda x: x['distance'])
-                    
-                    # Get the closest valid swing low
-                    for swing in swing_lows:
-                        swing_price = swing['price']
-                        
-                        # Check if this swing is still valid (not broken recently)
-                        recent_lows = df['low'].values[swing['position']+1:]
-                        if len(recent_lows) > 0 and min(recent_lows) < swing_price:
-                            continue  # This swing was broken, skip
-                        
-                        # Weight by timeframe (30M gets priority)
-                        timeframe_weight = 1.0
-                        if swing['timeframe'] == "30M":
-                            timeframe_weight = 1.2
-                        elif swing['timeframe'] == "15M":
-                            timeframe_weight = 1.0
-                        
-                        # Adjust price based on timeframe weight
-                        adjusted_price = swing_price * (1 - (timeframe_weight - 1) * 0.001)
-                        
-                        all_swings.append({
-                            'price': adjusted_price,
-                            'original_price': swing_price,
-                            'distance': swing['distance'],
-                            'timeframe': swing['timeframe'],
-                            'weight': timeframe_weight,
-                            'candles_ago': swing['candles_ago']
-                        })
-                        
-                        # Take only the best from each timeframe
-                        break
-                        
-                else:  # SHORT
-                    # For SHORT: look for recent swing highs ABOVE current price
-                    swing_highs = []
-                    
-                    # Scan last 50 candles for swing highs
-                    for i in range(5, len(df) - 5):
-                        high = df['high'].iloc[i]
-                        
-                        # Check if this is a swing high (higher than 5 candles on each side)
-                        is_swing = True
-                        for j in range(1, 6):
-                            if high <= df['high'].iloc[i-j]:
-                                is_swing = False
-                                break
-                            if high <= df['high'].iloc[i+j]:
-                                is_swing = False
-                                break
-                        
-                        if is_swing:
-                            # Only consider swing highs ABOVE entry zone with reasonable distance
-                            if high > zone_price * 1.02:  # At least 2% above
-                                swing_highs.append({
-                                    'price': high,
-                                    'position': i,
-                                    'distance': high - zone_price,
-                                    'timeframe': tf_name,
-                                    'candles_ago': len(df) - i - 1
-                                })
-                    
-                    if not swing_highs:
-                        continue
-                    
-                    # Sort by distance (closest first)
-                    swing_highs.sort(key=lambda x: x['distance'])
-                    
-                    # Get the closest valid swing high
-                    for swing in swing_highs:
-                        swing_price = swing['price']
-                        
-                        # Check if this swing is still valid (not broken recently)
-                        recent_highs = df['high'].values[swing['position']+1:]
-                        if len(recent_highs) > 0 and max(recent_highs) > swing_price:
-                            continue  # This swing was broken, skip
-                        
-                        # Weight by timeframe (30M gets priority)
-                        timeframe_weight = 1.0
-                        if swing['timeframe'] == "30M":
-                            timeframe_weight = 1.2
-                        elif swing['timeframe'] == "15M":
-                            timeframe_weight = 1.0
-                        
-                        # Adjust price based on timeframe weight
-                        adjusted_price = swing_price * (1 + (timeframe_weight - 1) * 0.001)
-                        
-                        all_swings.append({
-                            'price': adjusted_price,
-                            'original_price': swing_price,
-                            'distance': swing['distance'],
-                            'timeframe': swing['timeframe'],
-                            'weight': timeframe_weight,
-                            'candles_ago': swing['candles_ago']
-                        })
-                        
-                        # Take only the best from each timeframe
-                        break
-            
-            if not all_swings:
-                return None
-            
-            # Sort swings by weight (30M first) then distance
-            all_swings.sort(key=lambda x: (-x['weight'], x['distance']))
-            
-            # Get the best swing (30M priority, then closest distance)
-            best_swing = all_swings[0]
-            
-            # Add small buffer (0.3%)
-            if side == "LONG":
-                return best_swing['price'] * 0.997
-            else:  # SHORT
-                return best_swing['price'] * 1.003
-                
-        except Exception as e:
-            log.error(f"Swing analysis error: {e}")
-            return None
-    
-    def find_nearest_swing_tp_multi_tf(self, multi_tf_data: Dict[str, pd.DataFrame], side: str, 
-                                       entry_price: float, stop_loss: float, 
-                                       current_rsi: float) -> Optional[Tuple[float, str, str]]:
-        """
-        Find nearest swing high/low for take profit (FALLBACK METHOD)
-        Uses 15M and 30M ONLY
-        Returns (tp_price, source, timeframe) or None if no valid swing found
-        """
-        try:
-            # Define which timeframes to use for TP analysis (15M and 30M ONLY)
-            tp_tfs = ["15M", "30M"]
-            
-            all_targets = []
-            
-            for tf_name in tp_tfs:
-                if tf_name not in multi_tf_data:
-                    continue
-                    
-                df = multi_tf_data[tf_name]
-                
-                if len(df) < 50:
-                    continue
-                
-                if side == "LONG":
-                    # For LONG: look for nearest swing HIGH above entry
-                    swing_highs = []
-                    
-                    # Scan for swing highs (higher than 5 candles on each side)
-                    for i in range(10, len(df) - 10):
-                        high = df['high'].iloc[i]
-                        
-                        # Check if this is a swing high
-                        is_swing = True
-                        for j in range(1, 6):  # 5 candles each side
-                            if high <= df['high'].iloc[i-j]:
-                                is_swing = False
-                                break
-                            if high <= df['high'].iloc[i+j]:
-                                is_swing = False
-                                break
-                        
-                        if is_swing and high > entry_price:
-                            # Check if this swing is still valid (not broken)
-                            recent_highs = df['high'].values[i+1:]
-                            if len(recent_highs) == 0 or max(recent_highs) <= high:
-                                distance = high - entry_price
-                                swing_highs.append({
-                                    'price': high,
-                                    'distance': distance,
-                                    'position': i,
-                                    'timeframe': tf_name
-                                })
-                    
-                    if not swing_highs:
-                        continue
-                    
-                    # Sort by distance (NEAREST FIRST)
-                    swing_highs.sort(key=lambda x: x['distance'])
-                    
-                    # Take the NEAREST valid swing high
-                    for swing in swing_highs:
-                        swing_price = swing['price']
-                        
-                        # Basic minimum distance check (at least 0.3%)
-                        if swing['distance'] / entry_price > MIN_TP_DISTANCE_PCT / 100:
-                            # Add small buffer
-                            tp_price = swing_price * 0.998
-                            
-                            all_targets.append({
-                                'price': tp_price,
-                                'original_price': swing_price,
-                                'distance': swing['distance'],
-                                'timeframe': tf_name,
-                                'weight': 1.3 if tf_name == "30M" else 1.0
-                            })
-                            break  # Only take nearest from this timeframe
-                        
-                else:  # SHORT
-                    # For SHORT: look for nearest swing LOW below entry
-                    swing_lows = []
-                    
-                    # Scan for swing lows (lower than 5 candles on each side)
-                    for i in range(10, len(df) - 10):
-                        low = df['low'].iloc[i]
-                        
-                        # Check if this is a swing low
-                        is_swing = True
-                        for j in range(1, 6):  # 5 candles each side
-                            if low >= df['low'].iloc[i-j]:
-                                is_swing = False
-                                break
-                            if low >= df['low'].iloc[i+j]:
-                                is_swing = False
-                                break
-                        
-                        if is_swing and low < entry_price:
-                            # Check if this swing is still valid (not broken)
-                            recent_lows = df['low'].values[i+1:]
-                            if len(recent_lows) == 0 or min(recent_lows) >= low:
-                                distance = entry_price - low
-                                swing_lows.append({
-                                    'price': low,
-                                    'distance': distance,
-                                    'position': i,
-                                    'timeframe': tf_name
-                                })
-                    
-                    if not swing_lows:
-                        continue
-                    
-                    # Sort by distance (NEAREST FIRST)
-                    swing_lows.sort(key=lambda x: x['distance'])
-                    
-                    # Take the NEAREST valid swing low
-                    for swing in swing_lows:
-                        swing_price = swing['price']
-                        
-                        # Basic minimum distance check (at least 0.3%)
-                        if swing['distance'] / entry_price > MIN_TP_DISTANCE_PCT / 100:
-                            # Add small buffer
-                            tp_price = swing_price * 1.002
-                            
-                            all_targets.append({
-                                'price': tp_price,
-                                'original_price': swing_price,
-                                'distance': swing['distance'],
-                                'timeframe': tf_name,
-                                'weight': 1.3 if tf_name == "30M" else 1.0
-                            })
-                            break  # Only take nearest from this timeframe
-            
-            if not all_targets:
-                return None
-            
-            # Choose NEAREST across all timeframes (prioritize 30M if similar)
-            all_targets.sort(key=lambda x: (-x['weight'], x['distance']))
-            
-            best_target = all_targets[0]
-            
-            return best_target['price'], "SWING_HIGH_LOW", best_target['timeframe']
-                
-        except Exception as e:
-            log.error(f"Swing TP analysis error: {e}")
-            return None
-    
-    def find_liquidity_pool_target_multi_tf(self, multi_tf_data: Dict[str, pd.DataFrame], side: str, 
-                                            entry_price: float, stop_loss: float, 
-                                            current_rsi: float) -> Optional[Tuple[float, str, str]]:
-        """
-        Find nearest liquidity pool for take profit (PRIMARY METHOD)
-        Uses 15M and 30M ONLY
-        Returns (tp_price, source, timeframe) or None if no valid target found
-        """
-        try:
-            # Define which timeframes to use for liquidity analysis (15M and 30M ONLY)
-            liquidity_tfs = ["15M", "30M"]
-            
-            all_targets = []
-            
-            for tf_name in liquidity_tfs:
-                if tf_name not in multi_tf_data:
-                    continue
-                    
-                df = multi_tf_data[tf_name]
-                
-                if len(df) < 80:
-                    continue
-                
-                if side == "LONG":
-                    # For LONG: look for nearest resistance level (liquidity above)
-                    resistance_levels = []
-                    
-                    # 1. Recent swing highs (last 80 candles) - NEAREST ONLY
-                    for i in range(20, len(df) - 20):
-                        high = df['high'].iloc[i]
-                        
-                        # Check if this is a swing high
-                        is_swing = True
-                        for j in range(1, 6):  # 5 candles each side
-                            if high <= df['high'].iloc[i-j] or high <= df['high'].iloc[i+j]:
-                                is_swing = False
-                                break
-                        
-                        if is_swing and high > entry_price:
-                            # Check if this swing is still valid (not broken)
-                            recent_highs = df['high'].values[i+1:]
-                            if len(recent_highs) == 0 or max(recent_highs) <= high:
-                                distance = high - entry_price
-                                resistance_levels.append({
-                                    'price': high,
-                                    'distance': distance,
-                                    'timeframe': tf_name,
-                                    'type': 'swing_high'
-                                })
-                    
-                    # 2. High volume nodes (clusters) - NEAREST ONLY
-                    price_bins = np.linspace(df['low'].min(), df['high'].max(), 25)
-                    
-                    for i in range(len(price_bins) - 1):
-                        low_bound = price_bins[i]
-                        high_bound = price_bins[i + 1]
-                        
-                        # Sum volume in this price range
-                        mask = (df['low'] >= low_bound) & (df['high'] <= high_bound)
-                        if mask.any():
-                            volume_in_range = df.loc[mask, 'volume'].sum()
-                            mid_price = (low_bound + high_bound) / 2
-                            
-                            # Only consider if significant volume AND above entry
-                            if mid_price > entry_price and volume_in_range > df['volume'].mean() * 0.5:
-                                distance = mid_price - entry_price
-                                resistance_levels.append({
-                                    'price': mid_price,
-                                    'distance': distance,
-                                    'timeframe': tf_name,
-                                    'type': 'volume_node',
-                                    'volume': volume_in_range
-                                })
-                    
-                    # Combine and sort by distance (NEAREST FIRST)
-                    if resistance_levels:
-                        resistance_levels.sort(key=lambda x: x['distance'])
-                        
-                        # Take the NEAREST valid resistance
-                        for target in resistance_levels:
-                            # Basic safety check - at least minimum distance
-                            if target['distance'] / entry_price > MIN_TP_DISTANCE_PCT / 100:
-                                # Add small buffer below the level
-                                tp_price = target['price'] * 0.998
-                                
-                                all_targets.append({
-                                    'price': tp_price,
-                                    'original_price': target['price'],
-                                    'distance': target['distance'],
-                                    'timeframe': tf_name,
-                                    'type': target.get('type', 'unknown'),
-                                    'weight': 1.3 if tf_name == "30M" else 1.0
-                                })
-                                break  # Take only the NEAREST from this timeframe
-                    
-                else:  # SHORT
-                    # For SHORT: look for nearest support level (liquidity below)
-                    support_levels = []
-                    
-                    # 1. Recent swing lows (last 80 candles) - NEAREST ONLY
-                    for i in range(20, len(df) - 20):
-                        low = df['low'].iloc[i]
-                        
-                        # Check if this is a swing low
-                        is_swing = True
-                        for j in range(1, 6):  # 5 candles each side
-                            if low >= df['low'].iloc[i-j] or low >= df['low'].iloc[i+j]:
-                                is_swing = False
-                                break
-                        
-                        if is_swing and low < entry_price:
-                            # Check if this swing is still valid (not broken)
-                            recent_lows = df['low'].values[i+1:]
-                            if len(recent_lows) == 0 or min(recent_lows) >= low:
-                                distance = entry_price - low
-                                support_levels.append({
-                                    'price': low,
-                                    'distance': distance,
-                                    'timeframe': tf_name,
-                                    'type': 'swing_low'
-                                })
-                    
-                    # 2. High volume nodes (clusters) - NEAREST ONLY
-                    price_bins = np.linspace(df['low'].min(), df['high'].max(), 25)
-                    
-                    for i in range(len(price_bins) - 1):
-                        low_bound = price_bins[i]
-                        high_bound = price_bins[i + 1]
-                        
-                        # Sum volume in this price range
-                        mask = (df['low'] >= low_bound) & (df['high'] <= high_bound)
-                        if mask.any():
-                            volume_in_range = df.loc[mask, 'volume'].sum()
-                            mid_price = (low_bound + high_bound) / 2
-                            
-                            # Only consider if significant volume AND below entry
-                            if mid_price < entry_price and volume_in_range > df['volume'].mean() * 0.5:
-                                distance = entry_price - mid_price
-                                support_levels.append({
-                                    'price': mid_price,
-                                    'distance': distance,
-                                    'timeframe': tf_name,
-                                    'type': 'volume_node',
-                                    'volume': volume_in_range
-                                })
-                    
-                    # Combine and sort by distance (NEAREST FIRST)
-                    if support_levels:
-                        support_levels.sort(key=lambda x: x['distance'])
-                        
-                        # Take the NEAREST valid support
-                        for target in support_levels:
-                            # Basic safety check - at least minimum distance
-                            if target['distance'] / entry_price > MIN_TP_DISTANCE_PCT / 100:
-                                # Add small buffer above the level
-                                tp_price = target['price'] * 1.002
-                                
-                                all_targets.append({
-                                    'price': tp_price,
-                                    'original_price': target['price'],
-                                    'distance': target['distance'],
-                                    'timeframe': tf_name,
-                                    'type': target.get('type', 'unknown'),
-                                    'weight': 1.3 if tf_name == "30M" else 1.0
-                                })
-                                break  # Take only the NEAREST from this timeframe
-            
-            if not all_targets:
-                return None
-            
-            # Choose NEAREST across all timeframes (but prioritize 30M if similar distance)
-            all_targets.sort(key=lambda x: (-x['weight'], x['distance']))
-            
-            best_target = all_targets[0]
-            
-            return best_target['price'], "LIQUIDITY_POOL", best_target['timeframe']
-                
-        except Exception as e:
-            log.error(f"Liquidity pool analysis error: {e}")
-            return None
-    
-    def calculate_dynamic_sl_tp_multi_tf(self, multi_tf_data: Dict[str, pd.DataFrame], side: str, 
-                                        entry_price: float, zone_price: float, 
-                                        current_rsi: float) -> Tuple[Optional[float], Optional[float], Optional[str], Optional[str]]:
-        """
-        Calculate dynamic stop loss and take profit using 15M and 30M ONLY
-        Returns (stop_loss, take_profit, tp_source, tp_timeframe)
-        
-        NEW LOGIC: Always choose NEAREST valid levels
-        """
-        try:
-            # 1. Find nearest swing for stop loss (unchanged - already uses nearest)
-            stop_loss = self.find_nearest_swing_low_multi_tf(
-                multi_tf_data=multi_tf_data,
-                side=side,
-                entry_price=entry_price,
-                zone_price=zone_price
-            )
-            
-            if stop_loss is None:
-                log.debug(f"No valid swing found for {side} stop loss across 15M/30M")
-                return None, None, None, None
-            
-            # 2. Find nearest TP using new NEAREST-ONLY logic
-            take_profit = None
-            tp_source = None
-            tp_timeframe = None
-            
-            # Try liquidity pool first (NEAREST only)
-            result = self.find_liquidity_pool_target_multi_tf(
-                multi_tf_data=multi_tf_data,
-                side=side,
-                entry_price=entry_price,
-                stop_loss=stop_loss,
-                current_rsi=current_rsi
-            )
-            
-            if result:
-                take_profit, tp_source, tp_timeframe = result
-                log.info(f"✅ Using NEAREST LIQUIDITY_POOL as TP (from {tp_timeframe}) for {side}")
-            
-            # Fallback to swing if no liquidity pool
-            if take_profit is None:
-                log.debug(f"No valid liquidity pool found for {side}, trying nearest swing...")
-                result = self.find_nearest_swing_tp_multi_tf(
-                    multi_tf_data=multi_tf_data,
-                    side=side,
-                    entry_price=entry_price,
-                    stop_loss=stop_loss,
-                    current_rsi=current_rsi
-                )
-                
-                if result:
-                    take_profit, tp_source, tp_timeframe = result
-                    log.info(f"✅ Using NEAREST SWING_HIGH_LOW as TP (from {tp_timeframe}) for {side}")
-            
-            if take_profit is None:
-                log.debug(f"No valid take profit level found for {side} across 15M/30M")
-                return None, None, None, None
-            
-            # 3. Calculate final distance and log
-            if side == "LONG":
-                distance_pct = (take_profit - entry_price) / entry_price * 100
-                risk = entry_price - stop_loss
-            else:  # SHORT
-                distance_pct = (entry_price - take_profit) / entry_price * 100
-                risk = stop_loss - entry_price
-            
-            if risk > 0:
-                risk_reward = abs(take_profit - entry_price) / risk
-            else:
-                risk_reward = 0
-            
-            log.info(f"✅ Dynamic SL/TP (NEAREST): SL={stop_loss:.6f}, TP={take_profit:.6f}")
-            log.info(f"   Distance: {distance_pct:.1f}%, R:R={risk_reward:.2f}:1, Source={tp_source}, TF={tp_timeframe}")
-            
-            return stop_loss, take_profit, tp_source, tp_timeframe
-            
-        except Exception as e:
-            log.error(f"Dynamic SL/TP calculation error: {e}")
-            return None, None, None, None
-    
-    # ========== REJECTION SIGNAL GENERATION ==========
-    
-    def calculate_rsi(self, prices: pd.Series, period: int = RSI_PERIOD) -> pd.Series:
-        """Calculate RSI"""
-        delta = prices.diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
-        rs = gain / loss
-        rsi = 100 - (100 / (1 + rs))
-        return rsi
-    
-    def calculate_emas(self, df: pd.DataFrame) -> Dict[str, float]:
-        """Calculate current EMA values"""
-        try:
-            emas = {}
-            for name, period in EMA_PERIODS.items():
-                ema_series = df['close'].ewm(span=period, adjust=False).mean()
-                emas[name] = ema_series.iloc[-1] if len(ema_series) > 0 else 0
-            return emas
-        except Exception as e:
-            return {name: 0 for name in EMA_PERIODS.keys()}
-    
-    def generate_rejection_signal(self, multi_tf_data: Dict[str, pd.DataFrame], 
-                                 symbol: str) -> Optional[RejectionSignal]:
-        """
-        Generate rejection-based signal with DYNAMIC SL/TP from 15M/30M ONLY
-        NOW WITH: Confirmed Entry, Multi-TF Alignment, Volume-Weighted Strength, Market Context
-        """
-        try:
-            # Get timeframe data
-            tf_30m = multi_tf_data.get("30M")
-            tf_15m = multi_tf_data.get("15M")
-            tf_5m = multi_tf_data.get("5M")
-            tf_3m = multi_tf_data.get("3M")
-            tf_1m = multi_tf_data.get("1M")
-            
-            # Check data availability - need at least 15m and 3m for entry
-            if tf_15m is None or tf_3m is None:
-                log.debug(f"{symbol}: Missing key timeframe data")
-                return None
-            
-            # Check for 15M/30M data for SL/TP
-            if tf_30m is None and tf_15m is None:
-                log.debug(f"{symbol}: No 15M/30M data available for SL/TP")
-                return None
-            
-            # 1. Analyze wave context (15M + 5M)
-            wave_context = self.analyze_wave_context(tf_15m, tf_5m)
-            
-            # 2. Analyze market strength on 15M
-            market_strength = self.analyze_market_strength(tf_15m)
-            
-            # CRITICAL: No strength → no trade
-            if market_strength.strength_score < 0.2:
-                self.daily_stats["no_strength"] += 1
-                log.debug(f"{symbol}: No market strength ({market_strength.strength_score:.2f})")
-                return None
-            
-            # 3. Calculate indicators on 3M (entry timeframe)
-            current_price = tf_3m['close'].iloc[-1]
-            emas = self.calculate_emas(tf_3m)
-            
-            # Calculate RSI
-            rsi_series = self.calculate_rsi(tf_3m['close'])
-            current_rsi = rsi_series.iloc[-1] if len(rsi_series) > 0 else 50
-            
-            # 4. Find rejection zones on 3M
-            rejection_zones = self.find_rejection_zones(tf_3m, current_price, current_rsi, emas)
-            
-            # CRITICAL: No rejection zone → no trade
-            if not rejection_zones:
-                self.daily_stats["no_rejection_zone"] += 1
-                log.debug(f"{symbol}: No active rejection zone")
-                return None
-            
-            # 5. Check volume confirmation for each zone
-            valid_zones = []
-            for zone in rejection_zones:
-                # Check volume confirmation
-                zone.volume_confirmation = self._check_volume_confirmation(tf_3m, zone.zone_type)
-                
-                # Only consider zones with volume confirmation
-                if zone.volume_confirmation:
-                    valid_zones.append(zone)
-            
-            if not valid_zones:
-                log.debug(f"{symbol}: No volume confirmation at rejection zones")
-                return None
-            
-            # 6. Select strongest rejection zone
-            best_zone = max(valid_zones, key=lambda z: z.strength)
-            
-            # 7. Determine trade side based on zone type
-            side = None
-            if best_zone.zone_type in ["EMA_SUPPORT", "RANGE_LOW", "FAILED_BREAKDOWN", "DEMAND"]:
-                side = "LONG"
-            elif best_zone.zone_type in ["EMA_RESISTANCE", "RANGE_HIGH", "FAILED_BREAKOUT", "SUPPLY"]:
-                side = "SHORT"
-            
-            if not side:
-                log.debug(f"{symbol}: Could not determine side for zone {best_zone.zone_type}")
-                return None
-            
-            # 8. Check RSI position for the zone
-            if side == "LONG" and best_zone.rsi_position != "IN_ZONE":
-                log.debug(f"{symbol}: RSI not in LONG zone ({current_rsi:.1f})")
-                return None
-            elif side == "SHORT" and best_zone.rsi_position != "IN_ZONE":
-                log.debug(f"{symbol}: RSI not in SHORT zone ({current_rsi:.1f})")
-                return None
-            
-            # 9. **CRITICAL IMPROVEMENT #5: MARKET CONTEXT FILTERS**
-            market_context = self.check_market_context(multi_tf_data, symbol, side)
-            
-            if not market_context.can_trade:
-                log.debug(f"{symbol}: Bad market context: {', '.join(market_context.reasons[:3])}")
-                return None
-            
-            # 10. **CRITICAL IMPROVEMENT #1: CONFIRMED ENTRY ONLY**
-            entry_result = self._get_confirmed_entry_price(tf_3m, side, best_zone)
-            
-            if not entry_result:
-                self.daily_stats["no_confirmed_entry"] += 1
-                log.debug(f"{symbol}: No confirmed entry price found")
-                return None
-            
-            entry_price, rejection_type, trigger_candle = entry_result
-            
-            # 11. **CRITICAL IMPROVEMENT #2: MULTI-TIMEFRAME ALIGNMENT**
-            # (Already checked in market_context, but verify again)
-            if market_context.higher_tf_alignment < REJECTION_CONFIG["min_higher_tf_alignment"]:
-                log.debug(f"{symbol}: Insufficient higher TF alignment ({market_context.higher_tf_alignment})")
-                return None
-            
-            # 12. TRADE-BASED DEDUPLICATION CHECK
-            if not self.deduplicator.should_generate_signal(symbol, side, entry_price):
-                self.daily_stats["rejections_filtered"] += 1
-                return None
-            
-            # 13. Calculate DYNAMIC SL/TP using 15M/30M ONLY with NEAREST-ONLY logic
-            zone_price = best_zone.price_level
-            
-            # Calculate dynamic SL/TP with source tracking (NEAREST ONLY)
-            stop_loss, take_profit, tp_source, tp_timeframe = self.calculate_dynamic_sl_tp_multi_tf(
-                multi_tf_data=multi_tf_data,
-                side=side,
-                entry_price=entry_price,
-                zone_price=zone_price,
-                current_rsi=current_rsi
-            )
-            
-            if stop_loss is None or take_profit is None or tp_source is None or tp_timeframe is None:
-                log.debug(f"{symbol}: No valid dynamic SL/TP levels found across 15M/30M")
-                return None
-            
-            # Calculate Risk/Reward (for logging only, not for selection)
-            if side == "LONG":
-                risk = entry_price - stop_loss
-                reward = take_profit - entry_price
-            else:  # SHORT
-                risk = stop_loss - entry_price
-                reward = entry_price - take_profit
-            
-            if risk <= 0:
-                log.debug(f"{symbol}: Invalid risk calculation")
-                return None
-            
-            risk_reward = reward / risk
-            
-            # Calculate expected move percentage
-            if side == "LONG":
-                expected_move_pct = (take_profit - entry_price) / entry_price * 100
-            else:
-                expected_move_pct = (entry_price - take_profit) / entry_price * 100
-            
-            # 14. **CRITICAL IMPROVEMENT #3: VOLUME-WEIGHTED REJECTION STRENGTH**
-            rejection_strength = self._calculate_rejection_strength(
-                best_zone, market_strength, wave_context, current_rsi, tf_3m
-            )
-            
-            if rejection_strength < REJECTION_CONFIG["min_rejection_strength"]:
-                log.debug(f"{symbol}: Rejection too weak ({rejection_strength:.2f})")
-                return None
-            
-            # 15. Determine conditions met
-            conditions_met = self._get_rejection_conditions(
-                wave_context, market_strength, best_zone, rejection_type
-            )
-            
-            # Add market context conditions
-            conditions_met.append(f"TF_ALIGNMENT_{market_context.higher_tf_alignment}")
-            conditions_met.append(f"TREND_{market_context.trend_strength}")
-            conditions_met.append(f"VOLUME_{market_context.volume_health}")
-            
-            # 16. Create signal ID
-            signal_id = hashlib.md5(
-                f"{symbol}:{side}:{entry_price:.8f}:{time.time()}:{best_zone.zone_type}".encode()
-            ).hexdigest()
-            
-            # 17. Create final signal with all improvements
-            signal = RejectionSignal(
-                signal_id=signal_id,
-                symbol=symbol,
-                side=side,
-                
-                entry_price=entry_price,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                
-                # TP SOURCE TRACKING
-                tp_source=tp_source,
-                tp_timeframe=tp_timeframe,
-                
-                wave_context=wave_context,
-                market_strength=market_strength,
-                rejection_zone=best_zone,
-                market_context=market_context,  # NEW: Market context included
-                
-                rejection_type=rejection_type,
-                trigger_candle=trigger_candle,
-                rsi_at_entry=current_rsi,
-                
-                rejection_strength=rejection_strength,
-                risk_reward=risk_reward,
-                expected_move_pct=expected_move_pct,
-                
-                timeframe_used="3M",
-                signal_timestamp=time.time(),
-                conditions_met=conditions_met
-            )
-            
-            # 18. Update tracking and deduplication
-            self.deduplicator.register_signal(signal)
-            self.active_signal_ids.add(signal_id)
-            
-            # 19. Update statistics
-            self.daily_stats["rejections_found"] += 1
-            if side == "LONG":
-                self.daily_stats["long_rejections"] += 1
-            else:
-                self.daily_stats["short_rejections"] += 1
-            
-            log.info(f"🎯 CONFIRMED REJECTION SIGNAL: {symbol} {side} @ {entry_price:.4f}")
-            log.info(f"   Zone: {best_zone.zone_type}, Strength: {rejection_strength:.2f} (Volume-weighted)")
-            log.info(f"   RSI: {current_rsi:.1f}, TP Distance: {expected_move_pct:.1f}%")
-            log.info(f"   SL: {stop_loss:.4f} ({abs(entry_price-stop_loss)/entry_price*100:.1f}%)")
-            log.info(f"   TP: {take_profit:.4f} ({abs(take_profit-entry_price)/entry_price*100:.1f}%)")
-            log.info(f"   TP Source: {tp_source} (from {tp_timeframe})")
-            log.info(f"   Market Context: {market_context.trend_strength} trend, {market_context.higher_tf_alignment} TF aligned")
-            log.info(f"   Entry Type: {rejection_type} - {trigger_candle}")
-            log.info(f"   Wave: {wave_context.wave_length}, Maturity: {wave_context.wave_maturity:.1%}")
-            
-            return signal
-            
-        except Exception as e:
-            log.error(f"Rejection signal error for {symbol}: {e}")
-            return None
-    
-    def _check_volume_confirmation(self, df: pd.DataFrame, zone_type: str) -> bool:
-        """Check volume confirmation at rejection zone"""
-        try:
-            if len(df) < 5:
-                return False
-            
-            # Get recent candles
-            recent_candles = df.iloc[-5:]
-            
-            # Check for volume spike in last 1-2 candles
-            recent_volume = recent_candles['volume'].values[-2:].mean()
-            prev_volume = recent_candles['volume'].values[-5:-2].mean()
-            
-            if prev_volume > 0:
-                volume_ratio = recent_volume / prev_volume
-                
-                # Volume spike (1.5x or more) is confirmation
-                if volume_ratio >= 1.5:
-                    return True
-            
-            # Also check if volume is decreasing into the zone (for failed breaks)
-            if "FAILED" in zone_type:
-                volume_trend = np.polyfit(range(5), recent_candles['volume'].values[-5:], 1)[0]
-                if volume_trend < 0:  # Decreasing volume into the level
-                    return True
-            
-            return False
-            
-        except Exception as e:
-            return False
-    
-    def _get_rejection_conditions(self, wave: WaveContext, strength: MarketStrength, 
-                                 zone: RejectionZone, rejection_type: str) -> List[str]:
-        """Get list of conditions met for this rejection"""
-        conditions = []
-        
-        # Wave conditions
-        conditions.append(f"WAVE_{wave.wave_length}")
-        conditions.append(f"STRUCTURE_{wave.structure_type}")
-        
-        # Strength conditions
-        if strength.is_continuation:
-            conditions.append("STRENGTH_CONTINUATION")
-        if strength.is_rejection_setup:
-            conditions.append("STRENGTH_REJECTION_SETUP")
-        if strength.is_absorption:
-            conditions.append("STRENGTH_ABSORPTION")
-        if strength.is_compression:
-            conditions.append("STRENGTH_COMPRESSION")
-        
-        # Zone conditions
-        conditions.append(f"ZONE_{zone.zone_type}")
-        if zone.volume_confirmation:
-            conditions.append("VOLUME_CONFIRMED")
-        
-        # Rejection type
-        conditions.append(f"REJECTION_{rejection_type}")
-        
-        # RSI condition
-        conditions.append(f"RSI_{zone.rsi_position}")
-        
-        return conditions
-    
-    def get_daily_stats(self) -> Dict:
-        """Get daily statistics"""
-        return self.daily_stats
-    
-    def cleanup_old_signals(self):
-        """Clean up old signals from deduplication"""
-        self.deduplicator.remove_closed_signals()
+@dataclass
+class TakeProfitLevels:
+    """Step 7: Take Profit output"""
+    tp1: float  # Nearest internal liquidity
+    tp2: float  # Range boundary
+    tp3: float  # HTF liquidity
+    tp1_type: str = "INTERNAL_LIQUIDITY"
+    tp2_type: str = "RANGE_BOUNDARY"
+    tp3_type: str = "HTF_LIQUIDITY"
 
-# ================ MAIN SCANNER SYSTEM ================
-class RejectionScanner:
-    """Main scanner system for rejection-based trading"""
+@dataclass
+class ProbabilityScore:
+    """Step 8: Probability Check output"""
+    htf_alignment: float  # 0-1
+    liquidity_quality: float  # 0-1
+    sweep_strength: float  # 0-1
+    structure_clarity: float  # 0-1
+    entry_precision: float  # 0-1
+    total_score: float  # 0-5
     
-    def __init__(self):
-        self.scanner = RejectionBasedScanner()
-        self.exchange = None
-        self.db = None
-        self.scan_cycle = 0
-        
-    async def initialize(self):
-        """Initialize the scanner"""
-        log.info("=" * 70)
-        log.info("🔥 REJECTION-BASED HIGH-FREQUENCY SCANNER")
-        log.info("=" * 70)
-        log.info("TRADER ROLE: Discretionary reaction trader")
-        log.info("SPECIALTY: Wave-length awareness + Strength analysis + Rejection entries")
-        log.info("PHILOSOPHY: Wave length sets context, Strength & volume make decision")
-        log.info("ENTRY RULE: Rejection pulls the trigger")
-        log.info(f"SCAN INTERVAL: {SCAN_INTERVAL} seconds")
-        log.info("TIME FRAMES: 30M/15M (SL/TP ONLY), 5M/3M/1M (entries)")
-        log.info("REJECTION ZONES: EMA, Range, Failed breaks only")
-        log.info("RSI ZONES: 40-50 (LONG), 50-60 (SHORT)")
-        log.info("🎯 <u>STOP LOSS: Nearest Swing Low/High (15M/30M ONLY)</u>")
-        log.info("🎯 <u>TAKE PROFIT: Nearest Level Only (NO R:R SELECTION)</u>")
-        log.info("🎯 TP PRIORITY: 1) Nearest Liquidity Pool 2) Nearest Swing High/Low")
-        log.info(f"🎯 MINIMUM TP DISTANCE: {MIN_TP_DISTANCE_PCT}%")
-        log.info("🛑 STRICT RULE: NEVER use 1H/5M/3M/1M for SL/TP - ALWAYS use 15M/30M ONLY")
-        
-        log.info("=" * 70)
-        log.info("🚀 **CRITICAL IMPROVEMENTS IMPLEMENTED:**")
-        log.info("1. ✅ CONFIRMED ENTRY ONLY - Wait for candle close beyond zone")
-        log.info("2. ✅ MULTI-TIMEFRAME ALIGNMENT - Require 15M/30M trend agreement")
-        log.info("3. ✅ VOLUME-WEIGHTED STRENGTH - Volume is 30% of rejection score")
-        log.info("4. ✅ MARKET CONTEXT FILTERS - Avoid trading during bad conditions")
-        log.info("=" * 70)
-        
-        log.info("DEDUPLICATION: ONE TRADE PER SYMBOL")
-        log.info("TP SOURCE TRACKING: Shows source (Liquidity Pool/Swing) and timeframe (30M/15M)")
-        log.info("=" * 70)
-        
-        # Initialize database
-        await self._init_database()
-        
-        # Initialize exchange
-        await self._init_exchange()
-        
-        # Send startup message
-        await self._send_startup_message()
+    @property
+    def acceptable(self) -> bool:
+        """Accept if total >= MIN_SCORE (no component minimums)"""
+        MIN_SCORE = 0.5  # ← CHANGE THIS NUMBER TO ADJUST SENSITIVITY
+        return self.total_score >= MIN_SCORE
+
+# ---------------- TELEGRAM ----------------
+async def send_telegram(msg: str, parse_mode="HTML"):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
     
-    async def _init_database(self):
-        """Initialize database with schema migrations"""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    async with httpx.AsyncClient() as client:
         try:
-            os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-            self.db = await aiosqlite.connect(DB_PATH)
-            
-            # Check if table exists
-            async with self.db.execute("""
-                SELECT name FROM sqlite_master 
-                WHERE type='table' AND name='rejection_signals'
-            """) as cursor:
-                table_exists = await cursor.fetchone()
-            
-            if not table_exists:
-                # Create new table with all columns
-                await self.db.execute("""
-                CREATE TABLE rejection_signals (
-                    id TEXT PRIMARY KEY,
-                    symbol TEXT NOT NULL,
-                    side TEXT NOT NULL,
-                    entry_price REAL NOT NULL,
-                    stop_loss REAL NOT NULL,
-                    take_profit REAL NOT NULL,
-                    
-                    -- TP SOURCE TRACKING
-                    tp_source TEXT,
-                    tp_timeframe TEXT,
-                    
-                    wave_length TEXT NOT NULL,
-                    wave_maturity REAL NOT NULL,
-                    expansion_speed REAL NOT NULL,
-                    structure_type TEXT NOT NULL,
-                    
-                    candle_speed REAL NOT NULL,
-                    distance_ratio REAL NOT NULL,
-                    ema_angle REAL NOT NULL,
-                    volume_participation REAL NOT NULL,
-                    strength_score REAL NOT NULL,
-                    
-                    zone_type TEXT NOT NULL,
-                    rejection_strength REAL NOT NULL,
-                    rsi_at_entry REAL NOT NULL,
-                    rejection_type TEXT NOT NULL,
-                    trigger_candle TEXT NOT NULL,
-                    
-                    risk_reward REAL NOT NULL,
-                    expected_move REAL NOT NULL,
-                    timeframe_used TEXT NOT NULL,
-                    
-                    conditions_met TEXT,
-                    status TEXT DEFAULT 'PENDING',
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    
-                    triggered_at TIMESTAMP,
-                    trigger_price REAL,
-                    
-                    closed_at TIMESTAMP,
-                    close_price REAL,
-                    pnl_percent REAL,
-                    close_reason TEXT
-                )
-                """)
-                log.info("✅ Created rejection_signals table with TP source tracking")
-            else:
-                # Table exists, check and add missing columns
-                await self._migrate_database()
-            
-            # Performance table
-            await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS performance_daily (
-                date DATE PRIMARY KEY,
-                total_rejections INTEGER,
-                long_rejections INTEGER,
-                short_rejections INTEGER,
-                no_strength_count INTEGER,
-                no_zone_count INTEGER,
-                no_higher_tf_alignment INTEGER,
-                bad_market_context INTEGER,
-                no_confirmed_entry INTEGER,
-                win_rate REAL,
-                avg_win REAL,
-                avg_loss REAL,
-                total_pnl REAL,
-                tp_source_stats TEXT
-            )
-            """)
-            
-            await self.db.commit()
-            
-            log.info("✅ Database initialized with improved statistics")
-            
-        except Exception as e:
-            log.error(f"Database error: {e}")
-            raise
-    
-    async def _migrate_database(self):
-        """Migrate database schema to add new columns"""
-        try:
-            # Get existing columns
-            async with self.db.execute("PRAGMA table_info(rejection_signals)") as cursor:
-                columns = await cursor.fetchall()
-                column_names = [col[1] for col in columns]
-            
-            # Add missing columns
-            missing_columns = []
-            
-            if 'tp_source' not in column_names:
-                missing_columns.append('tp_source')
-            
-            if 'tp_timeframe' not in column_names:
-                missing_columns.append('tp_timeframe')
-            
-            # Add missing columns
-            for column in missing_columns:
-                if column == 'tp_source':
-                    await self.db.execute("ALTER TABLE rejection_signals ADD COLUMN tp_source TEXT")
-                    log.info(f"✅ Added {column} column")
-                elif column == 'tp_timeframe':
-                    await self.db.execute("ALTER TABLE rejection_signals ADD COLUMN tp_timeframe TEXT")
-                    log.info(f"✅ Added {column} column")
-            
-            if missing_columns:
-                await self.db.commit()
-                log.info(f"✅ Database migrated: Added {len(missing_columns)} columns")
-            
-        except Exception as e:
-            log.error(f"Database migration error: {e}")
-    
-    async def _init_exchange(self):
-        """Initialize exchange connection"""
-        try:
-            self.exchange = ccxt.okx({
-                "enableRateLimit": True,
-                "options": {"defaultType": "spot"},
-                "timeout": 20000,
-                "rateLimit": 50
+            await client.post(url, json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": msg,
+                "parse_mode": parse_mode
             })
-            
-            # Test connection
-            ticker = await self.exchange.fetch_ticker("BTC/USDT")
-            log.info(f"✅ Exchange connected. BTC: ${ticker['last']:.2f}")
-            
         except Exception as e:
-            log.error(f"Exchange error: {e}")
-            raise
+            log.warning(f"Telegram send failed: {e}")
+
+# ---------------- DATABASE ----------------
+async def init_db():
+    global db_conn
+    db_conn = await aiosqlite.connect(DB_PATH)
+    await db_conn.execute("PRAGMA journal_mode=WAL;")
     
-    async def _send_startup_message(self):
-        """Send startup message to Telegram"""
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            log.warning("⚠️ Telegram credentials not set. Notifications will not be sent.")
-            return
-        
-        try:
-            message = f"""
-🎯 <b>REJECTION-BASED HIGH-FREQUENCY SCANNER</b>
-
-<b>🧠 TRADER MINDSET:</b>
-• Reaction trader (not prediction-based)
-• Rejection specialist
-• Comfortable being wrong
-• Emotionless with losses
-• Hunts expansion, accepts losses
-
-<b>📊 ANALYSIS FRAMEWORK:</b>
-1️⃣ <b>الطول الموجي (Wave Length)</b> → السياق فقط
-‎   • طول الموجة ونضجها
-‎   • سرعة التوسع
-‎   • لا عد للموجات
-
-2️⃣ <b>القوة (Market Strength)</b> → قرار الدخول
-‎   • سرعة الشموع
-‎   • المسافة المقطوعة
-‎   • زاوية المتوسطات
-‎   • مشاركة الفوليوم
-
-3️⃣ <b>مناطق الرفض (Rejection Zones)</b> → الزناد الإجباري
-‎   • الدخول عند الرفض فقط
-‎   • دعم/مقاومة المتوسطات
-‎   • أعلى/أقل النطاق
-‎   • اختراقات فاشلة
-
-<b>⚡ إعدادات الدخول:</b>
-‎• إطار الدخول: 3M (رئيسي) + 1M (توقيت)
-• RSI: 40–50 للشراء، 50–60 للبيع
-
-<b>🎯 <u>إدارة المخاطر المحسنة:</u></b>
-<u>🛑 <b>قاعدة صارمة: لا تستخدم 1H/5M/3M/1M أبداً لوقف الخسارة/هدف الربح</b></u>
-‎• <b>وقف الخسارة: أقرب قاع تأرجح (15M/30M فقط)</b>
-‎• <b>هدف الربح: أقرب مستوى فقط (لا يعتمد على نسبة الربح/المخاطرة)</b>
-‎• <b>أولاً: أقرب بركة سيولة (15M/30M فقط)</b>
-‎• <b>ثانياً: أقرب قمة/قاع تأرجح (15M/30M فقط)</b>
-‎• <b>الحد الأدنى للمسافة: {MIN_TP_DISTANCE_PCT}%</b>
-
-<u><b>🚀 التحسينات الحرجة المطبقة:</b></u>
-‎✅ <b>1. دخول مؤكد فقط</b> - انتظار إغلاق الشمعة خارج المنطقة
-‎✅ <b>2. محاذاة الإطارات الزمنية المتعددة</b> - تتطلب اتفاق اتجاه 15M/30M
-‎✅ <b>3. قوة مرجحة بالفوليوم</b> - الفوليوم يمثل 30% من درجة الرفض
-‎✅ <b>4. مرشحات سياق السوق</b> - تجنب التداول في ظروف سيئة
-
-<b>🎯 <u>تتبع مصدر هدف الربح (جديد):</u></b>
-‎• كل إشارة تظهر مصدر الـ TP والـ TF المستخدم
-‎• <b>المصدر:</b> بركة سيولة أو قمة/قاع تأرجح
-‎• <b>الإطار الزمني:</b> 30M أو 15M فقط
-
-<b>🛡️ نظام التكرار:</b>
-• <b>صفقة واحدة لكل عملة فقط</b>
-‎• إشارات جديدة فقط بعد إغلاق الصفقة السابقة
-‎• لا يوجد تبريد زمني
-
-<b>🎯 فلسفة الدخول:</b>
-‎الدخول عند أول شمعة رفض قوية <b>مؤكدة</b>
-‎الدخول حيث يتردد الآخرون
-‎أدخل مبكراً عن قصد
-
-‎الطول الموجي يحدد السياق
-‎القوة والفوليوم يحددان القرار
-‎والرفض هو الزناد
-<u>‎<b>والتأكيد هو كل شيء</b></u>
-
-‎#متداول_تفاعلي #تخصص_الرفض #صفقة_واحدة #15M_30M_فقط #أقرب_مستوى_فقط #دخول_مؤكد
-"""
+    # Create signals table with step-by-step tracking
+    await db_conn.execute("""
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT,
+            timestamp TEXT,
+            side TEXT,
             
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(url, json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML"
-                })
-                
-            log.info("✅ Startup message sent to Telegram")
-                
-        except Exception as e:
-            log.error(f"Telegram startup error: {e}")
-    
-    async def fetch_timeframe_data(self, symbol: str) -> Dict[str, pd.DataFrame]:
-        """Fetch data for all timeframes"""
-        data = {}
-        
-        for tf_name, tf in TIMEFRAMES.items():
-            try:
-                # Adjust limits based on timeframe
-                if tf_name == "30M":
-                    limit = 120  # More for 30M for better swing analysis
-                elif tf_name == "15M":
-                    limit = 100
-                elif tf_name == "5M":
-                    limit = 80
-                elif tf_name == "3M":
-                    limit = 60
-                else:  # 1M
-                    limit = 50
-                
-                ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-                
-                if ohlcv and len(ohlcv) >= 20:
-                    df = pd.DataFrame(
-                        ohlcv,
-                        columns=["timestamp", "open", "high", "low", "close", "volume"]
-                    )
-                    
-                    # Convert to numeric
-                    for col in ["open", "high", "low", "close", "volume"]:
-                        df[col] = pd.to_numeric(df[col], errors='coerce')
-                    
-                    df = df.dropna()
-                    
-                    if len(df) >= 15:
-                        data[tf_name] = df
-                    
-            except Exception as e:
-                log.debug(f"{symbol} {tf_name}: {str(e)[:50]}")
-                continue
-        
-        return data
-    
-    async def get_active_pairs(self) -> List[Tuple[str, float]]:
-        """Get active trading pairs"""
-        try:
-            tickers = await self.exchange.fetch_tickers()
-            active_pairs = []
+            -- Step 1: HTF Bias
+            htf_bias TEXT,
+            htf_range_high REAL,
+            htf_range_low REAL,
+            htf_premium_discount TEXT,
+            htf_liquidity_zones_json TEXT,
+            htf_structure_json TEXT,
             
-            for symbol, ticker in tickers.items():
-                if symbol.endswith('/USDT'):
-                    volume = ticker.get('quoteVolume', 0)
-                    
-                    if volume >= MIN_VOLUME_USD:
-                        # Check price spread for liquidity
-                        bid = ticker.get('bid', 0)
-                        ask = ticker.get('ask', 0)
-                        
-                        if bid > 0 and ask > 0:
-                            spread = (ask - bid) / bid * 100
-                            if spread < 0.1:  # Good liquidity
-                                active_pairs.append((symbol, volume))
+            -- Step 2: Liquidity Map
+            liquidity_from_json TEXT,
+            liquidity_to_json TEXT,
+            has_clear_target BOOLEAN,
             
-            # Sort by volume
-            active_pairs.sort(key=lambda x: x[1], reverse=True)
+            -- Step 3: Liquidity Sweep
+            sweep_type TEXT,
+            swept_price REAL,
+            sweep_impulsive BOOLEAN,
+            sweep_strength REAL,
             
-            # Take top N
-            return active_pairs[:TOP_N_VOLUME]
+            -- Step 4: Structure Check
+            structure_shift_type TEXT,
+            structure_shift_confirmed BOOLEAN,
+            structure_description TEXT,
             
-        except Exception as e:
-            log.error(f"Error getting pairs: {e}")
-            return []
-    
-    async def save_signal(self, signal: RejectionSignal) -> bool:
-        """Save signal to database"""
-        try:
-            # Insert signal with TP source info
-            await self.db.execute("""
-                INSERT INTO rejection_signals (
-                    id, symbol, side, entry_price, stop_loss, take_profit,
-                    tp_source, tp_timeframe,
-                    wave_length, wave_maturity, expansion_speed, structure_type,
-                    candle_speed, distance_ratio, ema_angle, volume_participation, strength_score,
-                    zone_type, rejection_strength, rsi_at_entry, rejection_type, trigger_candle,
-                    risk_reward, expected_move, timeframe_used,
-                    conditions_met, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                signal.signal_id,
-                signal.symbol,
-                signal.side,
-                signal.entry_price,
-                signal.stop_loss,
-                signal.take_profit,
-                
-                # TP SOURCE INFO
-                signal.tp_source,
-                signal.tp_timeframe,
-                
-                signal.wave_context.wave_length,
-                signal.wave_context.wave_maturity,
-                signal.wave_context.expansion_speed,
-                signal.wave_context.structure_type,
-                signal.market_strength.candle_speed,
-                signal.market_strength.distance_ratio,
-                signal.market_strength.ema_angle,
-                signal.market_strength.volume_participation,
-                signal.market_strength.strength_score,
-                signal.rejection_zone.zone_type,
-                signal.rejection_strength,
-                signal.rsi_at_entry,
-                signal.rejection_type,
-                signal.trigger_candle,
-                signal.risk_reward,
-                signal.expected_move_pct,
-                signal.timeframe_used,
-                json.dumps(signal.conditions_met),
-                "PENDING",
-                datetime.now().isoformat()
-            ))
+            -- Step 5: Entry Zone
+            entry_type TEXT,
+            entry_price REAL,
+            entry_low REAL,
+            entry_high REAL,
+            entry_aligns_htf BOOLEAN,
+            entry_reaction_confirmed BOOLEAN,
             
-            await self.db.commit()
+            -- Step 6: Risk/SL
+            sl_price REAL,
+            sl_invalidation_type TEXT,
+            risk_amount REAL,
+            sl_distance_pct REAL,
             
-            log.info(f"✅ CONFIRMED rejection signal saved: {signal.symbol} (TP Source: {signal.tp_source} @ {signal.tp_timeframe})")
-            return True
+            -- Step 7: Take Profit
+            tp1_price REAL,
+            tp1_type TEXT,
+            tp2_price REAL,
+            tp2_type TEXT,
+            tp3_price REAL,
+            tp3_type TEXT,
             
-        except Exception as e:
-            log.error(f"Error saving signal: {e}")
-            return False
-    
-    async def format_signal_message(self, signal: RejectionSignal) -> str:
-        """Format signal for Telegram with TP source"""
-        side_emoji = "🟢" if signal.side == "LONG" else "🔴"
-        side_text = "شراء" if signal.side == "LONG" else "بيع"
-        
-        # Calculate risk percentages
-        if signal.side == "LONG":
-            risk_pct = (signal.entry_price - signal.stop_loss) / signal.entry_price * 100
-            target_pct = (signal.take_profit - signal.entry_price) / signal.entry_price * 100
-        else:
-            risk_pct = (signal.stop_loss - signal.entry_price) / signal.entry_price * 100
-            target_pct = (signal.entry_price - signal.take_profit) / signal.entry_price * 100
-        
-        # Wave context
-        wave_info = f"{signal.wave_context.wave_length} ({signal.wave_context.structure_type})"
-        
-        # Strength info
-        strength_type = []
-        if signal.market_strength.is_continuation:
-            strength_type.append("استمرارية")
-        if signal.market_strength.is_rejection_setup:
-            strength_type.append("إعداد رفض")
-        if signal.market_strength.is_absorption:
-            strength_type.append("امتصاص")
-        if signal.market_strength.is_compression:
-            strength_type.append("ضغط")
-        
-        strength_text = "، ".join(strength_type) if strength_type else "محايد"
-        
-        # Zone info in Arabic
-        zone_translation = {
-            "EMA_SUPPORT": "دعم المتوسط المتحرك",
-            "EMA_RESISTANCE": "مقاومة المتوسط المتحرك",
-            "RANGE_LOW": "قاع النطاق",
-            "RANGE_HIGH": "سقف النطاق",
-            "FAILED_BREAKDOWN": "اختراق فاشل للأسفل",
-            "FAILED_BREAKOUT": "اختراق فاشل للأعلى"
-        }
-        
-        zone_text = zone_translation.get(signal.rejection_zone.zone_type, signal.rejection_zone.zone_type)
-        
-        # TP SOURCE TRANSLATION
-        tp_source_translation = {
-            "LIQUIDITY_POOL": "بركة سيولة",
-            "SWING_HIGH_LOW": "قمة/قاع تأرجح"
-        }
-        
-        tp_source_text = tp_source_translation.get(signal.tp_source, signal.tp_source)
-        
-        # Market context info
-        context_info = f"{signal.market_context.trend_strength} اتجاه، {signal.market_context.higher_tf_alignment} إطار زمني متوافق"
-        
-        message = f"""
-{side_emoji} <b>إشارة رفض مؤكدة</b> ⚡
-
-<b>{signal.symbol}</b> | {side_text}
-
-<b>📊 السياق الموجي:</b>
-‎• طول الموجة: {wave_info}
-‎• النضج: {signal.wave_context.wave_maturity:.1%}
-‎• سرعة التوسع: {signal.wave_context.expansion_speed:.1%}
-
-<b>💪 قوة السوق:</b>
-‎• درجة القوة: {signal.market_strength.strength_score:.1%}
-‎• النوع: {strength_text}
-‎• سرعة الشموع: {signal.market_strength.candle_speed:.1%}
-‎• مشاركة الفوليوم: {signal.market_strength.volume_participation:.1%}
-
-<b>🎯 منطقة الرفض:</b>
-‎• النوع: {zone_text}
-‎• قوة المنطقة: {signal.rejection_zone.strength:.1%}
-‎• تأكيد الفوليوم: {"✅" if signal.rejection_zone.volume_confirmation else "❌"}
-• RSI عند الدخول: {signal.rsi_at_entry:.1f}
-
-<b>⚡ تفاصيل الرفض:</b>
-‎• نوع الرفض: {signal.rejection_type}
-‎• شمعة الزناد: {signal.trigger_candle}
-‎• <b>قوة الرفض (مرجحة بالفوليوم):</b> {signal.rejection_strength:.1%}
-
-<b>🌐 سياق السوق:</b>
-‎• {context_info}
-‎• صحة الفوليوم: {signal.market_context.volume_health}
-
-<b>🔧 التنفيذ:</b>
-‎• سعر الدخول: <code>{signal.entry_price:.6f}</code> <b>(مؤكد)</b>
-‎• وقف الخسارة: <code>{signal.stop_loss:.6f}</code> ({risk_pct:.1f}%)
-‎• هدف الربح: <code>{signal.take_profit:.6f}</code> ({target_pct:.1f}%)
-‎• نسبة الربح/المخاطرة: {signal.risk_reward:.2f}:1
-
-<b>🎯 <u>مصدر هدف الربح:</u></b>
-‎• <b>المصدر:</b> {tp_source_text}
-‎• <b>الإطار الزمني:</b> {signal.tp_timeframe}
-‎• <b>المنطق:</b> أقرب مستوى فقط (لا يعتمد على نسبة الربح/المخاطرة)
-
-<u><b>⚡ إعدادات الصفقة:</b></u>
-<u>🛑 <b>قاعدة صارمة: لا تستخدم 1H/5M/3M/1M أبداً</b></u>
-‎• وقف الخسارة: أقرب قاع تأرجح (15M/30M فقط)
-‎• هدف الربح: أقرب مستوى فقط (أولاً بركة سيولة، ثانياً قمة تأرجح)
-‎• الحد الأدنى للمسافة: {MIN_TP_DISTANCE_PCT}%
-
-<u><b>🚀 التحسينات المطبقة:</b></u>
-‎✅ دخول مؤكد فقط (انتظار إغلاق الشمعة)
-‎✅ محاذاة الإطارات الزمنية المتعددة
-‎✅ قوة مرجحة بالفوليوم (30% من الدرجة)
-‎✅ مرشحات سياق السوق
-
-<b>🛡️ نظام التكرار:</b>
-‎• نظام: <b>صفقة واحدة لكل عملة</b>
-‎• لا إشارات جديدة لـ {signal.symbol} حتى إغلاق هذه الصفقة
-
-<b>⚠️ ملاحظة التاجر:</b>
-‎الدخول عند الرفض <b>المؤكد</b> فقط
-‎أقرب مستوى للهدف (لا نسب)
-‎نقبل الخسائر - نصطاد التوسع
-
-#{side_text} #رفض_مؤكد #{"دعم" if signal.side == "LONG" else "مقاومة"} #صفقة_واحدة #15M_30M_فقط #أقرب_مستوى #مصدر_{tp_source_text.replace(' ', '_')} #إطار_{signal.tp_timeframe} #محاذاة_متعددة
-"""
-        return message
-    
-    async def send_trade_trigger_notification(self, symbol: str, side: str, entry_price: float):
-        """Send notification when trade is triggered/entered"""
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            log.warning(f"⚠️ Telegram credentials missing. Skipping trigger notification for {symbol}")
-            return
-        
-        try:
-            side_emoji = "🟢" if side == "LONG" else "🔴"
-            side_text = "شراء" if side == "LONG" else "بيع"
+            -- Step 8: Probability
+            prob_htf_alignment REAL,
+            prob_liquidity_quality REAL,
+            prob_sweep_strength REAL,
+            prob_structure_clarity REAL,
+            prob_entry_precision REAL,
+            prob_total_score REAL,
+            prob_acceptable BOOLEAN,
             
-            message = f"""
-{side_emoji} <b>تم تنفيذ صفقة الرفض المؤكدة</b> ⚡
-
-<b>{symbol}</b> | {side_text}
-
-<b>🎯 تم الدخول عند الرفض المؤكد:</b>
-<code>{entry_price:.6f}</code>
-
-<u><b>⚡ إعدادات الصفقة:</b></u>
-<u>🛑 <b>قاعدة صارمة: لا تستخدم 1H/5M/3M/1M أبداً</b></u>
-‎• وقف الخسارة: <b>أقرب قاع تأرجح (15M/30M فقط)</b>
-‎• هدف الربح: <b>أقرب مستوى فقط (لا يعتمد على نسبة الربح/المخاطرة)</b>
-‎• أولاً: أقرب بركة سيولة (15M/30M فقط)
-‎• ثانياً: أقرب قمة تأرجح (15M/30M فقط)
-‎• الحد الأدنى: {MIN_TP_DISTANCE_PCT}% مسافة
-
-<u><b>🚀 التحسينات المطبقة:</b></u>
-‎✅ دخول مؤكد فقط (انتظار إغلاق الشمعة)
-‎✅ محاذاة الإطارات الزمنية المتعددة
-‎✅ قوة مرجحة بالفوليوم
-‎✅ مرشحات سياق السوق
-
-<b>🧠 عقلية التاجر:</b>
-‎• دخول مبكر عند أول رفض <b>مؤكد</b>
-‎• دخول حيث يتردد الآخرون
-‎• راحة مع الخسائر المحتملة
-‎• صيد للتوسع القادم
-
-<b>🛡️ نظام التكرار:</b>
-❌ <b>ممنوع</b> إرسال إشارات جديدة لـ {symbol}
-‎✅ مسموح بإشارات جديدة بعد إغلاق هذه الصفقة
-
-<b>⚠️ المتابعة:</b>
-‎يتم متابعة الصفقة تلقائياً.
-‎ستصلك إشعار عند الوصول لوقف الخسارة أو هدف الربح.
-
-#{side_text} #تنفيذ_رفض_مؤكد #متابعة #لا_إشارات_جديدة #15M_30M_فقط #أقرب_مستوى
-"""
-            
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(url, json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML"
-                })
-            
-            log.info(f"{side_emoji} CONFIRMED rejection trade triggered: {symbol} {side} @ {entry_price:.4f}")
-            
-        except Exception as e:
-            log.error(f"Trigger notification error: {e}")
-    
-    async def send_trade_close_notification(self, symbol: str, side: str, pnl_percent: float, 
-                                           close_reason: str, entry_price: float, 
-                                           close_price: float, risk_reward: float):
-        """Send notification when trade hits TP/SL"""
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            log.warning(f"⚠️ Telegram credentials missing. Skipping close notification for {symbol}")
-            return
-        
-        try:
-            log.info(f"📤 Sending close notification for {symbol}: {close_reason} ({pnl_percent:.2f}%)")
-            
-            if close_reason == "TP_HIT":
-                emoji = "✅"
-                result_text = "هدف الربح"
-                result_emoji = "🎯"
-                color = "🟢"
-                pnl_emoji = "💰"
-            else:  # SL_HIT
-                emoji = "❌"
-                result_text = "وقف الخسارة"
-                result_emoji = "🛑"
-                color = "🔴"
-                pnl_emoji = "💸"
-            
-            side_text = "شراء" if side == "LONG" else "بيع"
-            
-            # Format P&L with sign
-            pnl_formatted = f"+{pnl_percent:.2f}%" if pnl_percent > 0 else f"{pnl_percent:.2f}%"
-            
-            # Trader mindset message based on result
-            if close_reason == "TP_HIT":
-                mindset = "التوسع تم اصطياده ✅ الدخول المبكر المؤكد حقق الربح"
-            else:
-                mindset = "الخسارة مقبولة ❌ الرفض المؤكد لم يحترم، ننتظر الرفض التالي"
-            
-            message = f"""
-{emoji} <b>تم إغلاق صفقة الرفض المؤكدة</b> {result_emoji}
-
-<b>{symbol}</b> | {side_text}
-
-{color} <b>النتيجة: {result_text}</b>
-{pnl_emoji} <b>النسبة: {pnl_formatted}</b>
-
-<b>📊 تفاصيل التنفيذ:</b>
-‎• نوع الدخول: {side_text} (عند الرفض المؤكد)
-‎• سعر الدخول: <code>{entry_price:.6f}</code>
-‎• سعر الإغلاق: <code>{close_price:.6f}</code>
-‎• نسبة الربح/الخسارة: <b>{pnl_formatted}</b>
-‎• نسبة الربح/المخاطرة المحققة: {risk_reward:.2f}:1
-
-<u><b>🎯 طريقة التحديد:</b></u>
-‎• وقف الخسارة: أقرب قاع تأرجح (15M/30M فقط)
-‎• هدف الربح: أقرب مستوى فقط (أولاً بركة سيولة، ثانياً قمة تأرجح)
-
-<u><b>🚀 التحسينات المطبقة:</b></u>
-‎✅ دخول مؤكد فقط
-‎✅ محاذاة الإطارات الزمنية المتعددة
-‎✅ قوة مرجحة بالفوليوم
-‎✅ مرشحات سياق السوق
-
-<b>🧠 عقلية التاجر:</b>
-{mindset}
-‎نقبل الخسائر - نصطاد التوسع
-‎كل رفض هو فرصة جديدة
-
-<b>🛡️ نظام التكرار:</b>
-✅ <b>مسموح الآن</b> بإرسال إشارات جديدة لـ {symbol}
-‎يمكن للماسح الضوئي البحث عن رفض جديد مؤكد لهذه العملة
-
-#{side_text} #إغلاق_رفض_مؤكد #{"ربح" if close_reason == "TP_HIT" else "خسارة"} #مسموح_إشارات_جديدة #15M_30M_فقط #أقرب_مستوى
-"""
-            
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.post(url, json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML"
-                })
-                
-                if response.status_code == 200:
-                    log.info(f"✅ Telegram close notification sent for {symbol}: {close_reason}")
-                else:
-                    log.error(f"❌ Telegram API error: {response.status_code} - {response.text}")
-            
-            log.info(f"{emoji} CONFIRMED rejection trade closed: {symbol} {side} {pnl_formatted} ({close_reason})")
-            
-        except Exception as e:
-            log.error(f"Close notification error: {e}")
-    
-    async def send_telegram_alert(self, signal: RejectionSignal):
-        """Send Telegram alert with TP source info"""
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            log.warning(f"⚠️ Telegram credentials missing. Skipping alert for {signal.symbol}")
-            return
-        
-        try:
-            message = await self.format_signal_message(signal)
-            
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(url, json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML"
-                })
-                
-            log.info(f"📤 Telegram CONFIRMED rejection alert sent: {signal.symbol} (TP Source: {signal.tp_source} @ {signal.tp_timeframe})")
-            
-        except Exception as e:
-            log.error(f"Telegram error: {e}")
-    
-    async def monitor_positions(self):
-        """Monitor and close positions with trade-based deduplication"""
-        log.info("👀 Starting position monitoring with Telegram notifications...")
-        
-        # Give database migration a moment to complete
-        await asyncio.sleep(2)
-        
-        while True:
-            try:
-                # Check if database has been migrated
-                try:
-                    async with self.db.execute("""
-                        SELECT id, symbol, side, entry_price, stop_loss, take_profit, status, 
-                               COALESCE(tp_source, 'UNKNOWN') as tp_source, 
-                               COALESCE(tp_timeframe, 'UNKNOWN') as tp_timeframe
-                        FROM rejection_signals 
-                        WHERE status IN ('PENDING', 'TRIGGERED')
-                    """) as cursor:
-                        positions = await cursor.fetchall()
-                except Exception as db_error:
-                    if 'no such column' in str(db_error):
-                        log.warning("Database columns not migrated yet, waiting...")
-                        await asyncio.sleep(5)
-                        continue
-                    else:
-                        raise db_error
-                
-                if positions:
-                    log.debug(f"📊 Monitoring {len(positions)} open positions")
-                
-                for pos_id, symbol, side, entry, sl, tp, status, tp_source, tp_timeframe in positions:
-                    try:
-                        # Get current price
-                        ticker = await self.exchange.fetch_ticker(symbol)
-                        current_price = ticker['last']
-                        
-                        # For PENDING positions: check if price reached entry
-                        if status == 'PENDING':
-                            # For CONFIRMED rejection trading, we enter at confirmed price
-                            # Mark as triggered if price is within reasonable range (0.5%)
-                            if abs(current_price - entry) / entry <= 0.005:  # 0.5% zone
-                                # Mark as triggered
-                                await self.db.execute("""
-                                    UPDATE rejection_signals SET 
-                                        status = 'TRIGGERED',
-                                        triggered_at = CURRENT_TIMESTAMP,
-                                        trigger_price = ?
-                                    WHERE id = ?
-                                """, (current_price, pos_id))
-                                
-                                await self.db.commit()
-                                
-                                # UPDATE DEDUPLICATION STATUS to TRIGGERED
-                                self.scanner.deduplicator.update_signal_status(pos_id, "TRIGGERED")
-                                
-                                # SEND TRIGGER NOTIFICATION
-                                await self.send_trade_trigger_notification(symbol, side, current_price)
-                                
-                                log.info(f"✅ CONFIRMED rejection position triggered: {symbol} {side} @ {current_price:.4f}")
-                                continue  # Skip SL/TP check for this cycle
-                        
-                        # Check SL/TP for ALL positions (including newly triggered ones)
-                        pnl_percent = 0
-                        close_reason = None
-                        
-                        if side == "LONG":
-                            if current_price <= sl:
-                                close_reason = "SL_HIT"
-                                pnl_percent = ((current_price - entry) / entry) * 100
-                            elif current_price >= tp:
-                                close_reason = "TP_HIT"
-                                pnl_percent = ((current_price - entry) / entry) * 100
-                        
-                        else:  # SHORT
-                            if current_price >= sl:
-                                close_reason = "SL_HIT"
-                                pnl_percent = ((entry - current_price) / entry) * 100
-                            elif current_price <= tp:
-                                close_reason = "TP_HIT"
-                                pnl_percent = ((entry - current_price) / entry) * 100
-                        
-                        if close_reason:
-                            # Get risk_reward from database
-                            async with self.db.execute("""
-                                SELECT risk_reward FROM rejection_signals WHERE id = ?
-                            """, (pos_id,)) as cursor:
-                                row = await cursor.fetchone()
-                                risk_reward = row[0] if row else 0
-                            
-                            # Update database
-                            await self.db.execute("""
-                                UPDATE rejection_signals SET 
-                                    status = 'CLOSED',
-                                    closed_at = CURRENT_TIMESTAMP,
-                                    close_price = ?,
-                                    pnl_percent = ?,
-                                    close_reason = ?
-                                WHERE id = ?
-                            """, (current_price, pnl_percent, close_reason, pos_id))
-                            
-                            await self.db.commit()
-                            
-                            # UPDATE DEDUPLICATION STATUS to CLOSED
-                            self.scanner.deduplicator.update_signal_status(pos_id, "CLOSED")
-                            
-                            # Clean up from tracking
-                            self.scanner.active_signal_ids.discard(pos_id)
-                            
-                            # SEND CLOSE NOTIFICATION
-                            await self.send_trade_close_notification(
-                                symbol=symbol,
-                                side=side,
-                                pnl_percent=pnl_percent,
-                                close_reason=close_reason,
-                                entry_price=entry,
-                                close_price=current_price,
-                                risk_reward=risk_reward
-                            )
-                            
-                            log.info(f"📤 Telegram close notification sent for {symbol}: {close_reason} ({pnl_percent:.2f}%)")
-                    
-                    except Exception as e:
-                        log.error(f"Monitor error for {symbol}: {e}")
-                        continue
-                
-                # Clean up old closed signals periodically
-                if int(time.time()) % 300 < 2:  # Every ~5 minutes
-                    self.scanner.deduplicator.remove_closed_signals()
-                
-                # Fast monitoring for rejection trading
-                await asyncio.sleep(2)  # Check every 2 seconds
-                
-            except Exception as e:
-                log.error(f"Monitoring loop error: {e}")
-                await asyncio.sleep(5)
-    
-    async def high_freq_scanning(self):
-        """Main high-frequency scanning loop for rejections"""
-        log.info("🚀 Starting CONFIRMED rejection-based high-frequency scanning...")
-        
-        while True:
-            try:
-                self.scan_cycle += 1
-                start_time = time.time()
-                
-                log.info(f"🔄 Scan cycle #{self.scan_cycle} (CONFIRMED rejection hunting)")
-                
-                # Get active pairs
-                pairs = await self.get_active_pairs()
-                
-                if not pairs:
-                    log.warning("No active pairs found")
-                    await asyncio.sleep(SCAN_INTERVAL)
-                    continue
-                
-                log.info(f"Scanning {len(pairs)} active pairs for CONFIRMED rejections")
-                
-                signals_found = 0
-                pairs_processed = 0
-                
-                # Ultra-fast scanning for rejections
-                for symbol, volume in pairs:
-                    try:
-                        # Fetch data
-                        multi_tf_data = await self.fetch_timeframe_data(symbol)
-                        
-                        # Need key timeframes for rejection analysis
-                        required_tfs = ["15M", "3M"]  # Minimum required
-                        has_all_data = all(tf in multi_tf_data for tf in required_tfs)
-                        
-                        if not has_all_data:
-                            continue
-                        
-                        # Generate rejection signal (WITH IMPROVEMENTS)
-                        signal = self.scanner.generate_rejection_signal(multi_tf_data, symbol)
-                        
-                        if signal:
-                            # Save and send
-                            saved = await self.save_signal(signal)
-                            
-                            if saved:
-                                await self.send_telegram_alert(signal)
-                                signals_found += 1
-                        
-                        pairs_processed += 1
-                        
-                        # Ultra-fast between pairs
-                        await asyncio.sleep(0.01)  # 10ms between pairs
-                        
-                    except Exception as e:
-                        log.debug(f"Pair error {symbol}: {str(e)[:50]}")
-                        continue
-                
-                # Update scanner stats
-                self.scanner.daily_stats["pairs_scanned"] += pairs_processed
-                
-                # Log rejection stats
-                active_count = len(self.scanner.deduplicator.active_signals)
-                stats = self.scanner.get_daily_stats()
-                
-                log.info(f"📊 CONFIRMED rejection stats: Found {signals_found}, Active: {active_count}")
-                log.info(f"   Filtered: {stats.get('rejections_filtered', 0)}, "
-                        f"No strength: {stats.get('no_strength', 0)}, "
-                        f"No zone: {stats.get('no_rejection_zone', 0)}")
-                log.info(f"   No higher TF alignment: {stats.get('no_higher_tf_alignment', 0)}, "
-                        f"Bad market context: {stats.get('bad_market_context', 0)}, "
-                        f"No confirmed entry: {stats.get('no_confirmed_entry', 0)}")
-                
-                scan_duration = time.time() - start_time
-                log.info(f"Scan #{self.scan_cycle}: {signals_found} CONFIRMED rejections in {scan_duration:.2f}s")
-                
-                # Log detailed stats periodically
-                if self.scan_cycle % 20 == 0:
-                    log.info(f"📈 Detailed stats: {stats}")
-                
-                # Wait for next scan (very fast for rejection hunting)
-                wait_time = max(0.1, SCAN_INTERVAL - scan_duration)
-                log.info(f"Next CONFIRMED rejection hunt in {wait_time:.1f}s...")
-                await asyncio.sleep(wait_time)
-                
-            except Exception as e:
-                log.error(f"Scanning loop error: {e}")
-                await asyncio.sleep(10)
-    
-    async def run(self):
-        """Run the scanner"""
-        try:
-            await self.initialize()
-            
-            # Run both loops
-            await asyncio.gather(
-                self.high_freq_scanning(),
-                self.monitor_positions()
-            )
-            
-        except KeyboardInterrupt:
-            log.info("Rejection scanner stopped by user")
-            
-            # Send final stats
-            await self.send_final_stats()
-            
-        except Exception as e:
-            log.error(f"Scanner crashed: {e}")
-            
-        finally:
-            await self.cleanup()
-    
-    async def send_final_stats(self):
-        """Send final statistics"""
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            log.warning("⚠️ Telegram credentials missing. Skipping final stats.")
-            return
-        
-        try:
-            stats = self.scanner.get_daily_stats()
-            
-            # Get active signals count
-            active_count = len(self.scanner.deduplicator.active_signals)
-            
-            # Calculate percentages
-            total_filtered = (stats.get('rejections_filtered', 0) + 
-                            stats.get('no_strength', 0) + 
-                            stats.get('no_rejection_zone', 0) +
-                            stats.get('no_higher_tf_alignment', 0) +
-                            stats.get('bad_market_context', 0) +
-                            stats.get('no_confirmed_entry', 0))
-            
-            total_analyzed = stats['rejections_found'] + total_filtered
-            
-            if total_analyzed > 0:
-                found_pct = stats['rejections_found'] / total_analyzed * 100
-                no_alignment_pct = stats.get('no_higher_tf_alignment', 0) / total_analyzed * 100
-                bad_context_pct = stats.get('bad_market_context', 0) / total_analyzed * 100
-                no_confirmed_pct = stats.get('no_confirmed_entry', 0) / total_analyzed * 100
-            else:
-                found_pct = no_alignment_pct = bad_context_pct = no_confirmed_pct = 0
-            
-            message = f"""
-🛑 <b>تم إيقاف ماسح الرفض المؤكد</b>
-
-<b>📊 إحصائيات اليوم:</b>
-‎• عمليات المسح: {self.scan_cycle}
-‎• الأزواج الممسوحة: {stats['pairs_scanned']}
-‎• حالات الرفض المؤكدة التي تم العثور عليها: {stats['rejections_found']} ({found_pct:.1f}%)
-‎• رفض شراء: {stats['long_rejections']}
-‎• رفض بيع: {stats['short_rejections']}
-
-<u><b>🎯 إدارة المخاطر المحسنة:</b></u>
-<u>🛑 <b>قاعدة صارمة: لا تستخدم 1H/5M/3M/1M أبداً</b></u>
-‎• وقف الخسارة: <b>أقرب قاع تأرجح (15M/30M فقط)</b>
-‎• هدف الربح: <b>أقرب مستوى فقط (لا يعتمد على نسبة الربح/المخاطرة)</b>
-‎• أولاً: أقرب بركة سيولة (15M/30M فقط)
-‎• ثانياً: أقرب قمة تأرجح (15M/30M فقط)
-‎• الحد الأدنى للمسافة: {MIN_TP_DISTANCE_PCT}%
-
-<u><b>🚀 التحسينات المطبقة:</b></u>
-‎✅ <b>1. دخول مؤكد فقط</b> - انتظار إغلاق الشمعة خارج المنطقة
-‎✅ <b>2. محاذاة الإطارات الزمنية المتعددة</b> - تتطلب اتفاق اتجاه 15M/30M
-‎✅ <b>3. قوة مرجحة بالفوليوم</b> - الفوليوم يمثل 30% من درجة الرفض
-‎✅ <b>4. مرشحات سياق السوق</b> - تجنب التداول في ظروف سيئة
-
-<b>🎯 <u>تتبع مصدر هدف الربح:</u></b>
-‎• <b>كل إشارة تظهر مصدر الـ TP والـ TF المستخدم</b>
-‎• المصدر: بركة سيولة أو قمة/قاع تأرجح
-‎• الإطار الزمني: 30M أو 15M فقط
-
-<b>🚫 أسباب الفلترة:</b>
-‎• بدون محاذاة إطار زمني أعلى: {stats.get('no_higher_tf_alignment', 0)} ({no_alignment_pct:.1f}%)
-‎• سياق سوق سيء: {stats.get('bad_market_context', 0)} ({bad_context_pct:.1f}%)
-‎• بدون دخول مؤكد: {stats.get('no_confirmed_entry', 0)} ({no_confirmed_pct:.1f}%)
-‎• بدون قوة كافية: {stats.get('no_strength', 0)}
-‎• بدون منطقة رفض: {stats.get('no_rejection_zone', 0)}
-‎• مفلتر (تكرار): {stats.get('rejections_filtered', 0)}
-
-<b>⚡ الصفقات النشطة:</b>
-‎• حالياً: {active_count} صفقة نشطة
-
-<b>🧠 فلسفة التاجر المحققة:</b>
-‎الطول الموجي ← السياق
-‎القوة والفوليوم ← القرار
-‎الرفض ← الزناد
-<u>‎والتأكيد هو كل شيء</u>
-
-‎تم الالتزام بـ:
-‎• الدخول عند الرفض المؤكد فقط
-‎• صفقة واحدة لكل عملة
-‎• عدم المطاردة
-‎• قبول الخسائر
-‎• صيد التوسع
-<u>‎• <b>لا تستخدم 1H/5M/3M/1M أبداً لوقف الخسارة/هدف الربح</b></u>
-<u>‎• <b>أقرب مستوى فقط (لا يعتمد على نسبة الربح/المخاطرة)</b></u>
-<u>‎• <b>تتبع مصدر هدف الربح والإطار الزمني (30M/15M فقط)</b></u>
-<u>‎• <b>التحسينات الأربعة الحرجة المطبقة</b></u>
-
-‎#إحصائيات_الرفض_المؤكد #متداول_تفاعلي #صفقة_واحدة #15M_30M_فقط #أقرب_مستوى_فقط #دخول_مؤكد
-"""
-            
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(url, json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML"
-                })
-                
-            log.info("✅ Final stats sent to Telegram")
-                
-        except Exception as e:
-            log.error(f"Final stats error: {e}")
-    
-    async def cleanup(self):
-        """Cleanup resources"""
-        try:
-            if self.exchange:
-                await self.exchange.close()
-                log.info("Exchange closed")
-            
-            if self.db:
-                await self.db.close()
-                log.info("Database closed")
-                
-        except Exception as e:
-            log.error(f"Cleanup error: {e}")
-
-# ================ SIMPLE HTTP SERVER ================
-async def start_http_server(scanner, port=8000):
-    """Start simple HTTP server for monitoring"""
-    async def handle_request(reader, writer):
-        try:
-            request = await reader.read(1024)
-            
-            # Parse request
-            lines = request.decode().split('\r\n')
-            if not lines:
-                writer.write(b'HTTP/1.1 400 Bad Request\r\n\r\n')
-                await writer.drain()
-                writer.close()
-                return
-            
-            request_line = lines[0]
-            method, path, _ = request_line.split(' ')
-            
-            response = ""
-            
-            if path == '/':
-                # Get scanner stats
-                stats = scanner.scanner.get_daily_stats()
-                active_count = len(scanner.scanner.deduplicator.active_signals)
-                
-                response = json.dumps({
-                    "status": "running",
-                    "scanner": "CONFIRMED Rejection-Based High-Frequency Scanner",
-                    "scan_cycle": scanner.scan_cycle,
-                    "active_trades": active_count,
-                    "daily_stats": stats,
-                    "critical_improvements": {
-                        "confirmed_entry": "ENABLED - Wait for candle close beyond zone",
-                        "multi_tf_alignment": "ENABLED - Require 15M/30M trend agreement",
-                        "volume_weighted_strength": "ENABLED - Volume is 30% of rejection score",
-                        "market_context_filters": "ENABLED - Avoid trading in bad conditions",
-                        "strict_rule": "NEVER use 1H/5M/3M/1M for SL/TP",
-                        "selection_logic": "NEAREST LEVELS ONLY (NO R:R SELECTION)",
-                        "min_tp_distance": f"{MIN_TP_DISTANCE_PCT}%",
-                        "tp_source_tracking": "ENABLED - Shows source and timeframe for each TP"
-                    },
-                    "trader_mindset": {
-                        "role": "Discretionary reaction trader",
-                        "specialty": "Wave-length awareness + Strength analysis + CONFIRMED Rejection entries",
-                        "philosophy": "Wave length sets context, Strength & volume make decision, CONFIRMED Rejection pulls trigger",
-                        "entry_rule": "Trade ONLY at CONFIRMED rejection zones",
-                        "frequency": "High frequency + confirmed entry + nearest level targeting",
-                        "tp_tracking": "TP Source and Timeframe (30M/15M) visible in all signals",
-                        "tp_selection": "NEAREST ONLY - No risk/reward ratio consideration"
-                    },
-                    "telegram": {
-                        "configured": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID),
-                        "notifications": "Signal + Entry + TP/SL alerts",
-                        "tp_info": "TP Source and Timeframe included in all messages"
-                    }
-                }, indent=2)
-            
-            elif path == '/stats':
-                response = json.dumps(scanner.scanner.get_daily_stats(), indent=2)
-            
-            elif path == '/mindset':
-                response = json.dumps({
-                    "trader_role": "Professional discretionary crypto trader",
-                    "specialization": "Wave-length awareness, strength analysis, CONFIRMED rejection-based entries",
-                    "trades": "Both LONG and SHORT symmetrically",
-                    "philosophy": "Accept losses, hunt expansion",
-                    "wave_length": "Context only - no Elliott wave counting",
-                    "market_strength": "Measure speed, distance, EMA angle, volume participation",
-                    "rejection_zones": "Trade ONLY at CONFIRMED rejection zones (EMA, Range, Failed breaks)",
-                    "entry_conditions": "RSI zones (40-50 LONG, 50-60 SHORT) + Volume confirmation + CONFIRMED candle close",
-                    "entry_philosophy": "Enter on first strong CONFIRMED rejection candle, early entries are intentional",
-                    "risk_management": "Dynamic SL (Nearest Swing - 15M/30M ONLY) + Dynamic TP (NEAREST LEVELS ONLY)",
-                    "critical_improvements": [
-                        "1. CONFIRMED ENTRY ONLY - Wait for candle close beyond zone",
-                        "2. MULTI-TIMEFRAME ALIGNMENT - Require 15M/30M trend agreement",
-                        "3. VOLUME-WEIGHTED STRENGTH - Volume is 30% of rejection score",
-                        "4. MARKET CONTEXT FILTERS - Avoid trading during bad conditions"
-                    ],
-                    "tp_selection_logic": "NEAREST ONLY - No R:R ratio consideration. Priority: 1) Liquidity Pool 2) Swing High/Low",
-                    "tp_source_tracking": "Each signal shows TP source (Liquidity Pool/Swing) and timeframe (30M/15M)",
-                    "strict_rule": "NEVER use 1H/5M/3M/1M for SL/TP - ALWAYS use 15M/30M",
-                    "frequency_rule": "High frequency + confirmed entry + nearest level payoff",
-                    "mindset": "Reaction trader, rejection specialist, not prediction-based, comfortable being wrong, CONFIRMED entries only"
-                }, indent=2)
-            
-            elif path == '/recent':
-                if scanner.db:
-                    scanner.db.row_factory = aiosqlite.Row
-                    async with scanner.db.execute("""
-                        SELECT symbol, side, entry_price, zone_type, rejection_type,
-                               rejection_strength, risk_reward, expected_move, 
-                               tp_source, tp_timeframe,  -- TP SOURCE INFO
-                               created_at, status, close_reason, pnl_percent
-                        FROM rejection_signals 
-                        ORDER BY created_at DESC 
-                        LIMIT 20
-                    """) as cursor:
-                        rows = await cursor.fetchall()
-                        signals = [dict(row) for row in rows]
-                    
-                    response = json.dumps({"signals": signals, "count": len(signals)}, indent=2)
-                else:
-                    response = json.dumps({"error": "Database not available"})
-            
-            else:
-                response = json.dumps({"error": "Endpoint not found"})
-            
-            # Send response
-            writer.write(f'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{response}'.encode())
-            await writer.drain()
-            writer.close()
-            
-        except Exception as e:
-            error_response = json.dumps({"error": str(e)})
-            writer.write(f'HTTP/1.1 500 Internal Server Error\r\n\r\nContent-Type: application/json\r\n\r\n{error_response}'.encode())
-            await writer.drain()
-            writer.close()
-    
-    server = await asyncio.start_server(handle_request, '0.0.0.0', port)
-    log.info(f"🌐 HTTP server started on port {port}")
-    
-    async with server:
-        await server.serve_forever()
-
-# ================ MAIN ================
-async def main():
-    """Main entry point"""
-    scanner = RejectionScanner()
-    
-    # Run scanner and HTTP server concurrently
-    try:
-        await asyncio.gather(
-            scanner.run(),
-            start_http_server(scanner, port=8000)
+            -- Entry Details
+            current_price REAL,
+            status TEXT DEFAULT 'DETECTED',
+            notes TEXT
         )
-    except KeyboardInterrupt:
-        log.info("Shutting down CONFIRMED rejection scanner...")
+    """)
+    
+    await db_conn.commit()
+
+# ---------------- OHLCV UTILS ----------------
+async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit: int = 200):
+    """Fetch OHLCV with retry"""
+    try:
+        return await exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     except Exception as e:
-        log.error(f"Main error: {e}")
-        raise
+        log.debug(f"Failed to fetch {symbol} {timeframe}: {e}")
+        return None
+
+def create_dataframe(ohlcv):
+    """Create DataFrame from OHLCV"""
+    if not ohlcv:
+        return None
+    df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+# ---------------- FIX: JSON SERIALIZATION HELPER ----------------
+def safe_json_serialize(obj):
+    """Convert numpy/pandas types to Python native types for JSON serialization"""
+    if isinstance(obj, (np.integer, np.int64, np.int32, np.int16, np.int8)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64, np.float32, np.float16)):
+        return float(obj)
+    elif isinstance(obj, (np.ndarray, pd.Series)):
+        return obj.tolist()
+    elif isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+    elif isinstance(obj, pd.DataFrame):
+        return obj.to_dict(orient='records')
+    elif hasattr(obj, '__dict__'):
+        return obj.__dict__
+    elif isinstance(obj, dict):
+        return {k: safe_json_serialize(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [safe_json_serialize(item) for item in obj]
+    else:
+        return obj
+
+# ---------------- STEP 1: HTF BIAS ----------------
+async def analyze_htf_bias(exchange, symbol: str) -> HTFContext:
+    """
+    Step 1: HTF Bias - No longer skips mid-range
+    """
+    
+    # Try 4H data (primary HTF)
+    ohlcv_htf = await fetch_ohlcv(exchange, symbol, "4h", 100)
+    timeframe_used = "4h"
+    
+    # If 4H insufficient, fallback to 1H
+    if not ohlcv_htf or len(ohlcv_htf) < 30:
+        log.debug(f"{symbol}: 4H data insufficient, falling back to 1H...")
+        ohlcv_htf = await fetch_ohlcv(exchange, symbol, "1h", 100)
+        timeframe_used = "1h"
+        
+        # If 1H also insufficient, return empty context
+        if not ohlcv_htf or len(ohlcv_htf) < 30:
+            return HTFContext(
+                bias="UNKNOWN", range_high=0, range_low=0, range_mid=0,
+                premium_discount="UNKNOWN", liquidity_zones=[], structure=[],
+                skip_reason="Insufficient HTF data", valid=True  # Still valid for scoring
+            )
+    
+    df_htf = create_dataframe(ohlcv_htf)
+    current_price = float(df_htf["close"].iloc[-1])
+    
+    # Identify swing highs/lows
+    swing_highs = []
+    swing_lows = []
+    
+    for i in range(3, len(df_htf) - 3):
+        high_i = df_htf["high"].iloc[i]
+        low_i = df_htf["low"].iloc[i]
+        
+        # Check for swing high
+        if (high_i > df_htf["high"].iloc[i-1] and 
+            high_i > df_htf["high"].iloc[i-2] and
+            high_i > df_htf["high"].iloc[i+1] and
+            high_i > df_htf["high"].iloc[i+2]):
+            swing_highs.append({
+                "price": float(high_i),
+                "index": int(i),
+                "timestamp": int(df_htf["timestamp"].iloc[i])
+            })
+        
+        # Check for swing low
+        if (low_i < df_htf["low"].iloc[i-1] and 
+            low_i < df_htf["low"].iloc[i-2] and
+            low_i < df_htf["low"].iloc[i+1] and
+            low_i < df_htf["low"].iloc[i+2]):
+            swing_lows.append({
+                "price": float(low_i),
+                "index": int(i),
+                "timestamp": int(df_htf["timestamp"].iloc[i])
+            })
+    
+    # Define current range
+    if len(df_htf) >= 20:
+        recent_high = df_htf["high"].iloc[-20:].max()
+        recent_low = df_htf["low"].iloc[-20:].min()
+    else:
+        recent_high = df_htf["high"].max()
+        recent_low = df_htf["low"].min()
+    
+    range_high = float(recent_high)
+    range_low = float(recent_low)
+    range_mid = (range_high + range_low) / 2
+    
+    # Determine bias
+    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+        last_two_highs = sorted([h["price"] for h in swing_highs[-2:]], reverse=True)
+        last_two_lows = sorted([l["price"] for l in swing_lows[-2:]])
+        
+        if last_two_highs[0] > last_two_highs[1] and last_two_lows[0] < last_two_lows[1]:
+            bias = "BULLISH"
+        elif last_two_highs[0] < last_two_highs[1] and last_two_lows[0] > last_two_lows[1]:
+            bias = "BEARISH"
+        else:
+            bias = "RANGING"
+    else:
+        bias = "RANGING"
+    
+    # Premium/Discount
+    range_height = range_high - range_low
+    if range_height > 0:
+        position_pct = (current_price - range_low) / range_height * 100
+        if position_pct > 60:
+            premium_discount = "PREMIUM"
+        elif position_pct < 40:
+            premium_discount = "DISCOUNT"
+        else:
+            premium_discount = "MIDDLE"
+    else:
+        premium_discount = "MIDDLE"
+    
+    # Mark HTF liquidity zones
+    liquidity_zones = []
+    
+    # Range boundaries
+    liquidity_zones.append({
+        "price": range_high,
+        "type": "RANGE_HIGH",
+        "timeframe": timeframe_used,
+        "strength": 3
+    })
+    liquidity_zones.append({
+        "price": range_low,
+        "type": "RANGE_LOW",
+        "timeframe": timeframe_used,
+        "strength": 3
+    })
+    
+    # Recent swing points
+    for swing in swing_highs[-3:]:
+        liquidity_zones.append({
+            "price": swing["price"],
+            "type": "SWING_HIGH",
+            "timeframe": timeframe_used,
+            "strength": 2
+        })
+    
+    for swing in swing_lows[-3:]:
+        liquidity_zones.append({
+            "price": swing["price"],
+            "type": "SWING_LOW",
+            "timeframe": timeframe_used,
+            "strength": 2
+        })
+    
+    context = HTFContext(
+        bias=bias,
+        range_high=range_high,
+        range_low=range_low,
+        range_mid=range_mid,
+        premium_discount=premium_discount,
+        liquidity_zones=liquidity_zones,
+        structure=swing_highs[-5:] + swing_lows[-5:],
+        skip_reason=None,
+        valid=True  # Always valid now
+    )
+    
+    return context
+
+# ---------------- STEP 2: LIQUIDITY MAP ----------------
+async def map_liquidity(exchange, symbol: str, htf_context: HTFContext, 
+                       current_price: float) -> LiquidityMap:
+    """
+    Step 2: Liquidity Map - Always returns something
+    """
+    
+    # Fetch 1H for more granular liquidity
+    ohlcv_1h = await fetch_ohlcv(exchange, symbol, "1h", 100)
+    if not ohlcv_1h:
+        return LiquidityMap(from_liquidity=[], to_liquidity=[], has_clear_target=False)
+    
+    df_1h = create_dataframe(ohlcv_1h)
+    
+    # FROM liquidity: Recent extremes
+    from_liquidity = []
+    
+    recent_df = df_1h.iloc[-10:] if len(df_1h) >= 10 else df_1h
+    
+    for i in range(len(recent_df) - 1):
+        candle = recent_df.iloc[i]
+        next_candle = recent_df.iloc[i + 1] if i + 1 < len(recent_df) else candle
+        
+        # High sweep detection
+        if candle["high"] > recent_df["high"].iloc[max(0, i-5):i].max() and next_candle["close"] < candle["close"]:
+            from_liquidity.append({
+                "price": float(candle["high"]),
+                "type": "SWEPT_HIGH",
+                "timeframe": "1h",
+                "direction": "FROM"
+            })
+        
+        # Low sweep detection
+        if candle["low"] < recent_df["low"].iloc[max(0, i-5):i].min() and next_candle["close"] > candle["close"]:
+            from_liquidity.append({
+                "price": float(candle["low"]),
+                "type": "SWEPT_LOW",
+                "timeframe": "1h",
+                "direction": "FROM"
+            })
+    
+    # TO liquidity: Targets based on HTF context
+    to_liquidity = []
+    
+    # Sort HTF liquidity zones by distance
+    sorted_zones = sorted(htf_context.liquidity_zones, 
+                         key=lambda z: abs(z["price"] - current_price))
+    
+    # Filter for relevant targets
+    if htf_context.bias == "BULLISH":
+        targets = [z for z in sorted_zones if z["price"] > current_price]
+    elif htf_context.bias == "BEARISH":
+        targets = [z for z in sorted_zones if z["price"] < current_price]
+    else:
+        targets = [z for z in sorted_zones if z["type"] in ["RANGE_HIGH", "RANGE_LOW"]]
+    
+    # Take top 3 targets
+    for target in targets[:3]:
+        to_liquidity.append({
+            "price": target["price"],
+            "type": target["type"],
+            "timeframe": target["timeframe"],
+            "strength": int(target.get("strength", 1)),
+            "direction": "TO"
+        })
+    
+    # Also add internal liquidity
+    if len(df_1h) >= 24:
+        high_values = df_1h["high"].iloc[-24:].values
+        for val in np.unique(np.round(high_values, 4)):
+            count = int(np.sum(np.round(high_values, 4) == val))
+            if count >= 2:
+                to_liquidity.append({
+                    "price": float(val),
+                    "type": "EQUAL_HIGH",
+                    "timeframe": "1h",
+                    "strength": int(min(2, count)),
+                    "direction": "TO"
+                })
+        
+        low_values = df_1h["low"].iloc[-24:].values
+        for val in np.unique(np.round(low_values, 4)):
+            count = int(np.sum(np.round(low_values, 4) == val))
+            if count >= 2:
+                to_liquidity.append({
+                    "price": float(val),
+                    "type": "EQUAL_LOW",
+                    "timeframe": "1h",
+                    "strength": int(min(2, count)),
+                    "direction": "TO"
+                })
+    
+    # Always has at least some targets (even if empty)
+    has_clear_target = len(to_liquidity) > 0
+    
+    return LiquidityMap(
+        from_liquidity=from_liquidity,
+        to_liquidity=to_liquidity,
+        has_clear_target=has_clear_target
+    )
+
+# ---------------- STEP 3: LIQUIDITY SWEEP ----------------
+async def analyze_sweep(exchange, symbol: str, htf_context: HTFContext) -> SweepAnalysis:
+    """
+    Step 3: Liquidity Sweep - Always returns something
+    """
+    
+    # Use 15m for sweep detection
+    ohlcv_15m = await fetch_ohlcv(exchange, symbol, "15m", 50)
+    if not ohlcv_15m or len(ohlcv_15m) < 10:
+        return SweepAnalysis(type="NONE", candle_index=-1, swept_price=0, 
+                           previous_extreme=0, impulsive=False)
+    
+    df_15m = create_dataframe(ohlcv_15m)
+    
+    # Look for sweeps in last 5 candles
+    lookback = min(5, len(df_15m))
+    
+    for i in range(-lookback, 0):
+        candle_idx = len(df_15m) + i
+        candle = df_15m.iloc[candle_idx]
+        
+        # Get previous candles
+        start_idx = max(0, candle_idx - 5)
+        prev_candles = df_15m.iloc[start_idx:candle_idx]
+        
+        if len(prev_candles) == 0:
+            continue
+        
+        previous_high = prev_candles["high"].max()
+        previous_low = prev_candles["low"].min()
+        
+        # Check for high sweep
+        if candle["high"] > previous_high:
+            body_size = abs(candle["close"] - candle["open"])
+            upper_wick = candle["high"] - max(candle["open"], candle["close"])
+            lower_wick = min(candle["open"], candle["close"]) - candle["low"]
+            total_wick = upper_wick + lower_wick
+            
+            impulsive = body_size > total_wick
+            
+            # Don't check for fake sweeps
+            fake_sweep = False
+            
+            strength = 0.0
+            if impulsive and not fake_sweep:
+                extension = (candle["high"] - previous_high) / previous_high
+                strength = min(1.0, extension * 100)
+            
+            return SweepAnalysis(
+                type="HIGH_SWEEP",
+                candle_index=int(candle_idx),
+                swept_price=float(candle["high"]),
+                previous_extreme=float(previous_high),
+                impulsive=impulsive,
+                fake_sweep=fake_sweep,
+                strength=float(strength)
+            )
+        
+        # Check for low sweep
+        elif candle["low"] < previous_low:
+            body_size = abs(candle["close"] - candle["open"])
+            upper_wick = candle["high"] - max(candle["open"], candle["close"])
+            lower_wick = min(candle["open"], candle["close"]) - candle["low"]
+            total_wick = upper_wick + lower_wick
+            
+            impulsive = body_size > total_wick
+            
+            fake_sweep = False
+            
+            strength = 0.0
+            if impulsive and not fake_sweep:
+                extension = (previous_low - candle["low"]) / previous_low
+                strength = min(1.0, extension * 100)
+            
+            return SweepAnalysis(
+                type="LOW_SWEEP",
+                candle_index=int(candle_idx),
+                swept_price=float(candle["low"]),
+                previous_extreme=float(previous_low),
+                impulsive=impulsive,
+                fake_sweep=fake_sweep,
+                strength=float(strength)
+            )
+    
+    return SweepAnalysis(type="NONE", candle_index=-1, swept_price=0, 
+                       previous_extreme=0, impulsive=False)
+
+# ---------------- STEP 4: STRUCTURE CHECK ----------------
+async def check_structure_shift(exchange, symbol: str, sweep: SweepAnalysis, 
+                               htf_context: HTFContext) -> StructureShift:
+    """
+    Step 4: Structure Check - Always returns something
+    """
+    
+    if sweep.type == "NONE":
+        return StructureShift(type="NONE", confirmed=False, candle_index=-1)
+    
+    # Fetch 15m data
+    ohlcv_15m = await fetch_ohlcv(exchange, symbol, "15m", 50)
+    if not ohlcv_15m:
+        return StructureShift(type="NONE", confirmed=False, candle_index=-1)
+    
+    df_15m = create_dataframe(ohlcv_15m)
+    
+    # Get candles after the sweep
+    sweep_idx = sweep.candle_index
+    if sweep_idx < 0 or sweep_idx >= len(df_15m) - 3:
+        return StructureShift(type="NONE", confirmed=False, candle_index=-1)
+    
+    post_sweep_candles = df_15m.iloc[sweep_idx + 1:]
+    if len(post_sweep_candles) < 3:
+        return StructureShift(type="NONE", confirmed=False, candle_index=-1)
+    
+    # Check for CHoCH or BOS
+    if sweep.type == "HIGH_SWEEP":
+        recent_low_before = df_15m["low"].iloc[max(0, sweep_idx-5):sweep_idx].min()
+        
+        for i in range(len(post_sweep_candles)):
+            candle = post_sweep_candles.iloc[i]
+            if candle["low"] < recent_low_before:
+                return StructureShift(
+                    type="CHoCH",
+                    confirmed=True,
+                    candle_index=int(sweep_idx + i + 1),
+                    description="High sweep followed by break below recent low"
+                )
+        
+        # Check for BOS
+        if len(post_sweep_candles) >= 5:
+            pullback_low = post_sweep_candles["low"].iloc[:3].min()
+            subsequent_high = post_sweep_candles["high"].iloc[3:].max()
+            
+            if subsequent_high > sweep.swept_price:
+                return StructureShift(
+                    type="BOS",
+                    confirmed=True,
+                    candle_index=int(sweep_idx + 3),
+                    description="High sweep followed by new higher high"
+                )
+    
+    elif sweep.type == "LOW_SWEEP":
+        recent_high_before = df_15m["high"].iloc[max(0, sweep_idx-5):sweep_idx].max()
+        
+        for i in range(len(post_sweep_candles)):
+            candle = post_sweep_candles.iloc[i]
+            if candle["high"] > recent_high_before:
+                return StructureShift(
+                    type="CHoCH",
+                    confirmed=True,
+                    candle_index=int(sweep_idx + i + 1),
+                    description="Low sweep followed by break above recent high"
+                )
+        
+        # Check for BOS
+        if len(post_sweep_candles) >= 5:
+            pullback_high = post_sweep_candles["high"].iloc[:3].max()
+            subsequent_low = post_sweep_candles["low"].iloc[3:].min()
+            
+            if subsequent_low < sweep.swept_price:
+                return StructureShift(
+                    type="BOS",
+                    confirmed=True,
+                    candle_index=int(sweep_idx + 3),
+                    description="Low sweep followed by new lower low"
+                )
+    
+    return StructureShift(type="NONE", confirmed=False, candle_index=-1)
+
+# ---------------- STEP 5: ENTRY ZONE ----------------
+async def find_entry_zone(exchange, symbol: str, htf_context: HTFContext,
+                         sweep: SweepAnalysis, structure_shift: StructureShift,
+                         side: str) -> EntryZone:
+    """
+    Step 5: Entry Zone - Always returns something
+    """
+    
+    # Fetch 5m data
+    ohlcv_5m = await fetch_ohlcv(exchange, symbol, "5m", 100)
+    if not ohlcv_5m:
+        # Return a default entry zone at current price
+        ticker = await exchange.fetch_ticker(symbol)
+        current_price = ticker.get("last", 0)
+        return EntryZone(
+            type="DEFAULT",
+            price=float(current_price),
+            low=float(current_price * 0.99),
+            high=float(current_price * 1.01),
+            aligns_with_htf=True,
+            candle_reaction=True
+        )
+    
+    df_5m = create_dataframe(ohlcv_5m)
+    current_price = float(df_5m["close"].iloc[-1])
+    
+    # Try to find best entry type
+    entry_type = "DEFAULT"
+    
+    # Try Order Blocks first
+    for i in range(2, len(df_5m) - 1):
+        candle = df_5m.iloc[i]
+        next_candle = df_5m.iloc[i + 1]
+        
+        # Bullish OB
+        if side == "BUY":
+            if (candle["close"] < candle["open"] and 
+                next_candle["close"] > next_candle["open"]):
+                ob_low = min(candle["low"], next_candle["low"])
+                ob_high = next_candle["close"]
+                
+                aligns = (htf_context.bias == "BULLISH" or 
+                         htf_context.premium_discount == "DISCOUNT")
+                
+                if current_price <= ob_high and current_price >= ob_low * 0.995:
+                    current_candle = df_5m.iloc[-1]
+                    prev_candle = df_5m.iloc[-2] if len(df_5m) >= 2 else current_candle
+                    
+                    reaction = (current_candle["close"] > current_candle["open"] or
+                               (prev_candle["close"] > prev_candle["open"] and
+                                current_candle["close"] > prev_candle["close"]))
+                    
+                    return EntryZone(
+                        type="ORDER_BLOCK",
+                        price=float((ob_low + ob_high) / 2),
+                        low=float(ob_low),
+                        high=float(ob_high),
+                        aligns_with_htf=aligns,
+                        candle_reaction=reaction
+                    )
+        
+        # Bearish OB
+        elif side == "SELL":
+            if (candle["close"] > candle["open"] and 
+                next_candle["close"] < next_candle["open"]):
+                ob_low = next_candle["close"]
+                ob_high = max(candle["high"], next_candle["high"])
+                
+                aligns = (htf_context.bias == "BEARISH" or 
+                         htf_context.premium_discount == "PREMIUM")
+                
+                if current_price >= ob_low and current_price <= ob_high * 1.005:
+                    current_candle = df_5m.iloc[-1]
+                    prev_candle = df_5m.iloc[-2] if len(df_5m) >= 2 else current_candle
+                    
+                    reaction = (current_candle["close"] < current_candle["open"] or
+                               (prev_candle["close"] < prev_candle["open"] and
+                                current_candle["close"] < prev_candle["close"]))
+                    
+                    return EntryZone(
+                        type="ORDER_BLOCK",
+                        price=float((ob_low + ob_high) / 2),
+                        low=float(ob_low),
+                        high=float(ob_high),
+                        aligns_with_htf=aligns,
+                        candle_reaction=reaction
+                    )
+    
+    # Default entry at current price
+    return EntryZone(
+        type="DEFAULT",
+        price=float(current_price),
+        low=float(current_price * 0.99),
+        high=float(current_price * 1.01),
+        aligns_with_htf=True,
+        candle_reaction=True
+    )
+
+# ---------------- STEP 6: RISK/SL ----------------
+def calculate_risk_sl(entry_zone: EntryZone, sweep: SweepAnalysis,
+                     htf_context: HTFContext, side: str) -> RiskManagement:
+    """
+    Step 6: Risk/SL - Always calculates something
+    """
+    
+    entry_price = entry_zone.price
+    
+    # Determine invalidation
+    sl_price = 0.0
+    invalidation_type = ""
+    
+    # Try swept level
+    if sweep.type != "NONE" and sweep.swept_price > 0:
+        if side == "BUY" and sweep.type == "LOW_SWEEP":
+            sl_price = sweep.swept_price * 0.995
+            invalidation_type = "SWEEP"
+        elif side == "SELL" and sweep.type == "HIGH_SWEEP":
+            sl_price = sweep.swept_price * 1.005
+            invalidation_type = "SWEEP"
+    
+    # Try order block
+    if invalidation_type == "" and entry_zone.type == "ORDER_BLOCK":
+        if side == "BUY":
+            sl_price = entry_zone.low * 0.995
+            invalidation_type = "ORDER_BLOCK"
+        elif side == "SELL":
+            sl_price = entry_zone.high * 1.005
+            invalidation_type = "ORDER_BLOCK"
+    
+    # Default: 2% ATR
+    if invalidation_type == "":
+        atr_approx = entry_price * 0.02
+        if side == "BUY":
+            sl_price = entry_price - (atr_approx * 1.5)
+        else:
+            sl_price = entry_price + (atr_approx * 1.5)
+        invalidation_type = "ATR"
+    
+    risk_amount = abs(entry_price - sl_price)
+    distance_pct = (risk_amount / entry_price) * 100 if entry_price > 0 else 0
+    
+    return RiskManagement(
+        sl_price=float(sl_price),
+        invalidation_type=invalidation_type,
+        risk_amount=float(risk_amount),
+        sl_to_entry_distance=float(distance_pct)
+    )
+
+# ---------------- STEP 7: TAKE PROFIT ----------------
+def calculate_take_profits(entry_price: float, side: str, 
+                          liquidity_map: LiquidityMap,
+                          htf_context: HTFContext) -> TakeProfitLevels:
+    """
+    Step 7: Take Profit - Always calculates something
+    """
+    
+    # Filter targets based on side
+    if side == "BUY":
+        potential_targets = [t for t in liquidity_map.to_liquidity 
+                           if t["price"] > entry_price]
+        range_boundary = htf_context.range_high
+        htf_targets = [z for z in htf_context.liquidity_zones 
+                      if z["price"] > entry_price and z["type"] != "RANGE_HIGH"]
+    else:  # SELL
+        potential_targets = [t for t in liquidity_map.to_liquidity 
+                           if t["price"] < entry_price]
+        range_boundary = htf_context.range_low
+        htf_targets = [z for z in htf_context.liquidity_zones 
+                      if z["price"] < entry_price and z["type"] != "RANGE_LOW"]
+    
+    # TP1: Nearest target or 2% RR
+    tp1_candidates = [t for t in potential_targets if t["timeframe"] == "1h"]
+    if tp1_candidates:
+        tp1_candidates.sort(key=lambda t: abs(t["price"] - entry_price))
+        tp1 = tp1_candidates[0]["price"]
+        tp1_type = tp1_candidates[0]["type"]
+    else:
+        if side == "BUY":
+            tp1 = entry_price * 1.02
+        else:
+            tp1 = entry_price * 0.98
+        tp1_type = "RISK_REWARD_2%"
+    
+    # TP2: Range boundary
+    tp2 = range_boundary
+    tp2_type = "RANGE_BOUNDARY"
+    
+    # TP3: HTF liquidity or extended target
+    if htf_targets:
+        htf_targets.sort(key=lambda z: z.get("strength", 0), reverse=True)
+        tp3 = htf_targets[0]["price"]
+        tp3_type = htf_targets[0]["type"]
+    else:
+        if side == "BUY":
+            range_distance = htf_context.range_high - htf_context.range_low
+            tp3 = htf_context.range_high + (range_distance * 0.5)
+            tp3_type = "EXTENDED"
+        else:
+            range_distance = htf_context.range_high - htf_context.range_low
+            tp3 = htf_context.range_low - (range_distance * 0.5)
+            tp3_type = "EXTENDED"
+    
+    return TakeProfitLevels(
+        tp1=float(tp1),
+        tp1_type=tp1_type,
+        tp2=float(tp2),
+        tp2_type=tp2_type,
+        tp3=float(tp3),
+        tp3_type=tp3_type
+    )
+
+# ---------------- STEP 8: PROBABILITY CHECK ----------------
+def calculate_probability(htf_context: HTFContext, liquidity_map: LiquidityMap,
+                         sweep: SweepAnalysis, structure_shift: StructureShift,
+                         entry_zone: EntryZone, side: str) -> ProbabilityScore:
+    """
+    Step 8: Probability Check - Always calculates score
+    """
+    
+    # 1. HTF Alignment (0-1)
+    if htf_context.bias == side.upper() or htf_context.bias == "RANGING":
+        htf_alignment = 1.0
+    elif (htf_context.bias == "BULLISH" and side == "SELL") or \
+         (htf_context.bias == "BEARISH" and side == "BUY"):
+        htf_alignment = 0.3  # Counter-trend
+    else:
+        htf_alignment = 0.5
+    
+    # Premium/discount alignment
+    if (side == "BUY" and htf_context.premium_discount == "DISCOUNT") or \
+       (side == "SELL" and htf_context.premium_discount == "PREMIUM"):
+        htf_alignment = min(1.0, htf_alignment + 0.2)
+    
+    # 2. Liquidity Quality (0-1)
+    if liquidity_map.has_clear_target:
+        quality_targets = sum(1 for t in liquidity_map.to_liquidity 
+                            if t.get("strength", 0) >= 2)
+        liquidity_quality = min(1.0, quality_targets / 3.0)
+    else:
+        liquidity_quality = 0.1  # Lower but not zero
+    
+    # 3. Sweep Strength (0-1)
+    sweep_strength = sweep.strength
+    if sweep.impulsive:
+        sweep_strength = min(1.0, sweep_strength + 0.3)
+    
+    # 4. Structure Clarity (0-1)
+    if structure_shift.confirmed:
+        if structure_shift.type == "CHoCH":
+            structure_clarity = 0.9
+        elif structure_shift.type == "BOS":
+            structure_clarity = 0.8
+        else:
+            structure_clarity = 0.6
+    else:
+        structure_clarity = 0.1  # Lower but not zero
+    
+    # 5. Entry Precision (0-1)
+    if entry_zone.type in ["ORDER_BLOCK", "FAIR_VALUE_GAP"]:
+        entry_precision = 0.8
+        if entry_zone.aligns_with_htf:
+            entry_precision = min(1.0, entry_precision + 0.1)
+        if entry_zone.candle_reaction:
+            entry_precision = min(1.0, entry_precision + 0.1)
+    elif entry_zone.type in ["PREMIUM", "DISCOUNT"]:
+        entry_precision = 0.6
+        if entry_zone.candle_reaction:
+            entry_precision = 0.7
+    else:
+        entry_precision = 0.3  # Default entry still gets some points
+    
+    total_score = (htf_alignment + liquidity_quality + sweep_strength + 
+                   structure_clarity + entry_precision)
+    
+    return ProbabilityScore(
+        htf_alignment=float(htf_alignment),
+        liquidity_quality=float(liquidity_quality),
+        sweep_strength=float(sweep_strength),
+        structure_clarity=float(structure_clarity),
+        entry_precision=float(entry_precision),
+        total_score=float(total_score)
+    )
+
+# ---------------- MAIN SCANNING LOGIC ----------------
+async def scan_symbol_full(exchange, symbol: str) -> Optional[Dict]:
+    """
+    Execute full 8-step process - NO HARD FILTERS, only score matters
+    """
+    
+    # Get current price
+    ticker = await exchange.fetch_ticker(symbol)
+    current_price = ticker.get("last", 0)
+    if not current_price:
+        return None
+    
+    # --- STEP 1: HTF BIAS ---
+    htf_context = await analyze_htf_bias(exchange, symbol)
+    
+    # --- STEP 2: LIQUIDITY MAP ---
+    liquidity_map = await map_liquidity(exchange, symbol, htf_context, current_price)
+    
+    # --- STEP 3: LIQUIDITY SWEEP ---
+    sweep = await analyze_sweep(exchange, symbol, htf_context)
+    
+    # Determine side based on sweep or price action
+    if sweep.type == "HIGH_SWEEP":
+        side = "SELL"
+    elif sweep.type == "LOW_SWEEP":
+        side = "BUY"
+    else:
+        # Default side based on HTF bias
+        if htf_context.bias == "BULLISH":
+            side = "BUY"
+        elif htf_context.bias == "BEARISH":
+            side = "SELL"
+        else:
+            # Random side if no bias
+            import random
+            side = random.choice(["BUY", "SELL"])
+    
+    # --- STEP 4: STRUCTURE CHECK ---
+    structure_shift = await check_structure_shift(exchange, symbol, sweep, htf_context)
+    
+    # --- STEP 5: ENTRY ZONE ---
+    entry_zone = await find_entry_zone(exchange, symbol, htf_context, sweep, structure_shift, side)
+    
+    # --- STEP 6: RISK/SL ---
+    risk_sl = calculate_risk_sl(entry_zone, sweep, htf_context, side)
+    
+    # --- STEP 7: TAKE PROFIT ---
+    tp_levels = calculate_take_profits(entry_zone.price, side, liquidity_map, htf_context)
+    
+    # --- STEP 8: PROBABILITY CHECK ---
+    probability = calculate_probability(
+        htf_context, liquidity_map, sweep, structure_shift, entry_zone, side
+    )
+    
+    # ONLY CHECK: Total score threshold
+    if not probability.acceptable:
+        log.debug(f"  {symbol}: Score too low ({probability.total_score:.2f}/5)")
+        return None
+    
+    log.info(f"✅ {symbol}: Setup detected! Score: {probability.total_score:.2f}/5")
+    
+    # --- COMPILE FINAL SETUP ---
+    setup = {
+        "symbol": symbol,
+        "timestamp": datetime.datetime.utcnow().isoformat(),
+        "side": side,
+        "current_price": current_price,
+        
+        # Step 1
+        "htf_bias": htf_context.bias,
+        "htf_range_high": htf_context.range_high,
+        "htf_range_low": htf_context.range_low,
+        "htf_premium_discount": htf_context.premium_discount,
+        "htf_liquidity_zones": htf_context.liquidity_zones,
+        "htf_structure": htf_context.structure,
+        
+        # Step 2
+        "liquidity_from": liquidity_map.from_liquidity,
+        "liquidity_to": liquidity_map.to_liquidity,
+        "has_clear_target": liquidity_map.has_clear_target,
+        
+        # Step 3
+        "sweep_type": sweep.type,
+        "swept_price": sweep.swept_price,
+        "sweep_impulsive": sweep.impulsive,
+        "sweep_strength": sweep.strength,
+        
+        # Step 4
+        "structure_shift_type": structure_shift.type,
+        "structure_shift_confirmed": structure_shift.confirmed,
+        "structure_description": structure_shift.description,
+        
+        # Step 5
+        "entry_type": entry_zone.type,
+        "entry_price": entry_zone.price,
+        "entry_low": entry_zone.low,
+        "entry_high": entry_zone.high,
+        "entry_aligns_htf": entry_zone.aligns_with_htf,
+        "entry_reaction_confirmed": entry_zone.candle_reaction,
+        
+        # Step 6
+        "sl_price": risk_sl.sl_price,
+        "sl_invalidation_type": risk_sl.invalidation_type,
+        "risk_amount": risk_sl.risk_amount,
+        "sl_distance_pct": risk_sl.sl_to_entry_distance,
+        
+        # Step 7
+        "tp1_price": tp_levels.tp1,
+        "tp1_type": tp_levels.tp1_type,
+        "tp2_price": tp_levels.tp2,
+        "tp2_type": tp_levels.tp2_type,
+        "tp3_price": tp_levels.tp3,
+        "tp3_type": tp_levels.tp3_type,
+        
+        # Step 8
+        "probability": {
+            "htf_alignment": probability.htf_alignment,
+            "liquidity_quality": probability.liquidity_quality,
+            "sweep_strength": probability.sweep_strength,
+            "structure_clarity": probability.structure_clarity,
+            "entry_precision": probability.entry_precision,
+            "total_score": probability.total_score,
+            "acceptable": probability.acceptable
+        }
+    }
+    
+    return setup
+
+# ---------------- ALERT FORMATTING ----------------
+async def send_setup_alert(setup: Dict):
+    """Format and send setup alert"""
+    
+    # Calculate RR ratios
+    entry = setup["entry_price"]
+    sl = setup["sl_price"]
+    tp1 = setup["tp1_price"]
+    
+    risk = abs(entry - sl)
+    reward_tp1 = abs(tp1 - entry)
+    rr_ratio = reward_tp1 / risk if risk > 0 else 0
+    
+    # Format message
+    msg = f"""
+🔥 <b>ROMEOTPT SETUP CONFIRMED</b>
+
+<b>Symbol:</b> {setup['symbol']}
+<b>Side:</b> {setup['side']}
+<b>Entry:</b> {setup['entry_price']:.8f}
+<b>Current:</b> {setup['current_price']:.8f}
+
+<b>Probability Score:</b> {setup['probability']['total_score']:.2f}/5.0
+<b>RR Ratio:</b> {rr_ratio:.2f}:1
+
+🎯 <b>Targets:</b>
+TP1: {setup['tp1_price']:.8f} ({setup['tp1_type']})
+TP2: {setup['tp2_price']:.8f} ({setup['tp2_type']})
+TP3: {setup['tp3_price']:.8f} ({setup['tp3_type']})
+
+🛡️ <b>Risk:</b>
+SL: {setup['sl_price']:.8f} ({setup['sl_invalidation_type']})
+Risk: {setup['risk_amount']:.8f} ({setup['sl_distance_pct']:.2f}%)
+
+📊 <b>Analysis:</b>
+• HTF: {setup['htf_bias']} in {setup['htf_premium_discount']}
+• Sweep: {setup['sweep_type']} (strength: {setup['sweep_strength']:.2f})
+• Structure: {setup['structure_shift_type']}
+• Entry: {setup['entry_type']}
+
+✅ <b>Probability Components:</b>
+HTF Alignment: {setup['probability']['htf_alignment']:.2f}
+Liquidity Quality: {setup['probability']['liquidity_quality']:.2f}
+Sweep Strength: {setup['probability']['sweep_strength']:.2f}
+Structure Clarity: {setup['probability']['structure_clarity']:.2f}
+Entry Precision: {setup['probability']['entry_precision']:.2f}
+
+<i>Detected: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}</i>
+"""
+    
+    await send_telegram(msg)
+    
+    # FIX: Use safe_json_serialize for all JSON fields
+    async with db_lock:
+        await db_conn.execute("""
+            INSERT INTO signals (
+                symbol, timestamp, side,
+                htf_bias, htf_range_high, htf_range_low, htf_premium_discount,
+                htf_liquidity_zones_json, htf_structure_json,
+                liquidity_from_json, liquidity_to_json, has_clear_target,
+                sweep_type, swept_price, sweep_impulsive, sweep_strength,
+                structure_shift_type, structure_shift_confirmed, structure_description,
+                entry_type, entry_price, entry_low, entry_high, entry_aligns_htf, entry_reaction_confirmed,
+                sl_price, sl_invalidation_type, risk_amount, sl_distance_pct,
+                tp1_price, tp1_type, tp2_price, tp2_type, tp3_price, tp3_type,
+                prob_htf_alignment, prob_liquidity_quality, prob_sweep_strength,
+                prob_structure_clarity, prob_entry_precision, prob_total_score, prob_acceptable,
+                current_price, status, notes
+            ) VALUES (
+                :symbol, :timestamp, :side,
+                :htf_bias, :htf_range_high, :htf_range_low, :htf_premium_discount,
+                :htf_liquidity_zones, :htf_structure,
+                :liquidity_from, :liquidity_to, :has_clear_target,
+                :sweep_type, :swept_price, :sweep_impulsive, :sweep_strength,
+                :structure_shift_type, :structure_shift_confirmed, :structure_description,
+                :entry_type, :entry_price, :entry_low, :entry_high, :entry_aligns_htf, :entry_reaction_confirmed,
+                :sl_price, :sl_invalidation_type, :risk_amount, :sl_distance_pct,
+                :tp1_price, :tp1_type, :tp2_price, :tp2_type, :tp3_price, :tp3_type,
+                :prob_htf_alignment, :prob_liquidity_quality, :prob_sweep_strength,
+                :prob_structure_clarity, :prob_entry_precision, :prob_total_score, :prob_acceptable,
+                :current_price, 'DETECTED', ''
+            )
+        """, {
+            "symbol": setup["symbol"],
+            "timestamp": setup["timestamp"],
+            "side": setup["side"],
+            "htf_bias": setup["htf_bias"],
+            "htf_range_high": float(setup["htf_range_high"]),
+            "htf_range_low": float(setup["htf_range_low"]),
+            "htf_premium_discount": setup["htf_premium_discount"],
+            "htf_liquidity_zones": json.dumps(safe_json_serialize(setup["htf_liquidity_zones"])),
+            "htf_structure": json.dumps(safe_json_serialize(setup["htf_structure"])),
+            "liquidity_from": json.dumps(safe_json_serialize(setup["liquidity_from"])),
+            "liquidity_to": json.dumps(safe_json_serialize(setup["liquidity_to"])),
+            "has_clear_target": setup["has_clear_target"],
+            "sweep_type": setup["sweep_type"],
+            "swept_price": float(setup["swept_price"]),
+            "sweep_impulsive": setup["sweep_impulsive"],
+            "sweep_strength": float(setup["sweep_strength"]),
+            "structure_shift_type": setup["structure_shift_type"],
+            "structure_shift_confirmed": setup["structure_shift_confirmed"],
+            "structure_description": setup["structure_description"],
+            "entry_type": setup["entry_type"],
+            "entry_price": float(setup["entry_price"]),
+            "entry_low": float(setup["entry_low"]),
+            "entry_high": float(setup["entry_high"]),
+            "entry_aligns_htf": setup["entry_aligns_htf"],
+            "entry_reaction_confirmed": setup["entry_reaction_confirmed"],
+            "sl_price": float(setup["sl_price"]),
+            "sl_invalidation_type": setup["sl_invalidation_type"],
+            "risk_amount": float(setup["risk_amount"]),
+            "sl_distance_pct": float(setup["sl_distance_pct"]),
+            "tp1_price": float(setup["tp1_price"]),
+            "tp1_type": setup["tp1_type"],
+            "tp2_price": float(setup["tp2_price"]),
+            "tp2_type": setup["tp2_type"],
+            "tp3_price": float(setup["tp3_price"]),
+            "tp3_type": setup["tp3_type"],
+            "prob_htf_alignment": float(setup["probability"]["htf_alignment"]),
+            "prob_liquidity_quality": float(setup["probability"]["liquidity_quality"]),
+            "prob_sweep_strength": float(setup["probability"]["sweep_strength"]),
+            "prob_structure_clarity": float(setup["probability"]["structure_clarity"]),
+            "prob_entry_precision": float(setup["probability"]["entry_precision"]),
+            "prob_total_score": float(setup["probability"]["total_score"]),
+            "prob_acceptable": bool(setup["probability"]["acceptable"]),
+            "current_price": float(setup["current_price"])
+        })
+        await db_conn.commit()
+
+# ---------------- MAIN SCANNER ----------------
+async def scanner_main(exchange):
+    """Main scanning loop"""
+    
+    await send_telegram("🚀 ROMEOTPT v2 Scanner Started - Score-Only Mode")
+    await send_telegram("ℹ️ Only total probability score matters (≥0.5). All other steps are optional.")
+    
+    while True:
+        try:
+            # Get top volume pairs
+            tickers = await exchange.fetch_tickers()
+            usdt_pairs = [(s, v.get("quoteVolume", 0)) 
+                         for s, v in tickers.items() 
+                         if s.endswith("/USDT")]
+            usdt_pairs.sort(key=lambda x: x[1], reverse=True)
+            top_pairs = usdt_pairs[:TOP_N]
+            
+            log.info(f"📊 Scanning {len(top_pairs)} symbols...")
+            
+            setups_found = 0
+            for symbol, volume in top_pairs:
+                try:
+                    setup = await scan_symbol_full(exchange, symbol)
+                    if setup:
+                        await send_setup_alert(setup)
+                        setups_found += 1
+                        # Rate limiting
+                        await asyncio.sleep(1)
+                except Exception as e:
+                    log.error(f"Error scanning {symbol}: {e}")
+                    continue
+            
+            if setups_found > 0:
+                log.info(f"✅ Found {setups_found} setups")
+            else:
+                log.info("⏳ No setups found this scan")
+            
+        except Exception as e:
+            log.exception(f"Scanner error: {e}")
+        
+        await asyncio.sleep(SCAN_INTERVAL)
+
+# ---------------- FASTAPI ----------------
+app = FastAPI()
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy", "scanner": "ROMEOTPT v2 Score-Only"}
+
+@app.get("/setups")
+async def get_setups(limit: int = 20, min_score: float = 2.5):
+    async with db_lock:
+        async with db_conn.execute(
+            """SELECT * FROM signals 
+               WHERE prob_total_score >= ? 
+               ORDER BY timestamp DESC LIMIT ?""",
+            (min_score, limit)
+        ) as cursor:
+            columns = [description[0] for description in cursor.description]
+            rows = await cursor.fetchall()
+        
+        setups = []
+        for row in rows:
+            setup = dict(zip(columns, row))
+            # Parse JSON fields
+            json_fields = ["htf_liquidity_zones_json", "htf_structure_json",
+                          "liquidity_from_json", "liquidity_to_json"]
+            for field in json_fields:
+                if setup.get(field):
+                    try:
+                        key = field.replace("_json", "")
+                        setup[key] = json.loads(setup[field])
+                    except:
+                        pass
+            setups.append(setup)
+        
+        return {"setups": setups, "count": len(setups)}
+
+# ---------------- MAIN ----------------
+async def main():
+    global db_conn
+    
+    # Initialize
+    await init_db()
+    
+    # Create exchange
+    exchange = ccxt.okx({
+        "enableRateLimit": True,
+        "options": {"defaultType": "spot"}
+    })
+    
+    # Start scanner
+    await scanner_main(exchange)
 
 if __name__ == "__main__":
-    # Set event loop policy for Windows compatibility
-    try:
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    except:
-        pass  # Not Windows
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--http", action="store_true", help="Run HTTP server")
+    args = parser.parse_args()
     
-    # Run main
-    asyncio.run(main())
+    if args.http:
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+    else:
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            log.info("Shutting down ROMEOTPT v2 scanner...")
+        finally:
+            if db_conn:
+                asyncio.run(db_conn.close())
