@@ -29,7 +29,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_PATH = "/app/data/romeopt_v2.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))
-TOP_N = int(os.getenv("TOP_N", 25))
+TOP_N = int(os.getenv("TOP_N", 20))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 5))
 
 # Cooldown settings
@@ -439,10 +439,16 @@ async def log_position_update(position_id: int, current_price: float,
     """Log a position update with PnL calculation"""
     
     # Calculate PnL
+    pnl_percent = 0.0
     if entry_price > 0:
         pnl_percent = ((current_price - entry_price) / entry_price) * 100
     
     # Calculate distances
+    distance_to_sl = 0.0
+    distance_to_tp1 = 0.0
+    distance_to_tp2 = 0.0
+    distance_to_tp3 = 0.0
+    
     if entry_price > 0:
         distance_to_sl = abs(current_price - sl_price) / entry_price * 100
         distance_to_tp1 = abs(current_price - tp1_price) / entry_price * 100
@@ -797,8 +803,8 @@ async def analyze_htf_bias(exchange, symbol: str) -> HTFContext:
         # Check for swing low
         if (low_i < df_htf["low"].iloc[i-1] and 
             low_i < df_htf["low"].iloc[i-2] and
-            low_i < df_ltf["low"].iloc[i+1] and
-            low_i < df_ltf["low"].iloc[i+2]):
+            low_i < df_htf["low"].iloc[i+1] and
+            low_i < df_htf["low"].iloc[i+2]):
             swing_lows.append({
                 "price": float(low_i),
                 "index": int(i),
@@ -1767,7 +1773,7 @@ async def health():
     return {"status": "healthy", "scanner": "ROMEOTPT v2 Score-Only"}
 
 @app.get("/setups")
-async def get_setups(limit: int = 20, min_score: float = 1.0):
+async def get_setups(limit: int = 20, min_score: float = 1.5):
     async with db_lock:
         async with db_conn.execute(
             """SELECT * FROM signals 
