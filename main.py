@@ -34,8 +34,8 @@ TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 100))   # Scan many pairs
 MIN_VOLUME_USD = 500000  # $500K minimum - more opportunities
 
 # Trading parameters (REJECTION-BASED) - FIXED 3% SL/TP
-FIXED_STOP_LOSS_PCT = 2.0    # FIXED 3% stop loss
-FIXED_TAKE_PROFIT_PCT = 2.0  # FIXED 3% take profit
+FIXED_STOP_LOSS_PCT = 1.0    # FIXED 3% stop loss
+FIXED_TAKE_PROFIT_PCT = 1.0  # FIXED 3% take profit
 MIN_RISK_REWARD = 1.0        # Minimum 1:1 risk/reward (fixed 3:3)
 
 # Rejection scanning
