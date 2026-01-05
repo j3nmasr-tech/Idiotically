@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ROMEOTPT SCANNER v2 - Score-Only Implementation
-Only total probability score matters - all steps are optional
+With Position Monitoring & SL/TP Alerts
 """
 
 import os
@@ -29,12 +29,15 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_PATH = "/app/data/romeopt_v2.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))
-TOP_N = int(os.getenv("TOP_N", 20))
+TOP_N = int(os.getenv("TOP_N", 25))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 5))
 
 # Cooldown settings
 COOLDOWN_MINUTES = int(os.getenv("COOLDOWN_MINUTES", 60))  # Default 1 hour cooldown
 MIN_PRICE_CHANGE = float(os.getenv("MIN_PRICE_CHANGE", 0.01))  # 1% minimum price change
+
+# Monitoring settings
+MONITOR_INTERVAL = int(os.getenv("MONITOR_INTERVAL", 30))  # Check positions every 30 seconds
 
 # ---------------- LOGGING ----------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
@@ -125,6 +128,16 @@ class ProbabilityScore:
         """Accept if total >= MIN_SCORE (no component minimums)"""
         MIN_SCORE = 0.5  # ← CHANGE THIS NUMBER TO ADJUST SENSITIVITY
         return self.total_score >= MIN_SCORE
+
+# ---------------- POSITION TRACKING ----------------
+@dataclass
+class PositionStatus:
+    ACTIVE = 'ACTIVE'
+    CLOSED_SL = 'CLOSED_SL'
+    CLOSED_TP1 = 'CLOSED_TP1'
+    CLOSED_TP2 = 'CLOSED_TP2'
+    CLOSED_TP3 = 'CLOSED_TP3'
+    EXPIRED = 'EXPIRED'
 
 # ---------------- TELEGRAM ----------------
 async def send_telegram(msg: str, parse_mode="HTML"):
@@ -334,11 +347,366 @@ async def init_db():
         )
     """)
     
-    # Create index for faster lookups
+    # Create positions tracking table
+    await db_conn.execute("""
+        CREATE TABLE IF NOT EXISTS positions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_id INTEGER NOT NULL,
+            symbol TEXT NOT NULL,
+            side TEXT NOT NULL,
+            entry_price REAL NOT NULL,
+            sl_price REAL NOT NULL,
+            tp1_price REAL NOT NULL,
+            tp2_price REAL NOT NULL,
+            tp3_price REAL NOT NULL,
+            entry_time TEXT NOT NULL,
+            exit_time TEXT,
+            exit_price REAL,
+            exit_type TEXT,  -- 'SL', 'TP1', 'TP2', 'TP3', 'EXPIRED', 'MANUAL'
+            pnl_percent REAL,
+            status TEXT DEFAULT 'ACTIVE',
+            pnl_updated_time TEXT,
+            FOREIGN KEY (signal_id) REFERENCES signals(id) ON DELETE CASCADE
+        )
+    """)
+    
+    # Create position updates table for tracking price movements
+    await db_conn.execute("""
+        CREATE TABLE IF NOT EXISTS position_updates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            position_id INTEGER NOT NULL,
+            timestamp TEXT NOT NULL,
+            current_price REAL NOT NULL,
+            pnl_percent REAL,
+            distance_to_sl_pct REAL,
+            distance_to_tp1_pct REAL,
+            distance_to_tp2_pct REAL,
+            distance_to_tp3_pct REAL,
+            FOREIGN KEY (position_id) REFERENCES positions(id) ON DELETE CASCADE
+        )
+    """)
+    
+    # Create indexes for faster lookups
     await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_symbol_timestamp ON signals(symbol, timestamp)")
     await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_cooldown_time ON signal_cooldown(last_alert_time)")
+    await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status)")
+    await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_positions_symbol_status ON positions(symbol, status)")
+    await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_position_updates_position ON position_updates(position_id, timestamp)")
     
     await db_conn.commit()
+
+# ---------------- POSITION MANAGEMENT ----------------
+async def create_position_from_setup(setup: Dict, signal_id: int) -> int:
+    """Create a new position from a setup and return position ID"""
+    async with db_lock:
+        cursor = await db_conn.execute("""
+            INSERT INTO positions 
+            (signal_id, symbol, side, entry_price, sl_price, 
+             tp1_price, tp2_price, tp3_price, entry_time, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')
+            RETURNING id
+        """, (
+            signal_id,
+            setup['symbol'],
+            setup['side'],
+            setup['entry_price'],
+            setup['sl_price'],
+            setup['tp1_price'],
+            setup['tp2_price'],
+            setup['tp3_price'],
+            setup['timestamp']
+        ))
+        
+        position_id = (await cursor.fetchone())[0]
+        await db_conn.commit()
+        
+        # Log initial position update
+        await log_position_update(
+            position_id,
+            setup['current_price'],
+            setup['entry_price'],
+            setup['sl_price'],
+            setup['tp1_price'],
+            setup['tp2_price'],
+            setup['tp3_price']
+        )
+        
+        return position_id
+
+async def log_position_update(position_id: int, current_price: float,
+                             entry_price: float, sl_price: float,
+                             tp1_price: float, tp2_price: float, tp3_price: float):
+    """Log a position update with PnL calculation"""
+    
+    # Calculate PnL
+    if entry_price > 0:
+        pnl_percent = ((current_price - entry_price) / entry_price) * 100
+    
+    # Calculate distances
+    if entry_price > 0:
+        distance_to_sl = abs(current_price - sl_price) / entry_price * 100
+        distance_to_tp1 = abs(current_price - tp1_price) / entry_price * 100
+        distance_to_tp2 = abs(current_price - tp2_price) / entry_price * 100
+        distance_to_tp3 = abs(current_price - tp3_price) / entry_price * 100
+    
+    async with db_lock:
+        await db_conn.execute("""
+            INSERT INTO position_updates 
+            (position_id, timestamp, current_price, pnl_percent,
+             distance_to_sl_pct, distance_to_tp1_pct, distance_to_tp2_pct, distance_to_tp3_pct)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            position_id,
+            datetime.datetime.utcnow().isoformat(),
+            current_price,
+            pnl_percent,
+            distance_to_sl,
+            distance_to_tp1,
+            distance_to_tp2,
+            distance_to_tp3
+        ))
+        
+        # Update position PnL
+        await db_conn.execute("""
+            UPDATE positions 
+            SET pnl_percent = ?, pnl_updated_time = ?
+            WHERE id = ?
+        """, (pnl_percent, datetime.datetime.utcnow().isoformat(), position_id))
+        
+        await db_conn.commit()
+
+async def close_position(position_id: int, exit_price: float, exit_type: str):
+    """Close a position and calculate final PnL"""
+    async with db_lock:
+        # Get position details
+        cursor = await db_conn.execute("""
+            SELECT symbol, side, entry_price FROM positions 
+            WHERE id = ? AND status = 'ACTIVE'
+        """, (position_id,))
+        
+        position = await cursor.fetchone()
+        if not position:
+            log.warning(f"Position {position_id} not found or already closed")
+            return False
+        
+        symbol, side, entry_price = position
+        
+        # Calculate final PnL
+        pnl_percent = ((exit_price - entry_price) / entry_price) * 100
+        
+        # Update position
+        await db_conn.execute("""
+            UPDATE positions 
+            SET exit_time = ?, exit_price = ?, exit_type = ?, 
+                pnl_percent = ?, status = 'CLOSED'
+            WHERE id = ?
+        """, (
+            datetime.datetime.utcnow().isoformat(),
+            exit_price,
+            exit_type,
+            pnl_percent,
+            position_id
+        ))
+        
+        await db_conn.commit()
+        
+        log.info(f"Closed position {position_id} ({symbol}) at {exit_price} via {exit_type}")
+        return True
+
+def calculate_time_in_trade(entry_time_str: str) -> str:
+    """Calculate time elapsed since entry"""
+    try:
+        entry_time = datetime.datetime.fromisoformat(entry_time_str)
+        now = datetime.datetime.utcnow()
+        diff = now - entry_time
+        
+        days = diff.days
+        hours = diff.seconds // 3600
+        minutes = (diff.seconds % 3600) // 60
+        
+        if days > 0:
+            return f"{days}d {hours}h"
+        elif hours > 0:
+            return f"{hours}h {minutes}m"
+        else:
+            return f"{minutes}m"
+    except:
+        return "Unknown"
+
+# ---------------- POSITION MONITORING ----------------
+async def monitor_positions(exchange):
+    """Monitor active positions for SL/TP hits"""
+    log.info("Starting position monitor...")
+    
+    while True:
+        try:
+            # Get all active positions
+            async with db_lock:
+                cursor = await db_conn.execute("""
+                    SELECT id, signal_id, symbol, side, entry_price, 
+                           sl_price, tp1_price, tp2_price, tp3_price, entry_time
+                    FROM positions 
+                    WHERE status = 'ACTIVE'
+                """)
+                active_positions = await cursor.fetchall()
+            
+            if not active_positions:
+                await asyncio.sleep(MONITOR_INTERVAL)
+                continue
+            
+            log.debug(f"Monitoring {len(active_positions)} active positions")
+            
+            for position in active_positions:
+                (position_id, signal_id, symbol, side, entry_price, 
+                 sl_price, tp1_price, tp2_price, tp3_price, entry_time) = position
+                
+                try:
+                    # Fetch current price
+                    ticker = await exchange.fetch_ticker(symbol)
+                    current_price = ticker.get('last', 0)
+                    
+                    if not current_price or current_price <= 0:
+                        log.warning(f"Invalid price for {symbol}: {current_price}")
+                        continue
+                    
+                    # Log position update
+                    await log_position_update(
+                        position_id,
+                        current_price,
+                        entry_price,
+                        sl_price,
+                        tp1_price,
+                        tp2_price,
+                        tp3_price
+                    )
+                    
+                    # Check for SL/TP hits
+                    sl_hit = False
+                    tp_hit_level = None
+                    exit_price = 0
+                    
+                    if side.upper() == 'BUY':
+                        # For BUY positions
+                        if current_price <= sl_price:
+                            sl_hit = True
+                            exit_price = current_price
+                        elif current_price >= tp3_price:
+                            tp_hit_level = 'TP3'
+                            exit_price = current_price
+                        elif current_price >= tp2_price:
+                            tp_hit_level = 'TP2'
+                            exit_price = current_price
+                        elif current_price >= tp1_price:
+                            tp_hit_level = 'TP1'
+                            exit_price = current_price
+                    
+                    elif side.upper() == 'SELL':
+                        # For SELL positions
+                        if current_price >= sl_price:
+                            sl_hit = True
+                            exit_price = current_price
+                        elif current_price <= tp3_price:
+                            tp_hit_level = 'TP3'
+                            exit_price = current_price
+                        elif current_price <= tp2_price:
+                            tp_hit_level = 'TP2'
+                            exit_price = current_price
+                        elif current_price <= tp1_price:
+                            tp_hit_level = 'TP1'
+                            exit_price = current_price
+                    
+                    # Handle exit if any level hit
+                    if sl_hit:
+                        exit_type = 'SL'
+                        await close_position(position_id, exit_price, exit_type)
+                        await send_position_closure_alert(
+                            symbol, side, entry_price, exit_price, 
+                            exit_type, entry_time, position_id
+                        )
+                    
+                    elif tp_hit_level:
+                        exit_type = tp_hit_level
+                        await close_position(position_id, exit_price, exit_type)
+                        await send_position_closure_alert(
+                            symbol, side, entry_price, exit_price, 
+                            exit_type, entry_time, position_id
+                        )
+                    
+                    # Check for expired positions (older than 7 days)
+                    entry_time_dt = datetime.datetime.fromisoformat(entry_time)
+                    now = datetime.datetime.utcnow()
+                    
+                    if (now - entry_time_dt).days >= 7:
+                        exit_type = 'EXPIRED'
+                        await close_position(position_id, current_price, exit_type)
+                        await send_position_closure_alert(
+                            symbol, side, entry_price, current_price, 
+                            exit_type, entry_time, position_id
+                        )
+                
+                except Exception as e:
+                    log.error(f"Error monitoring position {position_id} ({symbol}): {e}")
+                    continue
+                
+                # Small delay between symbol checks
+                await asyncio.sleep(0.5)
+        
+        except Exception as e:
+            log.error(f"Position monitoring error: {e}")
+        
+        # Wait for next monitoring cycle
+        await asyncio.sleep(MONITOR_INTERVAL)
+
+async def send_position_closure_alert(symbol: str, side: str, entry_price: float,
+                                     exit_price: float, exit_type: str,
+                                     entry_time: str, position_id: int):
+    """Send alert when position is closed"""
+    
+    # Calculate PnL
+    pnl_percent = ((exit_price - entry_price) / entry_price) * 100
+    pnl_abs = exit_price - entry_price
+    time_in_trade = calculate_time_in_trade(entry_time)
+    
+    # Format message based on exit type
+    if exit_type == 'SL':
+        emoji = "🛑"
+        title = "STOP LOSS HIT"
+        color = "🔴"
+    elif exit_type == 'EXPIRED':
+        emoji = "⏰"
+        title = "POSITION EXPIRED"
+        color = "🟡"
+    else:
+        emoji = "🎯"
+        title = "TAKE PROFIT HIT"
+        color = "🟢"
+    
+    pnl_color = "🟢" if pnl_percent > 0 else "🔴"
+    
+    msg = f"""
+{emoji} <b>{title}</b>
+
+<b>Symbol:</b> {symbol}
+<b>Side:</b> {side}
+<b>Position ID:</b> {position_id}
+
+<b>Entry Price:</b> {entry_price:.8f}
+<b>Exit Price:</b> {exit_price:.8f}
+<b>Exit Type:</b> {exit_type}
+
+<b>PnL:</b> {pnl_color} {pnl_percent:+.2f}% ({pnl_abs:+.8f})
+<b>Time in Trade:</b> {time_in_trade}
+
+{color} <b>Level Hit:</b> {exit_type}
+
+<i>Closed: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}</i>
+"""
+    
+    await send_telegram(msg)
+    
+    # Also send a brief update to the scanner channel
+    brief_msg = f"{emoji} {symbol} {side} closed at {exit_type} ({pnl_percent:+.2f}%)"
+    await send_telegram(brief_msg)
 
 # ---------------- OHLCV UTILS ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit: int = 200):
@@ -429,8 +797,8 @@ async def analyze_htf_bias(exchange, symbol: str) -> HTFContext:
         # Check for swing low
         if (low_i < df_htf["low"].iloc[i-1] and 
             low_i < df_htf["low"].iloc[i-2] and
-            low_i < df_htf["low"].iloc[i+1] and
-            low_i < df_htf["low"].iloc[i+2]):
+            low_i < df_ltf["low"].iloc[i+1] and
+            low_i < df_ltf["low"].iloc[i+2]):
             swing_lows.append({
                 "price": float(low_i),
                 "index": int(i),
@@ -1258,7 +1626,7 @@ Entry Precision: {setup['probability']['entry_precision']:.2f}
     
     # Save to database
     async with db_lock:
-        await db_conn.execute("""
+        cursor = await db_conn.execute("""
             INSERT INTO signals (
                 symbol, timestamp, side,
                 htf_bias, htf_range_high, htf_range_low, htf_premium_discount,
@@ -1294,10 +1662,10 @@ Entry Precision: {setup['probability']['entry_precision']:.2f}
             "htf_range_high": float(setup["htf_range_high"]),
             "htf_range_low": float(setup["htf_range_low"]),
             "htf_premium_discount": setup["htf_premium_discount"],
-            "htf_liquidity_zones": json.dumps(safe_json_serialize(setup["htf_liquidity_zones"])),
-            "htf_structure": json.dumps(safe_json_serialize(setup["htf_structure"])),
-            "liquidity_from": json.dumps(safe_json_serialize(setup["liquidity_from"])),
-            "liquidity_to": json.dumps(safe_json_serialize(setup["liquidity_to"])),
+            "htf_liquidity_zones": json.dumps(setup["htf_liquidity_zones"]),
+            "htf_structure": json.dumps(setup["htf_structure"]),
+            "liquidity_from": json.dumps(setup["liquidity_from"]),
+            "liquidity_to": json.dumps(setup["liquidity_to"]),
             "has_clear_target": setup["has_clear_target"],
             "sweep_type": setup["sweep_type"],
             "swept_price": float(setup["swept_price"]),
@@ -1332,13 +1700,21 @@ Entry Precision: {setup['probability']['entry_precision']:.2f}
             "current_price": float(setup["current_price"])
         })
         await db_conn.commit()
+        
+        # Get the signal ID
+        signal_id = cursor.lastrowid
+        
+        # Create position for monitoring
+        position_id = await create_position_from_setup(setup, signal_id)
+        
+        log.info(f"Created position {position_id} for {setup['symbol']}")
 
 # ---------------- MAIN SCANNER ----------------
 async def scanner_main(exchange):
     """Main scanning loop"""
     
     await send_telegram("🚀 ROMEOTPT v2 Scanner Started - Score-Only Mode")
-    await send_telegram("ℹ️ Only total probability score matters (≥0.5). All other steps are optional.")
+    await send_telegram("ℹ️ Position monitoring enabled with SL/TP alerts")
     
     while True:
         try:
@@ -1391,7 +1767,7 @@ async def health():
     return {"status": "healthy", "scanner": "ROMEOTPT v2 Score-Only"}
 
 @app.get("/setups")
-async def get_setups(limit: int = 20, min_score: float = 1.5):
+async def get_setups(limit: int = 20, min_score: float = 1.0):
     async with db_lock:
         async with db_conn.execute(
             """SELECT * FROM signals 
@@ -1419,6 +1795,98 @@ async def get_setups(limit: int = 20, min_score: float = 1.5):
         
         return {"setups": setups, "count": len(setups)}
 
+@app.get("/positions")
+async def get_positions(status: str = "ACTIVE", limit: int = 50):
+    async with db_lock:
+        if status.upper() == "ALL":
+            query = """SELECT p.*, s.timestamp as signal_time, 
+                              s.entry_type, s.sweep_type, s.structure_shift_type,
+                              s.prob_total_score
+                       FROM positions p
+                       LEFT JOIN signals s ON p.signal_id = s.id
+                       ORDER BY p.entry_time DESC LIMIT ?"""
+            params = (limit,)
+        else:
+            query = """SELECT p.*, s.timestamp as signal_time, 
+                              s.entry_type, s.sweep_type, s.structure_shift_type,
+                              s.prob_total_score
+                       FROM positions p
+                       LEFT JOIN signals s ON p.signal_id = s.id
+                       WHERE p.status = ?
+                       ORDER BY p.entry_time DESC LIMIT ?"""
+            params = (status.upper(), limit)
+        
+        async with db_conn.execute(query, params) as cursor:
+            columns = [description[0] for description in cursor.description]
+            rows = await cursor.fetchall()
+        
+        positions = []
+        for row in rows:
+            pos = dict(zip(columns, row))
+            
+            # Calculate current PnL if active
+            if pos['status'] == 'ACTIVE':
+                # Try to get latest price from position_updates
+                cursor2 = await db_conn.execute(
+                    """SELECT current_price FROM position_updates 
+                       WHERE position_id = ? ORDER BY timestamp DESC LIMIT 1""",
+                    (pos['id'],)
+                )
+                latest_price = await cursor2.fetchone()
+                if latest_price:
+                    current_price = latest_price[0]
+                    pos['current_price'] = current_price
+                    pos['current_pnl'] = ((current_price - pos['entry_price']) / pos['entry_price']) * 100
+            
+            positions.append(pos)
+        
+        return {"positions": positions, "count": len(positions)}
+
+@app.post("/positions/{position_id}/close")
+async def close_position_manual(position_id: int, price: Optional[float] = None):
+    """Manually close a position"""
+    try:
+        # Get position details
+        async with db_lock:
+            cursor = await db_conn.execute(
+                "SELECT symbol, side, entry_price, status FROM positions WHERE id = ?",
+                (position_id,)
+            )
+            position = await cursor.fetchone()
+            
+            if not position:
+                return {"error": "Position not found"}
+            
+            symbol, side, entry_price, status = position
+            
+            if status != 'ACTIVE':
+                return {"error": f"Position already closed (status: {status})"}
+            
+            # If no price provided, get current price
+            if price is None:
+                exchange = ccxt.okx({"enableRateLimit": True})
+                ticker = await exchange.fetch_ticker(symbol)
+                price = ticker.get('last', 0)
+                await exchange.close()
+            
+            if not price or price <= 0:
+                return {"error": "Invalid price"}
+            
+            # Close position
+            success = await close_position(position_id, price, 'MANUAL')
+            
+            if success:
+                await send_position_closure_alert(
+                    symbol, side, entry_price, price, 'MANUAL',
+                    datetime.datetime.utcnow().isoformat(), position_id
+                )
+                return {"success": True, "message": f"Position {position_id} closed at {price}"}
+            else:
+                return {"error": "Failed to close position"}
+    
+    except Exception as e:
+        return {"error": str(e)}
+
 # ---------------- CLEANUP ----------------
 async def cleanup_old_data():
     """Clean up old data to prevent database bloat"""
@@ -1431,15 +1899,28 @@ async def cleanup_old_data():
                     "DELETE FROM signals WHERE timestamp < ?",
                     (cutoff_30d,)
                 )
-                await db_conn.commit()
-            
-            # Clean old cooldown entries (older than 7 days)
-            cutoff_7d = (datetime.datetime.utcnow() - datetime.timedelta(days=7)).isoformat()
-            async with db_lock:
+                
+                # Clean old positions
+                await db_conn.execute(
+                    """DELETE FROM positions 
+                       WHERE status != 'ACTIVE' AND entry_time < ?""",
+                    (cutoff_30d,)
+                )
+                
+                # Clean old position updates
+                cutoff_7d = (datetime.datetime.utcnow() - datetime.timedelta(days=7)).isoformat()
+                await db_conn.execute(
+                    """DELETE FROM position_updates 
+                       WHERE timestamp < ?""",
+                    (cutoff_7d,)
+                )
+                
+                # Clean old cooldown entries (older than 7 days)
                 await db_conn.execute(
                     "DELETE FROM signal_cooldown WHERE last_alert_time < ?",
                     (cutoff_7d,)
                 )
+                
                 await db_conn.commit()
             
             log.info("🧹 Cleaned up old database entries")
@@ -1466,12 +1947,16 @@ async def main():
         "options": {"defaultType": "spot"}
     })
     
+    # Start position monitoring
+    monitor_task = asyncio.create_task(monitor_positions(exchange))
+    
     # Start scanner
     try:
         await scanner_main(exchange)
     except KeyboardInterrupt:
         log.info("Shutting down ROMEOTPT v2 scanner...")
     finally:
+        monitor_task.cancel()
         cleanup_task.cancel()
         if db_conn:
             await db_conn.close()
