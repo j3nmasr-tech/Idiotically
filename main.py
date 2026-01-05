@@ -44,10 +44,9 @@ REJECTION_CONFIG = {
     "min_rejection_strength": 0.2,  # Minimum rejection strength score
 }
 
-# Timeframes for REACTION TRADING
+# Timeframes for REACTION TRADING - UPDATED: Only 15M and 30M for SL/TP
 TIMEFRAMES = {
-    "1H": "1h",      # Wave length context + SL/TP ANALYSIS
-    "30M": "30m",    # SL/TP ANALYSIS
+    "30M": "30m",    # SL/TP ANALYSIS ONLY
     "15M": "15m",    # Strength and structure + SL/TP ANALYSIS
     "5M": "5m",      # Primary rejection analysis
     "3M": "3m",      # Fast trigger (MAIN)
@@ -116,7 +115,7 @@ class RejectionSignal:
     
     # TP SOURCE TRACKING - NEW
     tp_source: str            # "LIQUIDITY_POOL" or "SWING_HIGH_LOW"
-    tp_timeframe: str         # "1H", "30M", or "15M"
+    tp_timeframe: str         # "30M" or "15M" ONLY
     
     # Analysis context
     wave_context: WaveContext
@@ -244,29 +243,29 @@ class RejectionBasedScanner:
     
     # ========== WAVE LENGTH ANALYSIS (CONTEXT ONLY) ==========
     
-    def analyze_wave_context(self, df_1h: pd.DataFrame, df_15m: pd.DataFrame) -> WaveContext:
+    def analyze_wave_context(self, df_15m: pd.DataFrame, df_5m: pd.DataFrame) -> WaveContext:
         """
         Analyze wave length and maturity - NO WAVE COUNTING
         Determine context only
         """
         try:
-            if df_1h is None or df_15m is None:
+            if df_15m is None or df_5m is None:
                 return self._get_default_wave_context()
             
-            if len(df_1h) < 20 or len(df_15m) < 30:
+            if len(df_15m) < 20 or len(df_5m) < 30:
                 return self._get_default_wave_context()
             
-            # 1. Analyze wave length on 1H
-            wave_length, wave_maturity = self._analyze_wave_length(df_1h)
+            # 1. Analyze wave length on 15M
+            wave_length, wave_maturity = self._analyze_wave_length(df_15m)
             
-            # 2. Analyze expansion speed on 15M
-            expansion_speed = self._analyze_expansion_speed(df_15m)
+            # 2. Analyze expansion speed on 5M
+            expansion_speed = self._analyze_expansion_speed(df_5m)
             
             # 3. Determine structure type
-            structure_type = self._determine_structure(df_15m)
+            structure_type = self._determine_structure(df_5m)
             
             # 4. Determine context side (not trade direction, just context)
-            context_side = self._determine_context_side(df_1h, df_15m)
+            context_side = self._determine_context_side(df_15m, df_5m)
             
             return WaveContext(
                 wave_length=wave_length,
@@ -384,24 +383,24 @@ class RejectionBasedScanner:
         except Exception as e:
             return "COMPRESSION"
     
-    def _determine_context_side(self, df_1h: pd.DataFrame, df_15m: pd.DataFrame) -> str:
+    def _determine_context_side(self, df_15m: pd.DataFrame, df_5m: pd.DataFrame) -> str:
         """Determine context side (not trade direction)"""
         try:
-            # Use 1H for broader context
-            if len(df_1h) < 10:
+            # Use 15M for broader context
+            if len(df_15m) < 10:
                 return "NEUTRAL"
             
             # Simple slope analysis
-            prices_1h = df_1h['close'].values[-10:]
-            x = np.arange(len(prices_1h))
-            slope_1h, _ = np.polyfit(x, prices_1h, 1)
+            prices_15m = df_15m['close'].values[-10:]
+            x = np.arange(len(prices_15m))
+            slope_15m, _ = np.polyfit(x, prices_15m, 1)
             
-            # Use 15M for recent bias
-            prices_15m = df_15m['close'].values[-5:]
-            slope_15m, _ = np.polyfit(np.arange(len(prices_15m)), prices_15m, 1)
+            # Use 5M for recent bias
+            prices_5m = df_5m['close'].values[-5:]
+            slope_5m, _ = np.polyfit(np.arange(len(prices_5m)), prices_5m, 1)
             
             # Combine with weights
-            total_slope = (slope_1h * 0.7 + slope_15m * 0.3)
+            total_slope = (slope_15m * 0.7 + slope_5m * 0.3)
             
             if total_slope > 0.001:
                 return "BULLISH_CONTEXT"
@@ -817,18 +816,18 @@ class RejectionBasedScanner:
         
         return "NEUTRAL"
     
-    # ========== DYNAMIC SL/TP METHODS (USING 15M, 30M, 1H) ==========
+    # ========== DYNAMIC SL/TP METHODS (USING 15M, 30M ONLY) ==========
     
     def find_nearest_swing_low_multi_tf(self, multi_tf_data: Dict[str, pd.DataFrame], 
                                         side: str, entry_price: float, zone_price: float) -> Optional[float]:
         """
         Find nearest significant swing low for LONG or swing high for SHORT
-        Uses multiple higher timeframes (15M, 30M, 1H)
-        Returns the best swing level across all timeframes
+        Uses 15M and 30M ONLY for SL/TP
+        Returns the best swing level across timeframes
         """
         try:
-            # Define which timeframes to use for swing analysis (HIGHER TIMEFRAMES ONLY)
-            swing_tfs = ["15M", "30M", "1H"]
+            # Define which timeframes to use for swing analysis (15M and 30M ONLY)
+            swing_tfs = ["15M", "30M"]
             
             all_swings = []
             
@@ -885,11 +884,9 @@ class RejectionBasedScanner:
                         if len(recent_lows) > 0 and min(recent_lows) < swing_price:
                             continue  # This swing was broken, skip
                         
-                        # Weight by timeframe (higher timeframe = more weight)
+                        # Weight by timeframe (30M gets priority)
                         timeframe_weight = 1.0
-                        if swing['timeframe'] == "1H":
-                            timeframe_weight = 1.3
-                        elif swing['timeframe'] == "30M":
+                        if swing['timeframe'] == "30M":
                             timeframe_weight = 1.2
                         elif swing['timeframe'] == "15M":
                             timeframe_weight = 1.0
@@ -953,11 +950,9 @@ class RejectionBasedScanner:
                         if len(recent_highs) > 0 and max(recent_highs) > swing_price:
                             continue  # This swing was broken, skip
                         
-                        # Weight by timeframe (higher timeframe = more weight)
+                        # Weight by timeframe (30M gets priority)
                         timeframe_weight = 1.0
-                        if swing['timeframe'] == "1H":
-                            timeframe_weight = 1.3
-                        elif swing['timeframe'] == "30M":
+                        if swing['timeframe'] == "30M":
                             timeframe_weight = 1.2
                         elif swing['timeframe'] == "15M":
                             timeframe_weight = 1.0
@@ -980,10 +975,10 @@ class RejectionBasedScanner:
             if not all_swings:
                 return None
             
-            # Sort swings by weight (higher timeframe first) then distance
+            # Sort swings by weight (30M first) then distance
             all_swings.sort(key=lambda x: (-x['weight'], x['distance']))
             
-            # Get the best swing (highest timeframe, closest distance)
+            # Get the best swing (30M priority, then closest distance)
             best_swing = all_swings[0]
             
             # Add small buffer (0.3%)
@@ -993,7 +988,7 @@ class RejectionBasedScanner:
                 return best_swing['price'] * 1.003
                 
         except Exception as e:
-            log.error(f"Multi-timeframe swing analysis error: {e}")
+            log.error(f"Swing analysis error: {e}")
             return None
     
     def find_nearest_swing_tp_multi_tf(self, multi_tf_data: Dict[str, pd.DataFrame], side: str, 
@@ -1001,12 +996,12 @@ class RejectionBasedScanner:
                                        current_rsi: float) -> Optional[Tuple[float, str, str]]:
         """
         Find nearest swing high/low for take profit (FALLBACK METHOD)
-        Uses multiple higher timeframes (15M, 30M, 1H)
+        Uses 15M and 30M ONLY
         Returns (tp_price, source, timeframe) or None if no valid swing found
         """
         try:
-            # Define which timeframes to use for TP analysis (HIGHER TIMEFRAMES ONLY)
-            tp_tfs = ["15M", "30M", "1H"]
+            # Define which timeframes to use for TP analysis (15M and 30M ONLY)
+            tp_tfs = ["15M", "30M"]
             
             all_targets = []
             
@@ -1023,13 +1018,13 @@ class RejectionBasedScanner:
                     # For LONG: look for nearest swing HIGH above entry
                     swing_highs = []
                     
-                    # Scan for swing highs (higher than 5 candles on each side for higher TFs)
+                    # Scan for swing highs (higher than 5 candles on each side)
                     for i in range(10, len(df) - 10):
                         high = df['high'].iloc[i]
                         
                         # Check if this is a swing high
                         is_swing = True
-                        for j in range(1, 6):  # 5 candles each side for higher TFs
+                        for j in range(1, 6):  # 5 candles each side
                             if high <= df['high'].iloc[i-j]:
                                 is_swing = False
                                 break
@@ -1082,11 +1077,9 @@ class RejectionBasedScanner:
                     if adjusted_price > swing_price:
                         adjusted_price = swing_price
                     
-                    # Weight by timeframe (higher timeframe = more weight)
+                    # Weight by timeframe (30M gets priority)
                     timeframe_weight = 1.0
-                    if tf_name == "1H":
-                        timeframe_weight = 1.5
-                    elif tf_name == "30M":
+                    if tf_name == "30M":
                         timeframe_weight = 1.3
                     elif tf_name == "15M":
                         timeframe_weight = 1.0
@@ -1107,13 +1100,13 @@ class RejectionBasedScanner:
                     # For SHORT: look for nearest swing LOW below entry
                     swing_lows = []
                     
-                    # Scan for swing lows (lower than 5 candles on each side for higher TFs)
+                    # Scan for swing lows (lower than 5 candles on each side)
                     for i in range(10, len(df) - 10):
                         low = df['low'].iloc[i]
                         
                         # Check if this is a swing low
                         is_swing = True
-                        for j in range(1, 6):  # 5 candles each side for higher TFs
+                        for j in range(1, 6):  # 5 candles each side
                             if low >= df['low'].iloc[i-j]:
                                 is_swing = False
                                 break
@@ -1166,11 +1159,9 @@ class RejectionBasedScanner:
                     if adjusted_price < swing_price:
                         adjusted_price = swing_price
                     
-                    # Weight by timeframe (higher timeframe = more weight)
+                    # Weight by timeframe (30M gets priority)
                     timeframe_weight = 1.0
-                    if tf_name == "1H":
-                        timeframe_weight = 1.5
-                    elif tf_name == "30M":
+                    if tf_name == "30M":
                         timeframe_weight = 1.3
                     elif tf_name == "15M":
                         timeframe_weight = 1.0
@@ -1190,10 +1181,10 @@ class RejectionBasedScanner:
             if not all_targets:
                 return None
             
-            # Sort targets by weight (higher timeframe first) then R:R ratio
+            # Sort targets by weight (30M first) then R:R ratio
             all_targets.sort(key=lambda x: (-x['weight'], -x['rr_ratio']))
             
-            # Get the best target (highest timeframe, best R:R)
+            # Get the best target (30M priority, best R:R)
             best_target = all_targets[0]
             
             # Add small buffer
@@ -1205,7 +1196,7 @@ class RejectionBasedScanner:
             return tp_price, "SWING_HIGH_LOW", best_target['timeframe']
                 
         except Exception as e:
-            log.error(f"Multi-timeframe swing TP analysis error: {e}")
+            log.error(f"Swing TP analysis error: {e}")
             return None
     
     def find_liquidity_pool_target_multi_tf(self, multi_tf_data: Dict[str, pd.DataFrame], side: str, 
@@ -1213,13 +1204,13 @@ class RejectionBasedScanner:
                                             current_rsi: float) -> Optional[Tuple[float, str, str]]:
         """
         Find nearest liquidity pool for take profit (PRIMARY METHOD)
-        Uses multiple higher timeframes (15M, 30M, 1H)
+        Uses 15M and 30M ONLY
         Based on order book clusters, volume nodes, and market structure
         Returns (tp_price, source, timeframe) or None if no valid target found
         """
         try:
-            # Define which timeframes to use for liquidity analysis (HIGHER TIMEFRAMES ONLY)
-            liquidity_tfs = ["15M", "30M", "1H"]
+            # Define which timeframes to use for liquidity analysis (15M and 30M ONLY)
+            liquidity_tfs = ["15M", "30M"]
             
             all_targets = []
             
@@ -1229,20 +1220,20 @@ class RejectionBasedScanner:
                     
                 df = multi_tf_data[tf_name]
                 
-                if len(df) < 100:
+                if len(df) < 80:
                     continue
                 
                 if side == "LONG":
                     # For LONG: look for resistance levels (liquidity above)
                     resistance_levels = []
                     
-                    # 1. Recent swing highs (last 100 candles)
+                    # 1. Recent swing highs (last 80 candles)
                     for i in range(20, len(df) - 20):
                         high = df['high'].iloc[i]
                         
-                        # Check if this is a swing high (more strict for higher TFs)
+                        # Check if this is a swing high
                         is_swing = True
-                        for j in range(1, 8):  # 7 candles each side for higher TFs
+                        for j in range(1, 6):  # 5 candles each side
                             if high <= df['high'].iloc[i-j] or high <= df['high'].iloc[i+j]:
                                 is_swing = False
                                 break
@@ -1258,8 +1249,8 @@ class RejectionBasedScanner:
                                 'type': 'swing_high'
                             })
                     
-                    # 2. High volume nodes (clusters) - more bins for higher TFs
-                    price_bins = np.linspace(df['low'].min(), df['high'].max(), 30)
+                    # 2. High volume nodes (clusters)
+                    price_bins = np.linspace(df['low'].min(), df['high'].max(), 25)
                     volume_profile = []
                     
                     for i in range(len(price_bins) - 1):
@@ -1306,11 +1297,9 @@ class RejectionBasedScanner:
                                 adjusted_distance = target['distance'] * rsi_factor
                                 adjusted_price = entry_price + adjusted_distance
                                 
-                                # Weight by timeframe (higher timeframe = more weight)
+                                # Weight by timeframe (30M gets priority)
                                 timeframe_weight = 1.0
-                                if target['timeframe'] == "1H":
-                                    timeframe_weight = 1.5
-                                elif target['timeframe'] == "30M":
+                                if target['timeframe'] == "30M":
                                     timeframe_weight = 1.3
                                 elif target['timeframe'] == "15M":
                                     timeframe_weight = 1.0
@@ -1339,13 +1328,13 @@ class RejectionBasedScanner:
                     # For SHORT: look for support levels (liquidity below)
                     support_levels = []
                     
-                    # 1. Recent swing lows (last 100 candles)
+                    # 1. Recent swing lows (last 80 candles)
                     for i in range(20, len(df) - 20):
                         low = df['low'].iloc[i]
                         
-                        # Check if this is a swing low (more strict for higher TFs)
+                        # Check if this is a swing low
                         is_swing = True
-                        for j in range(1, 8):  # 7 candles each side for higher TFs
+                        for j in range(1, 6):  # 5 candles each side
                             if low >= df['low'].iloc[i-j] or low >= df['low'].iloc[i+j]:
                                 is_swing = False
                                 break
@@ -1361,8 +1350,8 @@ class RejectionBasedScanner:
                                 'type': 'swing_low'
                             })
                     
-                    # 2. High volume nodes (clusters) - more bins for higher TFs
-                    price_bins = np.linspace(df['low'].min(), df['high'].max(), 30)
+                    # 2. High volume nodes (clusters)
+                    price_bins = np.linspace(df['low'].min(), df['high'].max(), 25)
                     volume_profile = []
                     
                     for i in range(len(price_bins) - 1):
@@ -1409,11 +1398,9 @@ class RejectionBasedScanner:
                                 adjusted_distance = target['distance'] * rsi_factor
                                 adjusted_price = entry_price - adjusted_distance
                                 
-                                # Weight by timeframe (higher timeframe = more weight)
+                                # Weight by timeframe (30M gets priority)
                                 timeframe_weight = 1.0
-                                if target['timeframe'] == "1H":
-                                    timeframe_weight = 1.5
-                                elif target['timeframe'] == "30M":
+                                if target['timeframe'] == "30M":
                                     timeframe_weight = 1.3
                                 elif target['timeframe'] == "15M":
                                     timeframe_weight = 1.0
@@ -1441,7 +1428,7 @@ class RejectionBasedScanner:
             if not all_targets:
                 return None
             
-            # Sort all targets by weight (higher timeframe first) then combined score
+            # Sort all targets by weight (30M first) then combined score
             all_targets.sort(key=lambda x: (-x['weight'], -(x['rr_ratio'] * np.log1p(x['volume']))))
             
             # Get the best target across all timeframes
@@ -1456,23 +1443,23 @@ class RejectionBasedScanner:
             return tp_price, "LIQUIDITY_POOL", best_target['timeframe']
                 
         except Exception as e:
-            log.error(f"Multi-timeframe liquidity pool analysis error: {e}")
+            log.error(f"Liquidity pool analysis error: {e}")
             return None
     
     def calculate_dynamic_sl_tp_multi_tf(self, multi_tf_data: Dict[str, pd.DataFrame], side: str, 
                                         entry_price: float, zone_price: float, 
                                         current_rsi: float) -> Tuple[Optional[float], Optional[float], Optional[str], Optional[str]]:
         """
-        Calculate dynamic stop loss and take profit using multiple higher timeframes
+        Calculate dynamic stop loss and take profit using 15M and 30M ONLY
         Returns (stop_loss, take_profit, tp_source, tp_timeframe) or (None, None, None, None) if no valid levels found
         
         TP Priority:
-        1. Primary: Nearest liquidity pool (15M/30M/1H)
-        2. Fallback: Nearest swing high/low (15M/30M/1H)
+        1. Primary: Nearest liquidity pool (15M/30M ONLY)
+        2. Fallback: Nearest swing high/low (15M/30M ONLY)
         3. Minimum: At least MIN_RISK_REWARD:1 ratio
         """
         try:
-            # Find nearest swing for stop loss using multiple higher timeframes
+            # Find nearest swing for stop loss using 15M and 30M ONLY
             stop_loss = self.find_nearest_swing_low_multi_tf(
                 multi_tf_data=multi_tf_data,
                 side=side,
@@ -1481,7 +1468,7 @@ class RejectionBasedScanner:
             )
             
             if stop_loss is None:
-                log.debug(f"No valid swing found for {side} stop loss across higher timeframes")
+                log.debug(f"No valid swing found for {side} stop loss across 15M/30M")
                 return None, None, None, None
             
             # Calculate risk
@@ -1501,7 +1488,7 @@ class RejectionBasedScanner:
             tp_source = None
             tp_timeframe = None
             
-            # 1. FIRST TRY: Find liquidity pool target using higher timeframes (PRIMARY METHOD)
+            # 1. FIRST TRY: Find liquidity pool target using 15M/30M ONLY (PRIMARY METHOD)
             result = self.find_liquidity_pool_target_multi_tf(
                 multi_tf_data=multi_tf_data,
                 side=side,
@@ -1514,9 +1501,9 @@ class RejectionBasedScanner:
                 take_profit, tp_source, tp_timeframe = result
                 log.info(f"✅ Using LIQUIDITY_POOL as TP (from {tp_timeframe}) for {side}")
             
-            # 2. SECOND TRY: If no liquidity pool found, use swing high/low from higher timeframes (FALLBACK METHOD)
+            # 2. SECOND TRY: If no liquidity pool found, use swing high/low from 15M/30M ONLY (FALLBACK METHOD)
             if take_profit is None:
-                log.debug(f"No valid liquidity pool found for {side} across higher timeframes, trying swing high/low...")
+                log.debug(f"No valid liquidity pool found for {side} across 15M/30M, trying swing high/low...")
                 result = self.find_nearest_swing_tp_multi_tf(
                     multi_tf_data=multi_tf_data,
                     side=side,
@@ -1530,7 +1517,7 @@ class RejectionBasedScanner:
                     log.info(f"✅ Using SWING_HIGH_LOW as TP (from {tp_timeframe}) for {side}")
             
             if take_profit is None:
-                log.debug(f"No valid take profit level found for {side} across higher timeframes")
+                log.debug(f"No valid take profit level found for {side} across 15M/30M")
                 return None, None, None, None
             
             # Calculate reward and risk/reward ratio
@@ -1599,11 +1586,10 @@ class RejectionBasedScanner:
     def generate_rejection_signal(self, multi_tf_data: Dict[str, pd.DataFrame], 
                                  symbol: str) -> Optional[RejectionSignal]:
         """
-        Generate rejection-based signal with DYNAMIC SL/TP from higher timeframes
+        Generate rejection-based signal with DYNAMIC SL/TP from 15M/30M ONLY
         """
         try:
             # Get timeframe data
-            tf_1h = multi_tf_data.get("1H")
             tf_30m = multi_tf_data.get("30M")
             tf_15m = multi_tf_data.get("15M")
             tf_5m = multi_tf_data.get("5M")
@@ -1615,13 +1601,13 @@ class RejectionBasedScanner:
                 log.debug(f"{symbol}: Missing key timeframe data")
                 return None
             
-            # Check for higher timeframe data for SL/TP
-            if tf_1h is None and tf_30m is None and tf_15m is None:
-                log.debug(f"{symbol}: No higher timeframe data available for SL/TP")
+            # Check for 15M/30M data for SL/TP
+            if tf_30m is None and tf_15m is None:
+                log.debug(f"{symbol}: No 15M/30M data available for SL/TP")
                 return None
             
-            # 1. Analyze wave context (1H + 15M)
-            wave_context = self.analyze_wave_context(tf_1h, tf_15m)
+            # 1. Analyze wave context (15M + 5M)
+            wave_context = self.analyze_wave_context(tf_15m, tf_5m)
             
             # 2. Analyze market strength on 15M
             market_strength = self.analyze_market_strength(tf_15m)
@@ -1697,7 +1683,7 @@ class RejectionBasedScanner:
                 log.debug(f"{symbol}: No clear rejection candle")
                 return None
             
-            # 11. Calculate DYNAMIC SL/TP using MULTIPLE HIGHER TIMEFRAMES with SOURCE TRACKING
+            # 11. Calculate DYNAMIC SL/TP using 15M/30M ONLY with SOURCE TRACKING
             zone_price = best_zone.price_level
             
             # Entry at rejection zone
@@ -1716,7 +1702,7 @@ class RejectionBasedScanner:
             )
             
             if stop_loss is None or take_profit is None or tp_source is None or tp_timeframe is None:
-                log.debug(f"{symbol}: No valid dynamic SL/TP levels found across higher timeframes")
+                log.debug(f"{symbol}: No valid dynamic SL/TP levels found across 15M/30M")
                 return None
             
             # Calculate Risk/Reward
@@ -2018,15 +2004,15 @@ class RejectionScanner:
         log.info("PHILOSOPHY: Wave length sets context, Strength & volume make decision")
         log.info("ENTRY RULE: Rejection pulls the trigger")
         log.info(f"SCAN INTERVAL: {SCAN_INTERVAL} seconds")
-        log.info("TIME FRAMES: 1H/30M/15M (SL/TP), 5M/3M/1M (entries)")
+        log.info("TIME FRAMES: 30M/15M (SL/TP ONLY), 5M/3M/1M (entries)")
         log.info("REJECTION ZONES: EMA, Range, Failed breaks only")
         log.info("RSI ZONES: 40-50 (LONG), 50-60 (SHORT)")
-        log.info("🎯 STOP LOSS: Nearest Swing Low/High (15M/30M/1H ONLY)")
-        log.info("🎯 TAKE PROFIT: Primary: Liquidity Pool (15M/30M/1H) | Fallback: Swing High/Low")
+        log.info("🎯 STOP LOSS: Nearest Swing Low/High (15M/30M ONLY)")
+        log.info("🎯 TAKE PROFIT: Primary: Liquidity Pool (15M/30M ONLY) | Fallback: Swing High/Low")
         log.info(f"🎯 MINIMUM R:R: {MIN_RISK_REWARD}:1")
-        log.info("🛑 STRICT RULE: NEVER use 3M/5M for SL/TP - ALWAYS use 15M/30M/1H")
+        log.info("🛑 STRICT RULE: NEVER use 1H/5M/3M/1M for SL/TP - ALWAYS use 15M/30M ONLY")
         log.info("DEDUPLICATION: ONE TRADE PER SYMBOL")
-        log.info("TP SOURCE TRACKING: Shows source (Liquidity Pool/Swing) and timeframe (1H/30M/15M)")
+        log.info("TP SOURCE TRACKING: Shows source (Liquidity Pool/Swing) and timeframe (30M/15M)")
         log.info("=" * 70)
         
         # Initialize database
@@ -2220,17 +2206,17 @@ class RejectionScanner:
 ‎• إطار الدخول: 3M (رئيسي) + 1M (توقيت)
 • RSI: 40–50 للشراء، 50–60 للبيع
 
-<b>🎯 <u>إدارة المخاطر الجديدة والمحسنة:</u></b>
-<u>🛑 <b>قاعدة صارمة: لا تستخدم 3M/5M أبداً لوقف الخسارة/هدف الربح</b></u>
-‎• <b>وقف الخسارة: أقرب قاع تأرجح (15M/30M/1H فقط)</b>
-‎• <b>هدف الربح: <u>أولاً</u> أقرب بركة سيولة (15M/30M/1H فقط)</b>
-‎• <b>هدف الربح: <u>ثانياً</u> أقرب قمة تأرجح (15M/30M/1H فقط)</b>
+<b>🎯 <u>إدارة المخاطر المحسنة:</u></b>
+<u>🛑 <b>قاعدة صارمة: لا تستخدم 1H/5M/3M/1M أبداً لوقف الخسارة/هدف الربح</b></u>
+‎• <b>وقف الخسارة: أقرب قاع تأرجح (15M/30M فقط)</b>
+‎• <b>هدف الربح: <u>أولاً</u> أقرب بركة سيولة (15M/30M فقط)</b>
+‎• <b>هدف الربح: <u>ثانياً</u> أقرب قمة تأرجح (15M/30M فقط)</b>
 ‎• <b>نسبة الربح/المخاطرة: ديناميكية (الحد الأدنى {MIN_RISK_REWARD}:1)</b>
 
 <b>🎯 <u>تتبع مصدر هدف الربح (جديد):</u></b>
 ‎• كل إشارة تظهر مصدر الـ TP والـ TF المستخدم
 ‎• <b>المصدر:</b> بركة سيولة أو قمة/قاع تأرجح
-‎• <b>الإطار الزمني:</b> 1H أو 30M أو 15M
+‎• <b>الإطار الزمني:</b> 30M أو 15M فقط
 
 <b>🛡️ نظام التكرار:</b>
 • <b>صفقة واحدة لكل عملة فقط</b>
@@ -2246,7 +2232,7 @@ class RejectionScanner:
 ‎القوة والفوليوم يحددان القرار
 ‎والرفض هو الزناد
 
-‎#متداول_تفاعلي #تخصص_الرفض #صفقة_واحدة #أقرب_قاع_تأرجح #بركة_السيولة #15M_30M_1H_فقط #تتبع_مصدر_TP
+‎#متداول_تفاعلي #تخصص_الرفض #صفقة_واحدة #15M_30M_فقط #تتبع_مصدر_TP
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -2269,10 +2255,8 @@ class RejectionScanner:
         for tf_name, tf in TIMEFRAMES.items():
             try:
                 # Adjust limits based on timeframe
-                if tf_name == "1H":
-                    limit = 150  # More for 1H for better swing analysis
-                elif tf_name == "30M":
-                    limit = 120  # More for 30M
+                if tf_name == "30M":
+                    limit = 120  # More for 30M for better swing analysis
                 elif tf_name == "15M":
                     limit = 100
                 elif tf_name == "5M":
@@ -2347,8 +2331,8 @@ class RejectionScanner:
                     candle_speed, distance_ratio, ema_angle, volume_participation, strength_score,
                     zone_type, rejection_strength, rsi_at_entry, rejection_type, trigger_candle,
                     risk_reward, expected_move, timeframe_used,
-                    conditions_met
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    conditions_met, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 signal.signal_id,
                 signal.symbol,
@@ -2378,7 +2362,9 @@ class RejectionScanner:
                 signal.risk_reward,
                 signal.expected_move_pct,
                 signal.timeframe_used,
-                json.dumps(signal.conditions_met)
+                json.dumps(signal.conditions_met),
+                "PENDING",
+                datetime.now().isoformat()
             ))
             
             await self.db.commit()
@@ -2486,9 +2472,9 @@ class RejectionScanner:
 ‎• <b>الإطار الزمني:</b> {signal.tp_timeframe}
 
 <u><b>⚡ إعدادات الصفقة:</b></u>
-<u>🛑 <b>قاعدة صارمة: لا تستخدم 3M/5M أبداً</b></u>
-‎• وقف الخسارة: أقرب قاع تأرجح (15M/30M/1H فقط)
-‎• هدف الربح: أولاً بركة سيولة، ثانياً قمة تأرجح (15M/30M/1H فقط)
+<u>🛑 <b>قاعدة صارمة: لا تستخدم 1H/5M/3M/1M أبداً</b></u>
+‎• وقف الخسارة: أقرب قاع تأرجح (15M/30M فقط)
+‎• هدف الربح: أولاً بركة سيولة، ثانياً قمة تأرجح (15M/30M فقط)
 
 <b>🛡️ نظام التكرار:</b>
 ‎• نظام: <b>صفقة واحدة لكل عملة</b>
@@ -2497,9 +2483,9 @@ class RejectionScanner:
 <b>⚠️ ملاحظة التاجر:</b>
 ‎الدخول عند الرفض فقط
 ‎نسبة الربح/الخسارة ديناميكية
-‎نقبل الخسائر - نصطاح التوسع
+‎نقبل الخسائر - نصطاد التوسع
 
-#{side_text} #رفض #{"دعم" if signal.side == "LONG" else "مقاومة"} #صفقة_واحدة #أقرب_قاع_تأرجح #بركة_السيولة #15M_30M_1H_فقط #مصدر_{tp_source_text.replace(' ', '_')} #إطار_{signal.tp_timeframe}
+#{side_text} #رفض #{"دعم" if signal.side == "LONG" else "مقاومة"} #صفقة_واحدة #15M_30M_فقط #مصدر_{tp_source_text.replace(' ', '_')} #إطار_{signal.tp_timeframe}
 """
         return message
     
@@ -2522,10 +2508,10 @@ class RejectionScanner:
 <code>{entry_price:.6f}</code>
 
 <u><b>⚡ إعدادات الصفقة:</b></u>
-<u>🛑 <b>قاعدة صارمة: لا تستخدم 3M/5M أبداً</b></u>
-‎• وقف الخسارة: <b>أقرب قاع تأرجح (15M/30M/1H فقط)</b>
-‎• هدف الربح: <b>أولاً: أقرب بركة سيولة (15M/30M/1H فقط)</b>
-‎• هدف الربح: <b>ثانياً: أقرب قمة تأرجح (15M/30M/1H فقط)</b>
+<u>🛑 <b>قاعدة صارمة: لا تستخدم 1H/5M/3M/1M أبداً</b></u>
+‎• وقف الخسارة: <b>أقرب قاع تأرجح (15M/30M فقط)</b>
+‎• هدف الربح: <b>أولاً: أقرب بركة سيولة (15M/30M فقط)</b>
+‎• هدف الربح: <b>ثانياً: أقرب قمة تأرجح (15M/30M فقط)</b>
 ‎• نسبة الربح/الخسارة: <b>ديناميكية</b>
 
 <b>🧠 عقلية التاجر:</b>
@@ -2542,7 +2528,7 @@ class RejectionScanner:
 ‎يتم متابعة الصفقة تلقائياً.
 ‎ستصلك إشعار عند الوصول لوقف الخسارة أو هدف الربح.
 
-#{side_text} #تنفيذ_رفض #متابعة #لا_إشارات_جديدة #أقرب_قاع_تأرجح #بركة_السيولة #15M_30M_1H_فقط
+#{side_text} #تنفيذ_رفض #متابعة #لا_إشارات_جديدة #15M_30M_فقط
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -2609,8 +2595,8 @@ class RejectionScanner:
 ‎• نسبة الربح/المخاطرة المحققة: {risk_reward:.2f}:1
 
 <u><b>🎯 طريقة التحديد:</b></u>
-‎• وقف الخسارة: أقرب قاع تأرجح (15M/30M/1H فقط)
-‎• هدف الربح: أولاً بركة سيولة، ثانياً قمة تأرجح (15M/30M/1H فقط)
+‎• وقف الخسارة: أقرب قاع تأرجح (15M/30M فقط)
+‎• هدف الربح: أولاً بركة سيولة، ثانياً قمة تأرجح (15M/30M فقط)
 
 <b>🧠 عقلية التاجر:</b>
 {mindset}
@@ -2621,7 +2607,7 @@ class RejectionScanner:
 ✅ <b>مسموح الآن</b> بإرسال إشارات جديدة لـ {symbol}
 ‎يمكن للماسح الضوئي البحث عن رفض جديد لهذه العملة
 
-#{side_text} #إغلاق_رفض #{"ربح" if close_reason == "TP_HIT" else "خسارة"} #مسموح_إشارات_جديدة #أقرب_قاع_تأرجح #بركة_السيولة #15M_30M_1H_فقط
+#{side_text} #إغلاق_رفض #{"ربح" if close_reason == "TP_HIT" else "خسارة"} #مسموح_إشارات_جديدة #15M_30M_فقط
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -2809,7 +2795,7 @@ class RejectionScanner:
                 self.scan_cycle += 1
                 start_time = time.time()
                 
-                log.info(f"🔄 Scan cycle #{self.scan_cycle} (Rejection hunting - Dynamic SL/TP from Higher Timeframes)")
+                log.info(f"🔄 Scan cycle #{self.scan_cycle} (Rejection hunting - Dynamic SL/TP from 15M/30M ONLY)")
                 
                 # Get active pairs
                 pairs = await self.get_active_pairs()
@@ -2943,16 +2929,16 @@ class RejectionScanner:
 ‎• رفض بيع: {stats['short_rejections']}
 
 <u><b>🎯 إدارة المخاطر المحسنة:</b></u>
-<u>🛑 <b>قاعدة صارمة: لا تستخدم 3M/5M أبداً</b></u>
-‎• وقف الخسارة: <b>أقرب قاع تأرجح (15M/30M/1H فقط)</b>
-‎• هدف الربح: <b>أولاً: أقرب بركة سيولة (15M/30M/1H فقط)</b>
-‎• هدف الربح: <b>ثانياً: أقرب قمة تأرجح (15M/30M/1H فقط)</b>
+<u>🛑 <b>قاعدة صارمة: لا تستخدم 1H/5M/3M/1M أبداً</b></u>
+‎• وقف الخسارة: <b>أقرب قاع تأرجح (15M/30M فقط)</b>
+‎• هدف الربح: <b>أولاً: أقرب بركة سيولة (15M/30M فقط)</b>
+‎• هدف الربح: <b>ثانياً: أقرب قمة تأرجح (15M/30M فقط)</b>
 ‎• نسبة الربح/الخسارة: <b>ديناميكية (الحد الأدنى {MIN_RISK_REWARD}:1)</b>
 
 <b>🎯 <u>تتبع مصدر هدف الربح:</u></b>
 ‎• <b>كل إشارة تظهر مصدر الـ TP والـ TF المستخدم</b>
 ‎• المصدر: بركة سيولة أو قمة/قاع تأرجح
-‎• الإطار الزمني: 1H أو 30M أو 15M
+‎• الإطار الزمني: 30M أو 15M فقط
 
 <b>🚫 أسباب الفلترة:</b>
 ‎• مفلتر (تكرار): {stats.get('rejections_filtered', 0)} ({filtered_pct:.1f}%)
@@ -2968,8 +2954,8 @@ class RejectionScanner:
 ‎الرفض ← الزناد
 
 <u><b>🎯 إستراتيجية إدارة المخاطر:</b></u>
-‎• وقف الخسارة: ديناميكي (أقرب قاع تأرجح - 15M/30M/1H فقط)
-‎• هدف الربح: ديناميكي (أولاً بركة سيولة، ثانياً قمة تأرجح - 15M/30M/1H فقط)
+‎• وقف الخسارة: ديناميكي (أقرب قاع تأرجح - 15M/30M فقط)
+‎• هدف الربح: ديناميكي (أولاً بركة سيولة، ثانياً قمة تأرجح - 15M/30M فقط)
 ‎• نسبة: ديناميكية (الحد الأدنى {MIN_RISK_REWARD}:1)
 
 ‎تم الالتزام بـ:
@@ -2978,10 +2964,10 @@ class RejectionScanner:
 ‎• عدم المطاردة
 ‎• قبول الخسائر
 ‎• صيد التوسع
-<u>‎• <b>لا تستخدم 3M/5M أبداً لوقف الخسارة/هدف الربح</b></u>
-<u>‎• <b>تتبع مصدر هدف الربح والإطار الزمني</b></u>
+<u>‎• <b>لا تستخدم 1H/5M/3M/1M أبداً لوقف الخسارة/هدف الربح</b></u>
+<u>‎• <b>تتبع مصدر هدف الربح والإطار الزمني (30M/15M فقط)</b></u>
 
-‎#إحصائيات_الرفض #متداول_تفاعلي #صفقة_واحدة #أقرب_قاع_تأرجح #بركة_السيولة #15M_30M_1H_فقط #تتبع_مصدر_TP
+‎#إحصائيات_الرفض #متداول_تفاعلي #صفقة_واحدة #15M_30M_فقط #تتبع_مصدر_TP
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -3043,13 +3029,13 @@ async def start_http_server(scanner, port=8000):
                     "active_trades": active_count,
                     "daily_stats": stats,
                     "dynamic_risk_parameters": {
-                        "stop_loss": "Nearest Swing Low/High (15M/30M/1H ONLY)",
-                        "take_profit_primary": "Nearest Liquidity Pool (15M/30M/1H ONLY)",
-                        "take_profit_fallback": "Nearest Swing High/Low (15M/30M/1H ONLY)",
+                        "stop_loss": "Nearest Swing Low/High (15M/30M ONLY)",
+                        "take_profit_primary": "Nearest Liquidity Pool (15M/30M ONLY)",
+                        "take_profit_fallback": "Nearest Swing High/Low (15M/30M ONLY)",
                         "tp_source_tracking": "ENABLED - Shows source and timeframe for each TP",
-                        "strict_rule": "NEVER use 3M/5M for SL/TP",
+                        "strict_rule": "NEVER use 1H/5M/3M/1M for SL/TP",
                         "min_risk_reward": MIN_RISK_REWARD,
-                        "strategy": "Dynamic SL/TP with multi-timeframe analysis and source tracking"
+                        "strategy": "Dynamic SL/TP with 15M/30M analysis only"
                     },
                     "trader_mindset": {
                         "role": "Discretionary reaction trader",
@@ -3057,7 +3043,7 @@ async def start_http_server(scanner, port=8000):
                         "philosophy": "Wave length sets context, Strength & volume make decision, Rejection pulls trigger",
                         "entry_rule": "Trade ONLY at rejection zones",
                         "frequency": "High frequency + dynamic risk management",
-                        "tp_tracking": "TP Source and Timeframe visible in all signals"
+                        "tp_tracking": "TP Source and Timeframe (30M/15M) visible in all signals"
                     },
                     "telegram": {
                         "configured": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID),
@@ -3080,9 +3066,9 @@ async def start_http_server(scanner, port=8000):
                     "rejection_zones": "Trade ONLY at rejection zones (EMA, Range, Failed breaks)",
                     "entry_conditions": "RSI zones (40-50 LONG, 50-60 SHORT) + Volume confirmation",
                     "entry_philosophy": "Enter on first strong rejection candle, early entries are intentional",
-                    "risk_management": "Dynamic SL (Nearest Swing - 15M/30M/1H ONLY) + Dynamic TP (Liquidity Pool + Swing Fallback - 15M/30M/1H ONLY)",
-                    "tp_source_tracking": "Each signal shows TP source (Liquidity Pool/Swing) and timeframe (1H/30M/15M)",
-                    "strict_rule": "NEVER use 3M/5M for SL/TP - ALWAYS use 15M/30M/1H",
+                    "risk_management": "Dynamic SL (Nearest Swing - 15M/30M ONLY) + Dynamic TP (Liquidity Pool + Swing Fallback - 15M/30M ONLY)",
+                    "tp_source_tracking": "Each signal shows TP source (Liquidity Pool/Swing) and timeframe (30M/15M)",
+                    "strict_rule": "NEVER use 1H/5M/3M/1M for SL/TP - ALWAYS use 15M/30M",
                     "frequency_rule": "High frequency + dynamic payoff",
                     "mindset": "Reaction trader, rejection specialist, not prediction-based, comfortable being wrong"
                 }, indent=2)
