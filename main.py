@@ -114,6 +114,12 @@ class RejectionSignal:
     stop_loss: float
     take_profit: float
     
+    # TP Method Information - NEW FIELD
+    tp_method: str = "UNKNOWN"           # LIQUIDITY_POOL, MINIMUM_RR
+    tp_timeframe: str = "UNKNOWN"        # 15M, 30M, 1H, DYNAMIC
+    sl_timeframe: str = "UNKNOWN"        # 15M, 30M, 1H
+    sl_source: str = "UNKNOWN"           # SWING_LOW, SWING_HIGH
+    
     # Analysis context
     wave_context: WaveContext
     market_strength: MarketStrength
@@ -133,6 +139,9 @@ class RejectionSignal:
     timeframe_used: str        # Which TF triggered entry
     signal_timestamp: float
     conditions_met: List[str]  # Which rejection conditions triggered
+    
+    # Status tracking - SIMPLIFIED
+    status: str = "ACTIVE"     # ACTIVE, CLOSED (removed PENDING/TRIGGERED states)
 
 # ================ PROFESSIONAL LOGGING ================
 logging.basicConfig(
@@ -181,28 +190,32 @@ class RejectionBasedScanner:
                 if old_signal_id in self.signal_status:
                     del self.signal_status[old_signal_id]
             
-            # Register new signal as PENDING
+            # Register new signal as ACTIVE (no PENDING state)
             self.active_signals[symbol] = signal.signal_id
             self.signal_status[signal.signal_id] = {
                 "symbol": symbol,
                 "side": signal.side,
                 "price": signal.entry_price,
-                "status": "PENDING",
+                "status": "ACTIVE",
                 "timestamp": signal.signal_timestamp
             }
             
-            log.debug(f"Registered rejection signal {signal.signal_id[:8]} for {symbol}")
+            log.info(f"Registered ACTIVE rejection signal {signal.signal_id[:8]} for {symbol}")
         
         def update_signal_status(self, signal_id: str, status: str):
-            """Update signal status (PENDING → TRIGGERED → CLOSED)"""
+            """Update signal status (ACTIVE → CLOSED)"""
             if signal_id in self.signal_status:
                 self.signal_status[signal_id]["status"] = status
-                log.debug(f"Signal {signal_id[:8]} status updated to {status}")
+                log.info(f"Signal {signal_id[:8]} status updated to {status}")
                 
                 # If CLOSED, mark as ready for new signals
                 if status == "CLOSED":
                     symbol = self.signal_status[signal_id]["symbol"]
                     log.info(f"✅ Signal {signal_id[:8]} for {symbol} CLOSED - Ready for new rejections")
+                    
+                    # Immediately remove from active signals
+                    if symbol in self.active_signals and self.active_signals[symbol] == signal_id:
+                        del self.active_signals[symbol]
         
         def remove_closed_signals(self):
             """Clean up closed signals to free memory"""
@@ -211,19 +224,14 @@ class RejectionBasedScanner:
             
             for signal_id, data in list(self.signal_status.items()):
                 if data.get("status") == "CLOSED":
-                    # Remove if closed more than 1 hour ago
-                    if current_time - data.get("timestamp", 0) > 3600:
+                    # Remove if closed more than 30 minutes ago
+                    if current_time - data.get("timestamp", 0) > 1800:
                         closed_signal_ids.append(signal_id)
             
             for signal_id in closed_signal_ids:
-                symbol = self.signal_status[signal_id]["symbol"]
-                
-                # Only remove from active_signals if it's the current one
-                if self.active_signals.get(symbol) == signal_id:
-                    del self.active_signals[symbol]
-                
-                del self.signal_status[signal_id]
-                log.debug(f"Cleaned up closed signal {signal_id[:8]} for {symbol}")
+                if signal_id in self.signal_status:
+                    del self.signal_status[signal_id]
+                    log.debug(f"Cleaned up closed signal {signal_id[:8]}")
     
     def __init__(self):
         self.daily_stats = {
@@ -233,7 +241,9 @@ class RejectionBasedScanner:
             "pairs_scanned": 0,
             "rejections_filtered": 0,
             "no_strength": 0,
-            "no_rejection_zone": 0
+            "no_rejection_zone": 0,
+            "tp_liquidity_pool": 0,
+            "tp_minimum_rr": 0
         }
         self.deduplicator = self.SignalDeduplicator()
         self.active_signal_ids = set()
@@ -712,7 +722,6 @@ class RejectionBasedScanner:
             # Recent range (last 20 candles)
             recent_high = df['high'].values[-20:].max()
             recent_low = df['low'].values[-20:].min()
-            range_mid = (recent_high + recent_low) / 2
             
             # Check range high
             high_distance_pct = abs(current_price - recent_high) / recent_high * 100
@@ -816,11 +825,10 @@ class RejectionBasedScanner:
     # ========== DYNAMIC SL/TP METHODS (USING 15M, 30M, 1H) ==========
     
     def find_nearest_swing_low_multi_tf(self, multi_tf_data: Dict[str, pd.DataFrame], 
-                                        side: str, entry_price: float, zone_price: float) -> Optional[float]:
+                                        side: str, entry_price: float, zone_price: float) -> Tuple[Optional[float], str, str]:
         """
         Find nearest significant swing low for LONG or swing high for SHORT
-        Uses multiple higher timeframes (15M, 30M, 1H)
-        Returns the best swing level across all timeframes
+        Returns (price, source, timeframe)
         """
         try:
             # Define which timeframes to use for swing analysis (HIGHER TIMEFRAMES ONLY)
@@ -881,25 +889,13 @@ class RejectionBasedScanner:
                         if len(recent_lows) > 0 and min(recent_lows) < swing_price:
                             continue  # This swing was broken, skip
                         
-                        # Weight by timeframe (higher timeframe = more weight)
-                        timeframe_weight = 1.0
-                        if swing['timeframe'] == "1H":
-                            timeframe_weight = 1.3
-                        elif swing['timeframe'] == "30M":
-                            timeframe_weight = 1.2
-                        elif swing['timeframe'] == "15M":
-                            timeframe_weight = 1.0
-                        
-                        # Adjust price based on timeframe weight
-                        adjusted_price = swing_price * (1 - (timeframe_weight - 1) * 0.001)
-                        
                         all_swings.append({
-                            'price': adjusted_price,
+                            'price': swing_price,
                             'original_price': swing_price,
                             'distance': swing['distance'],
-                            'timeframe': swing['timeframe'],
-                            'weight': timeframe_weight,
-                            'candles_ago': swing['candles_ago']
+                            'timeframe': tf_name,
+                            'candles_ago': swing['candles_ago'],
+                            'type': 'SWING_LOW'
                         })
                         
                         # Take only the best from each timeframe
@@ -949,269 +945,51 @@ class RejectionBasedScanner:
                         if len(recent_highs) > 0 and max(recent_highs) > swing_price:
                             continue  # This swing was broken, skip
                         
-                        # Weight by timeframe (higher timeframe = more weight)
-                        timeframe_weight = 1.0
-                        if swing['timeframe'] == "1H":
-                            timeframe_weight = 1.3
-                        elif swing['timeframe'] == "30M":
-                            timeframe_weight = 1.2
-                        elif swing['timeframe'] == "15M":
-                            timeframe_weight = 1.0
-                        
-                        # Adjust price based on timeframe weight
-                        adjusted_price = swing_price * (1 + (timeframe_weight - 1) * 0.001)
-                        
                         all_swings.append({
-                            'price': adjusted_price,
+                            'price': swing_price,
                             'original_price': swing_price,
                             'distance': swing['distance'],
-                            'timeframe': swing['timeframe'],
-                            'weight': timeframe_weight,
-                            'candles_ago': swing['candles_ago']
+                            'timeframe': tf_name,
+                            'candles_ago': swing['candles_ago'],
+                            'type': 'SWING_HIGH'
                         })
                         
                         # Take only the best from each timeframe
                         break
             
             if not all_swings:
-                return None
+                return None, "NO_SWING_FOUND", "NONE"
             
-            # Sort swings by weight (higher timeframe first) then distance
-            all_swings.sort(key=lambda x: (-x['weight'], x['distance']))
+            # Sort swings by timeframe priority (1H > 30M > 15M) then distance
+            timeframe_priority = {"1H": 3, "30M": 2, "15M": 1}
+            all_swings.sort(key=lambda x: (-timeframe_priority.get(x['timeframe'], 0), x['distance']))
             
-            # Get the best swing (highest timeframe, closest distance)
+            # Get the best swing
             best_swing = all_swings[0]
             
             # Add small buffer (0.3%)
             if side == "LONG":
-                return best_swing['price'] * 0.997
+                final_price = best_swing['price'] * 0.997
+                source = "SWING_LOW"
             else:  # SHORT
-                return best_swing['price'] * 1.003
+                final_price = best_swing['price'] * 1.003
+                source = "SWING_HIGH"
+            
+            return final_price, source, best_swing['timeframe']
                 
         except Exception as e:
             log.error(f"Multi-timeframe swing analysis error: {e}")
-            return None
-    
-    def find_nearest_swing_tp_multi_tf(self, multi_tf_data: Dict[str, pd.DataFrame], side: str, 
-                                       entry_price: float, stop_loss: float, 
-                                       current_rsi: float) -> Optional[float]:
-        """
-        Find nearest swing high/low for take profit (FALLBACK METHOD)
-        Uses multiple higher timeframes (15M, 30M, 1H)
-        Returns take profit price or None if no valid swing found
-        """
-        try:
-            # Define which timeframes to use for TP analysis (HIGHER TIMEFRAMES ONLY)
-            tp_tfs = ["15M", "30M", "1H"]
-            
-            all_targets = []
-            
-            for tf_name in tp_tfs:
-                if tf_name not in multi_tf_data:
-                    continue
-                    
-                df = multi_tf_data[tf_name]
-                
-                if len(df) < 50:
-                    continue
-                
-                if side == "LONG":
-                    # For LONG: look for nearest swing HIGH above entry
-                    swing_highs = []
-                    
-                    # Scan for swing highs (higher than 5 candles on each side for higher TFs)
-                    for i in range(10, len(df) - 10):
-                        high = df['high'].iloc[i]
-                        
-                        # Check if this is a swing high
-                        is_swing = True
-                        for j in range(1, 6):  # 5 candles each side for higher TFs
-                            if high <= df['high'].iloc[i-j]:
-                                is_swing = False
-                                break
-                            if high <= df['high'].iloc[i+j]:
-                                is_swing = False
-                                break
-                        
-                        if is_swing and high > entry_price:
-                            # Calculate distance and ensure reasonable reward
-                            distance = high - entry_price
-                            risk = entry_price - stop_loss
-                            
-                            if risk > 0:
-                                rr_ratio = distance / risk
-                                
-                                # Must provide at least minimum R:R
-                                if rr_ratio >= MIN_RISK_REWARD:
-                                    # Check if this swing is still valid (not broken)
-                                    recent_highs = df['high'].values[i+1:]
-                                    if len(recent_highs) == 0 or max(recent_highs) <= high:
-                                        swing_highs.append({
-                                            'price': high,
-                                            'distance': distance,
-                                            'rr_ratio': rr_ratio,
-                                            'position': i,
-                                            'timeframe': tf_name
-                                        })
-                    
-                    if not swing_highs:
-                        continue
-                    
-                    # Sort by distance (closest first, but with R:R weighting)
-                    swing_highs.sort(key=lambda x: (x['distance'], -x['rr_ratio']))
-                    
-                    # Get the best swing high for this timeframe
-                    best_swing = swing_highs[0]
-                    swing_price = best_swing['price']
-                    
-                    # Adjust based on RSI (if overbought, closer target)
-                    rsi_factor = 1.0
-                    if current_rsi > 60:
-                        rsi_factor = 0.8  # Take profits earlier
-                    elif current_rsi < 40:
-                        rsi_factor = 1.2  # Let profits run more
-                    
-                    adjusted_distance = best_swing['distance'] * rsi_factor
-                    adjusted_price = entry_price + adjusted_distance
-                    
-                    # Ensure adjusted price doesn't exceed swing high
-                    if adjusted_price > swing_price:
-                        adjusted_price = swing_price
-                    
-                    # Weight by timeframe (higher timeframe = more weight)
-                    timeframe_weight = 1.0
-                    if tf_name == "1H":
-                        timeframe_weight = 1.5
-                    elif tf_name == "30M":
-                        timeframe_weight = 1.3
-                    elif tf_name == "15M":
-                        timeframe_weight = 1.0
-                    
-                    # Adjust price based on timeframe weight
-                    adjusted_price = adjusted_price * (1 - (timeframe_weight - 1) * 0.001)
-                    
-                    all_targets.append({
-                        'price': adjusted_price,
-                        'original_price': swing_price,
-                        'distance': best_swing['distance'],
-                        'rr_ratio': best_swing['rr_ratio'],
-                        'timeframe': tf_name,
-                        'weight': timeframe_weight
-                    })
-                    
-                else:  # SHORT
-                    # For SHORT: look for nearest swing LOW below entry
-                    swing_lows = []
-                    
-                    # Scan for swing lows (lower than 5 candles on each side for higher TFs)
-                    for i in range(10, len(df) - 10):
-                        low = df['low'].iloc[i]
-                        
-                        # Check if this is a swing low
-                        is_swing = True
-                        for j in range(1, 6):  # 5 candles each side for higher TFs
-                            if low >= df['low'].iloc[i-j]:
-                                is_swing = False
-                                break
-                            if low >= df['low'].iloc[i+j]:
-                                is_swing = False
-                                break
-                        
-                        if is_swing and low < entry_price:
-                            # Calculate distance and ensure reasonable reward
-                            distance = entry_price - low
-                            risk = stop_loss - entry_price
-                            
-                            if risk > 0:
-                                rr_ratio = distance / risk
-                                
-                                # Must provide at least minimum R:R
-                                if rr_ratio >= MIN_RISK_REWARD:
-                                    # Check if this swing is still valid (not broken)
-                                    recent_lows = df['low'].values[i+1:]
-                                    if len(recent_lows) == 0 or min(recent_lows) >= low:
-                                        swing_lows.append({
-                                            'price': low,
-                                            'distance': distance,
-                                            'rr_ratio': rr_ratio,
-                                            'position': i,
-                                            'timeframe': tf_name
-                                        })
-                    
-                    if not swing_lows:
-                        continue
-                    
-                    # Sort by distance (closest first, but with R:R weighting)
-                    swing_lows.sort(key=lambda x: (x['distance'], -x['rr_ratio']))
-                    
-                    # Get the best swing low for this timeframe
-                    best_swing = swing_lows[0]
-                    swing_price = best_swing['price']
-                    
-                    # Adjust based on RSI (if oversold, closer target)
-                    rsi_factor = 1.0
-                    if current_rsi < 40:
-                        rsi_factor = 0.8  # Take profits earlier
-                    elif current_rsi > 60:
-                        rsi_factor = 1.2  # Let profits run more
-                    
-                    adjusted_distance = best_swing['distance'] * rsi_factor
-                    adjusted_price = entry_price - adjusted_distance
-                    
-                    # Ensure adjusted price doesn't go below swing low
-                    if adjusted_price < swing_price:
-                        adjusted_price = swing_price
-                    
-                    # Weight by timeframe (higher timeframe = more weight)
-                    timeframe_weight = 1.0
-                    if tf_name == "1H":
-                        timeframe_weight = 1.5
-                    elif tf_name == "30M":
-                        timeframe_weight = 1.3
-                    elif tf_name == "15M":
-                        timeframe_weight = 1.0
-                    
-                    # Adjust price based on timeframe weight
-                    adjusted_price = adjusted_price * (1 + (timeframe_weight - 1) * 0.001)
-                    
-                    all_targets.append({
-                        'price': adjusted_price,
-                        'original_price': swing_price,
-                        'distance': best_swing['distance'],
-                        'rr_ratio': best_swing['rr_ratio'],
-                        'timeframe': tf_name,
-                        'weight': timeframe_weight
-                    })
-            
-            if not all_targets:
-                return None
-            
-            # Sort targets by weight (higher timeframe first) then R:R ratio
-            all_targets.sort(key=lambda x: (-x['weight'], -x['rr_ratio']))
-            
-            # Get the best target (highest timeframe, best R:R)
-            best_target = all_targets[0]
-            
-            # Add small buffer
-            if side == "LONG":
-                return best_target['price'] * 0.998
-            else:  # SHORT
-                return best_target['price'] * 1.002
-                
-        except Exception as e:
-            log.error(f"Multi-timeframe swing TP analysis error: {e}")
-            return None
+            return None, "ERROR", "NONE"
     
     def find_liquidity_pool_target_multi_tf(self, multi_tf_data: Dict[str, pd.DataFrame], side: str, 
                                             entry_price: float, stop_loss: float, 
-                                            current_rsi: float) -> Optional[float]:
+                                            current_rsi: float) -> Tuple[Optional[float], str, str]:
         """
-        Find nearest liquidity pool for take profit (PRIMARY METHOD)
-        Uses multiple higher timeframes (15M, 30M, 1H)
-        Based on order book clusters, volume nodes, and market structure
+        Find nearest liquidity pool for take profit
+        Returns (price, source, timeframe)
         """
         try:
-            # Define which timeframes to use for liquidity analysis (HIGHER TIMEFRAMES ONLY)
+            # Define which timeframes to use for liquidity analysis
             liquidity_tfs = ["15M", "30M", "1H"]
             
             all_targets = []
@@ -1233,9 +1011,9 @@ class RejectionBasedScanner:
                     for i in range(20, len(df) - 20):
                         high = df['high'].iloc[i]
                         
-                        # Check if this is a swing high (more strict for higher TFs)
+                        # Check if this is a swing high
                         is_swing = True
-                        for j in range(1, 8):  # 7 candles each side for higher TFs
+                        for j in range(1, 8):
                             if high <= df['high'].iloc[i-j] or high <= df['high'].iloc[i+j]:
                                 is_swing = False
                                 break
@@ -1248,10 +1026,10 @@ class RejectionBasedScanner:
                                 'volume': volume_at_level,
                                 'distance': high - entry_price,
                                 'timeframe': tf_name,
-                                'type': 'swing_high'
+                                'type': 'LIQUIDITY_POOL_SWING'
                             })
                     
-                    # 2. High volume nodes (clusters) - more bins for higher TFs
+                    # 2. High volume nodes (clusters)
                     price_bins = np.linspace(df['low'].min(), df['high'].max(), 30)
                     volume_profile = []
                     
@@ -1270,7 +1048,7 @@ class RejectionBasedScanner:
                                     'volume': volume_in_range,
                                     'distance': mid_price - entry_price,
                                     'timeframe': tf_name,
-                                    'type': 'volume_node'
+                                    'type': 'LIQUIDITY_POOL_VOLUME'
                                 })
                     
                     # Combine all potential targets
@@ -1287,46 +1065,30 @@ class RejectionBasedScanner:
                         reward = target['price'] - entry_price
                         if reward > 0:
                             rr_ratio = reward / risk
-                            # Must provide at least minimum R:R
                             if rr_ratio >= MIN_RISK_REWARD:
-                                # Adjust based on RSI (if overbought, closer target)
-                                rsi_factor = 1.0
-                                if current_rsi > 60:
-                                    rsi_factor = 0.8  # Take profits earlier
-                                elif current_rsi < 40:
-                                    rsi_factor = 1.2  # Let profits run more
-                                
-                                adjusted_distance = target['distance'] * rsi_factor
-                                adjusted_price = entry_price + adjusted_distance
-                                
-                                # Weight by timeframe (higher timeframe = more weight)
+                                # Weight by volume and timeframe
+                                volume_weight = np.log1p(target['volume'])
                                 timeframe_weight = 1.0
                                 if target['timeframe'] == "1H":
                                     timeframe_weight = 1.5
                                 elif target['timeframe'] == "30M":
                                     timeframe_weight = 1.3
-                                elif target['timeframe'] == "15M":
-                                    timeframe_weight = 1.0
-                                
-                                # Adjust price based on timeframe weight
-                                adjusted_price = adjusted_price * (1 - (timeframe_weight - 1) * 0.001)
                                 
                                 valid_targets.append({
-                                    'price': adjusted_price,
-                                    'original_price': target['price'],
+                                    'price': target['price'],
                                     'rr_ratio': rr_ratio,
-                                    'volume': target.get('volume', 0),
+                                    'volume': target['volume'],
                                     'distance': target['distance'],
                                     'timeframe': target['timeframe'],
-                                    'type': target.get('type', 'unknown'),
-                                    'weight': timeframe_weight
+                                    'type': target['type'],
+                                    'score': rr_ratio * volume_weight * timeframe_weight
                                 })
                     
                     if valid_targets:
-                        # Select best target for this timeframe: balance between R:R and volume confirmation
-                        valid_targets.sort(key=lambda x: x['rr_ratio'] * np.log1p(x['volume']), reverse=True)
-                        best_target_tf = valid_targets[0]
-                        all_targets.append(best_target_tf)
+                        # Select best target
+                        valid_targets.sort(key=lambda x: x['score'], reverse=True)
+                        best_target = valid_targets[0]
+                        all_targets.append(best_target)
                     
                 else:  # SHORT
                     # For SHORT: look for support levels (liquidity below)
@@ -1336,9 +1098,9 @@ class RejectionBasedScanner:
                     for i in range(20, len(df) - 20):
                         low = df['low'].iloc[i]
                         
-                        # Check if this is a swing low (more strict for higher TFs)
+                        # Check if this is a swing low
                         is_swing = True
-                        for j in range(1, 8):  # 7 candles each side for higher TFs
+                        for j in range(1, 8):
                             if low >= df['low'].iloc[i-j] or low >= df['low'].iloc[i+j]:
                                 is_swing = False
                                 break
@@ -1351,10 +1113,10 @@ class RejectionBasedScanner:
                                 'volume': volume_at_level,
                                 'distance': entry_price - low,
                                 'timeframe': tf_name,
-                                'type': 'swing_low'
+                                'type': 'LIQUIDITY_POOL_SWING'
                             })
                     
-                    # 2. High volume nodes (clusters) - more bins for higher TFs
+                    # 2. High volume nodes (clusters)
                     price_bins = np.linspace(df['low'].min(), df['high'].max(), 30)
                     volume_profile = []
                     
@@ -1373,7 +1135,7 @@ class RejectionBasedScanner:
                                     'volume': volume_in_range,
                                     'distance': entry_price - mid_price,
                                     'timeframe': tf_name,
-                                    'type': 'volume_node'
+                                    'type': 'LIQUIDITY_POOL_VOLUME'
                                 })
                     
                     # Combine all potential targets
@@ -1390,81 +1152,60 @@ class RejectionBasedScanner:
                         reward = entry_price - target['price']
                         if reward > 0:
                             rr_ratio = reward / risk
-                            # Must provide at least minimum R:R
                             if rr_ratio >= MIN_RISK_REWARD:
-                                # Adjust based on RSI (if oversold, closer target)
-                                rsi_factor = 1.0
-                                if current_rsi < 40:
-                                    rsi_factor = 0.8  # Take profits earlier
-                                elif current_rsi > 60:
-                                    rsi_factor = 1.2  # Let profits run more
-                                
-                                adjusted_distance = target['distance'] * rsi_factor
-                                adjusted_price = entry_price - adjusted_distance
-                                
-                                # Weight by timeframe (higher timeframe = more weight)
+                                # Weight by volume and timeframe
+                                volume_weight = np.log1p(target['volume'])
                                 timeframe_weight = 1.0
                                 if target['timeframe'] == "1H":
                                     timeframe_weight = 1.5
                                 elif target['timeframe'] == "30M":
                                     timeframe_weight = 1.3
-                                elif target['timeframe'] == "15M":
-                                    timeframe_weight = 1.0
-                                
-                                # Adjust price based on timeframe weight
-                                adjusted_price = adjusted_price * (1 + (timeframe_weight - 1) * 0.001)
                                 
                                 valid_targets.append({
-                                    'price': adjusted_price,
-                                    'original_price': target['price'],
+                                    'price': target['price'],
                                     'rr_ratio': rr_ratio,
-                                    'volume': target.get('volume', 0),
+                                    'volume': target['volume'],
                                     'distance': target['distance'],
                                     'timeframe': target['timeframe'],
-                                    'type': target.get('type', 'unknown'),
-                                    'weight': timeframe_weight
+                                    'type': target['type'],
+                                    'score': rr_ratio * volume_weight * timeframe_weight
                                 })
                     
                     if valid_targets:
-                        # Select best target for this timeframe: balance between R:R and volume confirmation
-                        valid_targets.sort(key=lambda x: x['rr_ratio'] * np.log1p(x['volume']), reverse=True)
-                        best_target_tf = valid_targets[0]
-                        all_targets.append(best_target_tf)
+                        # Select best target
+                        valid_targets.sort(key=lambda x: x['score'], reverse=True)
+                        best_target = valid_targets[0]
+                        all_targets.append(best_target)
             
             if not all_targets:
-                return None
+                return None, "NO_LIQUIDITY_POOL", "NONE"
             
-            # Sort all targets by weight (higher timeframe first) then combined score
-            all_targets.sort(key=lambda x: (-x['weight'], -(x['rr_ratio'] * np.log1p(x['volume']))))
-            
-            # Get the best target across all timeframes
+            # Select the best target across all timeframes
+            all_targets.sort(key=lambda x: x['score'], reverse=True)
             best_target = all_targets[0]
             
             # Add small buffer
             if side == "LONG":
-                return best_target['price'] * 0.998
+                final_price = best_target['price'] * 0.998
             else:  # SHORT
-                return best_target['price'] * 1.002
+                final_price = best_target['price'] * 1.002
+            
+            return final_price, "LIQUIDITY_POOL", best_target['timeframe']
                 
         except Exception as e:
             log.error(f"Multi-timeframe liquidity pool analysis error: {e}")
-            return None
+            return None, "ERROR", "NONE"
     
     def calculate_dynamic_sl_tp_multi_tf(self, multi_tf_data: Dict[str, pd.DataFrame], side: str, 
                                         entry_price: float, zone_price: float, 
-                                        current_rsi: float) -> Tuple[Optional[float], Optional[float]]:
+                                        current_rsi: float) -> Tuple[Optional[float], Optional[float], str, str, str, str]:
         """
-        Calculate dynamic stop loss and take profit using multiple higher timeframes
-        Returns (stop_loss, take_profit) or (None, None) if no valid levels found
-        
-        TP Priority:
-        1. Primary: Nearest liquidity pool (15M/30M/1H)
-        2. Fallback: Nearest swing high/low (15M/30M/1H)
-        3. Minimum: At least MIN_RISK_REWARD:1 ratio
+        Calculate dynamic stop loss and take profit with METHOD INFORMATION
+        Returns (stop_loss, take_profit, tp_method, tp_timeframe, sl_source, sl_timeframe)
         """
         try:
-            # Find nearest swing for stop loss using multiple higher timeframes
-            stop_loss = self.find_nearest_swing_low_multi_tf(
+            # Find nearest swing for stop loss
+            stop_loss, sl_source, sl_timeframe = self.find_nearest_swing_low_multi_tf(
                 multi_tf_data=multi_tf_data,
                 side=side,
                 entry_price=entry_price,
@@ -1472,26 +1213,23 @@ class RejectionBasedScanner:
             )
             
             if stop_loss is None:
-                log.debug(f"No valid swing found for {side} stop loss across higher timeframes")
-                return None, None
+                log.debug(f"No valid swing found for {side} stop loss")
+                return None, None, "NO_SL", "NONE", "NO_SOURCE", "NONE"
             
             # Calculate risk
             if side == "LONG":
                 risk = entry_price - stop_loss
                 if risk <= 0:
-                    log.debug(f"Invalid risk calculation for LONG: entry={entry_price}, SL={stop_loss}")
-                    return None, None
+                    log.debug(f"Invalid risk calculation for LONG")
+                    return None, None, "INVALID_RISK", "NONE", sl_source, sl_timeframe
             else:  # SHORT
                 risk = stop_loss - entry_price
                 if risk <= 0:
-                    log.debug(f"Invalid risk calculation for SHORT: entry={entry_price}, SL={stop_loss}")
-                    return None, None
+                    log.debug(f"Invalid risk calculation for SHORT")
+                    return None, None, "INVALID_RISK", "NONE", sl_source, sl_timeframe
             
-            # === NEW IMPROVED TP LOGIC USING MULTIPLE HIGHER TIMEFRAMES ===
-            take_profit = None
-            
-            # 1. FIRST TRY: Find liquidity pool target using higher timeframes (PRIMARY METHOD)
-            take_profit = self.find_liquidity_pool_target_multi_tf(
+            # 1. FIRST TRY: Find liquidity pool target (PRIMARY METHOD)
+            take_profit, tp_method, tp_timeframe = self.find_liquidity_pool_target_multi_tf(
                 multi_tf_data=multi_tf_data,
                 side=side,
                 entry_price=entry_price,
@@ -1499,23 +1237,27 @@ class RejectionBasedScanner:
                 current_rsi=current_rsi
             )
             
-            # 2. SECOND TRY: If no liquidity pool found, use swing high/low from higher timeframes (FALLBACK METHOD)
-            if take_profit is None:
-                log.debug(f"No valid liquidity pool found for {side} across higher timeframes, trying swing high/low...")
-                take_profit = self.find_nearest_swing_tp_multi_tf(
-                    multi_tf_data=multi_tf_data,
-                    side=side,
-                    entry_price=entry_price,
-                    stop_loss=stop_loss,
-                    current_rsi=current_rsi
-                )
-                
-                if take_profit is not None:
-                    log.info(f"✅ Using swing high/low as TP (fallback method) for {side} across higher timeframes")
+            # Update stats
+            if tp_method == "LIQUIDITY_POOL":
+                self.daily_stats["tp_liquidity_pool"] += 1
             
+            # 2. SECOND TRY: If no liquidity pool, use minimum R:R fallback
+            if take_profit is None or tp_method != "LIQUIDITY_POOL":
+                log.debug(f"No valid liquidity pool found, using minimum R:R fallback")
+                
+                # Calculate minimum TP based on MIN_RISK_REWARD
+                if side == "LONG":
+                    take_profit = entry_price + (risk * MIN_RISK_REWARD)
+                else:  # SHORT
+                    take_profit = entry_price - (risk * MIN_RISK_REWARD)
+                
+                tp_method = "MINIMUM_RR"
+                tp_timeframe = "DYNAMIC"  # Not from a specific timeframe
+                self.daily_stats["tp_minimum_rr"] += 1
+            
+            # Final validation
             if take_profit is None:
-                log.debug(f"No valid take profit level found for {side} across higher timeframes")
-                return None, None
+                return None, None, "NO_TP", "NONE", sl_source, sl_timeframe
             
             # Calculate reward and risk/reward ratio
             if side == "LONG":
@@ -1524,38 +1266,36 @@ class RejectionBasedScanner:
                 reward = entry_price - take_profit
             
             if reward <= 0:
-                log.debug(f"Invalid reward calculation: entry={entry_price}, TP={take_profit}")
-                return None, None
+                log.debug(f"Invalid reward calculation")
+                return None, None, "INVALID_REWARD", "NONE", sl_source, sl_timeframe
             
             rr_ratio = reward / risk
             
-            # Check minimum risk/reward
-            if rr_ratio < MIN_RISK_REWARD:
-                log.debug(f"Insufficient risk/reward: {rr_ratio:.2f}:1 (minimum: {MIN_RISK_REWARD}:1)")
-                return None, None
-            
             # Additional safety checks
             if side == "LONG":
-                if stop_loss >= entry_price * 0.99:  # SL too close (less than 1%)
-                    log.debug(f"Stop loss too close for LONG: {stop_loss/entry_price:.3%}")
-                    return None, None
-                if take_profit <= entry_price * 1.01:  # TP too close (less than 1%)
-                    log.debug(f"Take profit too close for LONG: {take_profit/entry_price:.3%}")
-                    return None, None
+                if stop_loss >= entry_price * 0.99:  # SL too close
+                    log.debug(f"Stop loss too close for LONG")
+                    return None, None, "SL_TOO_CLOSE", "NONE", sl_source, sl_timeframe
+                if take_profit <= entry_price * 1.005:  # TP too close
+                    log.debug(f"Take profit too close for LONG")
+                    return None, None, "TP_TOO_CLOSE", "NONE", sl_source, sl_timeframe
             else:  # SHORT
-                if stop_loss <= entry_price * 1.01:  # SL too close (less than 1%)
-                    log.debug(f"Stop loss too close for SHORT: {stop_loss/entry_price:.3%}")
-                    return None, None
-                if take_profit >= entry_price * 0.99:  # TP too close (less than 1%)
-                    log.debug(f"Take profit too close for SHORT: {take_profit/entry_price:.3%}")
-                    return None, None
+                if stop_loss <= entry_price * 1.01:  # SL too close
+                    log.debug(f"Stop loss too close for SHORT")
+                    return None, None, "SL_TOO_CLOSE", "NONE", sl_source, sl_timeframe
+                if take_profit >= entry_price * 0.995:  # TP too close
+                    log.debug(f"Take profit too close for SHORT")
+                    return None, None, "TP_TOO_CLOSE", "NONE", sl_source, sl_timeframe
             
-            log.info(f"Dynamic SL/TP calculated using higher timeframes: SL={stop_loss:.6f}, TP={take_profit:.6f}, R:R={rr_ratio:.2f}:1")
-            return stop_loss, take_profit
+            log.info(f"Dynamic SL/TP: SL={stop_loss:.6f} ({sl_source}@{sl_timeframe}), "
+                    f"TP={take_profit:.6f} ({tp_method}@{tp_timeframe}), "
+                    f"R:R={rr_ratio:.2f}:1")
+            
+            return stop_loss, take_profit, tp_method, tp_timeframe, sl_source, sl_timeframe
             
         except Exception as e:
             log.error(f"Dynamic SL/TP calculation error: {e}")
-            return None, None
+            return None, None, "ERROR", "NONE", "ERROR", "NONE"
     
     # ========== REJECTION SIGNAL GENERATION ==========
     
@@ -1593,17 +1333,12 @@ class RejectionBasedScanner:
             tf_3m = multi_tf_data.get("3M")
             tf_1m = multi_tf_data.get("1M")
             
-            # Check data availability - need at least 15m and 3m for entry
+            # Check data availability
             if tf_15m is None or tf_3m is None:
                 log.debug(f"{symbol}: Missing key timeframe data")
                 return None
             
-            # Check for higher timeframe data for SL/TP
-            if tf_1h is None and tf_30m is None and tf_15m is None:
-                log.debug(f"{symbol}: No higher timeframe data available for SL/TP")
-                return None
-            
-            # 1. Analyze wave context (1H + 15M)
+            # 1. Analyze wave context
             wave_context = self.analyze_wave_context(tf_1h, tf_15m)
             
             # 2. Analyze market strength on 15M
@@ -1635,10 +1370,7 @@ class RejectionBasedScanner:
             # 5. Check volume confirmation for each zone
             valid_zones = []
             for zone in rejection_zones:
-                # Check volume confirmation
                 zone.volume_confirmation = self._check_volume_confirmation(tf_3m, zone.zone_type)
-                
-                # Only consider zones with volume confirmation
                 if zone.volume_confirmation:
                     valid_zones.append(zone)
             
@@ -1680,7 +1412,7 @@ class RejectionBasedScanner:
                 log.debug(f"{symbol}: No clear rejection candle")
                 return None
             
-            # 11. Calculate DYNAMIC SL/TP using MULTIPLE HIGHER TIMEFRAMES
+            # 11. Calculate DYNAMIC SL/TP with METHOD INFORMATION
             zone_price = best_zone.price_level
             
             # Entry at rejection zone
@@ -1689,17 +1421,18 @@ class RejectionBasedScanner:
             else:  # SHORT
                 entry_price = zone_price * 0.999  # 0.1% below resistance
             
-            # Calculate dynamic SL/TP using higher timeframes
-            stop_loss, take_profit = self.calculate_dynamic_sl_tp_multi_tf(
-                multi_tf_data=multi_tf_data,
-                side=side,
-                entry_price=entry_price,
-                zone_price=zone_price,
-                current_rsi=current_rsi
-            )
+            # Calculate dynamic SL/TP with method information
+            stop_loss, take_profit, tp_method, tp_timeframe, sl_source, sl_timeframe = \
+                self.calculate_dynamic_sl_tp_multi_tf(
+                    multi_tf_data=multi_tf_data,
+                    side=side,
+                    entry_price=entry_price,
+                    zone_price=zone_price,
+                    current_rsi=current_rsi
+                )
             
             if stop_loss is None or take_profit is None:
-                log.debug(f"{symbol}: No valid dynamic SL/TP levels found across higher timeframes")
+                log.debug(f"{symbol}: No valid dynamic SL/TP levels found")
                 return None
             
             # Calculate Risk/Reward
@@ -1746,7 +1479,7 @@ class RejectionBasedScanner:
                 f"{symbol}:{side}:{entry_price:.8f}:{time.time()}:{best_zone.zone_type}".encode()
             ).hexdigest()
             
-            # 15. Create final signal
+            # 15. Create final signal with TP/SL METHOD INFORMATION
             signal = RejectionSignal(
                 signal_id=signal_id,
                 symbol=symbol,
@@ -1755,6 +1488,12 @@ class RejectionBasedScanner:
                 entry_price=entry_price,
                 stop_loss=stop_loss,
                 take_profit=take_profit,
+                
+                # TP/SL METHOD INFORMATION
+                tp_method=tp_method,
+                tp_timeframe=tp_timeframe,
+                sl_timeframe=sl_timeframe,
+                sl_source=sl_source,
                 
                 wave_context=wave_context,
                 market_strength=market_strength,
@@ -1770,7 +1509,10 @@ class RejectionBasedScanner:
                 
                 timeframe_used="3M",
                 signal_timestamp=time.time(),
-                conditions_met=conditions_met
+                conditions_met=conditions_met,
+                
+                # SIMPLIFIED STATUS - IMMEDIATELY ACTIVE
+                status="ACTIVE"
             )
             
             # 16. Update tracking and deduplication
@@ -1787,10 +1529,9 @@ class RejectionBasedScanner:
             log.info(f"🎯 REJECTION SIGNAL: {symbol} {side} @ {entry_price:.4f}")
             log.info(f"   Zone: {best_zone.zone_type}, Strength: {rejection_strength:.2f}")
             log.info(f"   RSI: {current_rsi:.1f}, Dynamic R:R: {risk_reward:.2f}:1")
-            log.info(f"   SL: {stop_loss:.4f} ({abs(entry_price-stop_loss)/entry_price*100:.1f}%)")
-            log.info(f"   TP: {take_profit:.4f} ({abs(take_profit-entry_price)/entry_price*100:.1f}%)")
-            log.info(f"   Wave: {wave_context.wave_length}, Maturity: {wave_context.wave_maturity:.1%}")
-            log.info(f"   SL/TP Timeframes: 15M/30M/1H (Higher Timeframes Only)")
+            log.info(f"   SL: {stop_loss:.4f} ({sl_source}@{sl_timeframe})")
+            log.info(f"   TP: {take_profit:.4f} ({tp_method}@{tp_timeframe})")
+            log.info(f"   TP Method: {tp_method}, SL Source: {sl_source}")
             
             return signal
             
@@ -1804,24 +1545,13 @@ class RejectionBasedScanner:
             if len(df) < 5:
                 return False
             
-            # Get recent candles
             recent_candles = df.iloc[-5:]
-            
-            # Check for volume spike in last 1-2 candles
             recent_volume = recent_candles['volume'].values[-2:].mean()
             prev_volume = recent_candles['volume'].values[-5:-2].mean()
             
             if prev_volume > 0:
                 volume_ratio = recent_volume / prev_volume
-                
-                # Volume spike (1.5x or more) is confirmation
                 if volume_ratio >= 1.5:
-                    return True
-            
-            # Also check if volume is decreasing into the zone (for failed breaks)
-            if "FAILED" in zone_type:
-                volume_trend = np.polyfit(range(5), recent_candles['volume'].values[-5:], 1)[0]
-                if volume_trend < 0:  # Decreasing volume into the level
                     return True
             
             return False
@@ -1836,59 +1566,25 @@ class RejectionBasedScanner:
                 return None, None
             
             current_candle = df.iloc[-1]
-            prev_candle = df.iloc[-2]
             
             # Check wick rejection
-            has_wick_rejection = False
-            wick_type = None
-            
             if side == "LONG":
-                # LONG: Price wicks below support but closes above
                 if (current_candle['low'] < zone.price_level and 
                     current_candle['close'] > zone.price_level):
-                    has_wick_rejection = True
-                    wick_type = "SUPPORT_WICK"
+                    return "WICK_REJECTION", "SUPPORT_WICK"
             
             else:  # SHORT
-                # SHORT: Price wicks above resistance but closes below
                 if (current_candle['high'] > zone.price_level and 
                     current_candle['close'] < zone.price_level):
-                    has_wick_rejection = True
-                    wick_type = "RESISTANCE_WICK"
+                    return "WICK_REJECTION", "RESISTANCE_WICK"
             
-            # Check momentum shift candle
-            momentum_shift = False
-            candle_type = None
-            
+            # Check price rejection
             if side == "LONG":
-                # LONG: Bearish candle followed by bullish candle at support
-                if (prev_candle['close'] < prev_candle['open'] and  # Bearish
-                    current_candle['close'] > current_candle['open'] and  # Bullish
-                    abs(current_candle['close'] - zone.price_level) / zone.price_level < 0.002):  # Near zone
-                    momentum_shift = True
-                    candle_type = "BULLISH_REVERSAL"
-            
-            else:  # SHORT
-                # SHORT: Bullish candle followed by bearish candle at resistance
-                if (prev_candle['close'] > prev_candle['open'] and  # Bullish
-                    current_candle['close'] < current_candle['open'] and  # Bearish
-                    abs(current_candle['close'] - zone.price_level) / zone.price_level < 0.002):  # Near zone
-                    momentum_shift = True
-                    candle_type = "BEARISH_REVERSAL"
-            
-            # Determine rejection type
-            if has_wick_rejection:
-                return "WICK_REJECTION", wick_type
-            elif momentum_shift:
-                return "MOMENTUM_REJECTION", candle_type
+                if current_candle['low'] <= zone.price_level * 1.001 and current_candle['close'] > zone.price_level:
+                    return "PRICE_REJECTION", "SUPPORT_HOLD"
             else:
-                # Check for simple rejection (price tests level and moves away)
-                if side == "LONG":
-                    if current_candle['low'] <= zone.price_level * 1.001 and current_candle['close'] > zone.price_level:
-                        return "PRICE_REJECTION", "SUPPORT_HOLD"
-                else:
-                    if current_candle['high'] >= zone.price_level * 0.999 and current_candle['close'] < zone.price_level:
-                        return "PRICE_REJECTION", "RESISTANCE_HOLD"
+                if current_candle['high'] >= zone.price_level * 0.999 and current_candle['close'] < zone.price_level:
+                    return "PRICE_REJECTION", "RESISTANCE_HOLD"
             
             return None, None
             
@@ -1901,16 +1597,12 @@ class RejectionBasedScanner:
         factors = []
         weights = []
         
-        # 1. Zone strength (30%)
         factors.append(zone.strength)
         weights.append(0.3)
         
-        # 2. Market strength (25%)
         factors.append(strength.strength_score)
         weights.append(0.25)
         
-        # 3. Wave context (20%)
-        # Favor corrective waves at support/resistance
         if wave.structure_type == "CORRECTIVE":
             wave_score = 0.8
         elif wave.structure_type == "COMPRESSION":
@@ -1918,13 +1610,10 @@ class RejectionBasedScanner:
         else:
             wave_score = 0.5
         
-        # Adjust for wave maturity (early waves better)
-        wave_score *= (1 - wave.wave_maturity * 0.5)  # Reduce if too mature
-        
+        wave_score *= (1 - wave.wave_maturity * 0.5)
         factors.append(wave_score)
         weights.append(0.2)
         
-        # 4. RSI position (25%)
         if zone.rsi_position == "IN_ZONE":
             rsi_score = 0.9
         elif zone.rsi_position == "OVEREXTENDED":
@@ -1941,30 +1630,19 @@ class RejectionBasedScanner:
                                  zone: RejectionZone, rejection_type: str) -> List[str]:
         """Get list of conditions met for this rejection"""
         conditions = []
-        
-        # Wave conditions
         conditions.append(f"WAVE_{wave.wave_length}")
         conditions.append(f"STRUCTURE_{wave.structure_type}")
         
-        # Strength conditions
         if strength.is_continuation:
             conditions.append("STRENGTH_CONTINUATION")
         if strength.is_rejection_setup:
             conditions.append("STRENGTH_REJECTION_SETUP")
-        if strength.is_absorption:
-            conditions.append("STRENGTH_ABSORPTION")
-        if strength.is_compression:
-            conditions.append("STRENGTH_COMPRESSION")
         
-        # Zone conditions
         conditions.append(f"ZONE_{zone.zone_type}")
         if zone.volume_confirmation:
             conditions.append("VOLUME_CONFIRMED")
         
-        # Rejection type
         conditions.append(f"REJECTION_{rejection_type}")
-        
-        # RSI condition
         conditions.append(f"RSI_{zone.rsi_position}")
         
         return conditions
@@ -2001,10 +1679,11 @@ class RejectionScanner:
         log.info("REJECTION ZONES: EMA, Range, Failed breaks only")
         log.info("RSI ZONES: 40-50 (LONG), 50-60 (SHORT)")
         log.info("🎯 STOP LOSS: Nearest Swing Low/High (15M/30M/1H ONLY)")
-        log.info("🎯 TAKE PROFIT: Primary: Liquidity Pool (15M/30M/1H) | Fallback: Swing High/Low")
+        log.info("🎯 TAKE PROFIT: Primary: Liquidity Pool (15M/30M/1H) | Fallback: Minimum R:R")
         log.info(f"🎯 MINIMUM R:R: {MIN_RISK_REWARD}:1")
         log.info("🛑 STRICT RULE: NEVER use 3M/5M for SL/TP - ALWAYS use 15M/30M/1H")
         log.info("DEDUPLICATION: ONE TRADE PER SYMBOL")
+        log.info("STATUS: SIGNAL = ACTIVE (No PENDING/TRIGGERED states)")
         log.info("=" * 70)
         
         # Initialize database
@@ -2022,7 +1701,7 @@ class RejectionScanner:
             os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
             self.db = await aiosqlite.connect(DB_PATH)
             
-            # Rejection signals table
+            # Rejection signals table with TP/SL method info
             await self.db.execute("""
             CREATE TABLE IF NOT EXISTS rejection_signals (
                 id TEXT PRIMARY KEY,
@@ -2031,6 +1710,12 @@ class RejectionScanner:
                 entry_price REAL NOT NULL,
                 stop_loss REAL NOT NULL,
                 take_profit REAL NOT NULL,
+                
+                -- TP/SL METHOD INFORMATION --
+                tp_method TEXT NOT NULL,
+                tp_timeframe TEXT NOT NULL,
+                sl_timeframe TEXT NOT NULL,
+                sl_source TEXT NOT NULL,
                 
                 wave_length TEXT NOT NULL,
                 wave_maturity REAL NOT NULL,
@@ -2054,11 +1739,8 @@ class RejectionScanner:
                 timeframe_used TEXT NOT NULL,
                 
                 conditions_met TEXT,
-                status TEXT DEFAULT 'PENDING',
+                status TEXT DEFAULT 'ACTIVE',  -- SIMPLIFIED: ACTIVE/CLOSED only
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                
-                triggered_at TIMESTAMP,
-                trigger_price REAL,
                 
                 closed_at TIMESTAMP,
                 close_price REAL,
@@ -2076,6 +1758,8 @@ class RejectionScanner:
                 short_rejections INTEGER,
                 no_strength_count INTEGER,
                 no_zone_count INTEGER,
+                tp_liquidity_pool INTEGER,
+                tp_minimum_rr INTEGER,
                 win_rate REAL,
                 avg_win REAL,
                 avg_loss REAL,
@@ -2152,24 +1836,22 @@ class RejectionScanner:
 <u>🛑 <b>قاعدة صارمة: لا تستخدم 3M/5M أبداً لوقف الخسارة/هدف الربح</b></u>
 ‎• <b>وقف الخسارة: أقرب قاع تأرجح (15M/30M/1H فقط)</b>
 ‎• <b>هدف الربح: <u>أولاً</u> أقرب بركة سيولة (15M/30M/1H فقط)</b>
-‎• <b>هدف الربح: <u>ثانياً</u> أقرب قمة تأرجح (15M/30M/1H فقط)</b>
-‎• <b>نسبة الربح/المخاطرة: ديناميكية (الحد الأدنى {MIN_RISK_REWARD}:1)</b>
+‎• <b>هدف الربح: <u>ثانياً</u> نسبة ربح/خسارة دنيا ({MIN_RISK_REWARD}:1)</b>
 
 <b>🛡️ نظام التكرار:</b>
 • <b>صفقة واحدة لكل عملة فقط</b>
 ‎• إشارات جديدة فقط بعد إغلاق الصفقة السابقة
-‎• لا يوجد تبريد زمني
 
-<b>🎯 فلسفة الدخول:</b>
-‎الدخول عند أول شمعة رفض قوية
-‎الدخول حيث يتردد الآخرون
-‎أدخل مبكراً عن قصد
+<b>🎯 نظام الإشارات المبسط:</b>
+‎• الإشارة = صفقة نشطة مباشرة
+‎• لا حاجة لتنفيذ منفصل
+‎• المتابعة التلقائية لوقف الخسارة/هدف الربح
 
 ‎الطول الموجي يحدد السياق
 ‎القوة والفوليوم يحددان القرار
 ‎والرفض هو الزناد
 
-‎#متداول_تفاعلي #تخصص_الرفض #صفقة_واحدة #أقرب_قاع_تأرجح #بركة_السيولة #15M_30M_1H_فقط
+‎#متداول_تفاعلي #تخصص_الرفض #صفقة_واحدة #نظام_مبسط #لا_حاجة_للتنفيذ
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -2191,18 +1873,17 @@ class RejectionScanner:
         
         for tf_name, tf in TIMEFRAMES.items():
             try:
-                # Adjust limits based on timeframe
                 if tf_name == "1H":
-                    limit = 150  # More for 1H for better swing analysis
+                    limit = 150
                 elif tf_name == "30M":
-                    limit = 120  # More for 30M
+                    limit = 120
                 elif tf_name == "15M":
                     limit = 100
                 elif tf_name == "5M":
                     limit = 80
                 elif tf_name == "3M":
                     limit = 60
-                else:  # 1M
+                else:
                     limit = 50
                 
                 ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
@@ -2213,7 +1894,6 @@ class RejectionScanner:
                         columns=["timestamp", "open", "high", "low", "close", "volume"]
                     )
                     
-                    # Convert to numeric
                     for col in ["open", "high", "low", "close", "volume"]:
                         df[col] = pd.to_numeric(df[col], errors='coerce')
                     
@@ -2239,19 +1919,15 @@ class RejectionScanner:
                     volume = ticker.get('quoteVolume', 0)
                     
                     if volume >= MIN_VOLUME_USD:
-                        # Check price spread for liquidity
                         bid = ticker.get('bid', 0)
                         ask = ticker.get('ask', 0)
                         
                         if bid > 0 and ask > 0:
                             spread = (ask - bid) / bid * 100
-                            if spread < 0.1:  # Good liquidity
+                            if spread < 0.1:
                                 active_pairs.append((symbol, volume))
             
-            # Sort by volume
             active_pairs.sort(key=lambda x: x[1], reverse=True)
-            
-            # Take top N
             return active_pairs[:TOP_N_VOLUME]
             
         except Exception as e:
@@ -2261,16 +1937,17 @@ class RejectionScanner:
     async def save_signal(self, signal: RejectionSignal) -> bool:
         """Save signal to database"""
         try:
-            # Insert signal
+            # Insert signal with TP/SL method info
             await self.db.execute("""
                 INSERT INTO rejection_signals (
                     id, symbol, side, entry_price, stop_loss, take_profit,
+                    tp_method, tp_timeframe, sl_timeframe, sl_source,
                     wave_length, wave_maturity, expansion_speed, structure_type,
                     candle_speed, distance_ratio, ema_angle, volume_participation, strength_score,
                     zone_type, rejection_strength, rsi_at_entry, rejection_type, trigger_candle,
                     risk_reward, expected_move, timeframe_used,
-                    conditions_met
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    conditions_met, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 signal.signal_id,
                 signal.symbol,
@@ -2278,6 +1955,10 @@ class RejectionScanner:
                 signal.entry_price,
                 signal.stop_loss,
                 signal.take_profit,
+                signal.tp_method,
+                signal.tp_timeframe,
+                signal.sl_timeframe,
+                signal.sl_source,
                 signal.wave_context.wave_length,
                 signal.wave_context.wave_maturity,
                 signal.wave_context.expansion_speed,
@@ -2295,12 +1976,13 @@ class RejectionScanner:
                 signal.risk_reward,
                 signal.expected_move_pct,
                 signal.timeframe_used,
-                json.dumps(signal.conditions_met)
+                json.dumps(signal.conditions_met),
+                signal.status
             ))
             
             await self.db.commit()
             
-            log.info(f"✅ Rejection signal saved: {signal.symbol}")
+            log.info(f"✅ Rejection signal saved: {signal.symbol} (TP: {signal.tp_method}@{signal.tp_timeframe})")
             return True
             
         except Exception as e:
@@ -2308,7 +1990,7 @@ class RejectionScanner:
             return False
     
     async def format_signal_message(self, signal: RejectionSignal) -> str:
-        """Format signal for Telegram"""
+        """Format signal for Telegram with TP/SL METHOD INFORMATION"""
         side_emoji = "🟢" if signal.side == "LONG" else "🔴"
         side_text = "شراء" if signal.side == "LONG" else "بيع"
         
@@ -2329,10 +2011,6 @@ class RejectionScanner:
             strength_type.append("استمرارية")
         if signal.market_strength.is_rejection_setup:
             strength_type.append("إعداد رفض")
-        if signal.market_strength.is_absorption:
-            strength_type.append("امتصاص")
-        if signal.market_strength.is_compression:
-            strength_type.append("ضغط")
         
         strength_text = "، ".join(strength_type) if strength_type else "محايد"
         
@@ -2348,17 +2026,26 @@ class RejectionScanner:
         
         zone_text = zone_translation.get(signal.rejection_zone.zone_type, signal.rejection_zone.zone_type)
         
-        # Rejection type in Arabic
-        rejection_translation = {
-            "WICK_REJECTION": "رفض بالفتيلة",
-            "MOMENTUM_REJECTION": "رفض بتحول الزخم",
-            "PRICE_REJECTION": "رفض بالسعر"
+        # TP Method in Arabic
+        tp_method_translation = {
+            "LIQUIDITY_POOL": "بركة سيولة",
+            "MINIMUM_RR": f"نسبة دنيا {MIN_RISK_REWARD}:1",
+            "SWING_HIGH_LOW": "قمة/قاع تأرجح"
         }
         
-        rejection_text = rejection_translation.get(signal.rejection_type, signal.rejection_type)
+        tp_method_text = tp_method_translation.get(signal.tp_method, signal.tp_method)
+        
+        # SL Source in Arabic
+        sl_source_translation = {
+            "SWING_LOW": "قاع تأرجح",
+            "SWING_HIGH": "قمة تأرجح",
+            "STRUCTURAL": "مستوى هيكلي"
+        }
+        
+        sl_source_text = sl_source_translation.get(signal.sl_source, signal.sl_source)
         
         message = f"""
-{side_emoji} <b>إشارة رفض</b> ⚡
+{side_emoji} <b>إشارة رفض - صفقة نشطة مباشرة</b> ⚡
 
 <b>{signal.symbol}</b> | {side_text}
 
@@ -2380,76 +2067,55 @@ class RejectionScanner:
 • RSI عند الدخول: {signal.rsi_at_entry:.1f}
 
 <b>⚡ تفاصيل الرفض:</b>
-‎• نوع الرفض: {rejection_text}
+‎• نوع الرفض: {signal.rejection_type}
 ‎• شمعة الزناد: {signal.trigger_candle}
 ‎• قوة الرفض: {signal.rejection_strength:.1%}
 
-<b>🔧 التنفيذ:</b>
-‎• سعر الدخول: <code>{signal.entry_price:.6f}</code>
-‎• وقف الخسارة: <code>{signal.stop_loss:.6f}</code> ({risk_pct:.1f}%)
-‎• هدف الربح: <code>{signal.take_profit:.6f}</code> ({target_pct:.1f}%)
-‎• نسبة الربح/المخاطرة: {signal.risk_reward:.2f}:1
+<u><b>🎯 طريقة تحديد المستويات:</b></u>
 
-<u><b>🎯 طريقة التحديد المحسنة:</b></u>
-<u>🛑 <b>قاعدة صارمة: لا تستخدم 3M/5M أبداً</b></u>
-‎• <b>وقف الخسارة:</b> أقرب قاع تأرجح (15M/30M/1H فقط)
-‎• <b>هدف الربح:</b> <u>أولاً</u> أقرب بركة سيولة (15M/30M/1H فقط)
-‎• <b>هدف الربح:</b> <u>ثانياً</u> أقرب قمة تأرجح (15M/30M/1H فقط)
+<b>🛡️ وقف الخسارة:</b>
+‎• السعر: <code>{signal.stop_loss:.6f}</code>
+‎• المصدر: {sl_source_text}
+‎• الإطار الزمني: {signal.sl_timeframe}
+‎• المخاطرة: {risk_pct:.1f}%
+
+<b>💰 هدف الربح:</b>
+‎• السعر: <code>{signal.take_profit:.6f}</code>
+‎• الطريقة: {tp_method_text}
+‎• الإطار الزمني: {signal.tp_timeframe}
+‎• الهدف: {target_pct:.1f}%
+
+<b>📈 نسبة الربح/المخاطرة:</b>
+‎• النسبة: {signal.risk_reward:.2f}:1
+‎• الحد الأدنى المطلوب: {MIN_RISK_REWARD}:1
+
+<u><b>⚡ حالة الصفقة:</b></u>
+‎✅ <b>صفقة نشطة مباشرة</b>
+‎✅ <b>متابعة تلقائية لوقف الخسارة/هدف الربح</b>
+‎✅ <b>لا حاجة لتنفيذ منفصل</b>
 
 <b>🛡️ نظام التكرار:</b>
 ‎• نظام: <b>صفقة واحدة لكل عملة</b>
-‎• لا إشارات جديدة لـ {signal.symbol} حتى إغلاق هذه الصفقة
+‎• ❌ <b>ممنوع</b> إرسال إشارات جديدة لـ {signal.symbol}
+‎• ✅ مسموح بعد إغلاق هذه الصفقة
 
 <b>⚠️ ملاحظة التاجر:</b>
 ‎الدخول عند الرفض فقط
-‎نسبة الربح/الخسارة ديناميكية
-‎نقبل الخسائر - نصطاد التوسع
+‎المستويات محددة ديناميكياً
+‎نظام مبسط - إشارة = صفقة نشطة
 
-#{side_text} #رفض #{"دعم" if signal.side == "LONG" else "مقاومة"} #صفقة_واحدة #أقرب_قاع_تأرجح #بركة_السيولة #15M_30M_1H_فقط
+#{side_text} #رفض #{"دعم" if signal.side == "LONG" else "مقاومة"} #صفقة_واحدة #{"بركة_سيولة" if signal.tp_method == "LIQUIDITY_POOL" else "نسبة_دنيا"} #نظام_مبسط
 """
         return message
     
-    async def send_trade_trigger_notification(self, symbol: str, side: str, entry_price: float):
-        """Send notification when trade is triggered/entered"""
+    async def send_telegram_alert(self, signal: RejectionSignal):
+        """Send Telegram alert - Signal is immediately ACTIVE"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            log.warning(f"⚠️ Telegram credentials missing. Skipping trigger notification for {symbol}")
+            log.warning(f"⚠️ Telegram credentials missing. Skipping alert for {signal.symbol}")
             return
         
         try:
-            side_emoji = "🟢" if side == "LONG" else "🔴"
-            side_text = "شراء" if side == "LONG" else "بيع"
-            
-            message = f"""
-{side_emoji} <b>تم تنفيذ صفقة الرفض</b> ⚡
-
-<b>{symbol}</b> | {side_text}
-
-<b>🎯 تم الدخول عند الرفض:</b>
-<code>{entry_price:.6f}</code>
-
-<u><b>⚡ إعدادات الصفقة:</b></u>
-<u>🛑 <b>قاعدة صارمة: لا تستخدم 3M/5M أبداً</b></u>
-‎• وقف الخسارة: <b>أقرب قاع تأرجح (15M/30M/1H فقط)</b>
-‎• هدف الربح: <b>أولاً: أقرب بركة سيولة (15M/30M/1H فقط)</b>
-‎• هدف الربح: <b>ثانياً: أقرب قمة تأرجح (15M/30M/1H فقط)</b>
-‎• نسبة الربح/الخسارة: <b>ديناميكية</b>
-
-<b>🧠 عقلية التاجر:</b>
-‎• دخول مبكر عند أول رفض
-‎• دخول حيث يتردد الآخرون
-‎• راحة مع الخسائر المحتملة
-‎• صيد للتوسع القادم
-
-<b>🛡️ نظام التكرار:</b>
-❌ <b>ممنوع</b> إرسال إشارات جديدة لـ {symbol}
-‎✅ مسموح بإشارات جديدة بعد إغلاق هذه الصفقة
-
-<b>⚠️ المتابعة:</b>
-‎يتم متابعة الصفقة تلقائياً.
-‎ستصلك إشعار عند الوصول لوقف الخسارة أو هدف الربح.
-
-#{side_text} #تنفيذ_رفض #متابعة #لا_إشارات_جديدة #أقرب_قاع_تأرجح #بركة_السيولة #15M_30M_1H_فقط
-"""
+            message = await self.format_signal_message(signal)
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             async with httpx.AsyncClient(timeout=10) as client:
@@ -2458,15 +2124,16 @@ class RejectionScanner:
                     "text": message,
                     "parse_mode": "HTML"
                 })
-            
-            log.info(f"{side_emoji} Rejection trade triggered: {symbol} {side} @ {entry_price:.4f}")
+                
+            log.info(f"📤 Telegram rejection alert sent: {signal.symbol} (ACTIVE immediately)")
             
         except Exception as e:
-            log.error(f"Trigger notification error: {e}")
+            log.error(f"Telegram error: {e}")
     
     async def send_trade_close_notification(self, symbol: str, side: str, pnl_percent: float, 
                                            close_reason: str, entry_price: float, 
-                                           close_price: float, risk_reward: float):
+                                           close_price: float, risk_reward: float,
+                                           tp_method: str, tp_timeframe: str):
         """Send notification when trade hits TP/SL"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             log.warning(f"⚠️ Telegram credentials missing. Skipping close notification for {symbol}")
@@ -2490,14 +2157,17 @@ class RejectionScanner:
             
             side_text = "شراء" if side == "LONG" else "بيع"
             
-            # Format P&L with sign
-            pnl_formatted = f"+{pnl_percent:.2f}%" if pnl_percent > 0 else f"{pnl_percent:.2f}%"
+            # TP Method in Arabic
+            tp_method_translation = {
+                "LIQUIDITY_POOL": "بركة سيولة",
+                "MINIMUM_RR": f"نسبة دنيا {MIN_RISK_REWARD}:1",
+                "SWING_HIGH_LOW": "قمة/قاع تأرجح"
+            }
             
-            # Trader mindset message based on result
-            if close_reason == "TP_HIT":
-                mindset = "التوسع تم اصطياده ✅ الدخول المبكر حقق الربح"
-            else:
-                mindset = "الخسارة مقبولة ❌ الرفض لم يحترم، ننتظر الرفض التالي"
+            tp_method_text = tp_method_translation.get(tp_method, tp_method)
+            
+            # Format P&L
+            pnl_formatted = f"+{pnl_percent:.2f}%" if pnl_percent > 0 else f"{pnl_percent:.2f}%"
             
             message = f"""
 {emoji} <b>تم إغلاق صفقة الرفض</b> {result_emoji}
@@ -2514,20 +2184,20 @@ class RejectionScanner:
 ‎• نسبة الربح/الخسارة: <b>{pnl_formatted}</b>
 ‎• نسبة الربح/المخاطرة المحققة: {risk_reward:.2f}:1
 
-<u><b>🎯 طريقة التحديد:</b></u>
-‎• وقف الخسارة: أقرب قاع تأرجح (15M/30M/1H فقط)
-‎• هدف الربح: أولاً بركة سيولة، ثانياً قمة تأرجح (15M/30M/1H فقط)
+<b>🎯 طريقة تحديد الهدف:</b>
+‎• طريقة هدف الربح: {tp_method_text}
+‎• إطار زمني هدف الربح: {tp_timeframe}
 
-<b>🧠 عقلية التاجر:</b>
-{mindset}
-‎نقبل الخسائر - نصطاد التوسع
-‎كل رفض هو فرصة جديدة
+<u><b>🎯 فلسفة النظام:</b></u>
+‎• الإشارة = صفقة نشطة مباشرة
+‎• المتابعة التلقائية لوقف الخسارة/هدف الربح
+‎• لا حاجة لتنفيذ منفصل
 
 <b>🛡️ نظام التكرار:</b>
 ✅ <b>مسموح الآن</b> بإرسال إشارات جديدة لـ {symbol}
 ‎يمكن للماسح الضوئي البحث عن رفض جديد لهذه العملة
 
-#{side_text} #إغلاق_رفض #{"ربح" if close_reason == "TP_HIT" else "خسارة"} #مسموح_إشارات_جديدة #أقرب_قاع_تأرجح #بركة_السيولة #15M_30M_1H_فقط
+#{side_text} #إغلاق_رفض #{"ربح" if close_reason == "TP_HIT" else "خسارة"} #مسموح_إشارات_جديدة #{tp_method.replace("_", "")}
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -2548,77 +2218,31 @@ class RejectionScanner:
         except Exception as e:
             log.error(f"Close notification error: {e}")
     
-    async def send_telegram_alert(self, signal: RejectionSignal):
-        """Send Telegram alert"""
-        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            log.warning(f"⚠️ Telegram credentials missing. Skipping alert for {signal.symbol}")
-            return
-        
-        try:
-            message = await self.format_signal_message(signal)
-            
-            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-            async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(url, json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML"
-                })
-                
-            log.info(f"📤 Telegram rejection alert sent: {signal.symbol}")
-            
-        except Exception as e:
-            log.error(f"Telegram error: {e}")
-    
     async def monitor_positions(self):
-        """Monitor and close positions with trade-based deduplication"""
-        log.info("👀 Starting position monitoring with Telegram notifications...")
+        """Monitor and close positions - SIMPLIFIED"""
+        log.info("👀 Starting position monitoring (Simplified - No PENDING/TRIGGERED states)...")
         
         while True:
             try:
-                # Get ALL open positions (both pending and triggered)
+                # Get ALL ACTIVE positions only
                 async with self.db.execute("""
-                    SELECT id, symbol, side, entry_price, stop_loss, take_profit, status
+                    SELECT id, symbol, side, entry_price, stop_loss, take_profit, 
+                           risk_reward, tp_method, tp_timeframe
                     FROM rejection_signals 
-                    WHERE status IN ('PENDING', 'TRIGGERED')
+                    WHERE status = 'ACTIVE'
                 """) as cursor:
                     positions = await cursor.fetchall()
                 
                 if positions:
-                    log.debug(f"📊 Monitoring {len(positions)} open positions")
+                    log.debug(f"📊 Monitoring {len(positions)} ACTIVE positions")
                 
-                for pos_id, symbol, side, entry, sl, tp, status in positions:
+                for pos_id, symbol, side, entry, sl, tp, risk_reward, tp_method, tp_timeframe in positions:
                     try:
                         # Get current price
                         ticker = await self.exchange.fetch_ticker(symbol)
                         current_price = ticker['last']
                         
-                        # For PENDING positions: check if price reached entry
-                        if status == 'PENDING':
-                            # For rejection trading, we enter immediately at signal price
-                            # Mark as triggered if price is within reasonable range (0.5%)
-                            if abs(current_price - entry) / entry <= 0.005:  # 0.5% zone
-                                # Mark as triggered
-                                await self.db.execute("""
-                                    UPDATE rejection_signals SET 
-                                        status = 'TRIGGERED',
-                                        triggered_at = CURRENT_TIMESTAMP,
-                                        trigger_price = ?
-                                    WHERE id = ?
-                                """, (current_price, pos_id))
-                                
-                                await self.db.commit()
-                                
-                                # UPDATE DEDUPLICATION STATUS to TRIGGERED
-                                self.scanner.deduplicator.update_signal_status(pos_id, "TRIGGERED")
-                                
-                                # SEND TRIGGER NOTIFICATION
-                                await self.send_trade_trigger_notification(symbol, side, current_price)
-                                
-                                log.info(f"✅ Rejection position triggered: {symbol} {side} @ {current_price:.4f}")
-                                continue  # Skip SL/TP check for this cycle
-                        
-                        # Check SL/TP for ALL positions (including newly triggered ones)
+                        # Check SL/TP for ACTIVE positions
                         pnl_percent = 0
                         close_reason = None
                         
@@ -2639,13 +2263,6 @@ class RejectionScanner:
                                 pnl_percent = ((entry - current_price) / entry) * 100
                         
                         if close_reason:
-                            # Get risk_reward from database
-                            async with self.db.execute("""
-                                SELECT risk_reward FROM rejection_signals WHERE id = ?
-                            """, (pos_id,)) as cursor:
-                                row = await cursor.fetchone()
-                                risk_reward = row[0] if row else 0
-                            
                             # Update database
                             await self.db.execute("""
                                 UPDATE rejection_signals SET 
@@ -2665,7 +2282,7 @@ class RejectionScanner:
                             # Clean up from tracking
                             self.scanner.active_signal_ids.discard(pos_id)
                             
-                            # SEND CLOSE NOTIFICATION
+                            # SEND CLOSE NOTIFICATION with TP method info
                             await self.send_trade_close_notification(
                                 symbol=symbol,
                                 side=side,
@@ -2673,21 +2290,21 @@ class RejectionScanner:
                                 close_reason=close_reason,
                                 entry_price=entry,
                                 close_price=current_price,
-                                risk_reward=risk_reward
+                                risk_reward=risk_reward,
+                                tp_method=tp_method,
+                                tp_timeframe=tp_timeframe
                             )
-                            
-                            log.info(f"📤 Telegram close notification sent for {symbol}: {close_reason} ({pnl_percent:.2f}%)")
                     
                     except Exception as e:
                         log.error(f"Monitor error for {symbol}: {e}")
                         continue
                 
                 # Clean up old closed signals periodically
-                if int(time.time()) % 300 < 2:  # Every ~5 minutes
+                if int(time.time()) % 300 < 2:
                     self.scanner.deduplicator.remove_closed_signals()
                 
-                # Fast monitoring for rejection trading
-                await asyncio.sleep(2)  # Check every 2 seconds
+                # Fast monitoring
+                await asyncio.sleep(2)
                 
             except Exception as e:
                 log.error(f"Monitoring loop error: {e}")
@@ -2695,14 +2312,14 @@ class RejectionScanner:
     
     async def high_freq_scanning(self):
         """Main high-frequency scanning loop for rejections"""
-        log.info("🚀 Starting rejection-based high-frequency scanning...")
+        log.info("🚀 Starting rejection-based high-frequency scanning (Simplified system)...")
         
         while True:
             try:
                 self.scan_cycle += 1
                 start_time = time.time()
                 
-                log.info(f"🔄 Scan cycle #{self.scan_cycle} (Rejection hunting - Dynamic SL/TP from Higher Timeframes)")
+                log.info(f"🔄 Scan cycle #{self.scan_cycle} (Signal = Active Trade immediately)")
                 
                 # Get active pairs
                 pairs = await self.get_active_pairs()
@@ -2723,14 +2340,14 @@ class RejectionScanner:
                         # Fetch data
                         multi_tf_data = await self.fetch_timeframe_data(symbol)
                         
-                        # Need key timeframes for rejection analysis
-                        required_tfs = ["15M", "3M"]  # Minimum required
+                        # Need key timeframes
+                        required_tfs = ["15M", "3M"]
                         has_all_data = all(tf in multi_tf_data for tf in required_tfs)
                         
                         if not has_all_data:
                             continue
                         
-                        # Generate rejection signal
+                        # Generate rejection signal (immediately ACTIVE)
                         signal = self.scanner.generate_rejection_signal(multi_tf_data, symbol)
                         
                         if signal:
@@ -2744,7 +2361,7 @@ class RejectionScanner:
                         pairs_processed += 1
                         
                         # Ultra-fast between pairs
-                        await asyncio.sleep(0.01)  # 10ms between pairs
+                        await asyncio.sleep(0.01)
                         
                     except Exception as e:
                         log.debug(f"Pair error {symbol}: {str(e)[:50]}")
@@ -2758,18 +2375,13 @@ class RejectionScanner:
                 stats = self.scanner.get_daily_stats()
                 
                 log.info(f"📊 Rejection stats: Found {signals_found}, Active: {active_count}")
-                log.info(f"   Filtered: {stats.get('rejections_filtered', 0)}, "
-                        f"No strength: {stats.get('no_strength', 0)}, "
-                        f"No zone: {stats.get('no_rejection_zone', 0)}")
+                log.info(f"   TP Methods: Liquidity Pool: {stats.get('tp_liquidity_pool', 0)}, "
+                        f"Minimum RR: {stats.get('tp_minimum_rr', 0)}")
                 
                 scan_duration = time.time() - start_time
                 log.info(f"Scan #{self.scan_cycle}: {signals_found} rejections in {scan_duration:.2f}s")
                 
-                # Log detailed stats periodically
-                if self.scan_cycle % 20 == 0:
-                    log.info(f"📈 Detailed stats: {stats}")
-                
-                # Wait for next scan (very fast for rejection hunting)
+                # Wait for next scan
                 wait_time = max(0.1, SCAN_INTERVAL - scan_duration)
                 log.info(f"Next rejection hunt in {wait_time:.1f}s...")
                 await asyncio.sleep(wait_time)
@@ -2791,8 +2403,6 @@ class RejectionScanner:
             
         except KeyboardInterrupt:
             log.info("Rejection scanner stopped by user")
-            
-            # Send final stats
             await self.send_final_stats()
             
         except Exception as e:
@@ -2809,21 +2419,15 @@ class RejectionScanner:
         
         try:
             stats = self.scanner.get_daily_stats()
-            
-            # Get active signals count
             active_count = len(self.scanner.deduplicator.active_signals)
             
             # Calculate percentages
-            total_analyzed = stats['rejections_found'] + stats.get('rejections_filtered', 0) + \
-                            stats.get('no_strength', 0) + stats.get('no_rejection_zone', 0)
-            
-            if total_analyzed > 0:
-                found_pct = stats['rejections_found'] / total_analyzed * 100
-                filtered_pct = stats.get('rejections_filtered', 0) / total_analyzed * 100
-                no_strength_pct = stats.get('no_strength', 0) / total_analyzed * 100
-                no_zone_pct = stats.get('no_rejection_zone', 0) / total_analyzed * 100
+            total_tp = stats.get('tp_liquidity_pool', 0) + stats.get('tp_minimum_rr', 0)
+            if total_tp > 0:
+                lp_pct = stats.get('tp_liquidity_pool', 0) / total_tp * 100
+                rr_pct = stats.get('tp_minimum_rr', 0) / total_tp * 100
             else:
-                found_pct = filtered_pct = no_strength_pct = no_zone_pct = 0
+                lp_pct = rr_pct = 0
             
             message = f"""
 🛑 <b>تم إيقاف ماسح الرفض</b>
@@ -2831,44 +2435,30 @@ class RejectionScanner:
 <b>📊 إحصائيات اليوم:</b>
 ‎• عمليات المسح: {self.scan_cycle}
 ‎• الأزواج الممسوحة: {stats['pairs_scanned']}
-‎• حالات الرفض التي تم العثور عليها: {stats['rejections_found']} ({found_pct:.1f}%)
+‎• حالات الرفض التي تم العثور عليها: {stats['rejections_found']}
 ‎• رفض شراء: {stats['long_rejections']}
 ‎• رفض بيع: {stats['short_rejections']}
 
-<u><b>🎯 إدارة المخاطر المحسنة:</b></u>
-<u>🛑 <b>قاعدة صارمة: لا تستخدم 3M/5M أبداً</b></u>
-‎• وقف الخسارة: <b>أقرب قاع تأرجح (15M/30M/1H فقط)</b>
-‎• هدف الربح: <b>أولاً: أقرب بركة سيولة (15M/30M/1H فقط)</b>
-‎• هدف الربح: <b>ثانياً: أقرب قمة تأرجح (15M/30M/1H فقط)</b>
-‎• نسبة الربح/الخسارة: <b>ديناميكية (الحد الأدنى {MIN_RISK_REWARD}:1)</b>
+<b>🎯 طرق تحديد الهدف:</b>
+‎• بركة سيولة: {stats.get('tp_liquidity_pool', 0)} ({lp_pct:.1f}%)
+‎• نسبة دنيا: {stats.get('tp_minimum_rr', 0)} ({rr_pct:.1f}%)
 
-<b>🚫 أسباب الفلترة:</b>
-‎• مفلتر (تكرار): {stats.get('rejections_filtered', 0)} ({filtered_pct:.1f}%)
-‎• بدون قوة كافية: {stats.get('no_strength', 0)} ({no_strength_pct:.1f}%)
-‎• بدون منطقة رفض: {stats.get('no_rejection_zone', 0)} ({no_zone_pct:.1f}%)
+<u><b>🎯 نظام الإشارات المبسط:</b></u>
+‎✅ <b>الإشارة = صفقة نشطة مباشرة</b>
+‎✅ <b>لا حاجة لتنفيذ منفصل</b>
+‎✅ <b>متابعة تلقائية لوقف الخسارة/هدف الربح</b>
+‎✅ <b>صفقة واحدة لكل عملة</b>
 
-<b>⚡ الصفقات النشطة:</b>
+<b>⚡ الصفقات النشطة المتبقية:</b>
 ‎• حالياً: {active_count} صفقة نشطة
 
-<b>🧠 فلسفة التاجر المحققة:</b>
-‎الطول الموجي ← السياق
-‎القوة والفوليوم ← القرار
-‎الرفض ← الزناد
+<b>🧠 فلسفة النظام المحققة:</b>
+‎• الطول الموجي ← السياق
+‎• القوة والفوليوم ← القرار  
+‎• الرفض ← الزناد
+‎• الإشارة ← صفقة نشطة مباشرة
 
-<u><b>🎯 إستراتيجية إدارة المخاطر:</b></u>
-‎• وقف الخسارة: ديناميكي (أقرب قاع تأرجح - 15M/30M/1H فقط)
-‎• هدف الربح: ديناميكي (أولاً بركة سيولة، ثانياً قمة تأرجح - 15M/30M/1H فقط)
-‎• نسبة: ديناميكية (الحد الأدنى {MIN_RISK_REWARD}:1)
-
-‎تم الالتزام بـ:
-‎• الدخول عند الرفض فقط
-‎• صفقة واحدة لكل عملة
-‎• عدم المطاردة
-‎• قبول الخسائر
-‎• صيد التوسع
-<u>‎• <b>لا تستخدم 3M/5M أبداً لوقف الخسارة/هدف الربح</b></u>
-
-‎#إحصائيات_الرفض #متداول_تفاعلي #صفقة_واحدة #أقرب_قاع_تأرجح #بركة_السيولة #15M_30M_1H_فقط
+‎#إحصائيات_الرفض #نظام_مبسط #إشارة_صفقة_نشطة #بركة_سيولة #نسبة_دنيا
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -2904,8 +2494,6 @@ async def start_http_server(scanner, port=8000):
     async def handle_request(reader, writer):
         try:
             request = await reader.read(1024)
-            
-            # Parse request
             lines = request.decode().split('\r\n')
             if not lines:
                 writer.write(b'HTTP/1.1 400 Bad Request\r\n\r\n')
@@ -2919,79 +2507,56 @@ async def start_http_server(scanner, port=8000):
             response = ""
             
             if path == '/':
-                # Get scanner stats
                 stats = scanner.scanner.get_daily_stats()
                 active_count = len(scanner.scanner.deduplicator.active_signals)
                 
                 response = json.dumps({
                     "status": "running",
                     "scanner": "Rejection-Based High-Frequency Scanner",
+                    "simplified_system": "Signal = Active Trade immediately",
                     "scan_cycle": scanner.scan_cycle,
                     "active_trades": active_count,
                     "daily_stats": stats,
-                    "dynamic_risk_parameters": {
-                        "stop_loss": "Nearest Swing Low/High (15M/30M/1H ONLY)",
-                        "take_profit_primary": "Nearest Liquidity Pool (15M/30M/1H ONLY)",
-                        "take_profit_fallback": "Nearest Swing High/Low (15M/30M/1H ONLY)",
-                        "strict_rule": "NEVER use 3M/5M for SL/TP",
-                        "min_risk_reward": MIN_RISK_REWARD,
-                        "strategy": "Dynamic SL/TP with multi-timeframe analysis"
+                    "tp_method_stats": {
+                        "liquidity_pool": stats.get('tp_liquidity_pool', 0),
+                        "minimum_rr": stats.get('tp_minimum_rr', 0)
                     },
-                    "trader_mindset": {
-                        "role": "Discretionary reaction trader",
-                        "specialty": "Wave-length awareness + Strength analysis + Rejection entries",
-                        "philosophy": "Wave length sets context, Strength & volume make decision, Rejection pulls trigger",
-                        "entry_rule": "Trade ONLY at rejection zones",
-                        "frequency": "High frequency + dynamic risk management"
-                    },
-                    "telegram": {
-                        "configured": bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID),
-                        "notifications": "Signal + Entry + TP/SL alerts"
+                    "system_features": {
+                        "status_states": "ACTIVE/CLOSED only (No PENDING/TRIGGERED)",
+                        "auto_monitoring": "SL/TP monitored automatically",
+                        "deduplication": "One trade per symbol",
+                        "tp_display": "TP method and timeframe included in signals"
                     }
                 }, indent=2)
             
             elif path == '/stats':
                 response = json.dumps(scanner.scanner.get_daily_stats(), indent=2)
             
-            elif path == '/mindset':
-                response = json.dumps({
-                    "trader_role": "Professional discretionary crypto trader",
-                    "specialization": "Wave-length awareness, strength analysis, rejection-based entries",
-                    "trades": "Both LONG and SHORT symmetrically",
-                    "philosophy": "Accept losses, hunt expansion",
-                    "wave_length": "Context only - no Elliott wave counting",
-                    "market_strength": "Measure speed, distance, EMA angle, volume participation",
-                    "rejection_zones": "Trade ONLY at rejection zones (EMA, Range, Failed breaks)",
-                    "entry_conditions": "RSI zones (40-50 LONG, 50-60 SHORT) + Volume confirmation",
-                    "entry_philosophy": "Enter on first strong rejection candle, early entries are intentional",
-                    "risk_management": "Dynamic SL (Nearest Swing - 15M/30M/1H ONLY) + Dynamic TP (Liquidity Pool + Swing Fallback - 15M/30M/1H ONLY)",
-                    "strict_rule": "NEVER use 3M/5M for SL/TP - ALWAYS use 15M/30M/1H",
-                    "frequency_rule": "High frequency + dynamic payoff",
-                    "mindset": "Reaction trader, rejection specialist, not prediction-based, comfortable being wrong"
-                }, indent=2)
-            
-            elif path == '/recent':
+            elif path == '/active':
                 if scanner.db:
                     scanner.db.row_factory = aiosqlite.Row
                     async with scanner.db.execute("""
-                        SELECT symbol, side, entry_price, zone_type, rejection_type,
-                               rejection_strength, risk_reward, expected_move, 
-                               created_at, status, close_reason, pnl_percent
+                        SELECT symbol, side, entry_price, stop_loss, take_profit,
+                               tp_method, tp_timeframe, sl_source, sl_timeframe,
+                               risk_reward, created_at
                         FROM rejection_signals 
-                        ORDER BY created_at DESC 
-                        LIMIT 20
+                        WHERE status = 'ACTIVE'
+                        ORDER BY created_at DESC
                     """) as cursor:
                         rows = await cursor.fetchall()
                         signals = [dict(row) for row in rows]
                     
-                    response = json.dumps({"signals": signals, "count": len(signals)}, indent=2)
+                    response = json.dumps({
+                        "active_signals": signals, 
+                        "count": len(signals),
+                        "note": "Signal = Active Trade immediately"
+                    }, indent=2)
                 else:
                     response = json.dumps({"error": "Database not available"})
             
             else:
                 response = json.dumps({"error": "Endpoint not found"})
             
-            # Send response
             writer.write(f'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{response}'.encode())
             await writer.drain()
             writer.close()
@@ -3013,7 +2578,6 @@ async def main():
     """Main entry point"""
     scanner = RejectionScanner()
     
-    # Run scanner and HTTP server concurrently
     try:
         await asyncio.gather(
             scanner.run(),
@@ -3026,11 +2590,9 @@ async def main():
         raise
 
 if __name__ == "__main__":
-    # Set event loop policy for Windows compatibility
     try:
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     except:
-        pass  # Not Windows
+        pass
     
-    # Run main
     asyncio.run(main())
