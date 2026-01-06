@@ -267,6 +267,7 @@ async def is_similar_to_recent_setup(setup: Dict) -> bool:
     symbol = setup['symbol']
     current_entry = setup['entry_price']
     current_side = setup['side']
+    now = datetime.datetime.utcnow()  # FIXED: Define now at the beginning
     
     # Check active positions first
     async with db_lock:
@@ -286,7 +287,7 @@ async def is_similar_to_recent_setup(setup: Dict) -> bool:
                 return True
     
     # Check recent signals (last 2 hours instead of 4)
-    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(hours=2)).isoformat()
+    cutoff = (now - datetime.timedelta(hours=2)).isoformat()
     
     async with db_lock:
         cursor = await db_conn.execute("""
@@ -301,7 +302,6 @@ async def is_similar_to_recent_setup(setup: Dict) -> bool:
         for row in rows:
             prev_entry = row[0]
             prev_time = datetime.datetime.fromisoformat(row[1])
-            now = datetime.datetime.utcnow()
             
             price_diff_pct = abs(current_entry - prev_entry) / prev_entry * 100
             
@@ -453,6 +453,8 @@ async def init_db():
 # ---------------- POSITION MANAGEMENT ----------------
 async def create_position_from_setup(setup: Dict, signal_id: int) -> int:
     """Create a new position from a setup and return position ID"""
+    now = datetime.datetime.utcnow()  # FIXED: Define now variable
+    
     async with db_lock:
         cursor = await db_conn.execute("""
             INSERT INTO positions 
@@ -469,7 +471,7 @@ async def create_position_from_setup(setup: Dict, signal_id: int) -> int:
             setup['tp1_price'],
             setup['tp2_price'],
             setup['tp3_price'],
-            setup['timestamp']
+            now.isoformat()  # FIXED: Use defined now variable
         ))
         
         position_id = (await cursor.fetchone())[0]
@@ -499,6 +501,8 @@ async def log_position_update(position_id: int, current_price: float,
         distance_to_tp2 = abs(current_price - tp2_price) / entry_price * 100
         distance_to_tp3 = abs(current_price - tp3_price) / entry_price * 100
     
+    now = datetime.datetime.utcnow()  # FIXED: Define now variable
+    
     async with db_lock:
         await db_conn.execute("""
             INSERT INTO position_updates 
@@ -507,7 +511,7 @@ async def log_position_update(position_id: int, current_price: float,
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             position_id,
-            datetime.datetime.utcnow().isoformat(),
+            now.isoformat(),  # FIXED: Use defined now variable
             current_price,
             pnl_percent,
             distance_to_sl,
@@ -521,12 +525,14 @@ async def log_position_update(position_id: int, current_price: float,
             UPDATE positions 
             SET pnl_percent = ?, pnl_updated_time = ?
             WHERE id = ?
-        """, (pnl_percent, datetime.datetime.utcnow().isoformat(), position_id))
+        """, (pnl_percent, now.isoformat(), position_id))  # FIXED: Use defined now variable
         
         await db_conn.commit()
 
 async def close_position(position_id: int, exit_price: float, exit_type: str):
     """Close a position and calculate final PnL"""
+    now = datetime.datetime.utcnow()  # FIXED: Define now at the beginning
+    
     async with db_lock:
         # Get position details
         cursor = await db_conn.execute("""
@@ -551,7 +557,7 @@ async def close_position(position_id: int, exit_price: float, exit_type: str):
                 pnl_percent = ?, status = 'CLOSED'
             WHERE id = ?
         """, (
-            datetime.datetime.utcnow().isoformat(),
+            now.isoformat(),  # FIXED: Use defined now variable
             exit_price,
             exit_type,
             pnl_percent,
@@ -842,7 +848,7 @@ async def analyze_htf_bias(exchange, symbol: str) -> HTFContext:
         if (low_i < df_htf["low"].iloc[i-1] and 
             low_i < df_htf["low"].iloc[i-2] and
             low_i < df_htf["low"].iloc[i+1] and
-            low_i < df_htf["low"].iloc[i+2]):  # FIXED: Changed df_ltf to df_htf
+            low_i < df_htf["low"].iloc[i+2]):
             swing_lows.append({
                 "price": float(low_i),
                 "index": int(i),
@@ -1752,6 +1758,65 @@ Entry Precision: {setup['probability']['entry_precision']:.2f}
         position_id = await create_position_from_setup(setup, signal_id)
         log.info(f"Created position {position_id} for {setup['symbol']}")
 
+# ---------------- GET TOP VOLUME PAIRS ----------------
+async def get_top_volume_pairs(exchange, limit=20):
+    """Get top volume pairs efficiently"""
+    try:
+        log.info("Fetching top volume pairs...")
+        
+        # Get all USDT pairs from markets
+        markets = exchange.markets
+        usdt_pairs = [s for s in markets if '/USDT' in s and markets[s]['active']]
+        
+        # If we have many pairs, sample them to avoid fetching all tickers
+        if len(usdt_pairs) > 100:
+            import random
+            # Take a random sample of 100 pairs to check volume
+            sampled_pairs = random.sample(usdt_pairs, 100)
+        else:
+            sampled_pairs = usdt_pairs
+        
+        # Fetch tickers in smaller batches
+        all_tickers = {}
+        batch_size = 10
+        
+        for i in range(0, len(sampled_pairs), batch_size):
+            batch = sampled_pairs[i:i+batch_size]
+            try:
+                batch_tickers = await exchange.fetch_tickers(batch)
+                all_tickers.update(batch_tickers)
+            except Exception as e:
+                log.warning(f"Error fetching batch {i//batch_size}: {e}")
+            
+            # Rate limiting
+            await asyncio.sleep(0.5)
+        
+        # Extract volume data
+        volume_data = []
+        for symbol, ticker in all_tickers.items():
+            if symbol.endswith('/USDT'):
+                volume = ticker.get('quoteVolume', 0)
+                if volume > 0:
+                    volume_data.append((symbol, volume))
+        
+        # Sort by volume and return top N
+        volume_data.sort(key=lambda x: x[1], reverse=True)
+        top_pairs = volume_data[:limit]
+        
+        log.info(f"Found {len(top_pairs)} top volume pairs")
+        return top_pairs
+        
+    except Exception as e:
+        log.error(f"Error getting top volume pairs: {e}")
+        # Fallback to hardcoded major pairs
+        fallback_pairs = [
+            "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT",
+            "ADA/USDT", "AVAX/USDT", "DOT/USDT", "DOGE/USDT", "MATIC/USDT",
+            "LTC/USDT", "UNI/USDT", "LINK/USDT", "ATOM/USDT", "ETC/USDT",
+            "XLM/USDT", "ALGO/USDT", "FIL/USDT", "VET/USDT", "ICP/USDT"
+        ]
+        return [(pair, 1000000) for pair in fallback_pairs[:limit]]
+
 # ---------------- MAIN SCANNER ----------------
 async def scanner_main(exchange):
     """Main scanning loop"""
@@ -1768,44 +1833,51 @@ async def scanner_main(exchange):
         try:
             log.info(f"🔄 Scan cycle #{cycle_count} starting...")
             
-            # Get top volume pairs
-            tickers = await exchange.fetch_tickers()
-            usdt_pairs = [(s, v.get("quoteVolume", 0)) 
-                         for s, v in tickers.items() 
-                         if s.endswith("/USDT")]
-            usdt_pairs.sort(key=lambda x: x[1], reverse=True)
-            top_pairs = usdt_pairs[:TOP_N]
+            # Get top volume pairs efficiently
+            top_pairs = await get_top_volume_pairs(exchange, TOP_N)
+            
+            if not top_pairs:
+                log.warning("No pairs to scan, sleeping...")
+                await asyncio.sleep(SCAN_INTERVAL)
+                continue
             
             log.info(f"📊 Scanning {len(top_pairs)} symbols...")
             
             setups_found = 0
             symbols_scanned = 0
             
-            for symbol, volume in top_pairs:
-                try:
-                    # Yield control to prevent freezing
-                    await asyncio.sleep(0.01)
-                    
-                    setup = await scan_symbol_full(exchange, symbol)
+            # Process symbols with concurrency control
+            semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+            
+            async def process_symbol(symbol_volume):
+                symbol, volume = symbol_volume
+                async with semaphore:
+                    try:
+                        setup = await scan_symbol_full(exchange, symbol)
+                        if setup:
+                            # Check deduplication
+                            if await should_send_alert(setup):
+                                if not await is_similar_to_recent_setup(setup):
+                                    await send_setup_alert(setup)
+                                    return 1  # Setup found
+                        return 0  # No setup found
+                    except Exception as e:
+                        log.error(f"Error scanning {symbol}: {e}")
+                        return 0
+                    finally:
+                        await asyncio.sleep(0.05)  # Small delay
+            
+            # Process all symbols concurrently
+            tasks = [process_symbol(pair) for pair in top_pairs]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Count results
+            for result in results:
+                if isinstance(result, int):
+                    setups_found += result
                     symbols_scanned += 1
-                    
-                    if setup:
-                        # Check deduplication
-                        if await should_send_alert(setup):
-                            if not await is_similar_to_recent_setup(setup):
-                                await send_setup_alert(setup)
-                                setups_found += 1
-                            else:
-                                log.debug(f"  {symbol}: Setup too similar to recent one, skipping alert")
-                        else:
-                            log.debug(f"  {symbol}: Setup in cooldown")
-                    
-                    # Small delay between symbols
-                    await asyncio.sleep(0.05)
-                    
-                except Exception as e:
-                    log.error(f"Error scanning {symbol}: {e}")
-                    continue
+                elif not isinstance(result, Exception):
+                    symbols_scanned += 1
             
             log.info(f"✅ Scan #{cycle_count} complete: Scanned {symbols_scanned}/{len(top_pairs)} symbols, found {setups_found} setups")
             
