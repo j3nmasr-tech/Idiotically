@@ -5,6 +5,7 @@ CONFLUENCE SCANNER v5.0 - 3-5% MOVE STRATEGY
 Multi-layer confluence analysis with precise entry detection
 NO TA-Lib DEPENDENCY - Pure Python implementation
 OKX EXCHANGE INTEGRATION - No geographical restrictions
+FIXED: DataFrame truth value handling
 """
 
 import os
@@ -12,6 +13,7 @@ import time
 import asyncio
 import logging
 import hashlib
+import traceback
 import aiosqlite
 import httpx
 import ccxt.async_support as ccxt
@@ -327,7 +329,12 @@ class ConfluenceScanner:
         Analyze market structure across multiple timeframes
         """
         try:
-            if df_daily is None or df_4h is None or df_1h is None:
+            # FIXED: Check for empty dataframes properly
+            if df_daily is None or df_daily.empty or len(df_daily) < 20:
+                return self._get_default_structure()
+            if df_4h is None or df_4h.empty or len(df_4h) < 20:
+                return self._get_default_structure()
+            if df_1h is None or df_1h.empty or len(df_1h) < 20:
                 return self._get_default_structure()
             
             # 1. Determine primary trend (Daily)
@@ -544,7 +551,8 @@ class ConfluenceScanner:
     def analyze_order_flow(self, df_15m: pd.DataFrame, current_price: float) -> OrderFlow:
         """Analyze order flow and volume profile"""
         try:
-            if df_15m is None or len(df_15m) < 30:
+            # FIXED: Check for empty dataframes properly
+            if df_15m is None or df_15m.empty or len(df_15m) < 30:
                 return self._get_default_order_flow()
             
             # 1. Volume profile analysis
@@ -769,7 +777,10 @@ class ConfluenceScanner:
     def analyze_momentum(self, df_15m: pd.DataFrame, df_5m: pd.DataFrame) -> MomentumSignal:
         """Analyze short-term momentum signals - NO TA-Lib"""
         try:
-            if df_15m is None or df_5m is None:
+            # FIXED: Check for empty dataframes properly
+            if df_15m is None or df_15m.empty or len(df_15m) < 30:
+                return self._get_default_momentum()
+            if df_5m is None or df_5m.empty or len(df_5m) < 30:
                 return self._get_default_momentum()
             
             # 1. RSI analysis (pure Python)
@@ -982,7 +993,10 @@ class ConfluenceScanner:
                                current_price: float) -> LiquidityZone:
         """Analyze liquidity zones for stop hunts"""
         try:
-            if df_4h is None or df_1h is None:
+            # FIXED: Check for empty dataframes properly
+            if df_4h is None or df_4h.empty or len(df_4h) < 20:
+                return self._get_default_liquidity_zone()
+            if df_1h is None or df_1h.empty or len(df_1h) < 20:
                 return self._get_default_liquidity_zone()
             
             # 1. Identify liquidity zones
@@ -1290,10 +1304,19 @@ class ConfluenceScanner:
             df_15m = multi_tf_data.get("15M")
             df_5m = multi_tf_data.get("5M")
             
-            # Check data
-            if None in [df_daily, df_4h, df_1h, df_15m, df_5m]:
-                log.debug(f"{symbol}: Missing timeframe data")
-                return None
+            # FIXED: Proper DataFrame checking without ambiguous truth values
+            required_data = [
+                ("DAILY", df_daily, 20),
+                ("4H", df_4h, 20),
+                ("1H", df_1h, 20),
+                ("15M", df_15m, 30),
+                ("5M", df_5m, 30)
+            ]
+            
+            for tf_name, df, min_length in required_data:
+                if df is None or df.empty or len(df) < min_length:
+                    log.debug(f"{symbol}: Missing or insufficient {tf_name} data")
+                    return None
             
             # Get current price from 5M
             current_price = df_5m['close'].iloc[-1]
@@ -1444,6 +1467,7 @@ class ConfluenceScanner:
             
         except Exception as e:
             log.error(f"Confluence signal error for {symbol}: {e}")
+            log.error(f"Traceback: {traceback.format_exc()}")
             return None
     
     def _determine_trade_side(self, structure: MarketStructure, 
@@ -2253,12 +2277,18 @@ Only one signal per symbol. New signals require better confluence or previous cl
                         # Fetch multi-timeframe data
                         multi_tf_data = await self.fetch_timeframe_data(symbol)
                         
-                        # Check we have all required timeframes
+                        # FIXED: Check if we have all required timeframes with sufficient data
                         required_tfs = ["DAILY", "4H", "1H", "15M", "5M"]
-                        has_all_data = all(tf in multi_tf_data for tf in required_tfs)
+                        has_all_data = True
+                        
+                        for tf in required_tfs:
+                            df = multi_tf_data.get(tf)
+                            if df is None or df.empty or len(df) < 20:
+                                has_all_data = False
+                                log.debug(f"{symbol}: Missing or insufficient {tf} data")
+                                break
                         
                         if not has_all_data:
-                            log.debug(f"{symbol}: Missing timeframe data")
                             continue
                         
                         # Generate confluence signal
@@ -2354,7 +2384,7 @@ Only one signal per symbol. New signals require better confluence or previous cl
 ‎• Currently active: {active_count}
 
 <b>🎯 STRATEGY PERFORMANCE:</b>
-The scanner hunted for 3-5% move setups with multi-layer confluence:
+The scanner hunts for 3-5% move setups with multi-layer confluence:
 ‎1. Market Structure alignment
 ‎2. Order flow confirmation
 ‎3. Momentum divergence
