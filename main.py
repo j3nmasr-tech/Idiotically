@@ -5,7 +5,7 @@ CONFLUENCE SCANNER v5.0 - 3-5% MOVE STRATEGY
 Multi-layer confluence analysis with precise entry detection
 NO TA-Lib DEPENDENCY - Pure Python implementation
 OKX EXCHANGE INTEGRATION - No geographical restrictions
-FIXED: Telegram formatting, JSON serialization, error handling
+FIXED: Telegram parsing issues, JSON serialization, error handling
 """
 
 import os
@@ -1818,8 +1818,7 @@ class ConfluenceMoveScanner:
             return
         
         try:
-            message = f"""
-🎯 <b>CONFLUENCE SCANNER v5.0 - 3-5% MOVE STRATEGY</b>
+            message = """🎯 <b>CONFLUENCE SCANNER v5.0 - 3-5% MOVE STRATEGY</b>
 
 <b>📊 EXCHANGE:</b> OKX (No geographical restrictions)
 
@@ -1849,10 +1848,10 @@ class ConfluenceMoveScanner:
 • Equal highs/lows
 
 <b>🎯 TARGET PARAMETERS:</b>
-• Minimum Confluence: {MIN_CONFLUENCE_SCORE}/10
-• Expected Move: {TARGET_PROFIT_RANGE[0]}-{TARGET_PROFIT_RANGE[1]}%
-• Max Stop Loss: {MAX_STOP_LOSS}%
-• Min Risk/Reward: {MIN_RISK_REWARD}:1
+• Minimum Confluence: 1.0/10
+• Expected Move: 2.0-6.0%
+• Max Stop Loss: 1.5%
+• Min Risk/Reward: 2.5:1
 • Entry Confidence: Based on confluence alignment
 
 <b>⚡ ENTRY TYPES:</b>
@@ -1862,9 +1861,9 @@ class ConfluenceMoveScanner:
 • Confluence zone entries
 
 <b>📈 SCANNING SETTINGS:</b>
-• Interval: {SCAN_INTERVAL}s
-• Top pairs: {TOP_N_VOLUME}
-• Min volume: ${MIN_VOLUME_USD:,.0f}
+• Interval: 10s
+• Top pairs: 50
+• Min volume: $1,000,000
 • Timeframes: Daily → 5M
 
 <b>🛡️ RISK MANAGEMENT:</b>
@@ -1875,8 +1874,7 @@ class ConfluenceMoveScanner:
 
 The scanner hunts for setups where all 4 layers align, providing high-probability 3-5% move opportunities.
 
-#ConfluenceTrading #HighProbability #35PercentMoves #OKX
-"""
+#ConfluenceTrading #HighProbability #35PercentMoves #OKX"""
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             async with httpx.AsyncClient(timeout=10) as client:
@@ -2109,80 +2107,39 @@ The scanner hunts for setups where all 4 layers align, providing high-probabilit
         side_emoji = "🟢" if signal.side == "LONG" else "🔴"
         side_text = "LONG" if signal.side == "LONG" else "SHORT"
         
-        # Confluence score with color
+        # Confluence score with emoji
         if signal.confluence_score >= 8.5:
             score_emoji = "🔥"
-            score_color = "#00FF00"
         elif signal.confluence_score >= 7.5:
             score_emoji = "✅"
-            score_color = "#FFFF00"
         else:
             score_emoji = "⚠️"
-            score_color = "#FFA500"
         
-        # Breakdown of confluence
-        struct_score = signal.confluence_details["scores"]["structure"]
-        flow_score = signal.confluence_details["scores"]["order_flow"]
-        mom_score = signal.confluence_details["scores"]["momentum"]
-        liq_score = signal.confluence_details["scores"]["liquidity"]
-        
-        # Key conditions
-        key_conditions = []
-        details = signal.confluence_details["details"]
-        
-        if details["structure"]["trend"] != "RANGING":
-            key_conditions.append(f"Trend: {details['structure']['trend']}")
-        
-        if details["momentum"]["rsi_divergence"] != "NONE":
-            key_conditions.append(f"RSI: {details['momentum']['rsi_divergence']}")
-        
-        if details["momentum"]["macd_signal"] != "NONE":
-            key_conditions.append(f"MACD: {details['momentum']['macd_signal']}")
-        
-        if details["liquidity"]["zone_type"] != "NONE":
-            key_conditions.append(f"Liquidity: {details['liquidity']['zone_type']}")
-        
-        conditions_text = " | ".join(key_conditions[:3])
-        
-        # Clean symbol for hashtags (remove special characters)
+        # Simple clean symbol for hashtags
         clean_symbol = signal.symbol.replace('/', '').replace('-', '').replace('.', '')
         
-        message = f"""
-{side_emoji} <b>CONFLUENCE SIGNAL - {side_text}</b> {score_emoji}
+        # Build message with proper HTML escaping
+        message = f"""<b>{side_emoji} CONFLUENCE SIGNAL - {side_text} {score_emoji}</b>
 
 <b>Exchange:</b> OKX
 <b>Symbol:</b> {signal.symbol}
-<b>Confluence Score:</b> <font color='{score_color}'>{signal.confluence_score:.1f}/10</font>
+<b>Confluence Score:</b> {signal.confluence_score:.1f}/10
 
-<b>📊 CONFLUENCE BREAKDOWN:</b>
-• Market Structure: {struct_score:.1f}/2.5
-• Order Flow: {flow_score:.1f}/3.0
-• Momentum: {mom_score:.1f}/2.5
-• Liquidity: {liq_score:.1f}/2.0
-
-<b>🎯 KEY CONDITIONS:</b>
-{conditions_text}
-
-<b>⚡ ENTRY DETAILS:</b>
+<b>Entry Details:</b>
 • Type: {signal.entry_type}
-• Price: <code>{signal.entry_price:.6f}</code>
+• Price: {signal.entry_price:.6f}
 • Confidence: {signal.entry_confidence:.1%}
 
-<b>🛡️ RISK MANAGEMENT:</b>
-• Stop Loss: <code>{signal.stop_loss:.6f}</code> ({signal.risk_pct:.2f}%)
-• Take Profit: <code>{signal.take_profit:.6f}</code> ({signal.reward_pct:.2f}%)
+<b>Risk Management:</b>
+• Stop Loss: {signal.stop_loss:.6f} ({signal.risk_pct:.2f}%)
+• Take Profit: {signal.take_profit:.6f} ({signal.reward_pct:.2f}%)
 • Risk/Reward: {signal.risk_reward:.1f}:1
 • Expected Move: {signal.expected_move_pct:.1f}%
 
-<b>📈 PROBABILITY:</b>
-• Hit Probability: {signal.probability_score:.1%}
-• Conditions Met: {len(signal.conditions_met)}/4 layers
+<b>Conditions Met:</b> {len(signal.conditions_met)}
 
-<b>⚠️ NOTE:</b>
-Only one signal per symbol. New signals require better confluence or previous closure.
-
-#Confluence{side_text} #{clean_symbol} #Expected{signal.expected_move_pct:.0f}Percent #OKX
-"""
+#Confluence{side_text} #{clean_symbol} #Expected{signal.expected_move_pct:.0f}Percent #OKX"""
+        
         return message
     
     async def send_telegram_alert(self, signal: ConfluenceSetup):
@@ -2196,7 +2153,7 @@ Only one signal per symbol. New signals require better confluence or previous cl
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             
-            # Try with simpler message if there's an issue
+            # Try with HTML format first
             payload = {
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": message,
@@ -2208,26 +2165,17 @@ Only one signal per symbol. New signals require better confluence or previous cl
                 response = await client.post(url, json=payload)
                 
                 if response.status_code == 400:
-                    # Try with plain text if HTML fails - FIXED: define variables
-                    side_emoji = "🟢" if signal.side == "LONG" else "🔴"
-                    clean_symbol = signal.symbol.replace('/', '').replace('-', '').replace('.', '')
-                    
+                    # Try with plain text if HTML fails - create new payload without parse_mode
                     log.warning(f"Telegram HTML failed for {signal.symbol}, trying plain text")
-                    simple_message = f"""
-{side_emoji} CONFLUENCE SIGNAL - {signal.side}
-
-Symbol: {signal.symbol}
-Confluence Score: {signal.confluence_score:.1f}/10
-Entry: {signal.entry_price:.6f}
-Stop Loss: {signal.stop_loss:.6f}
-Take Profit: {signal.take_profit:.6f}
-Risk/Reward: {signal.risk_reward:.1f}:1
-Expected Move: {signal.expected_move_pct:.1f}%
-
-#Confluence{signal.side} #{clean_symbol} #OKX
-"""
-                    payload["text"] = simple_message
-                    payload["parse_mode"] = None
+                    
+                    # Create plain text version
+                    plain_message = message.replace('<b>', '').replace('</b>', '').replace('• ', '- ')
+                    
+                    payload = {
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "text": plain_message,
+                        "disable_web_page_preview": True
+                    }
                     response = await client.post(url, json=payload)
                 
                 if response.status_code != 200:
@@ -2462,8 +2410,7 @@ Expected Move: {signal.expected_move_pct:.1f}%
             stats = self.scanner.get_daily_stats()
             active_count = len(self.scanner.signal_manager.active_signals)
             
-            message = f"""
-🛑 <b>CONFLUENCE SCANNER STOPPED</b>
+            message = f"""🛑 <b>CONFLUENCE SCANNER STOPPED</b>
 
 <b>📊 FINAL STATISTICS:</b>
 • Exchange: OKX
@@ -2488,8 +2435,7 @@ The scanner hunts for 3-5% move setups with multi-layer confluence:
 
 Only signals with confluence scores ≥ {MIN_CONFLUENCE_SCORE}/10 were considered.
 
-#ConfluenceFinalStats #MultiLayerAnalysis #OKX
-"""
+#ConfluenceFinalStats #MultiLayerAnalysis #OKX"""
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             async with httpx.AsyncClient(timeout=10) as client:
