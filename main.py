@@ -4,6 +4,7 @@
 CONFLUENCE SCANNER v5.0 - 3-5% MOVE STRATEGY
 Multi-layer confluence analysis with precise entry detection
 NO TA-Lib DEPENDENCY - Pure Python implementation
+OKX EXCHANGE INTEGRATION - No geographical restrictions
 """
 
 import os
@@ -1633,7 +1634,7 @@ class ConfluenceScanner:
 
 # ================ MAIN SCANNER SYSTEM ================
 class ConfluenceMoveScanner:
-    """Main scanner for 3-5% confluence moves"""
+    """Main scanner for 3-5% confluence moves with OKX exchange"""
     
     def __init__(self):
         self.scanner = ConfluenceScanner()
@@ -1646,6 +1647,7 @@ class ConfluenceMoveScanner:
         log.info("=" * 70)
         log.info("🎯 CONFLUENCE SCANNER v5.0 - 3-5% MOVE STRATEGY")
         log.info("=" * 70)
+        log.info("EXCHANGE: OKX (No geographical restrictions)")
         log.info("STRATEGY: Multi-layer confluence analysis")
         log.info("TARGET: 3-5% directional moves")
         log.info("ANALYSIS LAYERS:")
@@ -1736,22 +1738,50 @@ class ConfluenceMoveScanner:
             raise
     
     async def _init_exchange(self):
-        """Initialize exchange connection"""
+        """Initialize OKX exchange connection"""
         try:
-            self.exchange = ccxt.binance({
+            # Primary exchange: OKX
+            self.exchange = ccxt.okx({
                 "enableRateLimit": True,
-                "options": {"defaultType": "spot"},
-                "timeout": 20000,
-                "rateLimit": 50
+                "options": {
+                    "defaultType": "spot",
+                    "fetchMarkets": "spot",
+                    "adjustForTimeDifference": True,
+                },
+                "timeout": 30000,  # 30 second timeout
+                "rateLimit": 20,   # OKX rate limit is 20 req/sec for public
             })
             
-            # Test connection
+            # Test connection with market fetch
+            markets = await self.exchange.fetch_markets(params={'type': 'spot'})
+            
+            # Filter for USDT pairs only
+            usdt_pairs = [m['symbol'] for m in markets if m['symbol'].endswith('/USDT')]
+            
+            log.info(f"✅ OKX exchange connected. Found {len(usdt_pairs)} USDT pairs")
+            
+            # Get BTC price to verify
             ticker = await self.exchange.fetch_ticker("BTC/USDT")
-            log.info(f"✅ Exchange connected. BTC: ${ticker['last']:.2f}")
+            log.info(f"📊 BTC/USDT: ${ticker['last']:.2f}")
             
         except Exception as e:
-            log.error(f"Exchange error: {e}")
-            raise
+            log.error(f"OKX exchange error: {e}")
+            log.info("⚠️ Trying alternative exchange: Bybit...")
+            
+            # Fallback to Bybit
+            try:
+                self.exchange = ccxt.bybit({
+                    "enableRateLimit": True,
+                    "options": {"defaultType": "spot"},
+                    "timeout": 20000,
+                })
+                
+                ticker = await self.exchange.fetch_ticker("BTC/USDT")
+                log.info(f"✅ Bybit fallback connected. BTC: ${ticker['last']:.2f}")
+                
+            except Exception as fallback_error:
+                log.error(f"❌ All exchanges failed: {fallback_error}")
+                raise
     
     async def _send_startup_message(self):
         """Send startup message to Telegram"""
@@ -1763,8 +1793,7 @@ class ConfluenceMoveScanner:
             message = f"""
 🎯 <b>CONFLUENCE SCANNER v5.0 - 3-5% MOVE STRATEGY</b>
 
-<b>📊 STRATEGY OVERVIEW:</b>
-Multi-layer confluence analysis targeting 3-5% directional moves with high probability.
+<b>📊 EXCHANGE:</b> OKX (No geographical restrictions)
 
 <b>🧠 ANALYSIS FRAMEWORK (4 LAYERS):</b>
 1️⃣ <b>Market Structure (25%)</b>
@@ -1818,7 +1847,7 @@ Multi-layer confluence analysis targeting 3-5% directional moves with high proba
 
 The scanner hunts for setups where all 4 layers align, providing high-probability 3-5% move opportunities.
 
-#ConfluenceTrading #HighProbability #35PercentMoves
+#ConfluenceTrading #HighProbability #35PercentMoves #OKX
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -1834,71 +1863,108 @@ The scanner hunts for setups where all 4 layers align, providing high-probabilit
         except Exception as e:
             log.error(f"Telegram error: {e}")
     
+    async def _fetch_single_timeframe(self, symbol: str, timeframe: str, 
+                                     limit: int, tf_name: str) -> pd.DataFrame:
+        """Fetch single timeframe data"""
+        try:
+            # OKX specific parameters
+            params = {'type': 'spot'}
+            
+            ohlcv = await self.exchange.fetch_ohlcv(
+                symbol, 
+                timeframe=timeframe, 
+                limit=limit,
+                params=params
+            )
+            
+            if ohlcv and len(ohlcv) >= 20:
+                df = pd.DataFrame(
+                    ohlcv,
+                    columns=["timestamp", "open", "high", "low", "close", "volume"]
+                )
+                
+                # Convert to numeric
+                for col in ["open", "high", "low", "close", "volume"]:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                
+                df = df.dropna()
+                
+                if len(df) >= 15:
+                    return df
+            
+            return pd.DataFrame()
+            
+        except Exception as e:
+            log.debug(f"OHLCV error {symbol} {tf_name}: {str(e)[:50]}")
+            return pd.DataFrame()
+    
     async def fetch_timeframe_data(self, symbol: str) -> Dict[str, pd.DataFrame]:
-        """Fetch data for all timeframes"""
+        """Batch fetch OHLCV data for multiple timeframes"""
         data = {}
+        tasks = []
+        
+        # Adjust limits for OKX (better historical data)
+        limit_map = {
+            "DAILY": 100,
+            "4H": 120,    # 20 days of 4H
+            "1H": 168,    # 7 days of hourly
+            "15M": 96,    # 24 hours of 15m
+            "5M": 72      # 6 hours of 5m
+        }
         
         for tf_name, tf in TIMEFRAMES.items():
-            try:
-                # Adjust limits based on timeframe
-                if tf_name == "DAILY":
-                    limit = 100
-                elif tf_name == "4H":
-                    limit = 80
-                elif tf_name == "1H":
-                    limit = 60
-                elif tf_name == "15M":
-                    limit = 40
-                else:  # 5M
-                    limit = 30
-                
-                ohlcv = await self.exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-                
-                if ohlcv and len(ohlcv) >= 20:
-                    df = pd.DataFrame(
-                        ohlcv,
-                        columns=["timestamp", "open", "high", "low", "close", "volume"]
-                    )
-                    
-                    # Convert to numeric
-                    for col in ["open", "high", "low", "close", "volume"]:
-                        df[col] = pd.to_numeric(df[col], errors='coerce')
-                    
-                    df = df.dropna()
-                    
-                    if len(df) >= 15:
-                        data[tf_name] = df
-                    
-            except Exception as e:
-                log.debug(f"{symbol} {tf_name}: {str(e)[:50]}")
-                continue
+            limit = limit_map.get(tf_name, 50)
+            tasks.append(self._fetch_single_timeframe(symbol, tf, limit, tf_name))
+        
+        # Fetch all timeframes concurrently
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for tf_name, result in zip(TIMEFRAMES.keys(), results):
+            if isinstance(result, pd.DataFrame) and not result.empty:
+                data[tf_name] = result
+            else:
+                log.debug(f"No data for {symbol} {tf_name}")
         
         return data
     
     async def get_active_pairs(self) -> List[Tuple[str, float]]:
-        """Get active trading pairs"""
+        """Get active trading pairs from OKX"""
         try:
-            tickers = await self.exchange.fetch_tickers()
+            # OKX supports params for market type
+            markets = await self.exchange.fetch_markets(params={'type': 'spot'})
+            
             active_pairs = []
             
-            for symbol, ticker in tickers.items():
+            for market in markets:
+                symbol = market['symbol']
+                
+                # Filter for USDT pairs only
                 if symbol.endswith('/USDT'):
-                    volume = ticker.get('quoteVolume', 0)
-                    
-                    if volume >= MIN_VOLUME_USD:
-                        # Check price for minimum movement potential
-                        price = ticker.get('last', 0)
-                        if price > 0.01:  # Avoid penny stocks
-                            active_pairs.append((symbol, volume))
+                    # Get ticker for volume data
+                    try:
+                        ticker = await self.exchange.fetch_ticker(symbol)
+                        volume = ticker.get('quoteVolume', 0)
+                        
+                        if volume >= MIN_VOLUME_USD:
+                            # Check price for minimum movement potential
+                            price = ticker.get('last', 0)
+                            if price > 0.01:  # Avoid penny stocks
+                                active_pairs.append((symbol, volume))
+                    except Exception as e:
+                        log.debug(f"Ticker error {symbol}: {e}")
+                        continue
             
             # Sort by volume
             active_pairs.sort(key=lambda x: x[1], reverse=True)
             
             # Take top N
-            return active_pairs[:TOP_N_VOLUME]
+            selected_pairs = active_pairs[:TOP_N_VOLUME]
+            
+            log.info(f"📊 Selected {len(selected_pairs)} pairs from OKX (Volume > ${MIN_VOLUME_USD:,.0f})")
+            return selected_pairs
             
         except Exception as e:
-            log.error(f"Error getting pairs: {e}")
+            log.error(f"Error getting OKX pairs: {e}")
             return []
     
     async def save_signal(self, signal: ConfluenceSetup) -> bool:
@@ -2009,6 +2075,7 @@ The scanner hunts for setups where all 4 layers align, providing high-probabilit
         message = f"""
 {side_emoji} <b>CONFLUENCE SIGNAL - {side_text}</b> {score_emoji}
 
+<b>Exchange: OKX</b>
 <b>{signal.symbol}</b>
 <b>Confluence Score: <font color='{score_color}'>{signal.confluence_score:.1f}/10</font></b>
 
@@ -2039,7 +2106,7 @@ The scanner hunts for setups where all 4 layers align, providing high-probabilit
 <b>⚠️ NOTE:</b>
 Only one signal per symbol. New signals require better confluence or previous closure.
 
-#Confluence{side_text} #{signal.symbol.replace('/', '')} #Expected{signal.expected_move_pct:.0f}Percent
+#Confluence{side_text} #{signal.symbol.replace('/', '')} #Expected{signal.expected_move_pct:.0f}Percent #OKX
 """
         return message
     
@@ -2191,6 +2258,7 @@ Only one signal per symbol. New signals require better confluence or previous cl
                         has_all_data = all(tf in multi_tf_data for tf in required_tfs)
                         
                         if not has_all_data:
+                            log.debug(f"{symbol}: Missing timeframe data")
                             continue
                         
                         # Generate confluence signal
@@ -2272,6 +2340,7 @@ Only one signal per symbol. New signals require better confluence or previous cl
 🛑 <b>CONFLUENCE SCANNER STOPPED</b>
 
 <b>📊 FINAL STATISTICS:</b>
+‎• Exchange: OKX
 ‎• Total scans: {stats['scans']}
 ‎• Pairs analyzed: {stats['pairs_analyzed']}
 ‎• Confluence signals: {stats['confluence_signals']}
@@ -2293,7 +2362,7 @@ The scanner hunted for 3-5% move setups with multi-layer confluence:
 
 Only signals with confluence scores ≥ {MIN_CONFLUENCE_SCORE}/10 were considered.
 
-#ConfluenceFinalStats #MultiLayerAnalysis
+#ConfluenceFinalStats #MultiLayerAnalysis #OKX
 """
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -2347,6 +2416,7 @@ async def start_confluence_server(scanner, port=8000):
                 response = json.dumps({
                     "status": "running",
                     "scanner": "Confluence Scanner v5.0",
+                    "exchange": "OKX",
                     "target": "3-5% directional moves",
                     "scan_cycle": scanner.scan_cycle,
                     "active_signals": active_count,
@@ -2380,6 +2450,7 @@ async def start_confluence_server(scanner, port=8000):
             
             elif path == '/confluence':
                 response = json.dumps({
+                    "exchange": "OKX",
                     "analysis_layers": {
                         "market_structure": {
                             "weight": "25%",
