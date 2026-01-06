@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 ROMEOTPT SCANNER v3.2 - COMPLETE & CORRECTED VERSION
-Two-layer architecture + Deduplication + Outcome Tracking
+Two-layer architecture + Deduplication + Outcome Tracking + RATE LIMITING FIX
 """
 
 import os
@@ -27,9 +27,9 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v3_2.db")
 
 # Scanner settings
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 120))
-TOP_N = int(os.getenv("TOP_N", 30))
-MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 10))
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 180))  # Increased from 120 to 180
+TOP_N = int(os.getenv("TOP_N", 30))  # Reduced from 30 to 15
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 3))  # Reduced from 10 to 3
 
 # Signal thresholds
 MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 0.0))
@@ -43,6 +43,11 @@ PRICE_MOVEMENT_THRESHOLD = float(os.getenv("PRICE_MOVEMENT_THRESHOLD", 0.5))
 OUTCOME_CHECK_INTERVAL = int(os.getenv("OUTCOME_CHECK_INTERVAL", 60))
 MINIMUM_TRADE_HOLD_SECONDS = int(os.getenv("MINIMUM_TRADE_HOLD_SECONDS", 30))
 
+# Rate limiting settings
+MAX_REQUESTS_PER_SECOND = int(os.getenv("MAX_REQUESTS_PER_SECOND", 15))
+RATE_LIMIT_RETRIES = int(os.getenv("RATE_LIMIT_RETRIES", 3))
+RATE_LIMIT_BACKOFF_FACTOR = float(os.getenv("RATE_LIMIT_BACKOFF_FACTOR", 1.5))
+
 # ---------------- LOGGING ----------------
 logging.basicConfig(
     level=logging.INFO,
@@ -50,6 +55,61 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 log = logging.getLogger("romeopt_v3_2")
+
+# ---------------- RATE LIMITER ----------------
+class RateLimiter:
+    """Rate limiter with exponential backoff for OKX API"""
+    
+    def __init__(self):
+        self.max_rps = MAX_REQUESTS_PER_SECOND
+        self.max_concurrent = MAX_CONCURRENT
+        self.semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+        self.request_times = []
+        self.min_delay = 0.1  # Minimum delay between requests
+        self.backoff_factor = RATE_LIMIT_BACKOFF_FACTOR
+        self.max_retries = RATE_LIMIT_RETRIES
+        self.last_error_time = 0
+        
+    async def wait_if_needed(self):
+        """Wait if we're hitting rate limits"""
+        now = time.time()
+        
+        # Clean old request times
+        self.request_times = [t for t in self.request_times if now - t < 1.0]
+        
+        # Check if we're at the limit
+        if len(self.request_times) >= self.max_rps:
+            wait_time = 1.0 - (now - self.request_times[0])
+            if wait_time > 0:
+                await asyncio.sleep(wait_time)
+        
+        # Add this request
+        self.request_times.append(now)
+    
+    async def execute_with_backoff(self, func, *args, **kwargs):
+        """Execute function with exponential backoff on rate limits"""
+        async with self.semaphore:
+            for attempt in range(self.max_retries):
+                try:
+                    await self.wait_if_needed()
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    # Check if it's a rate limit error
+                    error_str = str(e)
+                    if "Too Many Requests" in error_str or "50011" in error_str or "429" in error_str:
+                        wait_time = self.min_delay * (self.backoff_factor ** attempt)
+                        log.warning(f"Rate limited, attempt {attempt+1}/{self.max_retries}, waiting {wait_time:.2f}s")
+                        await asyncio.sleep(wait_time)
+                        
+                        # Update last error time for global cooldown
+                        self.last_error_time = time.time()
+                    else:
+                        raise e
+            # All retries failed
+            raise Exception(f"Failed after {self.max_retries} retries")
+
+# Initialize rate limiter globally
+rate_limiter = RateLimiter()
 
 # ---------------- DATA STRUCTURES ----------------
 @dataclass
@@ -391,13 +451,32 @@ async def send_telegram(msg: str, parse_mode="HTML"):
         except Exception as e:
             log.warning(f"Telegram send failed: {e}")
 
+# ---------------- SAFE API WRAPPERS ----------------
+async def safe_fetch_ohlcv(exchange, symbol: str, timeframe: str, limit: int = 100):
+    """Fetch OHLCV with rate limiting"""
+    return await rate_limiter.execute_with_backoff(
+        exchange.fetch_ohlcv, symbol, timeframe=timeframe, limit=limit
+    )
+
+async def safe_fetch_ticker(exchange, symbol: str):
+    """Fetch ticker with rate limiting"""
+    return await rate_limiter.execute_with_backoff(
+        exchange.fetch_ticker, symbol
+    )
+
+async def safe_fetch_tickers(exchange):
+    """Fetch all tickers with rate limiting"""
+    return await rate_limiter.execute_with_backoff(
+        exchange.fetch_tickers
+    )
+
 # ---------------- UTILS ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit: int = 100):
-    """Fetch OHLCV with timeout"""
+    """Fetch OHLCV with timeout and rate limiting"""
     try:
         return await asyncio.wait_for(
-            exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit),
-            timeout=3.0
+            safe_fetch_ohlcv(exchange, symbol, timeframe, limit),
+            timeout=5.0  # Increased from 3.0 to 5.0
         )
     except Exception as e:
         log.debug(f"Failed to fetch {symbol} {timeframe}: {e}")
@@ -418,7 +497,7 @@ async def check_eligibility_fast(exchange, symbol: str) -> SetupEligibility:
     
     # Get current price
     try:
-        ticker = await exchange.fetch_ticker(symbol)
+        ticker = await safe_fetch_ticker(exchange, symbol)
         current_price = ticker.get("last", 0)
         if current_price == 0:
             return SetupEligibility(eligible=False, disqualify_reason="No price")
@@ -640,7 +719,7 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility) 
     
     try:
         # Get current price for accurate checks
-        ticker = await exchange.fetch_ticker(symbol)
+        ticker = await safe_fetch_ticker(exchange, symbol)
         current_price = ticker.get("last", entry_price)
         
         # === STEP 1: HTF Bias Alignment ===
@@ -790,7 +869,7 @@ async def scan_symbol_fast(exchange, symbol: str) -> Optional[Dict]:
         quality = await analyze_quality(exchange, symbol, eligibility)
         
         # Get current price
-        ticker = await exchange.fetch_ticker(symbol)
+        ticker = await safe_fetch_ticker(exchange, symbol)
         current_price = ticker.get("last", 0)
         
         # Calculate RR
@@ -1212,7 +1291,7 @@ async def outcome_checker_task(exchange):
             active_symbols = list(signal_tracker.active_signals.keys())
             
             if active_symbols:
-                tickers = await exchange.fetch_tickers()
+                tickers = await safe_fetch_tickers(exchange)
                 outcomes_found = 0
                 
                 for symbol in active_symbols:
@@ -1267,6 +1346,8 @@ async def outcome_aware_scanner(exchange):
 <b>Settings:</b>
 • Scan: {SCAN_INTERVAL}s
 • Top: {TOP_N} symbols
+• Rate limit: {MAX_REQUESTS_PER_SECOND} req/s
+• Concurrency: {MAX_CONCURRENT}
 • Cooldown: {SIGNAL_COOLDOWN_MINUTES}min
 • Validity: {SIGNAL_VALIDITY_HOURS}h
 • Outcome check: {OUTCOME_CHECK_INTERVAL}s
@@ -1285,8 +1366,8 @@ async def outcome_aware_scanner(exchange):
         scan_cycle += 1
         
         try:
-            # Get symbols
-            tickers = await exchange.fetch_tickers()
+            # Get symbols WITH RATE LIMITING
+            tickers = await safe_fetch_tickers(exchange)
             usdt_pairs = []
             
             for symbol, data in tickers.items():
@@ -1314,22 +1395,28 @@ async def outcome_aware_scanner(exchange):
                     win_rate = outcome_stats.get('win_rate', 0)
                     log.info(f"📈 Stats: WR={win_rate:.1f}% | TP1={outcome_stats.get('tp1_hits', 0)} | SL={outcome_stats.get('sl_hits', 0)}")
             
-            # Scan symbols
+            # Scan symbols WITH CONCURRENCY CONTROL
             alerts_this_scan = 0
             tasks = []
             
-            for symbol in symbols_to_scan:
-                task = asyncio.create_task(scan_symbol_fast(exchange, symbol))
-                tasks.append(task)
+            # Process in smaller batches
+            batch_size = MAX_CONCURRENT
+            
+            for i in range(0, len(symbols_to_scan), batch_size):
+                batch = symbols_to_scan[i:i+batch_size]
                 
-                if len(tasks) >= MAX_CONCURRENT:
+                for symbol in batch:
+                    task = asyncio.create_task(scan_symbol_fast(exchange, symbol))
+                    tasks.append(task)
+                
+                if tasks:
                     results = await asyncio.gather(*tasks, return_exceptions=True)
                     alerts_this_scan += await process_deduped_results(results)
                     tasks = []
-            
-            if tasks:
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                alerts_this_scan += await process_deduped_results(results)
+                
+                # Small delay between batches
+                if i + batch_size < len(symbols_to_scan):
+                    await asyncio.sleep(0.5)
             
             await asyncio.sleep(SCAN_INTERVAL)
             
@@ -1467,16 +1554,21 @@ async def main():
         db_conn = await aiosqlite.connect(DB_PATH)
         await init_database()
         
-        # Create exchange
+        # Create exchange with MORE conservative settings
         exchange = ccxt.okx({
             "enableRateLimit": True,
             "options": {"defaultType": "spot"},
-            "rateLimit": 10,
-            "timeout": 5000,
+            "rateLimit": 200,  # Increased from 10 to 200ms between requests
+            "timeout": 10000,  # Increased timeout
+            "verbose": False,
         })
         
-        log.info("🚀 ROMEOTPT v3.2 - COMPLETE")
+        # Add additional rate limiting at exchange level
+        exchange.sleep = lambda ms: asyncio.sleep(ms / 1000)
+        
+        log.info("🚀 ROMEOTPT v3.2 - COMPLETE WITH RATE LIMITING")
         log.info(f"Scan: {SCAN_INTERVAL}s | Top {TOP_N} symbols")
+        log.info(f"Rate limit: {MAX_REQUESTS_PER_SECOND} req/s | Concurrency: {MAX_CONCURRENT}")
         log.info(f"Cooldown: {SIGNAL_COOLDOWN_MINUTES}min | Validity: {SIGNAL_VALIDITY_HOURS}h")
         log.info(f"Outcome check: {OUTCOME_CHECK_INTERVAL}s")
         log.info(f"Now with 8-step numerical checklist display")
