@@ -5,7 +5,7 @@ CONFLUENCE SCANNER v5.0 - 3-5% MOVE STRATEGY
 Multi-layer confluence analysis with precise entry detection
 NO TA-Lib DEPENDENCY - Pure Python implementation
 OKX EXCHANGE INTEGRATION - No geographical restrictions
-FIXED: DataFrame truth value handling
+FIXED: DataFrame truth value handling and JSON serialization
 """
 
 import os
@@ -1178,30 +1178,30 @@ class ConfluenceScanner:
         struct_score = structure.structure_score * 2.5
         scores["structure"] = struct_score
         details["structure"] = {
-            "trend": structure.trend,
-            "aligned": structure.higher_timeframe_aligned,
-            "raw_score": structure.structure_score
+            "trend": str(structure.trend),
+            "aligned": bool(structure.higher_timeframe_aligned),
+            "raw_score": float(structure.structure_score)
         }
         
         # 2. Order Flow Score (0-3.0)
         flow_score = order_flow.flow_score * 3.0
         scores["order_flow"] = flow_score
         details["order_flow"] = {
-            "volume_spike": order_flow.volume_spike,
-            "volume_ratio": order_flow.volume_ratio,
-            "imbalance": order_flow.bid_ask_imbalance,
-            "raw_score": order_flow.flow_score
+            "volume_spike": bool(order_flow.volume_spike),
+            "volume_ratio": float(order_flow.volume_ratio),
+            "imbalance": float(order_flow.bid_ask_imbalance),
+            "raw_score": float(order_flow.flow_score)
         }
         
         # 3. Momentum Score (0-2.5)
         mom_score = momentum.momentum_score * 2.5
         scores["momentum"] = mom_score
         details["momentum"] = {
-            "rsi_divergence": momentum.rsi_divergence,
-            "rsi_zone": momentum.rsi_zone,
-            "macd_signal": momentum.macd_signal,
-            "candle_pattern": momentum.candle_pattern,
-            "raw_score": momentum.momentum_score
+            "rsi_divergence": str(momentum.rsi_divergence),
+            "rsi_zone": str(momentum.rsi_zone),
+            "macd_signal": str(momentum.macd_signal),
+            "candle_pattern": str(momentum.candle_pattern),
+            "raw_score": float(momentum.momentum_score)
         }
         
         # 4. Liquidity Score (0-2.0)
@@ -1214,9 +1214,9 @@ class ConfluenceScanner:
         
         scores["liquidity"] = liq_score
         details["liquidity"] = {
-            "zone_type": liquidity.zone_type,
-            "stop_hunt_potential": liquidity.stop_hunt_potential,
-            "strength": liquidity.strength
+            "zone_type": str(liquidity.zone_type),
+            "stop_hunt_potential": bool(liquidity.stop_hunt_potential),
+            "strength": float(liquidity.strength)
         }
         
         # 5. Side-specific adjustments
@@ -1992,8 +1992,67 @@ The scanner hunts for setups where all 4 layers align, providing high-probabilit
             return []
     
     async def save_signal(self, signal: ConfluenceSetup) -> bool:
-        """Save signal to database"""
+        """Save signal to database with proper JSON serialization"""
         try:
+            # Helper function to ensure JSON serializable data
+            def make_json_serializable(obj):
+                if isinstance(obj, (bool, np.bool_)):
+                    return bool(obj)
+                elif isinstance(obj, (int, np.integer)):
+                    return int(obj)
+                elif isinstance(obj, (float, np.floating)):
+                    return float(obj)
+                elif isinstance(obj, str):
+                    return str(obj)
+                elif isinstance(obj, dict):
+                    return {k: make_json_serializable(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [make_json_serializable(item) for item in obj]
+                elif obj is None:
+                    return None
+                else:
+                    return str(obj)
+            
+            # Prepare market structure data
+            market_structure_data = {
+                "trend": str(signal.market_structure.trend),
+                "aligned": bool(signal.market_structure.higher_timeframe_aligned),
+                "key_support": float(signal.market_structure.key_support),
+                "key_resistance": float(signal.market_structure.key_resistance),
+                "score": float(signal.market_structure.structure_score)
+            }
+            
+            # Prepare order flow data
+            order_flow_data = {
+                "volume_spike": bool(signal.order_flow.volume_spike),
+                "volume_ratio": float(signal.order_flow.volume_ratio),
+                "imbalance": float(signal.order_flow.bid_ask_imbalance),
+                "score": float(signal.order_flow.flow_score)
+            }
+            
+            # Prepare momentum data
+            momentum_data = {
+                "rsi_divergence": str(signal.momentum.rsi_divergence),
+                "rsi_value": float(signal.momentum.rsi_value),
+                "macd_signal": str(signal.momentum.macd_signal),
+                "candle_pattern": str(signal.momentum.candle_pattern),
+                "score": float(signal.momentum.momentum_score)
+            }
+            
+            # Prepare liquidity zone data
+            liquidity_data = {
+                "zone_type": str(signal.liquidity_zone.zone_type),
+                "price_level": float(signal.liquidity_zone.price_level),
+                "stop_hunt_potential": bool(signal.liquidity_zone.stop_hunt_potential),
+                "strength": float(signal.liquidity_zone.strength)
+            }
+            
+            # Prepare conditions met (list of strings)
+            conditions_met = [str(condition) for condition in signal.conditions_met]
+            
+            # Make confluence details serializable
+            confluence_details = make_json_serializable(signal.confluence_details)
+            
             # Insert signal
             await self.db.execute("""
                 INSERT INTO confluence_signals (
@@ -2004,48 +2063,26 @@ The scanner hunts for setups where all 4 layers align, providing high-probabilit
                     market_structure, order_flow, momentum, liquidity_zone
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                signal.signal_id,
-                signal.symbol,
-                signal.side,
-                signal.entry_price,
-                signal.stop_loss,
-                signal.take_profit,
-                signal.confluence_score,
-                json.dumps(signal.confluence_details),
-                json.dumps(signal.conditions_met),
-                signal.expected_move_pct,
-                signal.probability_score,
-                signal.entry_confidence,
-                signal.entry_type,
-                signal.risk_pct,
-                signal.reward_pct,
-                signal.risk_reward,
-                json.dumps({
-                    "trend": signal.market_structure.trend,
-                    "aligned": signal.market_structure.higher_timeframe_aligned,
-                    "key_support": signal.market_structure.key_support,
-                    "key_resistance": signal.market_structure.key_resistance,
-                    "score": signal.market_structure.structure_score
-                }),
-                json.dumps({
-                    "volume_spike": signal.order_flow.volume_spike,
-                    "volume_ratio": signal.order_flow.volume_ratio,
-                    "imbalance": signal.order_flow.bid_ask_imbalance,
-                    "score": signal.order_flow.flow_score
-                }),
-                json.dumps({
-                    "rsi_divergence": signal.momentum.rsi_divergence,
-                    "rsi_value": signal.momentum.rsi_value,
-                    "macd_signal": signal.momentum.macd_signal,
-                    "candle_pattern": signal.momentum.candle_pattern,
-                    "score": signal.momentum.momentum_score
-                }),
-                json.dumps({
-                    "zone_type": signal.liquidity_zone.zone_type,
-                    "price_level": signal.liquidity_zone.price_level,
-                    "stop_hunt_potential": signal.liquidity_zone.stop_hunt_potential,
-                    "strength": signal.liquidity_zone.strength
-                })
+                str(signal.signal_id),
+                str(signal.symbol),
+                str(signal.side),
+                float(signal.entry_price),
+                float(signal.stop_loss),
+                float(signal.take_profit),
+                float(signal.confluence_score),
+                json.dumps(confluence_details),
+                json.dumps(conditions_met),
+                float(signal.expected_move_pct),
+                float(signal.probability_score),
+                float(signal.entry_confidence),
+                str(signal.entry_type),
+                float(signal.risk_pct),
+                float(signal.reward_pct),
+                float(signal.risk_reward),
+                json.dumps(market_structure_data),
+                json.dumps(order_flow_data),
+                json.dumps(momentum_data),
+                json.dumps(liquidity_data)
             ))
             
             await self.db.commit()
@@ -2054,6 +2091,9 @@ The scanner hunts for setups where all 4 layers align, providing high-probabilit
             
         except Exception as e:
             log.error(f"Error saving signal: {e}")
+            log.error(f"Signal details: {signal.confluence_details}")
+            import traceback
+            log.error(f"Traceback: {traceback.format_exc()}")
             return False
     
     async def format_signal_message(self, signal: ConfluenceSetup) -> str:
