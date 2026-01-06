@@ -5,7 +5,7 @@ CONFLUENCE SCANNER v5.0 - 3-5% MOVE STRATEGY
 Multi-layer confluence analysis with precise entry detection
 NO TA-Lib DEPENDENCY - Pure Python implementation
 OKX EXCHANGE INTEGRATION - No geographical restrictions
-FIXED: DataFrame truth value handling, JSON serialization, Telegram formatting
+FIXED: Telegram formatting, JSON serialization, error handling
 """
 
 import os
@@ -329,7 +329,7 @@ class ConfluenceScanner:
         Analyze market structure across multiple timeframes
         """
         try:
-            # FIXED: Check for empty dataframes properly
+            # Check for empty dataframes properly
             if df_daily is None or df_daily.empty or len(df_daily) < 20:
                 return self._get_default_structure()
             if df_4h is None or df_4h.empty or len(df_4h) < 20:
@@ -551,7 +551,6 @@ class ConfluenceScanner:
     def analyze_order_flow(self, df_15m: pd.DataFrame, current_price: float) -> OrderFlow:
         """Analyze order flow and volume profile"""
         try:
-            # FIXED: Check for empty dataframes properly
             if df_15m is None or df_15m.empty or len(df_15m) < 30:
                 return self._get_default_order_flow()
             
@@ -777,7 +776,6 @@ class ConfluenceScanner:
     def analyze_momentum(self, df_15m: pd.DataFrame, df_5m: pd.DataFrame) -> MomentumSignal:
         """Analyze short-term momentum signals - NO TA-Lib"""
         try:
-            # FIXED: Check for empty dataframes properly
             if df_15m is None or df_15m.empty or len(df_15m) < 30:
                 return self._get_default_momentum()
             if df_5m is None or df_5m.empty or len(df_5m) < 30:
@@ -993,7 +991,6 @@ class ConfluenceScanner:
                                current_price: float) -> LiquidityZone:
         """Analyze liquidity zones for stop hunts"""
         try:
-            # FIXED: Check for empty dataframes properly
             if df_4h is None or df_4h.empty or len(df_4h) < 20:
                 return self._get_default_liquidity_zone()
             if df_1h is None or df_1h.empty or len(df_1h) < 20:
@@ -1304,18 +1301,25 @@ class ConfluenceScanner:
             df_15m = multi_tf_data.get("15M")
             df_5m = multi_tf_data.get("5M")
             
-            # FIXED: Proper DataFrame checking without ambiguous truth values
-            required_data = [
-                ("DAILY", df_daily, 20),
-                ("4H", df_4h, 20),
-                ("1H", df_1h, 20),
-                ("15M", df_15m, 30),
-                ("5M", df_5m, 30)
-            ]
+            # Validate all dataframes exist and have sufficient data
+            required_minimums = {
+                "DAILY": 30,
+                "4H": 40,
+                "1H": 50,
+                "15M": 60,
+                "5M": 50
+            }
             
-            for tf_name, df, min_length in required_data:
-                if df is None or df.empty or len(df) < min_length:
-                    log.debug(f"{symbol}: Missing or insufficient {tf_name} data")
+            for tf_name, df in [("DAILY", df_daily), ("4H", df_4h), ("1H", df_1h), 
+                               ("15M", df_15m), ("5M", df_5m)]:
+                min_len = required_minimums[tf_name]
+                if df is None or df.empty or len(df) < min_len:
+                    log.debug(f"{symbol}: Insufficient {tf_name} data")
+                    return None
+                
+                # Check for NaN values
+                if df['close'].isna().any():
+                    log.debug(f"{symbol}: NaN values in {tf_name} close prices")
                     return None
             
             # Get current price from 5M
@@ -1821,53 +1825,53 @@ class ConfluenceMoveScanner:
 
 <b>🧠 ANALYSIS FRAMEWORK (4 LAYERS):</b>
 1️⃣ <b>Market Structure (25%)</b>
-‎   • Trend direction (Daily/4H)
-‎   • Key support/resistance levels
-‎   • HTF alignment confirmation
-‎   • Swing point analysis
+• Trend direction (Daily/4H)
+• Key support/resistance levels
+• HTF alignment confirmation
+• Swing point analysis
 
 2️⃣ <b>Order Flow (30%)</b>
-‎   • Volume profile & spikes
-‎   • Bid/ask imbalance
-‎   • Orderbook depth
-‎   • Accumulation/distribution
+• Volume profile & spikes
+• Bid/ask imbalance
+• Orderbook depth
+• Accumulation/distribution
 
 3️⃣ <b>Momentum (25%)</b>
-‎   • RSI hidden divergence
-‎   • MACD histogram flips
-‎   • Candlestick patterns
-‎   • Short-term momentum shifts
+• RSI hidden divergence
+• MACD histogram flips
+• Candlestick patterns
+• Short-term momentum shifts
 
 4️⃣ <b>Liquidity (20%)</b>
-‎   • Liquidity zone identification
-‎   • Stop hunt potential
-‎   • Sweep highs/lows
-‎   • Equal highs/lows
+• Liquidity zone identification
+• Stop hunt potential
+• Sweep highs/lows
+• Equal highs/lows
 
 <b>🎯 TARGET PARAMETERS:</b>
-‎• Minimum Confluence: {MIN_CONFLUENCE_SCORE}/10
-‎• Expected Move: {TARGET_PROFIT_RANGE[0]}-{TARGET_PROFIT_RANGE[1]}%
-‎• Max Stop Loss: {MAX_STOP_LOSS}%
-‎• Min Risk/Reward: {MIN_RISK_REWARD}:1
-‎• Entry Confidence: Based on confluence alignment
+• Minimum Confluence: {MIN_CONFLUENCE_SCORE}/10
+• Expected Move: {TARGET_PROFIT_RANGE[0]}-{TARGET_PROFIT_RANGE[1]}%
+• Max Stop Loss: {MAX_STOP_LOSS}%
+• Min Risk/Reward: {MIN_RISK_REWARD}:1
+• Entry Confidence: Based on confluence alignment
 
 <b>⚡ ENTRY TYPES:</b>
-‎• Breakout/breakdown retests
-‎• Order block entries
-‎• Support/resistance bounces
-‎• Confluence zone entries
+• Breakout/breakdown retests
+• Order block entries
+• Support/resistance bounces
+• Confluence zone entries
 
 <b>📈 SCANNING SETTINGS:</b>
-‎• Interval: {SCAN_INTERVAL}s
-‎• Top pairs: {TOP_N_VOLUME}
-‎• Min volume: ${MIN_VOLUME_USD:,.0f}
-‎• Timeframes: Daily → 5M
+• Interval: {SCAN_INTERVAL}s
+• Top pairs: {TOP_N_VOLUME}
+• Min volume: ${MIN_VOLUME_USD:,.0f}
+• Timeframes: Daily → 5M
 
 <b>🛡️ RISK MANAGEMENT:</b>
-‎• One signal per symbol
-‎• Confluence-based deduplication
-‎• Dynamic stop losses
-‎• Asymmetric payoff focus
+• One signal per symbol
+• Confluence-based deduplication
+• Dynamic stop losses
+• Asymmetric payoff focus
 
 The scanner hunts for setups where all 4 layers align, providing high-probability 3-5% move opportunities.
 
@@ -1991,28 +1995,33 @@ The scanner hunts for setups where all 4 layers align, providing high-probabilit
             log.error(f"Error getting OKX pairs: {e}")
             return []
     
+    def make_json_serializable(self, obj):
+        """Helper function to ensure JSON serializable data"""
+        if isinstance(obj, (bool, np.bool_)):
+            return bool(obj)
+        elif isinstance(obj, (int, np.integer)):
+            return int(obj)
+        elif isinstance(obj, (float, np.floating)):
+            return float(obj)
+        elif isinstance(obj, str):
+            return str(obj)
+        elif isinstance(obj, dict):
+            return {k: self.make_json_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self.make_json_serializable(item) for item in obj]
+        elif hasattr(obj, '__dict__'):
+            return str(obj)
+        elif obj is None:
+            return None
+        else:
+            try:
+                return float(obj)
+            except:
+                return str(obj)
+    
     async def save_signal(self, signal: ConfluenceSetup) -> bool:
         """Save signal to database with proper JSON serialization"""
         try:
-            # Helper function to ensure JSON serializable data
-            def make_json_serializable(obj):
-                if isinstance(obj, (bool, np.bool_)):
-                    return bool(obj)
-                elif isinstance(obj, (int, np.integer)):
-                    return int(obj)
-                elif isinstance(obj, (float, np.floating)):
-                    return float(obj)
-                elif isinstance(obj, str):
-                    return str(obj)
-                elif isinstance(obj, dict):
-                    return {k: make_json_serializable(v) for k, v in obj.items()}
-                elif isinstance(obj, list):
-                    return [make_json_serializable(item) for item in obj]
-                elif obj is None:
-                    return None
-                else:
-                    return str(obj)
-            
             # Prepare market structure data
             market_structure_data = {
                 "trend": str(signal.market_structure.trend),
@@ -2051,7 +2060,7 @@ The scanner hunts for setups where all 4 layers align, providing high-probabilit
             conditions_met = [str(condition) for condition in signal.conditions_met]
             
             # Make confluence details serializable
-            confluence_details = make_json_serializable(signal.confluence_details)
+            confluence_details = self.make_json_serializable(signal.confluence_details)
             
             # Insert signal
             await self.db.execute("""
@@ -2091,7 +2100,6 @@ The scanner hunts for setups where all 4 layers align, providing high-probabilit
             
         except Exception as e:
             log.error(f"Error saving signal: {e}")
-            log.error(f"Signal details: {signal.confluence_details}")
             import traceback
             log.error(f"Traceback: {traceback.format_exc()}")
             return False
@@ -2200,7 +2208,10 @@ Only one signal per symbol. New signals require better confluence or previous cl
                 response = await client.post(url, json=payload)
                 
                 if response.status_code == 400:
-                    # Try with plain text if HTML fails
+                    # Try with plain text if HTML fails - FIXED: define variables
+                    side_emoji = "🟢" if signal.side == "LONG" else "🔴"
+                    clean_symbol = signal.symbol.replace('/', '').replace('-', '').replace('.', '')
+                    
                     log.warning(f"Telegram HTML failed for {signal.symbol}, trying plain text")
                     simple_message = f"""
 {side_emoji} CONFLUENCE SIGNAL - {signal.side}
@@ -2222,7 +2233,7 @@ Expected Move: {signal.expected_move_pct:.1f}%
                 if response.status_code != 200:
                     log.error(f"Telegram error for {signal.symbol}: {response.status_code} - {response.text}")
                     return
-                
+            
             log.info(f"📤 Confluence alert sent: {signal.symbol}")
             
         except Exception as e:
@@ -2319,6 +2330,42 @@ Expected Move: {signal.expected_move_pct:.1f}%
                 log.error(f"Monitoring loop error: {e}")
                 await asyncio.sleep(10)
     
+    async def process_single_pair(self, symbol: str, volume: float):
+        """Process a single pair for confluence signals"""
+        try:
+            # Fetch multi-timeframe data
+            multi_tf_data = await self.fetch_timeframe_data(symbol)
+            
+            # Check if we have all required timeframes with sufficient data
+            required_tfs = ["DAILY", "4H", "1H", "15M", "5M"]
+            has_all_data = True
+            
+            for tf in required_tfs:
+                df = multi_tf_data.get(tf)
+                if df is None or df.empty or len(df) < 30:
+                    has_all_data = False
+                    break
+            
+            if not has_all_data:
+                return None
+            
+            # Generate confluence signal
+            signal = self.scanner.generate_confluence_signal(multi_tf_data, symbol)
+            
+            if signal:
+                # Save and send
+                saved = await self.save_signal(signal)
+                
+                if saved:
+                    await self.send_telegram_alert(signal)
+                    return signal
+            
+            return None
+            
+        except Exception as e:
+            log.debug(f"Pair error {symbol}: {str(e)[:50]}")
+            return None
+    
     async def confluence_scanning(self):
         """Main confluence scanning loop"""
         log.info("🚀 Starting confluence scanning for 3-5% moves...")
@@ -2341,51 +2388,28 @@ Expected Move: {signal.expected_move_pct:.1f}%
                 log.info(f"Analyzing {len(pairs)} pairs for confluence")
                 
                 signals_found = 0
-                pairs_processed = 0
                 
-                # Scan pairs for confluence
-                for symbol, volume in pairs:
-                    try:
-                        # Fetch multi-timeframe data
-                        multi_tf_data = await self.fetch_timeframe_data(symbol)
-                        
-                        # FIXED: Check if we have all required timeframes with sufficient data
-                        required_tfs = ["DAILY", "4H", "1H", "15M", "5M"]
-                        has_all_data = True
-                        
-                        for tf in required_tfs:
-                            df = multi_tf_data.get(tf)
-                            if df is None or df.empty or len(df) < 20:
-                                has_all_data = False
-                                log.debug(f"{symbol}: Missing or insufficient {tf} data")
-                                break
-                        
-                        if not has_all_data:
-                            continue
-                        
-                        # Generate confluence signal
-                        signal = self.scanner.generate_confluence_signal(multi_tf_data, symbol)
-                        
-                        if signal:
-                            # Save and send
-                            saved = await self.save_signal(signal)
-                            
-                            if saved:
-                                await self.send_telegram_alert(signal)
-                                signals_found += 1
-                        
-                        pairs_processed += 1
-                        self.scanner.daily_stats["pairs_analyzed"] += 1
-                        
-                        # Small delay between pairs
-                        await asyncio.sleep(0.05)
-                        
-                    except Exception as e:
-                        log.debug(f"Pair error {symbol}: {str(e)[:50]}")
-                        continue
+                # Process pairs in batches for better performance
+                batch_size = 10
+                for i in range(0, len(pairs), batch_size):
+                    batch = pairs[i:i+batch_size]
+                    batch_tasks = []
+                    
+                    for symbol, volume in batch:
+                        batch_tasks.append(self.process_single_pair(symbol, volume))
+                    
+                    batch_results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+                    
+                    for result in batch_results:
+                        if isinstance(result, ConfluenceSetup):
+                            signals_found += 1
+                    
+                    # Small delay between batches
+                    await asyncio.sleep(0.5)
                 
                 # Update scan stats
                 self.scanner.daily_stats["scans"] += 1
+                self.scanner.daily_stats["pairs_analyzed"] += len(pairs)
                 
                 # Log stats
                 stats = self.scanner.get_daily_stats()
@@ -2442,25 +2466,25 @@ Expected Move: {signal.expected_move_pct:.1f}%
 🛑 <b>CONFLUENCE SCANNER STOPPED</b>
 
 <b>📊 FINAL STATISTICS:</b>
-‎• Exchange: OKX
-‎• Total scans: {stats['scans']}
-‎• Pairs analyzed: {stats['pairs_analyzed']}
-‎• Confluence signals: {stats['confluence_signals']}
-‎• High quality (8+): {stats['high_quality_signals']}
+• Exchange: OKX
+• Total scans: {stats['scans']}
+• Pairs analyzed: {stats['pairs_analyzed']}
+• Confluence signals: {stats['confluence_signals']}
+• High quality (8+): {stats['high_quality_signals']}
 
 <b>🚫 REJECTIONS:</b>
-‎• Low confluence: {stats['rejected_low_confluence']}
-‎• No alignment: {stats['rejected_no_alignment']}
+• Low confluence: {stats['rejected_low_confluence']}
+• No alignment: {stats['rejected_no_alignment']}
 
 <b>⚡ ACTIVE SIGNALS:</b>
-‎• Currently active: {active_count}
+• Currently active: {active_count}
 
 <b>🎯 STRATEGY PERFORMANCE:</b>
 The scanner hunts for 3-5% move setups with multi-layer confluence:
-‎1. Market Structure alignment
-‎2. Order flow confirmation
-‎3. Momentum divergence
-‎4. Liquidity zone targeting
+1. Market Structure alignment
+2. Order flow confirmation
+3. Momentum divergence
+4. Liquidity zone targeting
 
 Only signals with confluence scores ≥ {MIN_CONFLUENCE_SCORE}/10 were considered.
 
