@@ -1,8 +1,3 @@
-Have not been deployed yet:::
-
-
-
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
