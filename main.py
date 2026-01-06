@@ -3,7 +3,6 @@
 """
 ROMEOTPT SCANNER v2 - Score-Only Implementation
 With Position Monitoring & SL/TP Alerts
-FIXED VERSION: Prevents duplicate signals and sends exit messages
 """
 
 import os
@@ -30,7 +29,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_PATH = "/app/data/romeopt_v2.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))
-TOP_N = int(os.getenv("TOP_N", 10))  # Changed to 10
+TOP_N = int(os.getenv("TOP_N", 20))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 5))
 
 # Cooldown settings
@@ -41,7 +40,7 @@ MIN_PRICE_CHANGE = float(os.getenv("MIN_PRICE_CHANGE", 0.01))  # 1% minimum pric
 MONITOR_INTERVAL = int(os.getenv("MONITOR_INTERVAL", 30))  # Check positions every 30 seconds
 
 # ---------------- LOGGING ----------------
-logging.basicConfig(level=logging.DEBUG, format="%(asctime)s | %(levelname)s | %(message)s")  # Changed to DEBUG
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 log = logging.getLogger("romeopt_v2")
 db_lock = asyncio.Lock()
 db_conn = None
@@ -209,27 +208,14 @@ async def should_send_alert(setup: Dict) -> bool:
     Returns True if no recent alert for this setup
     """
     setup_hash = generate_setup_hash(setup)
-    symbol = setup['symbol']
-    side = setup['side']
     
     async with db_lock:
-        # 1. Check if already has active position for same symbol/side
-        cursor = await db_conn.execute("""
-            SELECT COUNT(*) FROM positions 
-            WHERE symbol = ? AND side = ? AND status = 'ACTIVE'
-        """, (symbol, side))
-        active_count = (await cursor.fetchone())[0]
-        
-        if active_count > 0:
-            log.debug(f"  {symbol}: Already has active {side} position, skipping")
-            return False
-        
-        # 2. Check cooldown table (existing logic)
+        # Check if this setup was recently alerted
         cursor = await db_conn.execute("""
             SELECT last_alert_time, alert_count 
             FROM signal_cooldown 
             WHERE symbol = ? AND entry_hash = ?
-        """, (symbol, setup_hash))
+        """, (setup['symbol'], setup_hash))
         
         row = await cursor.fetchone()
         
@@ -238,28 +224,32 @@ async def should_send_alert(setup: Dict) -> bool:
             alert_count = row[1]
             now = datetime.datetime.utcnow()
             
-            # Dynamic cooldown
-            dynamic_cooldown = COOLDOWN_MINUTES * (alert_count ** 0.5)
+            # Check cooldown period
             minutes_since_last = (now - last_alert_time).total_seconds() / 60
             
-            if minutes_since_last < dynamic_cooldown:
-                log.debug(f"  {symbol}: Cooldown active ({minutes_since_last:.1f}min < {dynamic_cooldown:.1f}min)")
-                return False
+            # Dynamic cooldown: longer for setups already alerted multiple times
+            dynamic_cooldown = COOLDOWN_MINUTES * (alert_count ** 0.5)  # Square root scaling
             
-            # Update existing
-            await db_conn.execute("""
-                UPDATE signal_cooldown 
-                SET last_alert_time = ?, alert_count = alert_count + 1
-                WHERE symbol = ? AND entry_hash = ?
-            """, (now.isoformat(), symbol, setup_hash))
-            await db_conn.commit()
-            return True
+            if minutes_since_last < dynamic_cooldown:
+                log.debug(f"  Skipping {setup['symbol']}: Cooldown active "
+                         f"({minutes_since_last:.1f}min < {dynamic_cooldown:.1f}min)")
+                return False
+            else:
+                # Update existing record
+                await db_conn.execute("""
+                    UPDATE signal_cooldown 
+                    SET last_alert_time = ?, alert_count = alert_count + 1
+                    WHERE symbol = ? AND entry_hash = ?
+                """, (now.isoformat(), setup['symbol'], setup_hash))
+                await db_conn.commit()
+                return True
         else:
-            # Insert new
+            # Insert new record
             await db_conn.execute("""
                 INSERT INTO signal_cooldown (symbol, side, entry_hash, last_alert_time)
                 VALUES (?, ?, ?, ?)
-            """, (symbol, side, setup_hash, now.isoformat()))
+            """, (setup['symbol'], setup['side'], setup_hash, 
+                  datetime.datetime.utcnow().isoformat()))
             await db_conn.commit()
             return True
 
@@ -271,32 +261,15 @@ async def is_similar_to_recent_setup(setup: Dict) -> bool:
     current_entry = setup['entry_price']
     current_side = setup['side']
     
-    # Check active positions first
-    async with db_lock:
-        cursor = await db_conn.execute("""
-            SELECT entry_price 
-            FROM positions 
-            WHERE symbol = ? AND side = ? AND status = 'ACTIVE'
-            LIMIT 1
-        """, (symbol, current_side))
-        
-        active_pos = await cursor.fetchone()
-        if active_pos:
-            prev_entry = active_pos[0]
-            price_diff_pct = abs(current_entry - prev_entry) / prev_entry * 100
-            if price_diff_pct < MIN_PRICE_CHANGE:
-                log.debug(f"  {symbol}: Similar to active position (price diff: {price_diff_pct:.2f}%)")
-                return True
-    
-    # Check recent signals (last 2 hours instead of 4)
-    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(hours=2)).isoformat()
+    # Check recent setups for same symbol/side (last 4 hours)
+    cutoff = (datetime.datetime.utcnow() - datetime.timedelta(hours=4)).isoformat()
     
     async with db_lock:
         cursor = await db_conn.execute("""
             SELECT entry_price, timestamp 
             FROM signals 
             WHERE symbol = ? AND side = ? AND timestamp > ?
-            ORDER BY timestamp DESC LIMIT 3
+            ORDER BY timestamp DESC LIMIT 5
         """, (symbol, current_side, cutoff))
         
         rows = await cursor.fetchall()
@@ -306,11 +279,12 @@ async def is_similar_to_recent_setup(setup: Dict) -> bool:
             prev_time = datetime.datetime.fromisoformat(row[1])
             now = datetime.datetime.utcnow()
             
+            # Calculate price difference percentage
             price_diff_pct = abs(current_entry - prev_entry) / prev_entry * 100
             
-            # If price is very similar and recent
+            # If price is very similar (< MIN_PRICE_CHANGE%) and recent (< 2 hours)
             if price_diff_pct < MIN_PRICE_CHANGE and (now - prev_time).total_seconds() < 7200:
-                log.debug(f"  {symbol}: Setup too similar to recent signal "
+                log.debug(f"  {symbol}: Setup too similar to recent one "
                          f"(price diff: {price_diff_pct:.2f}% < {MIN_PRICE_CHANGE}%)")
                 return True
     
@@ -606,7 +580,8 @@ async def monitor_positions_lightweight():
                            sl_price, tp1_price, tp2_price, tp3_price, entry_time
                     FROM positions 
                     WHERE status = 'ACTIVE'
-                """)  # Removed LIMIT - monitor all positions
+                    LIMIT 10  # Limit to 10 positions at a time
+                """)
                 active_positions = await cursor.fetchall()
             
             if not active_positions:
@@ -624,89 +599,74 @@ async def monitor_positions_lightweight():
             
             for position in active_positions:
                 try:
+                    await asyncio.sleep(0)  # Yield control
+                    
                     (position_id, signal_id, symbol, side, entry_price, 
                      sl_price, tp1_price, tp2_price, tp3_price, entry_time) = position
                     
-                    # Fetch current price with retry
-                    current_price = 0
-                    for attempt in range(3):
-                        try:
-                            ticker = await monitor_exchange.fetch_ticker(symbol)
-                            current_price = ticker.get('last', 0)
-                            if current_price > 0:
-                                break
-                        except Exception as e:
-                            log.warning(f"Attempt {attempt+1} failed for {symbol}: {e}")
-                            await asyncio.sleep(1)
-                    else:
-                        log.error(f"Failed to get price for {symbol} after 3 attempts")
-                        continue
+                    # Fetch current price
+                    ticker = await monitor_exchange.fetch_ticker(symbol)
+                    current_price = ticker.get('last', 0)
                     
-                    if current_price <= 0:
+                    if not current_price or current_price <= 0:
                         continue
-                    
-                    # Log position update
-                    await log_position_update(
-                        position_id, current_price, entry_price, 
-                        sl_price, tp1_price, tp2_price, tp3_price
-                    )
                     
                     # Check for SL/TP hits
                     sl_hit = False
                     tp_hit_level = None
-                    exit_price = current_price
+                    exit_price = 0
                     
                     if side.upper() == 'BUY':
                         # For BUY positions
                         if current_price <= sl_price:
                             sl_hit = True
+                            exit_price = current_price
                         elif current_price >= tp3_price:
                             tp_hit_level = 'TP3'
+                            exit_price = current_price
                         elif current_price >= tp2_price:
                             tp_hit_level = 'TP2'
+                            exit_price = current_price
                         elif current_price >= tp1_price:
                             tp_hit_level = 'TP1'
+                            exit_price = current_price
                     
                     elif side.upper() == 'SELL':
                         # For SELL positions
                         if current_price >= sl_price:
                             sl_hit = True
+                            exit_price = current_price
                         elif current_price <= tp3_price:
                             tp_hit_level = 'TP3'
+                            exit_price = current_price
                         elif current_price <= tp2_price:
                             tp_hit_level = 'TP2'
+                            exit_price = current_price
                         elif current_price <= tp1_price:
                             tp_hit_level = 'TP1'
+                            exit_price = current_price
                     
                     # Handle exit if any level hit
                     if sl_hit or tp_hit_level:
                         exit_type = 'SL' if sl_hit else tp_hit_level
-                        log.info(f"Position {position_id} ({symbol}) hit {exit_type} at {current_price}")
-                        
-                        success = await close_position(position_id, exit_price, exit_type)
-                        if success:
-                            await send_position_closure_alert(
-                                symbol, side, entry_price, exit_price, 
-                                exit_type, entry_time, position_id
-                            )
-                        else:
-                            log.error(f"Failed to close position {position_id}")
+                        await close_position(position_id, exit_price, exit_type)
+                        await send_position_closure_alert(
+                            symbol, side, entry_price, exit_price, 
+                            exit_type, entry_time, position_id
+                        )
                     
-                    # Check for expired positions (older than 3 days instead of 7)
+                    # Check for expired positions (older than 7 days)
                     entry_time_dt = datetime.datetime.fromisoformat(entry_time)
                     now = datetime.datetime.utcnow()
                     
-                    if (now - entry_time_dt).days >= 3:
+                    if (now - entry_time_dt).days >= 7:
                         exit_type = 'EXPIRED'
-                        log.info(f"Position {position_id} ({symbol}) expired after 3 days")
-                        
-                        success = await close_position(position_id, current_price, exit_type)
-                        if success:
-                            await send_position_closure_alert(
-                                symbol, side, entry_price, current_price, 
-                                exit_type, entry_time, position_id
-                            )
-                    
+                        await close_position(position_id, current_price, exit_type)
+                        await send_position_closure_alert(
+                            symbol, side, entry_price, current_price, 
+                            exit_type, entry_time, position_id
+                        )
+                
                 except Exception as e:
                     log.error(f"Error monitoring position {position_id} ({symbol}): {e}")
                     continue
@@ -763,7 +723,7 @@ async def send_position_closure_alert(symbol: str, side: str, entry_price: float
 
 {color} <b>Level Hit:</b> {exit_type}
 
-<i>Closed: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}</i>
+<i>Closed: {datetime.datetime.utcnow().strftime('%Y-%m-d %H:%M:%S UTC')}</i>
 """
     
     await send_telegram(msg)
@@ -858,7 +818,7 @@ async def analyze_htf_bias(exchange, symbol: str) -> HTFContext:
         if (low_i < df_htf["low"].iloc[i-1] and 
             low_i < df_htf["low"].iloc[i-2] and
             low_i < df_htf["low"].iloc[i+1] and
-            low_i < df_htf["low"].iloc[i+2]):  # FIXED: Changed from df_ltf to df_htf
+            low_i < df_htf["low"].iloc[i+2]):  # FIXED: Changed df_ltf to df_htf
             swing_lows.append({
                 "price": float(low_i),
                 "index": int(i),
@@ -1514,7 +1474,6 @@ async def scan_symbol_full(exchange, symbol: str) -> Optional[Dict]:
     ticker = await exchange.fetch_ticker(symbol)
     current_price = ticker.get("last", 0)
     if not current_price:
-        log.debug(f"  {symbol}: Failed to get current price")
         return None
     
     # --- STEP 1: HTF BIAS ---
@@ -1685,7 +1644,7 @@ Entry Precision: {setup['probability']['entry_precision']:.2f}
     
     await send_telegram(msg)
     
-    # Save to database AND create position for monitoring
+    # Save to database WITHOUT creating position immediately
     async with db_lock:
         cursor = await db_conn.execute("""
             INSERT INTO signals (
@@ -1765,16 +1724,16 @@ Entry Precision: {setup['probability']['entry_precision']:.2f}
         # Get the signal ID for potential later use
         signal_id = cursor.lastrowid
         
-        # CREATE POSITION FOR MONITORING (FIXED - UNCOMMENTED)
-        position_id = await create_position_from_setup(setup, signal_id)
-        log.info(f"Created position {position_id} for {setup['symbol']}")
+        # OPTIONAL: Create position for monitoring (commented out for now)
+        # position_id = await create_position_from_setup(setup, signal_id)
+        # log.info(f"Created position {position_id} for {setup['symbol']}")
 
 # ---------------- MAIN SCANNER ----------------
 async def scanner_main(exchange):
     """Main scanning loop"""
     
     await send_telegram("🚀 ROMEOTPT v2 Scanner Started - Score-Only Mode")
-    await send_telegram("ℹ️ Now with position monitoring and exit alerts")
+    await send_telegram("ℹ️ Scanner running without position monitoring")
     
     cycle_count = 0
     
@@ -1785,43 +1744,15 @@ async def scanner_main(exchange):
         try:
             log.info(f"🔄 Scan cycle #{cycle_count} starting...")
             
-            # Get top volume pairs with better error handling
-            try:
-                tickers = await exchange.fetch_tickers()
-                usdt_pairs = [(s, v.get("quoteVolume", 0)) 
-                             for s, v in tickers.items() 
-                             if s.endswith("/USDT")]
-                
-                if not usdt_pairs:
-                    log.warning("No USDT pairs found, trying alternative...")
-                    # Try alternative method
-                    markets = await exchange.load_markets()
-                    usdt_pairs = [s for s in markets.keys() if s.endswith("/USDT")]
-                    # Assign dummy volume
-                    usdt_pairs = [(s, 1000000) for s in usdt_pairs[:TOP_N]]
-                    log.info(f"Using alternative method, found {len(usdt_pairs)} pairs")
-                
-                usdt_pairs.sort(key=lambda x: x[1], reverse=True)
-                top_pairs = usdt_pairs[:TOP_N]
-                
-                log.info(f"📊 Found {len(usdt_pairs)} USDT pairs, scanning top {len(top_pairs)}...")
-                
-            except Exception as e:
-                log.error(f"Failed to fetch tickers: {e}")
-                # Use default pairs as fallback
-                top_pairs = [
-                    ("BTC/USDT", 1000000000),
-                    ("ETH/USDT", 500000000),
-                    ("SOL/USDT", 300000000),
-                    ("XRP/USDT", 200000000),
-                    ("DOGE/USDT", 150000000),
-                    ("ADA/USDT", 100000000),
-                    ("BNB/USDT", 80000000),
-                    ("MATIC/USDT", 70000000),
-                    ("DOT/USDT", 60000000),
-                    ("LINK/USDT", 50000000)
-                ]
-                log.info(f"Using default pairs: {[p[0] for p in top_pairs]}")
+            # Get top volume pairs
+            tickers = await exchange.fetch_tickers()
+            usdt_pairs = [(s, v.get("quoteVolume", 0)) 
+                         for s, v in tickers.items() 
+                         if s.endswith("/USDT")]
+            usdt_pairs.sort(key=lambda x: x[1], reverse=True)
+            top_pairs = usdt_pairs[:TOP_N]
+            
+            log.info(f"📊 Scanning {len(top_pairs)} symbols...")
             
             setups_found = 0
             symbols_scanned = 0
@@ -1831,7 +1762,6 @@ async def scanner_main(exchange):
                     # Yield control to prevent freezing
                     await asyncio.sleep(0.01)
                     
-                    log.debug(f"Scanning {symbol}...")
                     setup = await scan_symbol_full(exchange, symbol)
                     symbols_scanned += 1
                     
@@ -1845,8 +1775,6 @@ async def scanner_main(exchange):
                                 log.debug(f"  {symbol}: Setup too similar to recent one, skipping alert")
                         else:
                             log.debug(f"  {symbol}: Setup in cooldown")
-                    else:
-                        log.debug(f"  {symbol}: No setup found")
                     
                     # Small delay between symbols
                     await asyncio.sleep(0.05)
@@ -2071,11 +1999,8 @@ async def main():
     # Start watchdog
     watchdog_task = asyncio.create_task(watchdog())
     
-    # Start cleanup task
+    # Start cleanup task (optional)
     cleanup_task = asyncio.create_task(cleanup_old_data())
-    
-    # Start position monitor
-    monitor_task = asyncio.create_task(monitor_positions_lightweight())
     
     # Create exchange
     exchange = ccxt.okx({
@@ -2083,7 +2008,7 @@ async def main():
         "options": {"defaultType": "spot"}
     })
     
-    # Start scanner
+    # Start scanner (NO position monitoring for now)
     try:
         await scanner_main(exchange)
     except KeyboardInterrupt:
@@ -2092,11 +2017,8 @@ async def main():
         log.error(f"Fatal error in scanner: {e}")
         await send_telegram(f"🚨 ROMEOTPT Scanner crashed: {str(e)}")
     finally:
-        # Cancel all tasks
         watchdog_task.cancel()
         cleanup_task.cancel()
-        monitor_task.cancel()
-        
         if db_conn:
             await db_conn.close()
         await exchange.close()
