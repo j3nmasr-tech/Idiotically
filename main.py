@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CONFLUENCE SCANNER v5.0 - 3-5% MOVE STRATEGY
+CONFLUENCE SCANNER v5.1 - 3-5% MOVE STRATEGY
 Multi-layer confluence analysis with precise entry detection
 NO TA-Lib DEPENDENCY - Pure Python implementation
 OKX EXCHANGE INTEGRATION - No geographical restrictions
-COMPLETE TELEGRAM ALERTS: Signal → Trigger → Close (SL/TP)
+COMPACT TELEGRAM SIGNALS with full logic details
 """
 
 import os
@@ -330,11 +330,11 @@ class ConfluenceScanner:
         """
         try:
             # Check for empty dataframes properly
-            if df_daily is None or df_daily.empty or len(df_daily) < 20:
+            if not self._validate_dataframe(df_daily, 20):
                 return self._get_default_structure()
-            if df_4h is None or df_4h.empty or len(df_4h) < 20:
+            if not self._validate_dataframe(df_4h, 20):
                 return self._get_default_structure()
-            if df_1h is None or df_1h.empty or len(df_1h) < 20:
+            if not self._validate_dataframe(df_1h, 20):
                 return self._get_default_structure()
             
             # 1. Determine primary trend (Daily)
@@ -371,6 +371,16 @@ class ConfluenceScanner:
         except Exception as e:
             log.error(f"Market structure error: {e}")
             return self._get_default_structure()
+    
+    def _validate_dataframe(self, df: pd.DataFrame, min_rows: int) -> bool:
+        """Validate dataframe for analysis"""
+        if df is None or df.empty:
+            return False
+        if len(df) < min_rows:
+            return False
+        if any(df[col].isna().any() for col in ['open', 'high', 'low', 'close', 'volume']):
+            return False
+        return True
     
     def _determine_trend(self, df: pd.DataFrame, timeframe: str) -> str:
         """Determine trend direction"""
@@ -551,7 +561,7 @@ class ConfluenceScanner:
     def analyze_order_flow(self, df_15m: pd.DataFrame, current_price: float) -> OrderFlow:
         """Analyze order flow and volume profile"""
         try:
-            if df_15m is None or df_15m.empty or len(df_15m) < 30:
+            if not self._validate_dataframe(df_15m, 30):
                 return self._get_default_order_flow()
             
             # 1. Volume profile analysis
@@ -776,9 +786,7 @@ class ConfluenceScanner:
     def analyze_momentum(self, df_15m: pd.DataFrame, df_5m: pd.DataFrame) -> MomentumSignal:
         """Analyze short-term momentum signals - NO TA-Lib"""
         try:
-            if df_15m is None or df_15m.empty or len(df_15m) < 30:
-                return self._get_default_momentum()
-            if df_5m is None or df_5m.empty or len(df_5m) < 30:
+            if not self._validate_dataframe(df_15m, 30) or not self._validate_dataframe(df_5m, 30):
                 return self._get_default_momentum()
             
             # 1. RSI analysis (pure Python)
@@ -991,9 +999,7 @@ class ConfluenceScanner:
                                current_price: float) -> LiquidityZone:
         """Analyze liquidity zones for stop hunts"""
         try:
-            if df_4h is None or df_4h.empty or len(df_4h) < 20:
-                return self._get_default_liquidity_zone()
-            if df_1h is None or df_1h.empty or len(df_1h) < 20:
+            if not self._validate_dataframe(df_4h, 20) or not self._validate_dataframe(df_1h, 20):
                 return self._get_default_liquidity_zone()
             
             # 1. Identify liquidity zones
@@ -1301,7 +1307,7 @@ class ConfluenceScanner:
             df_15m = multi_tf_data.get("15M")
             df_5m = multi_tf_data.get("5M")
             
-            # Validate all dataframes exist and have sufficient data
+            # Validate all dataframes
             required_minimums = {
                 "DAILY": 30,
                 "4H": 40,
@@ -1317,9 +1323,9 @@ class ConfluenceScanner:
                     log.debug(f"{symbol}: Insufficient {tf_name} data")
                     return None
                 
-                # Check for NaN values
-                if df['close'].isna().any():
-                    log.debug(f"{symbol}: NaN values in {tf_name} close prices")
+                # Validate dataframe
+                if not self._validate_dataframe(df, 15):
+                    log.debug(f"{symbol}: Invalid data in {tf_name}")
                     return None
             
             # Get current price from 5M
@@ -1669,23 +1675,18 @@ class ConfluenceMoveScanner:
         self.exchange = None
         self.db = None
         self.scan_cycle = 0
-        
+        self.data_cache = {}
+        self.cache_ttl = 60  # Cache data for 60 seconds
+    
     async def initialize(self):
         """Initialize the scanner"""
         log.info("=" * 70)
-        log.info("🎯 CONFLUENCE SCANNER v5.0 - 3-5% MOVE STRATEGY")
+        log.info("🎯 CONFLUENCE SCANNER v5.1 - 3-5% MOVE STRATEGY")
         log.info("=" * 70)
         log.info("EXCHANGE: OKX (No geographical restrictions)")
         log.info("STRATEGY: Multi-layer confluence analysis")
         log.info("TARGET: 3-5% directional moves")
-        log.info("ANALYSIS LAYERS:")
-        log.info("  1. Market Structure (25%) - Trend & Key Levels")
-        log.info("  2. Order Flow (30%) - Volume & Orderbook")
-        log.info("  3. Momentum (25%) - RSI/MACD divergence")
-        log.info("  4. Liquidity (20%) - Stop hunts & Zones")
-        log.info(f"MIN CONFLUENCE: {MIN_CONFLUENCE_SCORE}/10")
-        log.info(f"TARGET RANGE: {TARGET_PROFIT_RANGE[0]}-{TARGET_PROFIT_RANGE[1]}%")
-        log.info(f"RISK/REWARD: {MIN_RISK_REWARD}:1 minimum")
+        log.info("TELEGRAM: Compact signals with full logic details")
         log.info("=" * 70)
         
         # Initialize database
@@ -1758,6 +1759,14 @@ class ConfluenceMoveScanner:
             )
             """)
             
+            # Add indexes for performance
+            await self.db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_signals_symbol ON confluence_signals(symbol)
+            """)
+            await self.db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_signals_status ON confluence_signals(status)
+            """)
+            
             await self.db.commit()
             log.info("✅ Database initialized")
             
@@ -1788,10 +1797,6 @@ class ConfluenceMoveScanner:
             
             log.info(f"✅ OKX exchange connected. Found {len(usdt_pairs)} USDT pairs")
             
-            # Get BTC price to verify
-            ticker = await self.exchange.fetch_ticker("BTC/USDT")
-            log.info(f"📊 BTC/USDT: ${ticker['last']:.2f}")
-            
         except Exception as e:
             log.error(f"OKX exchange error: {e}")
             log.info("⚠️ Trying alternative exchange: Bybit...")
@@ -1818,63 +1823,16 @@ class ConfluenceMoveScanner:
             return
         
         try:
-            message = """🎯 <b>CONFLUENCE SCANNER v5.0 - 3-5% MOVE STRATEGY</b>
+            message = """🎯 <b>CONFLUENCE SCANNER v5.1 - ONLINE</b>
 
-<b>📊 EXCHANGE:</b> OKX (No geographical restrictions)
+<b>📊 EXCHANGE:</b> OKX
+<b>🎯 TARGET:</b> 3-5% moves
+<b>🧠 LAYERS:</b> 4-layer confluence analysis
+<b>⚡ SIGNALS:</b> Compact format with full logic
 
-<b>🧠 ANALYSIS FRAMEWORK (4 LAYERS):</b>
-1️⃣ <b>Market Structure (25%)</b>
-• Trend direction (Daily/4H)
-• Key support/resistance levels
-• HTF alignment confirmation
-• Swing point analysis
+Scanner is now actively hunting for high-probability setups where all layers align.
 
-2️⃣ <b>Order Flow (30%)</b>
-• Volume profile & spikes
-• Bid/ask imbalance
-• Orderbook depth
-• Accumulation/distribution
-
-3️⃣ <b>Momentum (25%)</b>
-• RSI hidden divergence
-• MACD histogram flips
-• Candlestick patterns
-• Short-term momentum shifts
-
-4️⃣ <b>Liquidity (20%)</b>
-• Liquidity zone identification
-• Stop hunt potential
-• Sweep highs/lows
-• Equal highs/lows
-
-<b>🎯 TARGET PARAMETERS:</b>
-• Minimum Confluence: 1.0/10
-• Expected Move: 2.0-6.0%
-• Max Stop Loss: 1.5%
-• Min Risk/Reward: 2.5:1
-• Entry Confidence: Based on confluence alignment
-
-<b>⚡ ENTRY TYPES:</b>
-• Breakout/breakdown retests
-• Order block entries
-• Support/resistance bounces
-• Confluence zone entries
-
-<b>📈 SCANNING SETTINGS:</b>
-• Interval: 10s
-• Top pairs: 50
-• Min volume: $1,000,000
-• Timeframes: Daily → 5M
-
-<b>🛡️ RISK MANAGEMENT:</b>
-• One signal per symbol
-• Confluence-based deduplication
-• Dynamic stop losses
-• Asymmetric payoff focus
-
-The scanner hunts for setups where all 4 layers align, providing high-probability 3-5% move opportunities.
-
-#ConfluenceTrading #HighProbability #35PercentMoves #OKX"""
+#ConfluenceTrading #OKX #Ready"""
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             async with httpx.AsyncClient(timeout=10) as client:
@@ -1893,6 +1851,13 @@ The scanner hunts for setups where all 4 layers align, providing high-probabilit
                                      limit: int, tf_name: str) -> pd.DataFrame:
         """Fetch single timeframe data"""
         try:
+            # Check cache first
+            cache_key = f"{symbol}_{tf_name}"
+            if cache_key in self.data_cache:
+                data, timestamp = self.data_cache[cache_key]
+                if time.time() - timestamp < self.cache_ttl:
+                    return data
+            
             # OKX specific parameters
             params = {'type': 'spot'}
             
@@ -1903,7 +1868,7 @@ The scanner hunts for setups where all 4 layers align, providing high-probabilit
                 params=params
             )
             
-            if ohlcv and len(ohlcv) >= 20:
+            if ohlcv and len(ohlcv) >= 15:
                 df = pd.DataFrame(
                     ohlcv,
                     columns=["timestamp", "open", "high", "low", "close", "volume"]
@@ -1916,6 +1881,8 @@ The scanner hunts for setups where all 4 layers align, providing high-probabilit
                 df = df.dropna()
                 
                 if len(df) >= 15:
+                    # Cache the data
+                    self.data_cache[cache_key] = (df, time.time())
                     return df
             
             return pd.DataFrame()
@@ -2098,62 +2065,174 @@ The scanner hunts for setups where all 4 layers align, providing high-probabilit
             
         except Exception as e:
             log.error(f"Error saving signal: {e}")
-            import traceback
-            log.error(f"Traceback: {traceback.format_exc()}")
             return False
     
-    async def format_signal_message(self, signal: ConfluenceSetup) -> str:
-        """Format confluence signal for Telegram with proper escaping"""
-        side_emoji = "🟢" if signal.side == "LONG" else "🔴"
-        side_text = "LONG" if signal.side == "LONG" else "SHORT"
+    # ========== IMPROVED SIGNAL FORMATTING ==========
+    
+    async def format_confluence_signal(self, signal: ConfluenceSetup) -> str:
+        """Format confluence signal with all logic details in compact format"""
         
-        # Confluence score with emoji
+        side_emoji = "🟢" if signal.side == "LONG" else "🔴"
+        clean_symbol = signal.symbol.replace('/', '')
+        
+        # Confluence score color coding
         if signal.confluence_score >= 8.5:
-            score_emoji = "🔥"
+            score_emoji = "🔥🔥"
+            score_text = "EXCEPTIONAL"
         elif signal.confluence_score >= 7.5:
+            score_emoji = "🔥"
+            score_text = "HIGH"
+        elif signal.confluence_score >= 6.0:
             score_emoji = "✅"
+            score_text = "GOOD"
         else:
             score_emoji = "⚠️"
+            score_text = "FAIR"
         
-        # Simple clean symbol for hashtags
-        clean_symbol = signal.symbol.replace('/', '').replace('-', '').replace('.', '')
+        # Structure summary
+        structure_details = [
+            f"📊 Trend: {signal.market_structure.trend}",
+            f"🎯 Alignment: {'YES' if signal.market_structure.higher_timeframe_aligned else 'NO'}",
+            f"📍 Support: {signal.market_structure.key_support:.4f}",
+            f"📍 Resistance: {signal.market_structure.key_resistance:.4f}"
+        ]
         
-        # Build message with proper HTML escaping
-        message = f"""<b>{side_emoji} CONFLUENCE SIGNAL - {side_text} {score_emoji}</b>
+        # Order flow summary
+        flow_details = [
+            f"📈 Volume: {'SPIKE' if signal.order_flow.volume_spike else 'Normal'}",
+            f"⚖️ Imbalance: {signal.order_flow.bid_ask_imbalance:+.2f}",
+            f"💧 Flow Score: {signal.order_flow.flow_score:.2f}/1.0"
+        ]
+        
+        # Momentum summary
+        momentum_details = [
+            f"📉 RSI: {signal.momentum.rsi_value:.1f} ({signal.momentum.rsi_zone})",
+            f"🔀 Divergence: {signal.momentum.rsi_divergence.replace('_', ' ') if signal.momentum.rsi_divergence != 'NONE' else 'None'}",
+            f"📊 MACD: {signal.momentum.macd_signal.replace('_', ' ') if signal.momentum.macd_signal != 'NONE' else 'None'}",
+            f"🕯️ Pattern: {signal.momentum.candle_pattern.replace('_', ' ') if signal.momentum.candle_pattern != 'NONE' else 'None'}"
+        ]
+        
+        # Liquidity summary
+        liquidity_details = [
+            f"🌊 Zone: {signal.liquidity_zone.zone_type.replace('_', ' ')}",
+            f"🎯 Level: {signal.liquidity_zone.price_level:.4f}",
+            f"🎣 Stop Hunt: {'YES' if signal.liquidity_zone.stop_hunt_potential else 'NO'}"
+        ]
+        
+        # Entry details
+        entry_details = [
+            f"🎪 Type: {signal.entry_type.replace('_', ' ')}",
+            f"🎯 Confidence: {signal.entry_confidence:.0%}"
+        ]
+        
+        # Risk management
+        risk_details = [
+            f"🛡️ Risk: {signal.risk_pct:.2f}%",
+            f"💰 Reward: {signal.reward_pct:.2f}%",
+            f"⚖️ R:R: {signal.risk_reward:.1f}:1",
+            f"🎯 Target: {signal.expected_move_pct:.1f}%"
+        ]
+        
+        # Confluence conditions count
+        conditions_count = len(signal.conditions_met)
+        strong_conditions = sum(1 for c in signal.conditions_met 
+                              if c in ['VOLUME_SPIKE', 'HTF_ALIGNED', 'STOP_HUNT_POTENTIAL'])
+        
+        # Build the message
+        message = f"""{side_emoji} <b>CONFLUENCE SIGNAL - {signal.side}</b>
 
-<b>Exchange:</b> OKX
-<b>Symbol:</b> {signal.symbol}
-<b>Confluence Score:</b> {signal.confluence_score:.1f}/10
+<b>{score_emoji} CONFLUENCE: {score_text} ({signal.confluence_score:.1f}/10)</b>
+<b>📊 {signal.symbol}</b> | <b>🎪 {signal.entry_type.replace('_', ' ')}</b>
 
-<b>Entry Details:</b>
-• Type: {signal.entry_type}
-• Price: {signal.entry_price:.6f}
-• Confidence: {signal.entry_confidence:.1%}
+<b>🏗️ STRUCTURE:</b>
+{chr(10).join(structure_details)}
 
-<b>Risk Management:</b>
-• Stop Loss: {signal.stop_loss:.6f} ({signal.risk_pct:.2f}%)
-• Take Profit: {signal.take_profit:.6f} ({signal.reward_pct:.2f}%)
-• Risk/Reward: {signal.risk_reward:.1f}:1
-• Expected Move: {signal.expected_move_pct:.1f}%
+<b>💧 ORDER FLOW:</b>
+{chr(10).join(flow_details)}
 
-<b>Conditions Met:</b> {len(signal.conditions_met)}
+<b>📈 MOMENTUM:</b>
+{chr(10).join(momentum_details)}
 
-#Confluence{side_text} #{clean_symbol} #Expected{signal.expected_move_pct:.0f}Percent #OKX"""
+<b>🌊 LIQUIDITY:</b>
+{chr(10).join(liquidity_details)}
+
+<b>🎯 ENTRY:</b>
+• Price: <b>{signal.entry_price:.6f}</b>
+• SL: {signal.stop_loss:.6f}
+• TP: {signal.take_profit:.6f}
+{chr(10).join(entry_details)}
+
+<b>⚖️ RISK/REWARD:</b>
+{chr(10).join(risk_details)}
+
+<b>📋 CONDITIONS:</b>
+• Met: {conditions_count} conditions
+• Strong: {strong_conditions} strong signals
+• Probability: {signal.probability_score:.0%}
+
+#Confluence{signal.side} #{clean_symbol} #{score_text.replace(' ', '')}Confluence
+#Expected{signal.expected_move_pct:.0f}Percent #OKX"""
+        
+        return message
+    
+    async def format_compact_signal(self, signal: ConfluenceSetup) -> str:
+        """Ultra-compact format with key details only"""
+        
+        side_emoji = "🟢" if signal.side == "LONG" else "🔴"
+        clean_symbol = signal.signal.symbol.replace('/', '')
+        
+        # Get top 3 strongest conditions
+        strong_conditions = []
+        for condition in signal.conditions_met:
+            if any(keyword in condition for keyword in ['VOLUME_SPIKE', 'HTF_ALIGNED', 'STOP_HUNT', 'DIVERGENCE']):
+                cond_display = condition.replace('_', ' ')
+                if 'RSI' in cond_display:
+                    cond_display = cond_display.replace('RSI ', '')
+                elif 'MACD' in cond_display:
+                    cond_display = cond_display.replace('MACD ', '')
+                strong_conditions.append(cond_display)
+            if len(strong_conditions) >= 3:
+                break
+        
+        message = f"""{side_emoji} <b>{signal.side} {signal.symbol}</b>
+
+<b>CONFLUENCE: {signal.confluence_score:.1f}/10</b>
+• Entry: {signal.entry_price:.6f}
+• Target: {signal.expected_move_pct:.1f}%
+• R:R: {signal.risk_reward:.1f}:1
+• Confidence: {signal.entry_confidence:.0%}
+
+<b>KEY SIGNALS:</b>
+• Trend: {signal.market_structure.trend}
+• Flow: {'Spike' if signal.order_flow.volume_spike else 'Normal'}
+• Momentum: {signal.momentum.rsi_divergence.split('_')[0] if signal.momentum.rsi_divergence != 'NONE' else 'Neutral'}
+• Liquidity: {signal.liquidity_zone.zone_type.split('_')[0]}
+
+<b>STRONG CONDITIONS:</b>
+{chr(10).join(f"• {cond}" for cond in strong_conditions[:3])}
+
+SL: {signal.stop_loss:.6f} | TP: {signal.take_profit:.6f}
+
+#Confluence{signal.side} #{clean_symbol} #OKX"""
         
         return message
     
     async def send_telegram_alert(self, signal: ConfluenceSetup):
-        """Send Telegram alert for new confluence signal"""
+        """Send Telegram alert with smart formatting"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             log.warning(f"⚠️ Telegram credentials missing. Skipping alert for {signal.symbol}")
             return
         
         try:
-            message = await self.format_signal_message(signal)
+            # Try full message first
+            message = await self.format_confluence_signal(signal)
+            
+            # Check approximate length (Telegram limit is 4096)
+            if len(message) > 3800:  # Leave buffer
+                message = await self.format_compact_signal(signal)
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             
-            # Try with HTML format first
             payload = {
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": message,
@@ -2165,22 +2244,14 @@ The scanner hunts for setups where all 4 layers align, providing high-probabilit
                 response = await client.post(url, json=payload)
                 
                 if response.status_code == 400:
-                    # Try with plain text if HTML fails - create new payload without parse_mode
-                    log.warning(f"Telegram HTML failed for {signal.symbol}, trying plain text")
-                    
-                    # Create plain text version
-                    plain_message = message.replace('<b>', '').replace('</b>', '').replace('• ', '- ')
-                    
+                    # Try plain text if HTML fails
+                    plain_message = message.replace('<b>', '').replace('</b>', '')
                     payload = {
                         "chat_id": TELEGRAM_CHAT_ID,
                         "text": plain_message,
                         "disable_web_page_preview": True
                     }
-                    response = await client.post(url, json=payload)
-                
-                if response.status_code != 200:
-                    log.error(f"Telegram error for {signal.symbol}: {response.status_code} - {response.text}")
-                    return
+                    await client.post(url, json=payload)
             
             log.info(f"📤 Confluence alert sent: {signal.symbol}")
             
@@ -2264,9 +2335,6 @@ The position will auto-close when SL or TP is hit.
 <b>Close Price:</b> {close_price:.6f}
 <b>PNL:</b> <font color='{pnl_color}'>{pnl_percent:+.2f}%</font>
 <b>Reason:</b> {close_reason}
-
-<b>Summary:</b>
-Position closed with {pnl_percent:+.2f}% {'profit' if pnl_percent > 0 else 'loss'} ({close_reason})
 
 #{clean_symbol} #{result_text} #{side} #{close_reason} #OKX"""
             
@@ -2390,6 +2458,12 @@ Position closed with {pnl_percent:+.2f}% {'profit' if pnl_percent > 0 else 'loss
                 
                 # Clean up old signals
                 self.scanner.cleanup_old_signals()
+                
+                # Clean cache
+                current_time = time.time()
+                to_remove = [k for k, (_, t) in self.data_cache.items() if current_time - t > self.cache_ttl]
+                for k in to_remove:
+                    del self.data_cache[k]
                 
                 await asyncio.sleep(5)  # Check every 5 seconds
                 
@@ -2545,16 +2619,7 @@ Position closed with {pnl_percent:+.2f}% {'profit' if pnl_percent > 0 else 'loss
 <b>⚡ ACTIVE SIGNALS:</b>
 • Currently active: {active_count}
 
-<b>🎯 STRATEGY PERFORMANCE:</b>
-The scanner hunts for 3-5% move setups with multi-layer confluence:
-1. Market Structure alignment
-2. Order flow confirmation
-3. Momentum divergence
-4. Liquidity zone targeting
-
-Only signals with confluence scores ≥ {MIN_CONFLUENCE_SCORE}/10 were considered.
-
-#ConfluenceFinalStats #MultiLayerAnalysis #OKX"""
+#ConfluenceFinalStats #OKX"""
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             async with httpx.AsyncClient(timeout=10) as client:
@@ -2606,7 +2671,7 @@ async def start_confluence_server(scanner, port=8000):
                 
                 response = json.dumps({
                     "status": "running",
-                    "scanner": "Confluence Scanner v5.0",
+                    "scanner": "Confluence Scanner v5.1",
                     "exchange": "OKX",
                     "target": "3-5% directional moves",
                     "scan_cycle": scanner.scan_cycle,
