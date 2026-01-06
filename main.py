@@ -1,6 +1,3 @@
-A+ steps 3 layers :::::
-
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
