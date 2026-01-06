@@ -5,7 +5,7 @@ CONFLUENCE SCANNER v5.0 - 3-5% MOVE STRATEGY
 Multi-layer confluence analysis with precise entry detection
 NO TA-Lib DEPENDENCY - Pure Python implementation
 OKX EXCHANGE INTEGRATION - No geographical restrictions
-FIXED: Telegram parsing issues, JSON serialization, error handling
+COMPLETE TELEGRAM ALERTS: Signal → Trigger → Close (SL/TP)
 """
 
 import os
@@ -2143,7 +2143,7 @@ The scanner hunts for setups where all 4 layers align, providing high-probabilit
         return message
     
     async def send_telegram_alert(self, signal: ConfluenceSetup):
-        """Send Telegram alert with better error handling"""
+        """Send Telegram alert for new confluence signal"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             log.warning(f"⚠️ Telegram credentials missing. Skipping alert for {signal.symbol}")
             return
@@ -2187,8 +2187,119 @@ The scanner hunts for setups where all 4 layers align, providing high-probabilit
         except Exception as e:
             log.error(f"Telegram error for {signal.symbol}: {e}")
     
+    async def send_triggered_position_alert(self, symbol: str, side: str, trigger_price: float):
+        """Send Telegram alert when position triggers"""
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            log.warning(f"⚠️ Telegram credentials missing. Skipping triggered alert for {symbol}")
+            return
+        
+        try:
+            side_emoji = "🟢" if side == "LONG" else "🔴"
+            clean_symbol = symbol.replace('/', '').replace('-', '').replace('.', '')
+            
+            message = f"""✅ <b>POSITION TRIGGERED - {side} {side_emoji}</b>
+
+<b>Symbol:</b> {symbol}
+<b>Trigger Price:</b> {trigger_price:.6f}
+<b>Status:</b> Position is now active and being monitored.
+
+Stop Loss and Take Profit are now active.
+The position will auto-close when SL or TP is hit.
+
+#{clean_symbol} #{side} #Triggered #OKX"""
+            
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            
+            payload = {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True
+            }
+            
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(url, json=payload)
+                
+                if response.status_code == 400:
+                    plain_message = message.replace('<b>', '').replace('</b>', '')
+                    payload = {
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "text": plain_message,
+                        "disable_web_page_preview": True
+                    }
+                    await client.post(url, json=payload)
+            
+            log.info(f"📤 Triggered position alert sent: {symbol}")
+            
+        except Exception as e:
+            log.error(f"Triggered position alert error: {e}")
+    
+    async def send_closed_position_alert(self, symbol: str, side: str, entry_price: float, 
+                                        close_price: float, pnl_percent: float, close_reason: str):
+        """Send Telegram alert when position closes (SL/TP hit)"""
+        if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+            log.warning(f"⚠️ Telegram credentials missing. Skipping closed position alert for {symbol}")
+            return
+        
+        try:
+            side_emoji = "🟢" if side == "LONG" else "🔴"
+            
+            if pnl_percent > 0:
+                pnl_emoji = "💰"
+                pnl_color = "#00FF00"
+                result_text = "PROFIT"
+            else:
+                pnl_emoji = "💸"
+                pnl_color = "#FF0000"
+                result_text = "LOSS"
+            
+            # Clean symbol for hashtags
+            clean_symbol = symbol.replace('/', '').replace('-', '').replace('.', '')
+            
+            message = f"""{pnl_emoji} <b>POSITION CLOSED - {side} {side_emoji}</b>
+
+<b>Symbol:</b> {symbol}
+<b>Side:</b> {side}
+<b>Entry Price:</b> {entry_price:.6f}
+<b>Close Price:</b> {close_price:.6f}
+<b>PNL:</b> <font color='{pnl_color}'>{pnl_percent:+.2f}%</font>
+<b>Reason:</b> {close_reason}
+
+<b>Summary:</b>
+Position closed with {pnl_percent:+.2f}% {'profit' if pnl_percent > 0 else 'loss'} ({close_reason})
+
+#{clean_symbol} #{result_text} #{side} #{close_reason} #OKX"""
+            
+            url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            
+            # Try HTML first
+            payload = {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True
+            }
+            
+            async with httpx.AsyncClient(timeout=10) as client:
+                response = await client.post(url, json=payload)
+                
+                if response.status_code == 400:
+                    # Try plain text
+                    plain_message = message.replace('<b>', '').replace('</b>', '').replace('<font color=\'', '').replace('\'>', '').replace('</font>', '')
+                    payload = {
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "text": plain_message,
+                        "disable_web_page_preview": True
+                    }
+                    await client.post(url, json=payload)
+            
+            log.info(f"📤 Closed position alert sent: {symbol} {pnl_percent:+.2f}% ({close_reason})")
+            
+        except Exception as e:
+            log.error(f"Closed position alert error: {e}")
+    
     async def monitor_positions(self):
-        """Monitor and close positions"""
+        """Monitor and close positions with Telegram alerts"""
         log.info("👀 Starting position monitoring...")
         
         while True:
@@ -2224,6 +2335,9 @@ The scanner hunts for setups where all 4 layers align, providing high-probabilit
                                 
                                 await self.db.commit()
                                 self.scanner.signal_manager.update_signal_status(pos_id, "TRIGGERED")
+                                
+                                # SEND TELEGRAM ALERT FOR TRIGGERED POSITION
+                                await self.send_triggered_position_alert(symbol, side, current_price)
                                 
                                 log.info(f"✅ Position triggered: {symbol} {side} @ {current_price:.4f}")
                                 continue
@@ -2262,6 +2376,11 @@ The scanner hunts for setups where all 4 layers align, providing high-probabilit
                             
                             await self.db.commit()
                             self.scanner.signal_manager.update_signal_status(pos_id, "CLOSED")
+                            
+                            # SEND TELEGRAM ALERT FOR CLOSED POSITION
+                            await self.send_closed_position_alert(
+                                symbol, side, entry, current_price, pnl_percent, close_reason
+                            )
                             
                             log.info(f"📤 Position closed: {symbol} {side} {pnl_percent:+.2f}% ({close_reason})")
                     
