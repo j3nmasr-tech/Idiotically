@@ -30,7 +30,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_PATH = "/app/data/romeopt_v2.db"
 
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 15))
-TOP_N = int(os.getenv("TOP_N", 10))
+TOP_N = int(os.getenv("TOP_N", 10))  # Changed to 10
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 5))
 
 # Cooldown settings
@@ -41,7 +41,7 @@ MIN_PRICE_CHANGE = float(os.getenv("MIN_PRICE_CHANGE", 0.01))  # 1% minimum pric
 MONITOR_INTERVAL = int(os.getenv("MONITOR_INTERVAL", 30))  # Check positions every 30 seconds
 
 # ---------------- LOGGING ----------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
+logging.basicConfig(level=logging.DEBUG, format="%(asctime)s | %(levelname)s | %(message)s")  # Changed to DEBUG
 log = logging.getLogger("romeopt_v2")
 db_lock = asyncio.Lock()
 db_conn = None
@@ -858,7 +858,7 @@ async def analyze_htf_bias(exchange, symbol: str) -> HTFContext:
         if (low_i < df_htf["low"].iloc[i-1] and 
             low_i < df_htf["low"].iloc[i-2] and
             low_i < df_htf["low"].iloc[i+1] and
-            low_i < df_ltf["low"].iloc[i+2]):
+            low_i < df_htf["low"].iloc[i+2]):  # FIXED: Changed from df_ltf to df_htf
             swing_lows.append({
                 "price": float(low_i),
                 "index": int(i),
@@ -1514,6 +1514,7 @@ async def scan_symbol_full(exchange, symbol: str) -> Optional[Dict]:
     ticker = await exchange.fetch_ticker(symbol)
     current_price = ticker.get("last", 0)
     if not current_price:
+        log.debug(f"  {symbol}: Failed to get current price")
         return None
     
     # --- STEP 1: HTF BIAS ---
@@ -1784,15 +1785,43 @@ async def scanner_main(exchange):
         try:
             log.info(f"🔄 Scan cycle #{cycle_count} starting...")
             
-            # Get top volume pairs
-            tickers = await exchange.fetch_tickers()
-            usdt_pairs = [(s, v.get("quoteVolume", 0)) 
-                         for s, v in tickers.items() 
-                         if s.endswith("/USDT")]
-            usdt_pairs.sort(key=lambda x: x[1], reverse=True)
-            top_pairs = usdt_pairs[:TOP_N]
-            
-            log.info(f"📊 Scanning {len(top_pairs)} symbols...")
+            # Get top volume pairs with better error handling
+            try:
+                tickers = await exchange.fetch_tickers()
+                usdt_pairs = [(s, v.get("quoteVolume", 0)) 
+                             for s, v in tickers.items() 
+                             if s.endswith("/USDT")]
+                
+                if not usdt_pairs:
+                    log.warning("No USDT pairs found, trying alternative...")
+                    # Try alternative method
+                    markets = await exchange.load_markets()
+                    usdt_pairs = [s for s in markets.keys() if s.endswith("/USDT")]
+                    # Assign dummy volume
+                    usdt_pairs = [(s, 1000000) for s in usdt_pairs[:TOP_N]]
+                    log.info(f"Using alternative method, found {len(usdt_pairs)} pairs")
+                
+                usdt_pairs.sort(key=lambda x: x[1], reverse=True)
+                top_pairs = usdt_pairs[:TOP_N]
+                
+                log.info(f"📊 Found {len(usdt_pairs)} USDT pairs, scanning top {len(top_pairs)}...")
+                
+            except Exception as e:
+                log.error(f"Failed to fetch tickers: {e}")
+                # Use default pairs as fallback
+                top_pairs = [
+                    ("BTC/USDT", 1000000000),
+                    ("ETH/USDT", 500000000),
+                    ("SOL/USDT", 300000000),
+                    ("XRP/USDT", 200000000),
+                    ("DOGE/USDT", 150000000),
+                    ("ADA/USDT", 100000000),
+                    ("BNB/USDT", 80000000),
+                    ("MATIC/USDT", 70000000),
+                    ("DOT/USDT", 60000000),
+                    ("LINK/USDT", 50000000)
+                ]
+                log.info(f"Using default pairs: {[p[0] for p in top_pairs]}")
             
             setups_found = 0
             symbols_scanned = 0
@@ -1802,6 +1831,7 @@ async def scanner_main(exchange):
                     # Yield control to prevent freezing
                     await asyncio.sleep(0.01)
                     
+                    log.debug(f"Scanning {symbol}...")
                     setup = await scan_symbol_full(exchange, symbol)
                     symbols_scanned += 1
                     
@@ -1815,6 +1845,8 @@ async def scanner_main(exchange):
                                 log.debug(f"  {symbol}: Setup too similar to recent one, skipping alert")
                         else:
                             log.debug(f"  {symbol}: Setup in cooldown")
+                    else:
+                        log.debug(f"  {symbol}: No setup found")
                     
                     # Small delay between symbols
                     await asyncio.sleep(0.05)
@@ -1859,7 +1891,7 @@ async def health():
     return {"status": "healthy", "scanner": "ROMEOTPT v2 Score-Only", "last_activity": last_activity_time}
 
 @app.get("/setups")
-async def get_setups(limit: int = 20, min_score: float = 1.5):
+async def get_setups(limit: int = 20, min_score: float = 1.0):
     update_activity()
     async with db_lock:
         async with db_conn.execute(
