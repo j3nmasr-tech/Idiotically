@@ -5,7 +5,7 @@ CONFLUENCE SCANNER v5.0 - 3-5% MOVE STRATEGY
 Multi-layer confluence analysis with precise entry detection
 NO TA-Lib DEPENDENCY - Pure Python implementation
 OKX EXCHANGE INTEGRATION - No geographical restrictions
-FIXED: DataFrame truth value handling and JSON serialization
+FIXED: DataFrame truth value handling, JSON serialization, Telegram formatting
 """
 
 import os
@@ -2097,7 +2097,7 @@ The scanner hunts for setups where all 4 layers align, providing high-probabilit
             return False
     
     async def format_signal_message(self, signal: ConfluenceSetup) -> str:
-        """Format confluence signal for Telegram"""
+        """Format confluence signal for Telegram with proper escaping"""
         side_emoji = "🟢" if signal.side == "LONG" else "🔴"
         side_text = "LONG" if signal.side == "LONG" else "SHORT"
         
@@ -2136,46 +2136,49 @@ The scanner hunts for setups where all 4 layers align, providing high-probabilit
         
         conditions_text = " | ".join(key_conditions[:3])
         
+        # Clean symbol for hashtags (remove special characters)
+        clean_symbol = signal.symbol.replace('/', '').replace('-', '').replace('.', '')
+        
         message = f"""
 {side_emoji} <b>CONFLUENCE SIGNAL - {side_text}</b> {score_emoji}
 
-<b>Exchange: OKX</b>
-<b>{signal.symbol}</b>
-<b>Confluence Score: <font color='{score_color}'>{signal.confluence_score:.1f}/10</font></b>
+<b>Exchange:</b> OKX
+<b>Symbol:</b> {signal.symbol}
+<b>Confluence Score:</b> <font color='{score_color}'>{signal.confluence_score:.1f}/10</font>
 
 <b>📊 CONFLUENCE BREAKDOWN:</b>
-‎• Market Structure: {struct_score:.1f}/2.5
-‎• Order Flow: {flow_score:.1f}/3.0
-‎• Momentum: {mom_score:.1f}/2.5
-‎• Liquidity: {liq_score:.1f}/2.0
+• Market Structure: {struct_score:.1f}/2.5
+• Order Flow: {flow_score:.1f}/3.0
+• Momentum: {mom_score:.1f}/2.5
+• Liquidity: {liq_score:.1f}/2.0
 
 <b>🎯 KEY CONDITIONS:</b>
 {conditions_text}
 
 <b>⚡ ENTRY DETAILS:</b>
-‎• Type: {signal.entry_type}
-‎• Price: <code>{signal.entry_price:.6f}</code>
-‎• Confidence: {signal.entry_confidence:.1%}
+• Type: {signal.entry_type}
+• Price: <code>{signal.entry_price:.6f}</code>
+• Confidence: {signal.entry_confidence:.1%}
 
 <b>🛡️ RISK MANAGEMENT:</b>
-‎• Stop Loss: <code>{signal.stop_loss:.6f}</code> ({signal.risk_pct:.2f}%)
-‎• Take Profit: <code>{signal.take_profit:.6f}</code> ({signal.reward_pct:.2f}%)
-‎• Risk/Reward: {signal.risk_reward:.1f}:1
-‎• Expected Move: {signal.expected_move_pct:.1f}%
+• Stop Loss: <code>{signal.stop_loss:.6f}</code> ({signal.risk_pct:.2f}%)
+• Take Profit: <code>{signal.take_profit:.6f}</code> ({signal.reward_pct:.2f}%)
+• Risk/Reward: {signal.risk_reward:.1f}:1
+• Expected Move: {signal.expected_move_pct:.1f}%
 
 <b>📈 PROBABILITY:</b>
-‎• Hit Probability: {signal.probability_score:.1%}
-‎• Conditions Met: {len(signal.conditions_met)}/4 layers
+• Hit Probability: {signal.probability_score:.1%}
+• Conditions Met: {len(signal.conditions_met)}/4 layers
 
 <b>⚠️ NOTE:</b>
 Only one signal per symbol. New signals require better confluence or previous closure.
 
-#Confluence{side_text} #{signal.symbol.replace('/', '')} #Expected{signal.expected_move_pct:.0f}Percent #OKX
+#Confluence{side_text} #{clean_symbol} #Expected{signal.expected_move_pct:.0f}Percent #OKX
 """
         return message
     
     async def send_telegram_alert(self, signal: ConfluenceSetup):
-        """Send Telegram alert"""
+        """Send Telegram alert with better error handling"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             log.warning(f"⚠️ Telegram credentials missing. Skipping alert for {signal.symbol}")
             return
@@ -2184,17 +2187,46 @@ Only one signal per symbol. New signals require better confluence or previous cl
             message = await self.format_signal_message(signal)
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+            
+            # Try with simpler message if there's an issue
+            payload = {
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True
+            }
+            
             async with httpx.AsyncClient(timeout=10) as client:
-                await client.post(url, json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message,
-                    "parse_mode": "HTML"
-                })
+                response = await client.post(url, json=payload)
+                
+                if response.status_code == 400:
+                    # Try with plain text if HTML fails
+                    log.warning(f"Telegram HTML failed for {signal.symbol}, trying plain text")
+                    simple_message = f"""
+{side_emoji} CONFLUENCE SIGNAL - {signal.side}
+
+Symbol: {signal.symbol}
+Confluence Score: {signal.confluence_score:.1f}/10
+Entry: {signal.entry_price:.6f}
+Stop Loss: {signal.stop_loss:.6f}
+Take Profit: {signal.take_profit:.6f}
+Risk/Reward: {signal.risk_reward:.1f}:1
+Expected Move: {signal.expected_move_pct:.1f}%
+
+#Confluence{signal.side} #{clean_symbol} #OKX
+"""
+                    payload["text"] = simple_message
+                    payload["parse_mode"] = None
+                    response = await client.post(url, json=payload)
+                
+                if response.status_code != 200:
+                    log.error(f"Telegram error for {signal.symbol}: {response.status_code} - {response.text}")
+                    return
                 
             log.info(f"📤 Confluence alert sent: {signal.symbol}")
             
         except Exception as e:
-            log.error(f"Telegram error: {e}")
+            log.error(f"Telegram error for {signal.symbol}: {e}")
     
     async def monitor_positions(self):
         """Monitor and close positions"""
