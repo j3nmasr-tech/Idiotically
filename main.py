@@ -32,8 +32,8 @@ DB_PATH = "/app/data/confluence_scanner.db"
 
 # Scanning settings
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))   # 10 seconds
-TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 50))     # Focus on quality pairs
-MIN_VOLUME_USD = 1000000  # $1M minimum for liquidity
+TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 100))     # Focus on quality pairs
+MIN_VOLUME_USD = 100000  # $1M minimum for liquidity
 
 # Confluence parameters - TARGET: 3-5% MOVES
 TARGET_PROFIT_RANGE = (2.0, 6.0)  # Target 2-6% moves (aim for 3-5%)
