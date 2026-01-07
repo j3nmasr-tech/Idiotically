@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CONFLUENCE SCANNER v5.1 - 3-5% MOVE STRATEGY
+CONFLUENCE SCANNER v5.2 - 3-5% MOVE STRATEGY
+FIXED VERSION - Preserves winners, eliminates systematic losers
 Multi-layer confluence analysis with precise entry detection
 NO TA-Lib DEPENDENCY - Pure Python implementation
 OKX EXCHANGE INTEGRATION - No geographical restrictions
@@ -225,7 +226,7 @@ log = logging.getLogger("confluence_scanner")
 
 # ================ CORE CONFLUENCE ENGINE ================
 class ConfluenceScanner:
-    """Multi-layer confluence scanner for 3-5% moves"""
+    """Multi-layer confluence scanner for 3-5% moves - FIXED VERSION"""
     
     class SignalManager:
         """Manage signals with confluence-based deduplication"""
@@ -234,9 +235,20 @@ class ConfluenceScanner:
             self.active_signals = {}      # symbol: signal_id
             self.signal_states = {}       # signal_id: state
             self.confluence_history = {}  # symbol: recent confluence scores
+            # NEW: Track consecutive failures per symbol
+            self.consecutive_failures = {}  # symbol: {LONG: count, SHORT: count}
+            self.symbol_blacklist = {}    # symbol: expiry_time
             
-        def should_generate_signal(self, symbol: str, new_score: float) -> bool:
+        def should_generate_signal(self, symbol: str, new_score: float, side: str) -> bool:
             """Check if new signal has significantly better confluence"""
+            # Check blacklist
+            if symbol in self.symbol_blacklist:
+                if time.time() < self.symbol_blacklist[symbol]:
+                    log.debug(f"{symbol}: Blacklisted until {datetime.fromtimestamp(self.symbol_blacklist[symbol])}")
+                    return False
+                else:
+                    del self.symbol_blacklist[symbol]
+            
             if symbol not in self.active_signals:
                 return True
             
@@ -262,6 +274,7 @@ class ConfluenceScanner:
         def register_signal(self, signal: ConfluenceSetup):
             """Register new confluence signal"""
             symbol = signal.symbol
+            side = signal.side
             
             # Clear old if exists
             if symbol in self.active_signals:
@@ -273,7 +286,7 @@ class ConfluenceScanner:
             self.active_signals[symbol] = signal.signal_id
             self.signal_states[signal.signal_id] = {
                 "symbol": symbol,
-                "side": signal.side,
+                "side": side,
                 "confluence_score": signal.confluence_score,
                 "status": "PENDING",
                 "timestamp": signal.signal_timestamp
@@ -284,13 +297,54 @@ class ConfluenceScanner:
                 self.confluence_history[symbol] = deque(maxlen=10)
             self.confluence_history[symbol].append(signal.confluence_score)
             
-            log.debug(f"Registered confluence signal {signal.signal_id[:8]} for {symbol}")
+            # Reset failure count for this side
+            if symbol in self.consecutive_failures:
+                self.consecutive_failures[symbol][side] = 0
+            
+            log.debug(f"Registered confluence signal {signal.signal_id[:8]} for {symbol} {side}")
         
-        def update_signal_status(self, signal_id: str, status: str):
-            """Update signal status"""
+        def update_signal_status(self, signal_id: str, status: str, result: str = None):
+            """Update signal status with result (WIN/LOSS)"""
             if signal_id in self.signal_states:
-                self.signal_states[signal_id]["status"] = status
-                log.debug(f"Signal {signal_id[:8]} → {status}")
+                state = self.signal_states[signal_id]
+                state["status"] = status
+                
+                # Track failures if closed with loss
+                if status == "CLOSED" and result == "LOSS":
+                    symbol = state["symbol"]
+                    side = state["side"]
+                    
+                    if symbol not in self.consecutive_failures:
+                        self.consecutive_failures[symbol] = {"LONG": 0, "SHORT": 0}
+                    
+                    self.consecutive_failures[symbol][side] += 1
+                    
+                    # BLACKLIST LOGIC: After 3 consecutive failures on same side
+                    if self.consecutive_failures[symbol][side] >= 3:
+                        # Blacklist this symbol for 4 hours for this side
+                        self.symbol_blacklist[symbol] = time.time() + (4 * 3600)
+                        log.warning(f"{symbol} {side}: 3+ consecutive losses - blacklisted for 4 hours")
+                    
+                    # Reset opposite side counter (fresh start)
+                    opposite_side = "SHORT" if side == "LONG" else "LONG"
+                    self.consecutive_failures[symbol][opposite_side] = 0
+                
+                log.debug(f"Signal {signal_id[:8]} → {status}" + (f" ({result})" if result else ""))
+        
+        def get_consecutive_failures(self, symbol: str, side: str) -> int:
+            """Get consecutive failures for symbol/side"""
+            if symbol in self.consecutive_failures:
+                return self.consecutive_failures[symbol].get(side, 0)
+            return 0
+        
+        def is_blacklisted(self, symbol: str) -> bool:
+            """Check if symbol is currently blacklisted"""
+            if symbol in self.symbol_blacklist:
+                if time.time() < self.symbol_blacklist[symbol]:
+                    return True
+                else:
+                    del self.symbol_blacklist[symbol]
+            return False
         
         def cleanup_old_signals(self):
             """Clean up old closed signals"""
@@ -318,7 +372,9 @@ class ConfluenceScanner:
             "confluence_signals": 0,
             "high_quality_signals": 0,
             "rejected_low_confluence": 0,
-            "rejected_no_alignment": 0
+            "rejected_no_alignment": 0,
+            "rejected_counter_trend": 0,  # NEW
+            "rejected_blacklisted": 0     # NEW
         }
     
     # ========== MARKET STRUCTURE ANALYSIS ==========
@@ -352,7 +408,7 @@ class ConfluenceScanner:
             # 5. Find order blocks/FVGs (1H)
             breaker_blocks = self._find_breaker_blocks(df_1h)
             
-            # 6. Calculate structure score
+            # 6. Calculate structure score WITH PENALTY FOR MISALIGNMENT
             structure_score = self._calculate_structure_score(
                 daily_trend, htf_aligned, swing_highs, swing_lows
             )
@@ -419,6 +475,10 @@ class ConfluenceScanner:
             
             higher_trend = self._determine_trend(df_higher, "HTF")
             lower_trend = self._determine_trend(df_lower, "LTF")
+            
+            # Require clear trend on both timeframes
+            if higher_trend == "RANGING" or lower_trend == "RANGING":
+                return False
             
             return higher_trend == lower_trend
             
@@ -527,22 +587,26 @@ class ConfluenceScanner:
     
     def _calculate_structure_score(self, trend: str, aligned: bool, 
                                   swing_highs: List, swing_lows: List) -> float:
-        """Calculate market structure quality score"""
+        """Calculate market structure quality score WITH PENALTY FOR MISALIGNMENT"""
         score = 0.0
         
         # Trend strength (0-0.3)
         if trend != "RANGING":
             score += 0.3
         
-        # HTF alignment (0-0.3)
+        # HTF alignment - FIXED: Penalize misalignment, reward alignment
         if aligned:
-            score += 0.3
+            score += 0.3  # Bonus for alignment
+        elif trend != "RANGING":
+            # MISALIGNMENT PENALTY: -0.2 (was 0.0 in v5.1)
+            score -= 0.2  # Penalty for trading against HTF trend
         
         # Clear swing points (0-0.4)
         if len(swing_highs) >= 2 and len(swing_lows) >= 2:
             score += 0.4
         
-        return min(score, 1.0)
+        # Ensure non-negative
+        return max(0.0, min(score, 1.0))
     
     def _get_default_structure(self) -> MarketStructure:
         return MarketStructure(
@@ -1222,29 +1286,37 @@ class ConfluenceScanner:
             "strength": float(liquidity.strength)
         }
         
-        # 5. Side-specific adjustments
+        # 5. Side-specific adjustments - FIXED: More conservative for SHORT signals
         side_adjustment = 0.0
         if side == "LONG":
-            # Bonus for bullish confluence
+            # Bonus for bullish confluence - keep original logic (WORKING)
             if (structure.trend == "BULLISH" and 
                 momentum.rsi_divergence == "BULLISH_HIDDEN" and
                 momentum.macd_signal in ["BULLISH_CROSS", "BULLISH_FLIP"]):
                 side_adjustment = 0.5
         
         elif side == "SHORT":
-            # Bonus for bearish confluence
-            if (structure.trend == "BEARISH" and
+            # STRICTER: Shorts require HTF alignment OR very strong momentum
+            if (structure.higher_timeframe_aligned and  # MUST BE ALIGNED
                 momentum.rsi_divergence == "BEARISH_HIDDEN" and
                 momentum.macd_signal in ["BEARISH_CROSS", "BEARISH_FLIP"]):
-                side_adjustment = 0.5
+                side_adjustment = 0.5  # Same bonus but stricter requirements
         
         scores["side_adjustment"] = side_adjustment
+        
+        # NEW: Penalize counter-trend trades more heavily
+        if not structure.higher_timeframe_aligned and side == structure.trend:
+            # Trading with trend but misaligned? Strange case
+            scores["alignment_penalty"] = -0.5
+        elif not structure.higher_timeframe_aligned:
+            # Counter-trend trade - penalize
+            scores["alignment_penalty"] = -1.0
         
         # Calculate total score (0-10)
         total_score = sum(scores.values())
         
-        # Ensure max 10
-        total_score = min(total_score, 10.0)
+        # Ensure max 10, min 0
+        total_score = max(0.0, min(total_score, 10.0))
         
         return total_score, {
             "scores": scores,
@@ -1297,7 +1369,7 @@ class ConfluenceScanner:
     def generate_confluence_signal(self, multi_tf_data: Dict[str, pd.DataFrame],
                                  symbol: str) -> Optional[ConfluenceSetup]:
         """
-        Generate confluence-based signal for 3-5% moves
+        Generate confluence-based signal for 3-5% moves - FIXED VERSION
         """
         try:
             # Get timeframe data
@@ -1334,10 +1406,16 @@ class ConfluenceScanner:
             # 1. Analyze market structure
             market_structure = self.analyze_market_structure(df_daily, df_4h, df_1h)
             
-            # CRITICAL: Need clear structure
+            # CRITICAL FIX: Need clear structure AND alignment
             if market_structure.trend == "RANGING":
                 self.daily_stats["rejected_no_alignment"] += 1
                 log.debug(f"{symbol}: No clear trend/ranging")
+                return None
+            
+            # NEW: Check for blacklisted symbol
+            if self.signal_manager.is_blacklisted(symbol):
+                self.daily_stats["rejected_blacklisted"] += 1
+                log.debug(f"{symbol}: Currently blacklisted")
                 return None
             
             # 2. Analyze order flow
@@ -1349,19 +1427,36 @@ class ConfluenceScanner:
             # 4. Analyze liquidity zones
             liquidity_zone = self.analyze_liquidity_zones(df_4h, df_1h, current_price)
             
-            # 5. Determine trade side based on confluence
+            # 5. Determine trade side based on confluence - FIXED LOGIC
             side = self._determine_trade_side(
-                market_structure, momentum, liquidity_zone
+                market_structure, momentum, liquidity_zone, symbol
             )
             
             if not side:
                 log.debug(f"{symbol}: No clear trade side from confluence")
                 return None
             
+            # NEW: Check consecutive failures for this symbol/side
+            consecutive_failures = self.signal_manager.get_consecutive_failures(symbol, side)
+            if consecutive_failures >= 2:
+                log.debug(f"{symbol} {side}: Skipping due to {consecutive_failures} consecutive failures")
+                return None
+            
             # 6. Calculate confluence score
             confluence_score, confluence_details = self.calculate_confluence_score(
                 market_structure, order_flow, momentum, liquidity_zone, side
             )
+            
+            # CRITICAL FIX: Higher threshold for counter-trend trades
+            required_min_confluence = MIN_CONFLUENCE_SCORE
+            if not market_structure.higher_timeframe_aligned:
+                # Counter-trend trades need higher confluence
+                required_min_confluence = max(MIN_CONFLUENCE_SCORE * 1.5, 6.0)
+                
+                if confluence_score < required_min_confluence:
+                    self.daily_stats["rejected_counter_trend"] += 1
+                    log.debug(f"{symbol}: Counter-trade needs {required_min_confluence:.1f}, got {confluence_score:.1f}")
+                    return None
             
             # CRITICAL: Minimum confluence score
             if confluence_score < MIN_CONFLUENCE_SCORE:
@@ -1370,7 +1465,7 @@ class ConfluenceScanner:
                 return None
             
             # 7. Confluence-based deduplication
-            if not self.signal_manager.should_generate_signal(symbol, confluence_score):
+            if not self.signal_manager.should_generate_signal(symbol, confluence_score, side):
                 return None
             
             # 8. Determine entry parameters
@@ -1470,8 +1565,8 @@ class ConfluenceScanner:
             log.info(f"🎯 CONFLUENCE SIGNAL: {symbol} {side} @ {entry_price:.4f}")
             log.info(f"   Confluence: {confluence_score:.1f}/10 | R:R: {risk_reward:.1f}:1")
             log.info(f"   Expected: {expected_move_pct:.1f}% | Confidence: {entry_confidence:.1%}")
-            log.info(f"   Structure: {market_structure.trend} | Flow: {order_flow.flow_score:.2f}")
-            log.info(f"   Momentum: {momentum.rsi_divergence} | Liquidity: {liquidity_zone.zone_type}")
+            log.info(f"   Structure: {market_structure.trend} | Alignment: {'YES' if market_structure.higher_timeframe_aligned else 'NO'}")
+            log.info(f"   Flow: {order_flow.flow_score:.2f} | Momentum: {momentum.rsi_divergence}")
             
             return signal
             
@@ -1482,47 +1577,90 @@ class ConfluenceScanner:
     
     def _determine_trade_side(self, structure: MarketStructure, 
                              momentum: MomentumSignal, 
-                             liquidity: LiquidityZone) -> Optional[str]:
-        """Determine trade side based on confluence alignment"""
+                             liquidity: LiquidityZone,
+                             symbol: str) -> Optional[str]:
+        """Determine trade side based on confluence alignment - FIXED VERSION"""
         
-        bullish_factors = 0
-        bearish_factors = 0
+        # NEW: Track factors for debugging
+        bullish_factors = []
+        bearish_factors = []
         
-        # Market structure
+        # 1. Market structure - PRIMARY FACTOR
         if structure.trend == "BULLISH":
-            bullish_factors += 2
+            bullish_factors.append(("Trend BULLISH", 2))
         elif structure.trend == "BEARISH":
-            bearish_factors += 2
+            bearish_factors.append(("Trend BEARISH", 2))
         
-        # HTF alignment
+        # 2. HTF alignment - CRITICAL FIX: Penalize misalignment heavily
         if structure.higher_timeframe_aligned:
             if structure.trend == "BULLISH":
-                bullish_factors += 1
+                bullish_factors.append(("HTF Aligned BULLISH", 1))
             elif structure.trend == "BEARISH":
-                bearish_factors += 1
+                bearish_factors.append(("HTF Aligned BEARISH", 1))
+        else:
+            # MISALIGNMENT: Reduce confidence in the trend
+            if structure.trend == "BULLISH":
+                bearish_factors.append(("HTF Misaligned", -1))  # Penalty
+            elif structure.trend == "BEARISH":
+                bullish_factors.append(("HTF Misaligned", -1))  # Penalty
         
-        # Momentum
+        # 3. Momentum - Check if it CONFIRMS the trend
         if momentum.rsi_divergence == "BULLISH_HIDDEN":
-            bullish_factors += 2
+            if structure.trend == "BULLISH":
+                bullish_factors.append(("RSI Bullish Divergence (CONFIRMING)", 2))
+            else:
+                bullish_factors.append(("RSI Bullish Divergence (COUNTER)", 1))  # Less weight
+        
         elif momentum.rsi_divergence == "BEARISH_HIDDEN":
-            bearish_factors += 2
+            if structure.trend == "BEARISH":
+                bearish_factors.append(("RSI Bearish Divergence (CONFIRMING)", 2))
+            else:
+                bearish_factors.append(("RSI Bearish Divergence (COUNTER)", 1))  # Less weight
         
+        # 4. MACD signals
         if momentum.macd_signal in ["BULLISH_CROSS", "BULLISH_FLIP"]:
-            bullish_factors += 1
+            bullish_factors.append((f"MACD {momentum.macd_signal}", 1))
+        
         elif momentum.macd_signal in ["BEARISH_CROSS", "BEARISH_FLIP"]:
-            bearish_factors += 1
+            bearish_factors.append((f"MACD {momentum.macd_signal}", 1))
         
-        # Liquidity zones
+        # 5. Liquidity zones
         if liquidity.zone_type in ["SWEEP_LOW", "EQ_LOW"]:
-            bullish_factors += 1
-        elif liquidity.zone_type in ["SWEEP_HIGH", "EQ_HIGH"]:
-            bearish_factors += 1
+            bullish_factors.append((f"Liquidity {liquidity.zone_type}", 1))
         
-        # Determine side with clear majority
-        if bullish_factors >= 3 and bullish_factors > bearish_factors:
+        elif liquidity.zone_type in ["SWEEP_HIGH", "EQ_HIGH"]:
+            bearish_factors.append((f"Liquidity {liquidity.zone_type}", 1))
+        
+        # 6. Calculate scores
+        bullish_score = sum(score for _, score in bullish_factors)
+        bearish_score = sum(score for _, score in bearish_factors)
+        
+        # DEBUG LOGGING
+        log.debug(f"{symbol} Side Determination:")
+        log.debug(f"  Bullish factors ({bullish_score}): {bullish_factors}")
+        log.debug(f"  Bearish factors ({bearish_score}): {bearish_factors}")
+        
+        # 7. Determine side with clear majority AND trend alignment
+        if bullish_score >= 3 and bullish_score > bearish_score:
+            # Additional check: If counter-trend, require higher score
+            if not structure.higher_timeframe_aligned and structure.trend != "BULLISH":
+                if bullish_score < 5:  # Need stronger confluence for counter-trend
+                    log.debug(f"{symbol}: Bullish but counter-trend, score {bullish_score} < 5")
+                    return None
             return "LONG"
-        elif bearish_factors >= 3 and bearish_factors > bullish_factors:
+        
+        elif bearish_score >= 3 and bearish_score > bullish_score:
+            # CRITICAL FIX: Shorts require HTF alignment OR very strong confluence
+            if not structure.higher_timeframe_aligned:
+                if bearish_score < 6:  # Need very strong confluence for counter-trend shorts
+                    log.debug(f"{symbol}: Bearish but counter-trend, score {bearish_score} < 6")
+                    return None
             return "SHORT"
+        
+        # NEW: If scores are close, prefer trend-following
+        if abs(bullish_score - bearish_score) <= 1:
+            if structure.higher_timeframe_aligned:
+                return "LONG" if structure.trend == "BULLISH" else "SHORT"
         
         return None
     
@@ -1627,6 +1765,8 @@ class ConfluenceScanner:
         conditions.append(f"TREND_{structure.trend}")
         if structure.higher_timeframe_aligned:
             conditions.append("HTF_ALIGNED")
+        else:
+            conditions.append("HTF_MISALIGNED")  # NEW
         
         # Order flow conditions
         if order_flow.volume_spike:
@@ -1681,12 +1821,13 @@ class ConfluenceMoveScanner:
     async def initialize(self):
         """Initialize the scanner"""
         log.info("=" * 70)
-        log.info("🎯 CONFLUENCE SCANNER v5.1 - 3-5% MOVE STRATEGY")
+        log.info("🎯 CONFLUENCE SCANNER v5.2 - 3-5% MOVE STRATEGY")
+        log.info("FIXED VERSION - Eliminates systematic losers, preserves winners")
         log.info("=" * 70)
         log.info("EXCHANGE: OKX (No geographical restrictions)")
         log.info("STRATEGY: Multi-layer confluence analysis")
         log.info("TARGET: 3-5% directional moves")
-        log.info("TELEGRAM: Compact signals with full logic details")
+        log.info("FIXES: Counter-trend penalty, failure tracking, blacklisting")
         log.info("=" * 70)
         
         # Initialize database
@@ -1823,14 +1964,15 @@ class ConfluenceMoveScanner:
             return
         
         try:
-            message = """🎯 <b>CONFLUENCE SCANNER v5.1 - ONLINE</b>
+            message = """🎯 <b>CONFLUENCE SCANNER v5.2 - ONLINE</b>
 
 <b>📊 EXCHANGE:</b> OKX
 <b>🎯 TARGET:</b> 3-5% moves
 <b>🧠 LAYERS:</b> 4-layer confluence analysis
 <b>⚡ SIGNALS:</b> Compact format with full logic
+<b>🛡️ FIXES:</b> Counter-trend penalty, failure tracking, blacklisting
 
-Scanner is now actively hunting for high-probability setups where all layers align.
+Scanner v5.2 actively hunting for high-probability setups with improved risk management.
 
 #ConfluenceTrading #OKX #Ready"""
             
@@ -2067,8 +2209,6 @@ Scanner is now actively hunting for high-probability setups where all layers ali
             log.error(f"Error saving signal: {e}")
             return False
     
-    # ========== IMPROVED SIGNAL FORMATTING ==========
-    
     async def format_confluence_signal(self, signal: ConfluenceSetup) -> str:
         """Format confluence signal with all logic details in compact format"""
         
@@ -2179,7 +2319,7 @@ Scanner is now actively hunting for high-probability setups where all layers ali
         """Ultra-compact format with key details only"""
         
         side_emoji = "🟢" if signal.side == "LONG" else "🔴"
-        clean_symbol = signal.signal.symbol.replace('/', '')
+        clean_symbol = signal.symbol.replace('/', '')
         
         # Get top 3 strongest conditions
         strong_conditions = []
@@ -2443,7 +2583,10 @@ The position will auto-close when SL or TP is hit.
                             """, (current_price, pnl_percent, close_reason, pos_id))
                             
                             await self.db.commit()
-                            self.scanner.signal_manager.update_signal_status(pos_id, "CLOSED")
+                            
+                            # Update signal manager with result
+                            result = "LOSS" if pnl_percent < 0 else "WIN"
+                            self.scanner.signal_manager.update_signal_status(pos_id, "CLOSED", result)
                             
                             # SEND TELEGRAM ALERT FOR CLOSED POSITION
                             await self.send_closed_position_alert(
@@ -2561,6 +2704,8 @@ The position will auto-close when SL or TP is hit.
                 log.info(f"   High quality: {stats['high_quality_signals']}")
                 log.info(f"   Rejected (low confluence): {stats['rejected_low_confluence']}")
                 log.info(f"   Rejected (no alignment): {stats['rejected_no_alignment']}")
+                log.info(f"   Rejected (counter-trend): {stats['rejected_counter_trend']}")
+                log.info(f"   Rejected (blacklisted): {stats['rejected_blacklisted']}")
                 
                 scan_duration = time.time() - start_time
                 log.info(f"Scan #{self.scan_cycle}: {signals_found} confluence signals in {scan_duration:.2f}s")
@@ -2603,7 +2748,7 @@ The position will auto-close when SL or TP is hit.
             stats = self.scanner.get_daily_stats()
             active_count = len(self.scanner.signal_manager.active_signals)
             
-            message = f"""🛑 <b>CONFLUENCE SCANNER STOPPED</b>
+            message = f"""🛑 <b>CONFLUENCE SCANNER v5.2 STOPPED</b>
 
 <b>📊 FINAL STATISTICS:</b>
 • Exchange: OKX
@@ -2615,6 +2760,8 @@ The position will auto-close when SL or TP is hit.
 <b>🚫 REJECTIONS:</b>
 • Low confluence: {stats['rejected_low_confluence']}
 • No alignment: {stats['rejected_no_alignment']}
+• Counter-trend: {stats['rejected_counter_trend']}
+• Blacklisted: {stats['rejected_blacklisted']}
 
 <b>⚡ ACTIVE SIGNALS:</b>
 • Currently active: {active_count}
@@ -2671,7 +2818,7 @@ async def start_confluence_server(scanner, port=8000):
                 
                 response = json.dumps({
                     "status": "running",
-                    "scanner": "Confluence Scanner v5.1",
+                    "scanner": "Confluence Scanner v5.2",
                     "exchange": "OKX",
                     "target": "3-5% directional moves",
                     "scan_cycle": scanner.scan_cycle,
