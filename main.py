@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CONFLUENCE SCANNER v5.2 - 3-5% MOVE STRATEGY
-FIXED VERSION - Preserves winners, eliminates systematic losers
-Multi-layer confluence analysis with precise entry detection
-NO TA-Lib DEPENDENCY - Pure Python implementation
+CONFLUENCE SCANNER v6.0 - BTC-CENTRIC STRATEGY
+BITCOIN AS PRIMARY STRUCTURE - Alts must follow BTC direction
+When BTC moves, everything moves with it - Trade accordingly
 OKX EXCHANGE INTEGRATION - No geographical restrictions
-COMPACT TELEGRAM SIGNALS with full logic details
 """
 
 import os
@@ -32,34 +30,38 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 DB_PATH = "/app/data/confluence_scanner.db"
 
 # Scanning settings
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))   # 10 seconds
-TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 100))     # Focus on quality pairs
-MIN_VOLUME_USD = 100000  # $1M minimum for liquidity
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 10))
+TOP_N_VOLUME = int(os.getenv("TOP_N_VOLUME", 100))
+MIN_VOLUME_USD = 100000
 
 # Confluence parameters - TARGET: 3-5% MOVES
-TARGET_PROFIT_RANGE = (2.0, 6.0)  # Target 2-6% moves (aim for 3-5%)
-MAX_STOP_LOSS = 1.5               # Max 1.5% stop loss
-MIN_RISK_REWARD = 2.5             # Minimum 1:2.5 risk/reward
-MIN_CONFLUENCE_SCORE = 1.0        # Min confluence score (out of 10)
+TARGET_PROFIT_RANGE = (2.0, 6.0)
+MAX_STOP_LOSS = 1.5
+MIN_RISK_REWARD = 2.5
+MIN_CONFLUENCE_SCORE = 1.0
+
+# BTC-CENTRIC PARAMETERS
+BTC_MIN_TREND_STRENGTH = 4.0  # Minimum BTC trend strength to trade alts
+BTC_ANALYSIS_INTERVAL = 300   # Re-analyze BTC every 5 minutes
 
 # Timeframes for multi-layer analysis
 TIMEFRAMES = {
-    "DAILY": "1d",      # Primary trend direction
-    "4H": "4h",         # Key support/resistance
-    "1H": "1h",         # Market structure
-    "15M": "15m",       # Entry zone & momentum
-    "5M": "5m",         # Entry trigger
+    "DAILY": "1d",
+    "4H": "4h",
+    "1H": "1h",
+    "15M": "15m",
+    "5M": "5m",
 }
 
 # Confluence scoring weights
 CONFLUENCE_WEIGHTS = {
-    "market_structure": 0.25,      # Structure alignment
-    "order_flow": 0.30,            # Volume & orderbook
-    "momentum": 0.25,              # RSI/MACD divergence
-    "liquidity": 0.20,             # Liquidity zones
+    "market_structure": 0.25,
+    "order_flow": 0.30,
+    "momentum": 0.25,
+    "liquidity": 0.20,
 }
 
-# RSI settings for divergence detection
+# RSI settings
 RSI_PERIOD = 14
 RSI_OVERBOUGHT = 70
 RSI_OVERSOLD = 30
@@ -67,51 +69,36 @@ RSI_OVERSOLD = 30
 # EMA alignment periods
 EMA_PERIODS = {
     "fast": 9,
-    "medium": 21, 
+    "medium": 21,
     "slow": 50
 }
 
 # ================ PURE PYTHON TA FUNCTIONS ================
-
 def calculate_rsi_pure(prices: pd.Series, period: int = 14) -> pd.Series:
-    """Pure Python RSI calculation - no TA-Lib needed"""
+    """Pure Python RSI calculation"""
     delta = prices.diff()
-    
-    # Separate gains and losses
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
     
-    # Calculate average gain and loss
     avg_gain = gain.rolling(window=period, min_periods=period).mean()
     avg_loss = loss.rolling(window=period, min_periods=period).mean()
     
-    # Handle initial period
     for i in range(period, len(prices)):
         avg_gain.iloc[i] = (avg_gain.iloc[i-1] * (period - 1) + gain.iloc[i]) / period
         avg_loss.iloc[i] = (avg_loss.iloc[i-1] * (period - 1) + loss.iloc[i]) / period
     
-    # Calculate RS and RSI
     rs = avg_gain / avg_loss
     rsi = 100 - (100 / (1 + rs))
-    
     return rsi
 
 def calculate_macd_pure(prices: pd.Series, fast_period: int = 12, 
                        slow_period: int = 26, signal_period: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    """Pure Python MACD calculation - no TA-Lib needed"""
-    # Calculate EMAs
+    """Pure Python MACD calculation"""
     ema_fast = prices.ewm(span=fast_period, adjust=False).mean()
     ema_slow = prices.ewm(span=slow_period, adjust=False).mean()
-    
-    # MACD line
     macd_line = ema_fast - ema_slow
-    
-    # Signal line (EMA of MACD)
     signal_line = macd_line.ewm(span=signal_period, adjust=False).mean()
-    
-    # Histogram
     histogram = macd_line - signal_line
-    
     return macd_line, signal_line, histogram
 
 def calculate_ema(prices: pd.Series, period: int) -> pd.Series:
@@ -121,100 +108,85 @@ def calculate_ema(prices: pd.Series, period: int) -> pd.Series:
 # ================ DATA STRUCTURES ================
 @dataclass
 class MarketStructure:
-    """Market structure analysis - Trend & Key Levels"""
-    trend: str                     # BULLISH, BEARISH, RANGING
-    higher_timeframe_aligned: bool # Daily/4H aligned
-    key_support: float             # Major support level
-    key_resistance: float          # Major resistance level
-    structure_score: float         # 0-1 structure quality
-    
-    # Structure details
-    swing_highs: List[float]       # Recent swing highs
-    swing_lows: List[float]        # Recent swing lows
-    breaker_blocks: List[Dict]     # Order blocks / FVGs
+    """Market structure analysis"""
+    trend: str
+    higher_timeframe_aligned: bool
+    key_support: float
+    key_resistance: float
+    structure_score: float
+    swing_highs: List[float]
+    swing_lows: List[float]
+    breaker_blocks: List[Dict]
 
 @dataclass
 class OrderFlow:
     """Order flow & volume profile analysis"""
-    volume_profile: Dict           # Volume nodes
-    volume_spike: bool             # Volume spike at level
-    volume_ratio: float            # Current vs average volume
-    
-    # Order book analysis
-    bid_ask_imbalance: float       # -1 to +1 (bearish to bullish)
-    orderbook_depth: float         # Orderbook depth ratio
-    
-    # Accumulation/distribution
-    accumulation_score: float      # 0-1 accumulation
-    large_transactions: int        # Large tx count
-    
-    flow_score: float              # Overall flow score 0-1
+    volume_profile: Dict
+    volume_spike: bool
+    volume_ratio: float
+    bid_ask_imbalance: float
+    orderbook_depth: float
+    accumulation_score: float
+    large_transactions: int
+    flow_score: float
 
 @dataclass
 class MomentumSignal:
     """Short-term momentum signals"""
-    rsi_divergence: str           # BULLISH, BEARISH, NONE
-    rsi_value: float              # Current RSI
-    rsi_zone: str                 # OVERSOLD, OVERBOUGHT, NEUTRAL
-    
-    macd_signal: str              # BULLISH_CROSS, BEARISH_CROSS, NONE
-    macd_histogram: float         # MACD histogram value
-    
-    candle_pattern: str           # Pattern name
-    pattern_strength: float       # 0-1 pattern strength
-    
-    momentum_score: float         # Overall momentum score 0-1
+    rsi_divergence: str
+    rsi_value: float
+    rsi_zone: str
+    macd_signal: str
+    macd_histogram: float
+    candle_pattern: str
+    pattern_strength: float
+    momentum_score: float
 
-@dataclass 
+@dataclass
 class LiquidityZone:
     """Liquidity & stop hunt zones"""
-    zone_type: str               # SWEEP_LOW, SWEEP_HIGH, EQ_HIGH, EQ_LOW
-    price_level: float           # Key liquidity level
-    distance_pct: float          # Distance from current price
-    recently_tested: bool        # Recently tested
-    strength: float              # Zone strength 0-1
-    
-    # Liquidation levels
-    liquidation_cluster: Dict    # Nearby liquidations
-    stop_hunt_potential: bool    # Stop hunt likely
+    zone_type: str
+    price_level: float
+    distance_pct: float
+    recently_tested: bool
+    strength: float
+    liquidation_cluster: Dict
+    stop_hunt_potential: bool
 
 @dataclass
 class ConfluenceSetup:
-    """Complete confluence setup for 3-5% move"""
+    """Complete confluence setup"""
     signal_id: str
     symbol: str
-    side: str                    # LONG, SHORT
+    side: str
     
-    # Confluence analysis
     market_structure: MarketStructure
     order_flow: OrderFlow
     momentum: MomentumSignal
     liquidity_zone: LiquidityZone
     
-    # Entry parameters
     entry_price: float
-    entry_type: str              # LIMIT_AT_SUPPORT, BREAKOUT_RETEST, etc.
-    entry_confidence: float      # 0-1 entry confidence
+    entry_type: str
+    entry_confidence: float
     
-    # Risk management
     stop_loss: float
     take_profit: float
-    risk_pct: float              # % risk
-    reward_pct: float            # % reward
+    risk_pct: float
+    reward_pct: float
     risk_reward: float
     
-    # Confluence scoring
-    confluence_score: float      # 0-10 overall score
-    confluence_details: Dict     # Breakdown of scores
-    conditions_met: List[str]    # Which conditions triggered
+    confluence_score: float
+    confluence_details: Dict
+    conditions_met: List[str]
     
-    # Expected move
-    expected_move_pct: float     # Expected move percentage (3-5%)
-    probability_score: float     # Probability of hitting target
+    expected_move_pct: float
+    probability_score: float
     
-    # Timing
-    timeframe_used: str          # Primary entry timeframe
+    timeframe_used: str
     signal_timestamp: float
+    
+    # BTC alignment info (NEW)
+    btc_alignment: Dict = None
 
 # ================ PROFESSIONAL LOGGING ================
 logging.basicConfig(
@@ -224,27 +196,321 @@ logging.basicConfig(
 )
 log = logging.getLogger("confluence_scanner")
 
-# ================ CORE CONFLUENCE ENGINE ================
-class ConfluenceScanner:
-    """Multi-layer confluence scanner for 3-5% moves - FIXED VERSION"""
+# ================ BITCOIN STRUCTURE ANALYSIS ================
+class BitcoinStructure:
+    """Analyze Bitcoin as the primary market structure"""
+    
+    def __init__(self):
+        self.current_structure = None
+        self.last_update = 0
+    
+    async def analyze_bitcoin_structure(self, exchange) -> Dict:
+        """Comprehensive Bitcoin structure analysis"""
+        try:
+            current_time = time.time()
+            if (self.current_structure and 
+                current_time - self.last_update < BTC_ANALYSIS_INTERVAL):
+                return self.current_structure
+            
+            # Fetch BTC data across key timeframes
+            btc_data = {}
+            timeframes = {
+                "DAILY": "1d",
+                "4H": "4h",
+                "1H": "1h",
+                "15M": "15m"
+            }
+            
+            # Fetch all timeframes in parallel
+            tasks = []
+            for tf_name, tf in timeframes.items():
+                limit = 100 if tf_name == "DAILY" else 200
+                tasks.append(self._fetch_btc_timeframe(exchange, tf, limit, tf_name))
+            
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for tf_name, result in zip(timeframes.keys(), results):
+                if isinstance(result, pd.DataFrame) and not result.empty:
+                    btc_data[tf_name] = result
+            
+            # Analyze structure
+            structure = self._analyze_multi_tf_structure(btc_data)
+            
+            # Update cache
+            self.current_structure = structure
+            self.last_update = current_time
+            
+            log.info(f"₿ BTC STRUCTURE: {structure['primary_trend']} | Strength: {structure['trend_strength']:.1f}/10")
+            log.info(f"   Direction: {structure['direction']} | Regime: {structure['regime']}")
+            
+            return structure
+            
+        except Exception as e:
+            log.error(f"BTC analysis error: {e}")
+            return self._get_default_structure()
+    
+    async def _fetch_btc_timeframe(self, exchange, timeframe: str, limit: int, tf_name: str) -> pd.DataFrame:
+        """Fetch BTC OHLCV data"""
+        try:
+            ohlcv = await exchange.fetch_ohlcv(
+                "BTC/USDT",
+                timeframe=timeframe,
+                limit=limit,
+                params={'type': 'spot'}
+            )
+            
+            if ohlcv and len(ohlcv) >= 20:
+                df = pd.DataFrame(
+                    ohlcv,
+                    columns=["timestamp", "open", "high", "low", "close", "volume"]
+                )
+                for col in ["open", "high", "low", "close", "volume"]:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+                df = df.dropna()
+                return df
+            return pd.DataFrame()
+            
+        except Exception as e:
+            log.debug(f"BTC {tf_name} fetch error: {e}")
+            return pd.DataFrame()
+    
+    def _analyze_multi_tf_structure(self, btc_data: Dict) -> Dict:
+        """Analyze Bitcoin structure across all timeframes"""
+        structure = {
+            "primary_trend": "NEUTRAL",
+            "direction": "NEUTRAL",
+            "trend_strength": 0.0,
+            "regime": "RANGING",
+            "key_levels": {},
+            "alignment": {},
+            "momentum": {},
+            "timestamp": time.time()
+        }
+        
+        try:
+            # 1. Determine PRIMARY TREND (Daily)
+            daily_trend = self._get_trend_direction(btc_data.get("DAILY", pd.DataFrame()), "DAILY")
+            structure["primary_trend"] = daily_trend
+            if daily_trend != "NEUTRAL":
+                structure["trend_strength"] += 4.0
+            
+            # 2. Determine TRADING DIRECTION (4H + 1H)
+            tf_4h_trend = self._get_trend_direction(btc_data.get("4H", pd.DataFrame()), "4H")
+            tf_1h_trend = self._get_trend_direction(btc_data.get("1H", pd.DataFrame()), "1H")
+            
+            # Trading direction (what we actually trade)
+            if tf_4h_trend == tf_1h_trend and tf_4h_trend != "NEUTRAL":
+                structure["direction"] = tf_4h_trend
+                structure["trend_strength"] += 3.0
+            
+            # 3. Check alignment
+            trends = [daily_trend, tf_4h_trend, tf_1h_trend]
+            alignment_score = sum(1 for t in trends if t == structure["direction"])
+            structure["alignment"]["score"] = alignment_score / 3.0
+            structure["alignment"]["all_aligned"] = alignment_score == 3
+            
+            # 4. Identify key levels
+            if "DAILY" in btc_data:
+                daily_df = btc_data["DAILY"]
+                structure["key_levels"]["support"] = float(daily_df['low'].iloc[-20:].min())
+                structure["key_levels"]["resistance"] = float(daily_df['high'].iloc[-20:].max())
+                structure["key_levels"]["current"] = float(daily_df['close'].iloc[-1])
+            
+            # 5. Momentum analysis
+            if "15M" in btc_data:
+                momentum = self._analyze_momentum(btc_data["15M"])
+                structure["momentum"] = momentum
+            
+            # 6. Determine market regime
+            structure["regime"] = self._determine_regime(structure, btc_data)
+            
+            # 7. Final strength
+            structure["trend_strength"] = min(structure["trend_strength"], 10.0)
+            
+            return structure
+            
+        except Exception as e:
+            return self._get_default_structure()
+    
+    def _get_trend_direction(self, df: pd.DataFrame, timeframe: str) -> str:
+        """Determine trend direction"""
+        if df is None or df.empty or len(df) < 20:
+            return "NEUTRAL"
+        
+        current_price = df['close'].iloc[-1]
+        
+        # EMA alignment
+        ema_fast = calculate_ema(df['close'], 9).iloc[-1]
+        ema_medium = calculate_ema(df['close'], 21).iloc[-1]
+        ema_slow = calculate_ema(df['close'], 50).iloc[-1]
+        
+        # Check EMA alignment
+        if ema_fast > ema_medium > ema_slow and current_price > ema_fast:
+            return "BULLISH"
+        elif ema_fast < ema_medium < ema_slow and current_price < ema_fast:
+            return "BEARISH"
+        
+        # Check recent price action
+        if len(df) >= 10:
+            recent_return = (current_price - df['close'].iloc[-10]) / df['close'].iloc[-10] * 100
+            if recent_return > 2.0:
+                return "BULLISH"
+            elif recent_return < -2.0:
+                return "BEARISH"
+        
+        return "NEUTRAL"
+    
+    def _analyze_momentum(self, df: pd.DataFrame) -> Dict:
+        """Analyze short-term momentum"""
+        if df is None or df.empty or len(df) < 20:
+            return {"rsi": 50, "macd": "NEUTRAL", "direction": "NEUTRAL"}
+        
+        # RSI
+        rsi_values = calculate_rsi_pure(df['close'], period=14)
+        current_rsi = float(rsi_values.iloc[-1]) if not rsi_values.empty else 50
+        
+        # MACD
+        macd_line, signal_line, _ = calculate_macd_pure(df['close'])
+        macd_signal = "NEUTRAL"
+        if len(macd_line) > 1:
+            if macd_line.iloc[-1] > signal_line.iloc[-1] and macd_line.iloc[-2] <= signal_line.iloc[-2]:
+                macd_signal = "BULLISH_CROSS"
+            elif macd_line.iloc[-1] < signal_line.iloc[-1] and macd_line.iloc[-2] >= signal_line.iloc[-2]:
+                macd_signal = "BEARISH_CROSS"
+        
+        # Direction
+        if "BULLISH" in macd_signal or current_rsi > 55:
+            direction = "BULLISH"
+        elif "BEARISH" in macd_signal or current_rsi < 45:
+            direction = "BEARISH"
+        else:
+            direction = "NEUTRAL"
+        
+        return {
+            "rsi": current_rsi,
+            "macd": macd_signal,
+            "direction": direction
+        }
+    
+    def _determine_regime(self, structure: Dict, btc_data: Dict) -> str:
+        """Determine current Bitcoin market regime"""
+        trend_strength = structure["trend_strength"]
+        direction = structure["direction"]
+        
+        if trend_strength >= 7.0:
+            return f"STRONG_{direction}_TREND"
+        elif trend_strength >= 5.0:
+            return f"{direction}_TREND"
+        elif trend_strength >= 3.0:
+            return f"MILD_{direction}"
+        
+        # Check volatility
+        if "15M" in btc_data:
+            df = btc_data["15M"]
+            if len(df) >= 10:
+                volatility = df['close'].pct_change().std() * 100
+                if volatility > 1.0:
+                    return "HIGH_VOL_RANGE"
+        
+        return "LOW_VOL_RANGE"
+    
+    def _get_default_structure(self) -> Dict:
+        return {
+            "primary_trend": "NEUTRAL",
+            "direction": "NEUTRAL",
+            "trend_strength": 0.0,
+            "regime": "RANGING",
+            "key_levels": {"support": 0, "resistance": 0, "current": 0},
+            "alignment": {"score": 0, "all_aligned": False},
+            "momentum": {"rsi": 50, "macd": "NEUTRAL", "direction": "NEUTRAL"},
+            "timestamp": time.time()
+        }
+    
+    def should_trade_alts(self, btc_structure: Dict) -> bool:
+        """Determine if we should trade altcoins based on BTC structure"""
+        direction = btc_structure["direction"]
+        strength = btc_structure["trend_strength"]
+        regime = btc_structure["regime"]
+        
+        # NEVER trade alts when BTC has no clear direction
+        if direction == "NEUTRAL":
+            return False
+        
+        # Only trade alts when BTC has sufficient trend strength
+        if strength < BTC_MIN_TREND_STRENGTH:
+            return False
+        
+        # Avoid high volatility periods
+        if "HIGH_VOL" in regime:
+            return False
+        
+        return True
+    
+    def get_recommended_alt_side(self, btc_structure: Dict) -> str:
+        """Get recommended side for altcoin trades based on BTC"""
+        btc_direction = btc_structure["direction"]
+        btc_momentum = btc_structure["momentum"]["direction"]
+        
+        # BTC direction overrides everything
+        if btc_direction == "BULLISH":
+            return "LONG"
+        elif btc_direction == "BEARISH":
+            return "SHORT"
+        
+        # If BTC is neutral, check momentum
+        if btc_momentum == "BULLISH":
+            return "LONG"
+        elif btc_momentum == "BEARISH":
+            return "SHORT"
+        
+        return "NEUTRAL"
+    
+    def calculate_btc_adjusted_score(self, alt_signal: ConfluenceSetup, btc_structure: Dict) -> float:
+        """Adjust altcoin confluence score based on BTC alignment"""
+        alt_side = alt_signal.side
+        btc_recommended_side = self.get_recommended_alt_side(btc_structure)
+        
+        base_score = alt_signal.confluence_score
+        
+        # CRITICAL: Score multiplier based on BTC alignment
+        if alt_side == btc_recommended_side:
+            # STRONG ALIGNMENT - major bonus
+            alignment_multiplier = 1.3
+            
+            # Extra bonus if BTC trend is strong
+            if btc_structure["trend_strength"] >= 7.0:
+                alignment_multiplier = 1.5
+            
+        elif btc_recommended_side == "NEUTRAL":
+            # BTC has no strong opinion - neutral multiplier
+            alignment_multiplier = 1.0
+            
+        else:
+            # COUNTER-BTC TRADE - heavy penalty
+            alignment_multiplier = 0.5
+        
+        # Apply multiplier
+        adjusted_score = base_score * alignment_multiplier
+        return min(adjusted_score, 10.0)
+
+# ================ BTC-CENTRIC CONFLUENCE SCANNER ================
+class BTCConfluenceScanner:
+    """BTC-centric confluence scanner - Bitcoin structure determines altcoin trades"""
     
     class SignalManager:
-        """Manage signals with confluence-based deduplication"""
+        """Manage signals with BTC-based filtering"""
         
         def __init__(self):
-            self.active_signals = {}      # symbol: signal_id
-            self.signal_states = {}       # signal_id: state
-            self.confluence_history = {}  # symbol: recent confluence scores
-            # NEW: Track consecutive failures per symbol
-            self.consecutive_failures = {}  # symbol: {LONG: count, SHORT: count}
-            self.symbol_blacklist = {}    # symbol: expiry_time
+            self.active_signals = {}
+            self.signal_states = {}
+            self.confluence_history = {}
+            self.consecutive_failures = {}
+            self.symbol_blacklist = {}
             
         def should_generate_signal(self, symbol: str, new_score: float, side: str) -> bool:
             """Check if new signal has significantly better confluence"""
-            # Check blacklist
             if symbol in self.symbol_blacklist:
                 if time.time() < self.symbol_blacklist[symbol]:
-                    log.debug(f"{symbol}: Blacklisted until {datetime.fromtimestamp(self.symbol_blacklist[symbol])}")
                     return False
                 else:
                     del self.symbol_blacklist[symbol]
@@ -257,16 +523,11 @@ class ConfluenceScanner:
                 return True
             
             state = self.signal_states[signal_id]
-            
-            # Only allow new signal if:
-            # 1. Old signal is CLOSED, OR
-            # 2. New confluence score is 15%+ better
             if state.get("status") == "CLOSED":
                 return True
             
             old_score = state.get("confluence_score", 0)
-            if new_score > old_score * 1.15:  # 15% better confluence
-                log.debug(f"{symbol}: New confluence {new_score:.1f} vs old {old_score:.1f}")
+            if new_score > old_score * 1.15:
                 return True
             
             return False
@@ -304,7 +565,7 @@ class ConfluenceScanner:
             log.debug(f"Registered confluence signal {signal.signal_id[:8]} for {symbol} {side}")
         
         def update_signal_status(self, signal_id: str, status: str, result: str = None):
-            """Update signal status with result (WIN/LOSS)"""
+            """Update signal status with result"""
             if signal_id in self.signal_states:
                 state = self.signal_states[signal_id]
                 state["status"] = status
@@ -319,13 +580,12 @@ class ConfluenceScanner:
                     
                     self.consecutive_failures[symbol][side] += 1
                     
-                    # BLACKLIST LOGIC: After 3 consecutive failures on same side
+                    # Blacklist after 3 consecutive failures
                     if self.consecutive_failures[symbol][side] >= 3:
-                        # Blacklist this symbol for 4 hours for this side
                         self.symbol_blacklist[symbol] = time.time() + (4 * 3600)
                         log.warning(f"{symbol} {side}: 3+ consecutive losses - blacklisted for 4 hours")
                     
-                    # Reset opposite side counter (fresh start)
+                    # Reset opposite side
                     opposite_side = "SHORT" if side == "LONG" else "LONG"
                     self.consecutive_failures[symbol][opposite_side] = 0
                 
@@ -354,7 +614,7 @@ class ConfluenceScanner:
             for signal_id, state in list(self.signal_states.items()):
                 if state.get("status") == "CLOSED":
                     age = current_time - state.get("timestamp", 0)
-                    if age > 3600:  # 1 hour
+                    if age > 3600:
                         to_remove.append(signal_id)
             
             for signal_id in to_remove:
@@ -362,10 +622,11 @@ class ConfluenceScanner:
                 if self.active_signals.get(symbol) == signal_id:
                     del self.active_signals[symbol]
                 del self.signal_states[signal_id]
-                log.debug(f"Cleaned signal {signal_id[:8]} for {symbol}")
     
     def __init__(self):
         self.signal_manager = self.SignalManager()
+        self.bitcoin_structure = BitcoinStructure()
+        self.btc_structure = None
         self.daily_stats = {
             "scans": 0,
             "pairs_analyzed": 0,
@@ -373,19 +634,21 @@ class ConfluenceScanner:
             "high_quality_signals": 0,
             "rejected_low_confluence": 0,
             "rejected_no_alignment": 0,
-            "rejected_counter_trend": 0,  # NEW
-            "rejected_blacklisted": 0     # NEW
+            "rejected_counter_trend": 0,
+            "rejected_blacklisted": 0,
+            # BTC-centric stats
+            "rejected_counter_btc": 0,
+            "rejected_btc_neutral": 0,
+            "btc_aligned_signals": 0,
+            "btc_direction": "NEUTRAL"
         }
     
     # ========== MARKET STRUCTURE ANALYSIS ==========
     
     def analyze_market_structure(self, df_daily: pd.DataFrame, df_4h: pd.DataFrame, 
                                 df_1h: pd.DataFrame) -> MarketStructure:
-        """
-        Analyze market structure across multiple timeframes
-        """
+        """Analyze market structure across multiple timeframes"""
         try:
-            # Check for empty dataframes properly
             if not self._validate_dataframe(df_daily, 20):
                 return self._get_default_structure()
             if not self._validate_dataframe(df_4h, 20):
@@ -408,7 +671,7 @@ class ConfluenceScanner:
             # 5. Find order blocks/FVGs (1H)
             breaker_blocks = self._find_breaker_blocks(df_1h)
             
-            # 6. Calculate structure score WITH PENALTY FOR MISALIGNMENT
+            # 6. Calculate structure score
             structure_score = self._calculate_structure_score(
                 daily_trend, htf_aligned, swing_highs, swing_lows
             )
@@ -444,18 +707,15 @@ class ConfluenceScanner:
             if len(df) < 50:
                 return "RANGING"
             
-            # Use EMAs for trend (pure Python)
             ema_fast = calculate_ema(df['close'], 9).iloc[-1]
             ema_medium = calculate_ema(df['close'], 21).iloc[-1]
             ema_slow = calculate_ema(df['close'], 50).iloc[-1]
             
-            # Check alignment
             if ema_fast > ema_medium > ema_slow:
                 return "BULLISH"
             elif ema_fast < ema_medium < ema_slow:
                 return "BEARISH"
             
-            # Check price position relative to EMAs
             current_price = df['close'].iloc[-1]
             if current_price > ema_medium:
                 return "BULLISH"
@@ -476,7 +736,6 @@ class ConfluenceScanner:
             higher_trend = self._determine_trend(df_higher, "HTF")
             lower_trend = self._determine_trend(df_lower, "LTF")
             
-            # Require clear trend on both timeframes
             if higher_trend == "RANGING" or lower_trend == "RANGING":
                 return False
             
@@ -491,14 +750,10 @@ class ConfluenceScanner:
             if len(df) < 30:
                 return 0.0, 0.0
             
-            # Use recent price action for key levels
             recent_highs = df['high'].iloc[-30:].nlargest(3).values
             recent_lows = df['low'].iloc[-30:].nsmallest(3).values
             
-            # Major resistance (cluster of highs)
             key_resistance = np.mean(recent_highs) if len(recent_highs) > 0 else 0.0
-            
-            # Major support (cluster of lows)
             key_support = np.mean(recent_lows) if len(recent_lows) > 0 else 0.0
             
             return float(key_support), float(key_resistance)
@@ -515,9 +770,8 @@ class ConfluenceScanner:
             swing_highs = []
             swing_lows = []
             
-            # Simple swing point detection
             for i in range(2, len(df) - 2):
-                if i < 5:  # Skip too recent
+                if i < 5:
                     continue
                 
                 high = df['high'].iloc[i]
@@ -537,7 +791,7 @@ class ConfluenceScanner:
                     low < df['low'].iloc[i+2]):
                     swing_lows.append(float(low))
             
-            return swing_highs[-3:], swing_lows[-3:]  # Return last 3
+            return swing_highs[-3:], swing_lows[-3:]
             
         except Exception as e:
             return [], []
@@ -554,10 +808,10 @@ class ConfluenceScanner:
                 current = df.iloc[i]
                 prev = df.iloc[i-1]
                 
-                # Bearish order block (rally base drop)
-                if (prev['close'] > prev['open'] and  # Bullish candle
-                    current['close'] < current['open'] and  # Bearish candle
-                    current['low'] < prev['low']):  # Takes out low
+                # Bearish order block
+                if (prev['close'] > prev['open'] and
+                    current['close'] < current['open'] and
+                    current['low'] < prev['low']):
                     
                     block = {
                         "type": "BEARISH_OB",
@@ -567,10 +821,10 @@ class ConfluenceScanner:
                     }
                     blocks.append(block)
                 
-                # Bullish order block (drop base rally)
-                if (prev['close'] < prev['open'] and  # Bearish candle
-                    current['close'] > current['open'] and  # Bullish candle
-                    current['high'] > prev['high']):  # Takes out high
+                # Bullish order block
+                if (prev['close'] < prev['open'] and
+                    current['close'] > current['open'] and
+                    current['high'] > prev['high']):
                     
                     block = {
                         "type": "BULLISH_OB",
@@ -580,32 +834,27 @@ class ConfluenceScanner:
                     }
                     blocks.append(block)
             
-            return blocks[-5:]  # Return last 5 blocks
+            return blocks[-5:]
             
         except Exception as e:
             return []
     
     def _calculate_structure_score(self, trend: str, aligned: bool, 
                                   swing_highs: List, swing_lows: List) -> float:
-        """Calculate market structure quality score WITH PENALTY FOR MISALIGNMENT"""
+        """Calculate market structure quality score"""
         score = 0.0
         
-        # Trend strength (0-0.3)
         if trend != "RANGING":
             score += 0.3
         
-        # HTF alignment - FIXED: Penalize misalignment, reward alignment
         if aligned:
-            score += 0.3  # Bonus for alignment
+            score += 0.3
         elif trend != "RANGING":
-            # MISALIGNMENT PENALTY: -0.2 (was 0.0 in v5.1)
-            score -= 0.2  # Penalty for trading against HTF trend
+            score -= 0.2
         
-        # Clear swing points (0-0.4)
         if len(swing_highs) >= 2 and len(swing_lows) >= 2:
             score += 0.4
         
-        # Ensure non-negative
         return max(0.0, min(score, 1.0))
     
     def _get_default_structure(self) -> MarketStructure:
@@ -628,25 +877,13 @@ class ConfluenceScanner:
             if not self._validate_dataframe(df_15m, 30):
                 return self._get_default_order_flow()
             
-            # 1. Volume profile analysis
             volume_profile = self._analyze_volume_profile(df_15m)
-            
-            # 2. Volume spike detection
             volume_spike, volume_ratio = self._detect_volume_spike(df_15m)
-            
-            # 3. Bid/ask imbalance (simulated)
             bid_ask_imbalance = self._estimate_bid_ask_imbalance(df_15m)
-            
-            # 4. Orderbook depth (simulated)
             orderbook_depth = self._estimate_orderbook_depth(df_15m)
-            
-            # 5. Accumulation score
             accumulation_score = self._calculate_accumulation_score(df_15m)
-            
-            # 6. Large transactions (simulated)
             large_transactions = self._count_large_transactions(df_15m)
             
-            # 7. Overall flow score
             flow_score = self._calculate_flow_score(
                 volume_spike, volume_ratio, bid_ask_imbalance,
                 orderbook_depth, accumulation_score
@@ -673,7 +910,6 @@ class ConfluenceScanner:
             if len(df) < 20:
                 return {"high_volume_nodes": [], "low_volume_gaps": []}
             
-            # Simple volume profile
             price_bins = np.linspace(df['low'].min(), df['high'].max(), 20)
             volume_by_price = []
             
@@ -681,7 +917,6 @@ class ConfluenceScanner:
                 low_bin = price_bins[i]
                 high_bin = price_bins[i+1]
                 
-                # Volume in this price range
                 mask = (df['low'] >= low_bin) & (df['high'] <= high_bin)
                 volume_in_range = df.loc[mask, 'volume'].sum()
                 
@@ -690,7 +925,6 @@ class ConfluenceScanner:
                     "volume": float(volume_in_range)
                 })
             
-            # Find high volume nodes (POC areas)
             volumes = [item["volume"] for item in volume_by_price]
             if volumes:
                 avg_volume = np.mean(volumes)
@@ -702,8 +936,8 @@ class ConfluenceScanner:
                 high_volume_nodes = []
             
             return {
-                "high_volume_nodes": high_volume_nodes[:3],  # Top 3
-                "low_volume_gaps": []  # Simplified
+                "high_volume_nodes": high_volume_nodes[:3],
+                "low_volume_gaps": []
             }
             
         except Exception as e:
@@ -720,7 +954,7 @@ class ConfluenceScanner:
             
             if avg_volume > 0:
                 ratio = recent_volume / avg_volume
-                spike = ratio >= 2.0  # 2x volume spike
+                spike = ratio >= 2.0
                 return spike, float(ratio)
             
             return False, 1.0
@@ -734,12 +968,10 @@ class ConfluenceScanner:
             if len(df) < 10:
                 return 0.0
             
-            # Use close vs open to estimate buying/selling pressure
             recent = df.iloc[-5:]
             closes = recent['close'].values
             opens = recent['open'].values
             
-            # Count bullish vs bearish candles
             bullish = sum(closes > opens)
             bearish = sum(closes < opens)
             
@@ -759,7 +991,6 @@ class ConfluenceScanner:
             if len(df) < 20:
                 return 0.5
             
-            # Lower volatility suggests better depth
             recent_volatility = df['close'].pct_change().std() * 100
             avg_volatility = df['close'].pct_change().iloc[-50:].std() * 100
             
@@ -778,14 +1009,11 @@ class ConfluenceScanner:
             if len(df) < 30:
                 return 0.5
             
-            # Using price-volume relationship
             price_change = df['close'].iloc[-1] - df['close'].iloc[-10]
             volume_change = df['volume'].iloc[-10:].mean() / df['volume'].iloc[-30:-10].mean()
             
-            # Positive price with increasing volume = accumulation
             if price_change > 0 and volume_change > 1.2:
                 return 0.8
-            # Negative price with decreasing volume = possible accumulation
             elif price_change < 0 and volume_change < 0.8:
                 return 0.6
             
@@ -800,7 +1028,6 @@ class ConfluenceScanner:
             if len(df) < 10:
                 return 0
             
-            # Simulate based on volume spikes
             avg_volume = df['volume'].mean()
             large_tx_count = sum(df['volume'] > avg_volume * 3)
             
@@ -814,19 +1041,10 @@ class ConfluenceScanner:
         """Calculate overall flow score"""
         weights = [0.25, 0.20, 0.25, 0.15, 0.15]
         
-        # Volume spike score
         spike_score = 1.0 if volume_spike else 0.5
-        
-        # Volume ratio score (normalized)
         volume_score = min(volume_ratio / 3.0, 1.0)
-        
-        # Imbalance score (absolute value)
         imbalance_score = abs(imbalance)
-        
-        # Depth score
         depth_score = depth
-        
-        # Accumulation score
         accum_score = accumulation
         
         factors = [spike_score, volume_score, imbalance_score, depth_score, accum_score]
@@ -845,24 +1063,18 @@ class ConfluenceScanner:
             flow_score=0.5
         )
     
-    # ========== MOMENTUM ANALYSIS (NO TA-Lib) ==========
+    # ========== MOMENTUM ANALYSIS ==========
     
     def analyze_momentum(self, df_15m: pd.DataFrame, df_5m: pd.DataFrame) -> MomentumSignal:
-        """Analyze short-term momentum signals - NO TA-Lib"""
+        """Analyze short-term momentum signals"""
         try:
             if not self._validate_dataframe(df_15m, 30) or not self._validate_dataframe(df_5m, 30):
                 return self._get_default_momentum()
             
-            # 1. RSI analysis (pure Python)
             rsi_divergence, rsi_value, rsi_zone = self._analyze_rsi_pure(df_15m)
-            
-            # 2. MACD analysis (pure Python)
             macd_signal, macd_histogram = self._analyze_macd_pure(df_15m)
-            
-            # 3. Candlestick patterns
             candle_pattern, pattern_strength = self._analyze_candle_patterns(df_5m)
             
-            # 4. Momentum score
             momentum_score = self._calculate_momentum_score(
                 rsi_divergence, rsi_zone, macd_signal, candle_pattern
             )
@@ -883,12 +1095,11 @@ class ConfluenceScanner:
             return self._get_default_momentum()
     
     def _analyze_rsi_pure(self, df: pd.DataFrame) -> Tuple[str, float, str]:
-        """Analyze RSI for divergence and zones - Pure Python"""
+        """Analyze RSI for divergence and zones"""
         try:
             if len(df) < 30:
                 return "NONE", 50.0, "NEUTRAL"
             
-            # Calculate RSI using pure Python
             prices = df['close']
             rsi_values = calculate_rsi_pure(prices, period=RSI_PERIOD)
             
@@ -897,7 +1108,6 @@ class ConfluenceScanner:
             
             current_rsi = float(rsi_values.iloc[-1])
             
-            # Determine RSI zone
             if current_rsi <= RSI_OVERSOLD:
                 rsi_zone = "OVERSOLD"
             elif current_rsi >= RSI_OVERBOUGHT:
@@ -905,21 +1115,18 @@ class ConfluenceScanner:
             else:
                 rsi_zone = "NEUTRAL"
             
-            # Check for divergence (simplified)
             rsi_divergence = "NONE"
             
-            # Look for hidden bullish divergence (RSI making higher low while price makes lower low)
             if len(rsi_values) >= 10:
                 recent_rsi = rsi_values.iloc[-5:].values
                 recent_prices = prices.iloc[-5:].values
                 
-                if (recent_rsi[-1] > recent_rsi[-3] and  # RSI higher low
-                    recent_prices[-1] < recent_prices[-3]):  # Price lower low
+                if (recent_rsi[-1] > recent_rsi[-3] and
+                    recent_prices[-1] < recent_prices[-3]):
                     rsi_divergence = "BULLISH_HIDDEN"
                 
-                # Hidden bearish divergence
-                elif (recent_rsi[-1] < recent_rsi[-3] and  # RSI lower high
-                      recent_prices[-1] > recent_prices[-3]):  # Price higher high
+                elif (recent_rsi[-1] < recent_rsi[-3] and
+                      recent_prices[-1] > recent_prices[-3]):
                     rsi_divergence = "BEARISH_HIDDEN"
             
             return rsi_divergence, current_rsi, rsi_zone
@@ -928,15 +1135,14 @@ class ConfluenceScanner:
             return "NONE", 50.0, "NEUTRAL"
     
     def _analyze_macd_pure(self, df: pd.DataFrame) -> Tuple[str, float]:
-        """Analyze MACD signals - Pure Python"""
+        """Analyze MACD signals"""
         try:
             if len(df) < 35:
                 return "NONE", 0.0
             
-            # Calculate MACD using pure Python
             prices = df['close'].values
             macd_line, signal_line, hist = calculate_macd_pure(
-                df['close'], 
+                df['close'],
                 fast_period=12,
                 slow_period=26,
                 signal_period=9
@@ -948,7 +1154,6 @@ class ConfluenceScanner:
             current_hist = float(hist.iloc[-1])
             prev_hist = float(hist.iloc[-2]) if len(hist) > 1 else 0.0
             
-            # Check for crossover
             current_macd = float(macd_line.iloc[-1])
             current_signal = float(signal_line.iloc[-1])
             prev_macd = float(macd_line.iloc[-2]) if len(macd_line) > 1 else 0.0
@@ -956,13 +1161,10 @@ class ConfluenceScanner:
             
             macd_signal = "NONE"
             
-            # Bullish crossover
             if prev_macd < prev_signal and current_macd > current_signal:
                 macd_signal = "BULLISH_CROSS"
-            # Bearish crossover
             elif prev_macd > prev_signal and current_macd < current_signal:
                 macd_signal = "BEARISH_CROSS"
-            # Histogram flip
             elif prev_hist < 0 and current_hist > 0:
                 macd_signal = "BULLISH_FLIP"
             elif prev_hist > 0 and current_hist < 0:
@@ -979,43 +1181,41 @@ class ConfluenceScanner:
             if len(df) < 5:
                 return "NONE", 0.0
             
-            # Get recent candles
             current = df.iloc[-1]
             prev1 = df.iloc[-2]
-            prev2 = df.iloc[-3] if len(df) >= 3 else None
             
             # Bullish engulfing
-            if (prev1['close'] < prev1['open'] and  # Previous bearish
-                current['close'] > current['open'] and  # Current bullish
-                current['close'] > prev1['open'] and  # Engulfs previous
+            if (prev1['close'] < prev1['open'] and
+                current['close'] > current['open'] and
+                current['close'] > prev1['open'] and
                 current['open'] < prev1['close']):
                 return "BULLISH_ENGULFING", 0.8
             
             # Bearish engulfing
-            if (prev1['close'] > prev1['open'] and  # Previous bullish
-                current['close'] < current['open'] and  # Current bearish
-                current['close'] < prev1['open'] and  # Engulfs previous
+            if (prev1['close'] > prev1['open'] and
+                current['close'] < current['open'] and
+                current['close'] < prev1['open'] and
                 current['open'] > prev1['close']):
                 return "BEARISH_ENGULFING", 0.8
             
-            # Hammer (bullish reversal)
-            if (current['close'] > current['open'] and  # Bullish
-                (current['low'] - min(current['open'], current['close'])) > 
-                (abs(current['close'] - current['open']) * 2) and  # Long lower wick
-                (current['high'] - max(current['open'], current['close'])) < 
-                abs(current['close'] - current['open'])):  # Small upper wick
+            # Hammer
+            if (current['close'] > current['open'] and
+                (current['low'] - min(current['open'], current['close'])) >
+                (abs(current['close'] - current['open']) * 2) and
+                (current['high'] - max(current['open'], current['close'])) <
+                abs(current['close'] - current['open'])):
                 return "HAMMER", 0.7
             
-            # Shooting star (bearish reversal)
-            if (current['close'] < current['open'] and  # Bearish
-                (current['high'] - max(current['open'], current['close'])) > 
-                (abs(current['close'] - current['open']) * 2) and  # Long upper wick
-                (min(current['open'], current['close']) - current['low']) < 
-                abs(current['close'] - current['open'])):  # Small lower wick
+            # Shooting star
+            if (current['close'] < current['open'] and
+                (current['high'] - max(current['open'], current['close'])) >
+                (abs(current['close'] - current['open']) * 2) and
+                (min(current['open'], current['close']) - current['low']) <
+                abs(current['close'] - current['open'])):
                 return "SHOOTING_STAR", 0.7
             
             # Inside bar
-            if (current['high'] < prev1['high'] and 
+            if (current['high'] < prev1['high'] and
                 current['low'] > prev1['low']):
                 return "INSIDE_BAR", 0.6
             
@@ -1024,22 +1224,19 @@ class ConfluenceScanner:
         except Exception as e:
             return "NONE", 0.0
     
-    def _calculate_momentum_score(self, rsi_div: str, rsi_zone: str, 
+    def _calculate_momentum_score(self, rsi_div: str, rsi_zone: str,
                                  macd_signal: str, candle_pattern: str) -> float:
         """Calculate momentum score"""
         score = 0.0
         
-        # RSI divergence (0-0.4)
         if rsi_div != "NONE":
             score += 0.4
         elif rsi_zone in ["OVERSOLD", "OVERBOUGHT"]:
             score += 0.2
         
-        # MACD signal (0-0.3)
         if macd_signal != "NONE":
             score += 0.3
         
-        # Candlestick pattern (0-0.3)
         if candle_pattern != "NONE":
             score += 0.3
         
@@ -1059,29 +1256,23 @@ class ConfluenceScanner:
     
     # ========== LIQUIDITY ZONE ANALYSIS ==========
     
-    def analyze_liquidity_zones(self, df_4h: pd.DataFrame, df_1h: pd.DataFrame, 
+    def analyze_liquidity_zones(self, df_4h: pd.DataFrame, df_1h: pd.DataFrame,
                                current_price: float) -> LiquidityZone:
         """Analyze liquidity zones for stop hunts"""
         try:
             if not self._validate_dataframe(df_4h, 20) or not self._validate_dataframe(df_1h, 20):
                 return self._get_default_liquidity_zone()
             
-            # 1. Identify liquidity zones
             best_zone = self._identify_liquidity_zone(df_4h, df_1h, current_price)
             
-            # 2. Calculate distance
             if best_zone["price_level"] > 0:
                 distance_pct = abs(current_price - best_zone["price_level"]) / current_price * 100
             else:
                 distance_pct = 0.0
             
-            # 3. Check if recently tested
             recently_tested = self._check_recent_test(df_1h, best_zone["price_level"])
-            
-            # 4. Liquidation clusters (simulated)
             liquidation_cluster = self._estimate_liquidations(df_1h, best_zone["price_level"])
             
-            # 5. Stop hunt potential
             stop_hunt_potential = self._assess_stop_hunt_potential(
                 best_zone["zone_type"], distance_pct, liquidation_cluster
             )
@@ -1100,33 +1291,31 @@ class ConfluenceScanner:
             log.error(f"Liquidity zone error: {e}")
             return self._get_default_liquidity_zone()
     
-    def _identify_liquidity_zone(self, df_4h: pd.DataFrame, df_1h: pd.DataFrame, 
+    def _identify_liquidity_zone(self, df_4h: pd.DataFrame, df_1h: pd.DataFrame,
                                 current_price: float) -> Dict:
         """Identify the strongest liquidity zone"""
         zones = []
         
         try:
-            # 1. Recent swing high/low (4H)
+            # Recent swing high/low (4H)
             recent_high_4h = df_4h['high'].iloc[-20:].max()
             recent_low_4h = df_4h['low'].iloc[-20:].min()
             
-            # Equal highs/lows
-            if abs(current_price - recent_high_4h) / recent_high_4h < 0.01:  # 1%
+            if abs(current_price - recent_high_4h) / recent_high_4h < 0.01:
                 zones.append({
                     "zone_type": "EQ_HIGH",
                     "price_level": float(recent_high_4h),
                     "strength": 0.8
                 })
             
-            if abs(current_price - recent_low_4h) / recent_low_4h < 0.01:  # 1%
+            if abs(current_price - recent_low_4h) / recent_low_4h < 0.01:
                 zones.append({
-                    "zone_type": "EQ_LOW", 
+                    "zone_type": "EQ_LOW",
                     "price_level": float(recent_low_4h),
                     "strength": 0.8
                 })
             
-            # 2. Previous liquidity sweeps (1H)
-            # Look for wicks that took out previous highs/lows
+            # Previous liquidity sweeps (1H)
             if len(df_1h) >= 10:
                 for i in range(5, len(df_1h) - 1):
                     candle = df_1h.iloc[i]
@@ -1134,7 +1323,7 @@ class ConfluenceScanner:
                     prev_low = df_1h['low'].iloc[i-5:i].min()
                     
                     # Sweep high
-                    if candle['high'] > prev_high * 1.005:  # 0.5% above
+                    if candle['high'] > prev_high * 1.005:
                         zones.append({
                             "zone_type": "SWEEP_HIGH",
                             "price_level": float(candle['high']),
@@ -1142,16 +1331,14 @@ class ConfluenceScanner:
                         })
                     
                     # Sweep low
-                    if candle['low'] < prev_low * 0.995:  # 0.5% below
+                    if candle['low'] < prev_low * 0.995:
                         zones.append({
                             "zone_type": "SWEEP_LOW",
                             "price_level": float(candle['low']),
                             "strength": 0.9
                         })
             
-            # 3. Select strongest zone near price
             if zones:
-                # Sort by strength and proximity
                 zones.sort(key=lambda x: (
                     x["strength"],
                     -abs(current_price - x["price_level"]) / current_price
@@ -1185,37 +1372,29 @@ class ConfluenceScanner:
             if price_level == 0 or len(df) < 20:
                 return {"longs": 0, "shorts": 0, "total": 0}
             
-            # Simulate based on volatility and price action
             volatility = df['close'].pct_change().std() * 100
-            
-            # More liquidations near swing points
             recent_high = df['high'].iloc[-10:].max()
             recent_low = df['low'].iloc[-10:].min()
             
             if abs(price_level - recent_high) / recent_high < 0.01:
-                # Near high = more short liquidations if broken
                 return {"longs": 50, "shorts": 150, "total": 200}
             elif abs(price_level - recent_low) / recent_low < 0.01:
-                # Near low = more long liquidations if broken
                 return {"longs": 150, "shorts": 50, "total": 200}
             else:
-                # Neutral zone
                 return {"longs": 100, "shorts": 100, "total": 200}
                 
         except Exception as e:
             return {"longs": 0, "shorts": 0, "total": 0}
     
-    def _assess_stop_hunt_potential(self, zone_type: str, distance_pct: float, 
+    def _assess_stop_hunt_potential(self, zone_type: str, distance_pct: float,
                                    liquidations: Dict) -> bool:
         """Assess stop hunt potential"""
         if zone_type == "NONE":
             return False
         
-        # Close to level with liquidations nearby
         if distance_pct < 1.0 and liquidations.get("total", 0) > 100:
             return True
         
-        # Sweep zones always have potential
         if "SWEEP" in zone_type:
             return True
         
@@ -1232,9 +1411,336 @@ class ConfluenceScanner:
             stop_hunt_potential=False
         )
     
-    # ========== CONFLUENCE SIGNAL GENERATION ==========
+    # ========== CONFLUENCE SIGNAL GENERATION (BTC-CENTRIC) ==========
     
-    def calculate_confluence_score(self, structure: MarketStructure, 
+    async def generate_confluence_signal(self, multi_tf_data: Dict[str, pd.DataFrame],
+                                       symbol: str, exchange=None) -> Optional[ConfluenceSetup]:
+        """
+        Generate BTC-CENTRIC confluence signal
+        Bitcoin structure is PRIMARY, altcoin must align
+        """
+        
+        # === STEP 1: ANALYZE BITCOIN FIRST (CRITICAL) ===
+        if exchange and (self.btc_structure is None or time.time() - self.btc_structure.get("timestamp", 0) > BTC_ANALYSIS_INTERVAL):
+            self.btc_structure = await self.bitcoin_structure.analyze_bitcoin_structure(exchange)
+            self.daily_stats["btc_direction"] = self.btc_structure["direction"]
+        
+        # If no BTC structure or BTC is neutral, can't proceed
+        if not self.btc_structure or self.btc_structure["direction"] == "NEUTRAL":
+            self.daily_stats["rejected_btc_neutral"] += 1
+            log.debug(f"{symbol}: BTC has no clear direction")
+            return None
+        
+        # Check if we should trade alts in this BTC regime
+        if not self.bitcoin_structure.should_trade_alts(self.btc_structure):
+            self.daily_stats["rejected_btc_neutral"] += 1
+            log.debug(f"{symbol}: BTC regime {self.btc_structure['regime']} not suitable for alts")
+            return None
+        
+        # Get BTC-recommended side
+        btc_recommended_side = self.bitcoin_structure.get_recommended_alt_side(self.btc_structure)
+        
+        # === STEP 2: Analyze altcoin (your existing analysis) ===
+        try:
+            df_daily = multi_tf_data.get("DAILY")
+            df_4h = multi_tf_data.get("4H")
+            df_1h = multi_tf_data.get("1H")
+            df_15m = multi_tf_data.get("15M")
+            df_5m = multi_tf_data.get("5M")
+            
+            required_minimums = {
+                "DAILY": 30,
+                "4H": 40,
+                "1H": 50,
+                "15M": 60,
+                "5M": 50
+            }
+            
+            for tf_name, df in [("DAILY", df_daily), ("4H", df_4h), ("1H", df_1h),
+                               ("15M", df_15m), ("5M", df_5m)]:
+                min_len = required_minimums[tf_name]
+                if df is None or df.empty or len(df) < min_len:
+                    log.debug(f"{symbol}: Insufficient {tf_name} data")
+                    return None
+                
+                if not self._validate_dataframe(df, 15):
+                    log.debug(f"{symbol}: Invalid data in {tf_name}")
+                    return None
+            
+            current_price = df_5m['close'].iloc[-1]
+            
+            # === STEP 3: Analyze altcoin components ===
+            market_structure = self.analyze_market_structure(df_daily, df_4h, df_1h)
+            
+            # Check for blacklisted symbol
+            if self.signal_manager.is_blacklisted(symbol):
+                self.daily_stats["rejected_blacklisted"] += 1
+                log.debug(f"{symbol}: Currently blacklisted")
+                return None
+            
+            order_flow = self.analyze_order_flow(df_15m, current_price)
+            momentum = self.analyze_momentum(df_15m, df_5m)
+            liquidity_zone = self.analyze_liquidity_zones(df_4h, df_1h, current_price)
+            
+            # === STEP 4: Determine altcoin side WITH BTC CONSTRAINT ===
+            # First, get the altcoin's natural side from confluence
+            alt_side = self._determine_trade_side_original(
+                market_structure, momentum, liquidity_zone, symbol
+            )
+            
+            if not alt_side:
+                log.debug(f"{symbol}: No clear altcoin side from confluence")
+                return None
+            
+            # === STEP 5: ENFORCE BTC ALIGNMENT ===
+            # CRITICAL: Altcoin side MUST match BTC direction
+            if alt_side != btc_recommended_side:
+                self.daily_stats["rejected_counter_btc"] += 1
+                log.debug(f"{symbol}: Rejected - {alt_side} vs BTC {btc_recommended_side}")
+                return None
+            
+            # Perfect BTC alignment - proceed
+            self.daily_stats["btc_aligned_signals"] += 1
+            log.debug(f"{symbol}: Perfect BTC alignment - {alt_side}")
+            
+            # === STEP 6: Check consecutive failures ===
+            consecutive_failures = self.signal_manager.get_consecutive_failures(symbol, alt_side)
+            if consecutive_failures >= 2:
+                log.debug(f"{symbol} {alt_side}: Skipping due to {consecutive_failures} consecutive failures")
+                return None
+            
+            # === STEP 7: Calculate confluence score ===
+            confluence_score, confluence_details = self.calculate_confluence_score(
+                market_structure, order_flow, momentum, liquidity_zone, alt_side
+            )
+            
+            # Apply BTC adjustment to score
+            btc_adjusted_score = self.bitcoin_structure.calculate_btc_adjusted_score(
+                ConfluenceSetup(
+                    signal_id="temp",
+                    symbol=symbol,
+                    side=alt_side,
+                    confluence_score=confluence_score,
+                    # Other fields are not needed for score adjustment
+                    market_structure=market_structure,
+                    order_flow=order_flow,
+                    momentum=momentum,
+                    liquidity_zone=liquidity_zone,
+                    entry_price=current_price,
+                    entry_type="",
+                    entry_confidence=0,
+                    stop_loss=0,
+                    take_profit=0,
+                    risk_pct=0,
+                    reward_pct=0,
+                    risk_reward=0,
+                    confluence_details={},
+                    conditions_met=[],
+                    expected_move_pct=0,
+                    probability_score=0,
+                    timeframe_used="",
+                    signal_timestamp=0
+                ),
+                self.btc_structure
+            )
+            
+            # CRITICAL: Minimum confluence score after BTC adjustment
+            if btc_adjusted_score < MIN_CONFLUENCE_SCORE:
+                self.daily_stats["rejected_low_confluence"] += 1
+                log.debug(f"{symbol}: Low BTC-adjusted confluence {btc_adjusted_score:.1f}/10")
+                return None
+            
+            # === STEP 8: Confluence-based deduplication ===
+            if not self.signal_manager.should_generate_signal(symbol, btc_adjusted_score, alt_side):
+                return None
+            
+            # === STEP 9: Determine entry parameters ===
+            entry_type = self.determine_entry_type(
+                market_structure, momentum, liquidity_zone, alt_side
+            )
+            
+            entry_price = self._calculate_entry_price(
+                alt_side, market_structure, liquidity_zone, current_price
+            )
+            
+            stop_loss = self._calculate_stop_loss(
+                alt_side, entry_price, market_structure, liquidity_zone
+            )
+            
+            take_profit, expected_move_pct = self._calculate_take_profit(
+                alt_side, entry_price, market_structure, btc_adjusted_score
+            )
+            
+            # === STEP 10: Calculate risk/reward ===
+            risk = abs(entry_price - stop_loss)
+            reward = abs(take_profit - entry_price)
+            
+            if risk == 0:
+                return None
+            
+            risk_reward = reward / risk
+            risk_pct = risk / entry_price * 100
+            reward_pct = reward / entry_price * 100
+            
+            if risk_reward < MIN_RISK_REWARD:
+                log.debug(f"{symbol}: R:R too low {risk_reward:.1f}:1")
+                return None
+            
+            # === STEP 11: Calculate entry confidence ===
+            entry_confidence = self.calculate_entry_confidence(
+                btc_adjusted_score, order_flow, momentum
+            )
+            
+            # === STEP 12: Determine conditions met ===
+            conditions_met = self._get_confluence_conditions(
+                market_structure, order_flow, momentum, liquidity_zone, alt_side
+            )
+            
+            # Add BTC alignment condition
+            conditions_met.append("BTC_ALIGNED")
+            
+            # === STEP 13: Probability score ===
+            probability_score = min(btc_adjusted_score / 10.0 * 1.2, 0.95)
+            
+            # === STEP 14: Create signal ID ===
+            signal_id = hashlib.md5(
+                f"{symbol}:{alt_side}:{btc_adjusted_score}:{time.time()}".encode()
+            ).hexdigest()
+            
+            # === STEP 15: Create final signal ===
+            signal = ConfluenceSetup(
+                signal_id=signal_id,
+                symbol=symbol,
+                side=alt_side,
+                
+                market_structure=market_structure,
+                order_flow=order_flow,
+                momentum=momentum,
+                liquidity_zone=liquidity_zone,
+                
+                entry_price=entry_price,
+                entry_type=entry_type,
+                entry_confidence=entry_confidence,
+                
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                risk_pct=risk_pct,
+                reward_pct=reward_pct,
+                risk_reward=risk_reward,
+                
+                confluence_score=btc_adjusted_score,
+                confluence_details=confluence_details,
+                conditions_met=conditions_met,
+                
+                expected_move_pct=expected_move_pct,
+                probability_score=probability_score,
+                
+                timeframe_used="15M",
+                signal_timestamp=time.time(),
+                
+                # BTC alignment info
+                btc_alignment={
+                    "btc_direction": self.btc_structure["direction"],
+                    "btc_strength": self.btc_structure["trend_strength"],
+                    "btc_regime": self.btc_structure["regime"],
+                    "recommended_side": btc_recommended_side,
+                    "original_score": confluence_score,
+                    "btc_adjusted_score": btc_adjusted_score,
+                    "alignment_multiplier": btc_adjusted_score / confluence_score if confluence_score > 0 else 1.0
+                }
+            )
+            
+            # === STEP 16: Register signal ===
+            self.signal_manager.register_signal(signal)
+            
+            # === STEP 17: Update stats ===
+            self.daily_stats["confluence_signals"] += 1
+            if btc_adjusted_score >= 8.0:
+                self.daily_stats["high_quality_signals"] += 1
+            
+            log.info(f"🎯 BTC-ALIGNED SIGNAL: {symbol} {alt_side} @ {entry_price:.4f}")
+            log.info(f"   BTC Direction: {self.btc_structure['direction']} | Regime: {self.btc_structure['regime']}")
+            log.info(f"   Original Score: {confluence_score:.1f} | BTC-Adjusted: {btc_adjusted_score:.1f}")
+            log.info(f"   Expected: {expected_move_pct:.1f}% | R:R: {risk_reward:.1f}:1")
+            
+            return signal
+            
+        except Exception as e:
+            log.error(f"Confluence signal error for {symbol}: {e}")
+            log.error(f"Traceback: {traceback.format_exc()}")
+            return None
+    
+    def _determine_trade_side_original(self, structure: MarketStructure,
+                                      momentum: MomentumSignal,
+                                      liquidity: LiquidityZone,
+                                      symbol: str) -> Optional[str]:
+        """Original altcoin side determination (without BTC constraint)"""
+        
+        bullish_factors = []
+        bearish_factors = []
+        
+        # 1. Market structure
+        if structure.trend == "BULLISH":
+            bullish_factors.append(("Trend BULLISH", 2))
+        elif structure.trend == "BEARISH":
+            bearish_factors.append(("Trend BEARISH", 2))
+        
+        # 2. HTF alignment
+        if structure.higher_timeframe_aligned:
+            if structure.trend == "BULLISH":
+                bullish_factors.append(("HTF Aligned BULLISH", 1))
+            elif structure.trend == "BEARISH":
+                bearish_factors.append(("HTF Aligned BEARISH", 1))
+        else:
+            if structure.trend == "BULLISH":
+                bearish_factors.append(("HTF Misaligned", -1))
+            elif structure.trend == "BEARISH":
+                bullish_factors.append(("HTF Misaligned", -1))
+        
+        # 3. Momentum
+        if momentum.rsi_divergence == "BULLISH_HIDDEN":
+            if structure.trend == "BULLISH":
+                bullish_factors.append(("RSI Bullish Divergence (CONFIRMING)", 2))
+            else:
+                bullish_factors.append(("RSI Bullish Divergence (COUNTER)", 1))
+        
+        elif momentum.rsi_divergence == "BEARISH_HIDDEN":
+            if structure.trend == "BEARISH":
+                bearish_factors.append(("RSI Bearish Divergence (CONFIRMING)", 2))
+            else:
+                bearish_factors.append(("RSI Bearish Divergence (COUNTER)", 1))
+        
+        # 4. MACD signals
+        if momentum.macd_signal in ["BULLISH_CROSS", "BULLISH_FLIP"]:
+            bullish_factors.append((f"MACD {momentum.macd_signal}", 1))
+        
+        elif momentum.macd_signal in ["BEARISH_CROSS", "BEARISH_FLIP"]:
+            bearish_factors.append((f"MACD {momentum.macd_signal}", 1))
+        
+        # 5. Liquidity zones
+        if liquidity.zone_type in ["SWEEP_LOW", "EQ_LOW"]:
+            bullish_factors.append((f"Liquidity {liquidity.zone_type}", 1))
+        
+        elif liquidity.zone_type in ["SWEEP_HIGH", "EQ_HIGH"]:
+            bearish_factors.append((f"Liquidity {liquidity.zone_type}", 1))
+        
+        # Calculate scores
+        bullish_score = sum(score for _, score in bullish_factors)
+        bearish_score = sum(score for _, score in bearish_factors)
+        
+        log.debug(f"{symbol} Side Determination (Original):")
+        log.debug(f"  Bullish factors ({bullish_score}): {bullish_factors}")
+        log.debug(f"  Bearish factors ({bearish_score}): {bearish_factors}")
+        
+        if bullish_score >= 3 and bullish_score > bearish_score:
+            return "LONG"
+        
+        elif bearish_score >= 3 and bearish_score > bullish_score:
+            return "SHORT"
+        
+        return None
+    
+    def calculate_confluence_score(self, structure: MarketStructure,
                                   order_flow: OrderFlow, momentum: MomentumSignal,
                                   liquidity: LiquidityZone, side: str) -> Tuple[float, Dict]:
         """Calculate overall confluence score (0-10)"""
@@ -1275,7 +1781,7 @@ class ConfluenceScanner:
         if liquidity.zone_type != "NONE":
             liq_score = liquidity.strength * 2.0
             if liquidity.stop_hunt_potential:
-                liq_score *= 1.2  # Bonus for stop hunt potential
+                liq_score *= 1.2
         else:
             liq_score = 0.0
         
@@ -1286,36 +1792,30 @@ class ConfluenceScanner:
             "strength": float(liquidity.strength)
         }
         
-        # 5. Side-specific adjustments - FIXED: More conservative for SHORT signals
+        # 5. Side-specific adjustments
         side_adjustment = 0.0
         if side == "LONG":
-            # Bonus for bullish confluence - keep original logic (WORKING)
-            if (structure.trend == "BULLISH" and 
+            if (structure.trend == "BULLISH" and
                 momentum.rsi_divergence == "BULLISH_HIDDEN" and
                 momentum.macd_signal in ["BULLISH_CROSS", "BULLISH_FLIP"]):
                 side_adjustment = 0.5
         
         elif side == "SHORT":
-            # STRICTER: Shorts require HTF alignment OR very strong momentum
-            if (structure.higher_timeframe_aligned and  # MUST BE ALIGNED
+            if (structure.higher_timeframe_aligned and
                 momentum.rsi_divergence == "BEARISH_HIDDEN" and
                 momentum.macd_signal in ["BEARISH_CROSS", "BEARISH_FLIP"]):
-                side_adjustment = 0.5  # Same bonus but stricter requirements
+                side_adjustment = 0.5
         
         scores["side_adjustment"] = side_adjustment
         
-        # NEW: Penalize counter-trend trades more heavily
+        # Penalize misalignment
         if not structure.higher_timeframe_aligned and side == structure.trend:
-            # Trading with trend but misaligned? Strange case
             scores["alignment_penalty"] = -0.5
         elif not structure.higher_timeframe_aligned:
-            # Counter-trend trade - penalize
             scores["alignment_penalty"] = -1.0
         
         # Calculate total score (0-10)
         total_score = sum(scores.values())
-        
-        # Ensure max 10, min 0
         total_score = max(0.0, min(total_score, 10.0))
         
         return total_score, {
@@ -1328,11 +1828,9 @@ class ConfluenceScanner:
                            liquidity: LiquidityZone, side: str) -> str:
         """Determine entry type based on confluence"""
         
-        # Check for breakout retest
         if liquidity.recently_tested and "SWEEP" in liquidity.zone_type:
             return "BREAKOUT_RETEST" if side == "LONG" else "BREAKDOWN_RETEST"
         
-        # Check for order block entry
         if structure.breaker_blocks:
             last_block = structure.breaker_blocks[-1]
             if side == "LONG" and last_block["type"] == "BULLISH_OB":
@@ -1340,380 +1838,67 @@ class ConfluenceScanner:
             elif side == "SHORT" and last_block["type"] == "BEARISH_OB":
                 return "ORDER_BLOCK_ENTRY"
         
-        # Check for support/resistance bounce
         if momentum.candle_pattern in ["HAMMER", "BULLISH_ENGULFING", "INSIDE_BAR"]:
             return "SUPPORT_BOUNCE" if side == "LONG" else "RESISTANCE_BOUNCE"
         
-        # Default
         return "CONFLUENCE_ZONE_ENTRY"
     
-    def calculate_entry_confidence(self, confluence_score: float, 
+    def calculate_entry_confidence(self, confluence_score: float,
                                   order_flow: OrderFlow, momentum: MomentumSignal) -> float:
         """Calculate entry confidence (0-1)"""
         base_confidence = confluence_score / 10.0
         
-        # Volume confirmation bonus
         if order_flow.volume_spike:
             base_confidence *= 1.2
         
-        # Strong momentum bonus
         if momentum.momentum_score > 0.7:
             base_confidence *= 1.1
         
-        # RSI divergence bonus
         if momentum.rsi_divergence != "NONE":
             base_confidence *= 1.15
         
         return min(base_confidence, 1.0)
     
-    def generate_confluence_signal(self, multi_tf_data: Dict[str, pd.DataFrame],
-                                 symbol: str) -> Optional[ConfluenceSetup]:
-        """
-        Generate confluence-based signal for 3-5% moves - FIXED VERSION
-        """
-        try:
-            # Get timeframe data
-            df_daily = multi_tf_data.get("DAILY")
-            df_4h = multi_tf_data.get("4H")
-            df_1h = multi_tf_data.get("1H")
-            df_15m = multi_tf_data.get("15M")
-            df_5m = multi_tf_data.get("5M")
-            
-            # Validate all dataframes
-            required_minimums = {
-                "DAILY": 30,
-                "4H": 40,
-                "1H": 50,
-                "15M": 60,
-                "5M": 50
-            }
-            
-            for tf_name, df in [("DAILY", df_daily), ("4H", df_4h), ("1H", df_1h), 
-                               ("15M", df_15m), ("5M", df_5m)]:
-                min_len = required_minimums[tf_name]
-                if df is None or df.empty or len(df) < min_len:
-                    log.debug(f"{symbol}: Insufficient {tf_name} data")
-                    return None
-                
-                # Validate dataframe
-                if not self._validate_dataframe(df, 15):
-                    log.debug(f"{symbol}: Invalid data in {tf_name}")
-                    return None
-            
-            # Get current price from 5M
-            current_price = df_5m['close'].iloc[-1]
-            
-            # 1. Analyze market structure
-            market_structure = self.analyze_market_structure(df_daily, df_4h, df_1h)
-            
-            # CRITICAL FIX: Need clear structure AND alignment
-            if market_structure.trend == "RANGING":
-                self.daily_stats["rejected_no_alignment"] += 1
-                log.debug(f"{symbol}: No clear trend/ranging")
-                return None
-            
-            # NEW: Check for blacklisted symbol
-            if self.signal_manager.is_blacklisted(symbol):
-                self.daily_stats["rejected_blacklisted"] += 1
-                log.debug(f"{symbol}: Currently blacklisted")
-                return None
-            
-            # 2. Analyze order flow
-            order_flow = self.analyze_order_flow(df_15m, current_price)
-            
-            # 3. Analyze momentum
-            momentum = self.analyze_momentum(df_15m, df_5m)
-            
-            # 4. Analyze liquidity zones
-            liquidity_zone = self.analyze_liquidity_zones(df_4h, df_1h, current_price)
-            
-            # 5. Determine trade side based on confluence - FIXED LOGIC
-            side = self._determine_trade_side(
-                market_structure, momentum, liquidity_zone, symbol
-            )
-            
-            if not side:
-                log.debug(f"{symbol}: No clear trade side from confluence")
-                return None
-            
-            # NEW: Check consecutive failures for this symbol/side
-            consecutive_failures = self.signal_manager.get_consecutive_failures(symbol, side)
-            if consecutive_failures >= 2:
-                log.debug(f"{symbol} {side}: Skipping due to {consecutive_failures} consecutive failures")
-                return None
-            
-            # 6. Calculate confluence score
-            confluence_score, confluence_details = self.calculate_confluence_score(
-                market_structure, order_flow, momentum, liquidity_zone, side
-            )
-            
-            # CRITICAL FIX: Higher threshold for counter-trend trades
-            required_min_confluence = MIN_CONFLUENCE_SCORE
-            if not market_structure.higher_timeframe_aligned:
-                # Counter-trend trades need higher confluence
-                required_min_confluence = max(MIN_CONFLUENCE_SCORE * 1.5, 6.0)
-                
-                if confluence_score < required_min_confluence:
-                    self.daily_stats["rejected_counter_trend"] += 1
-                    log.debug(f"{symbol}: Counter-trade needs {required_min_confluence:.1f}, got {confluence_score:.1f}")
-                    return None
-            
-            # CRITICAL: Minimum confluence score
-            if confluence_score < MIN_CONFLUENCE_SCORE:
-                self.daily_stats["rejected_low_confluence"] += 1
-                log.debug(f"{symbol}: Low confluence {confluence_score:.1f}/10")
-                return None
-            
-            # 7. Confluence-based deduplication
-            if not self.signal_manager.should_generate_signal(symbol, confluence_score, side):
-                return None
-            
-            # 8. Determine entry parameters
-            entry_type = self.determine_entry_type(
-                market_structure, momentum, liquidity_zone, side
-            )
-            
-            # 9. Calculate entry price based on zone
-            entry_price = self._calculate_entry_price(
-                side, market_structure, liquidity_zone, current_price
-            )
-            
-            # 10. Calculate stop loss
-            stop_loss = self._calculate_stop_loss(
-                side, entry_price, market_structure, liquidity_zone
-            )
-            
-            # 11. Calculate take profit for 3-5% move
-            take_profit, expected_move_pct = self._calculate_take_profit(
-                side, entry_price, market_structure, confluence_score
-            )
-            
-            # 12. Calculate risk/reward
-            risk = abs(entry_price - stop_loss)
-            reward = abs(take_profit - entry_price)
-            
-            if risk == 0:
-                return None
-            
-            risk_reward = reward / risk
-            risk_pct = risk / entry_price * 100
-            reward_pct = reward / entry_price * 100
-            
-            # CRITICAL: Minimum risk/reward
-            if risk_reward < MIN_RISK_REWARD:
-                log.debug(f"{symbol}: R:R too low {risk_reward:.1f}:1")
-                return None
-            
-            # 13. Calculate entry confidence
-            entry_confidence = self.calculate_entry_confidence(
-                confluence_score, order_flow, momentum
-            )
-            
-            # 14. Determine conditions met
-            conditions_met = self._get_confluence_conditions(
-                market_structure, order_flow, momentum, liquidity_zone, side
-            )
-            
-            # 15. Probability score based on confluence
-            probability_score = min(confluence_score / 10.0 * 1.2, 0.95)  # Max 95%
-            
-            # 16. Create signal ID
-            signal_id = hashlib.md5(
-                f"{symbol}:{side}:{confluence_score}:{time.time()}".encode()
-            ).hexdigest()
-            
-            # 17. Create final signal
-            signal = ConfluenceSetup(
-                signal_id=signal_id,
-                symbol=symbol,
-                side=side,
-                
-                market_structure=market_structure,
-                order_flow=order_flow,
-                momentum=momentum,
-                liquidity_zone=liquidity_zone,
-                
-                entry_price=entry_price,
-                entry_type=entry_type,
-                entry_confidence=entry_confidence,
-                
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                risk_pct=risk_pct,
-                reward_pct=reward_pct,
-                risk_reward=risk_reward,
-                
-                confluence_score=confluence_score,
-                confluence_details=confluence_details,
-                conditions_met=conditions_met,
-                
-                expected_move_pct=expected_move_pct,
-                probability_score=probability_score,
-                
-                timeframe_used="15M",
-                signal_timestamp=time.time()
-            )
-            
-            # 18. Register signal
-            self.signal_manager.register_signal(signal)
-            
-            # 19. Update stats
-            self.daily_stats["confluence_signals"] += 1
-            if confluence_score >= 8.0:
-                self.daily_stats["high_quality_signals"] += 1
-            
-            log.info(f"🎯 CONFLUENCE SIGNAL: {symbol} {side} @ {entry_price:.4f}")
-            log.info(f"   Confluence: {confluence_score:.1f}/10 | R:R: {risk_reward:.1f}:1")
-            log.info(f"   Expected: {expected_move_pct:.1f}% | Confidence: {entry_confidence:.1%}")
-            log.info(f"   Structure: {market_structure.trend} | Alignment: {'YES' if market_structure.higher_timeframe_aligned else 'NO'}")
-            log.info(f"   Flow: {order_flow.flow_score:.2f} | Momentum: {momentum.rsi_divergence}")
-            
-            return signal
-            
-        except Exception as e:
-            log.error(f"Confluence signal error for {symbol}: {e}")
-            log.error(f"Traceback: {traceback.format_exc()}")
-            return None
-    
-    def _determine_trade_side(self, structure: MarketStructure, 
-                             momentum: MomentumSignal, 
-                             liquidity: LiquidityZone,
-                             symbol: str) -> Optional[str]:
-        """Determine trade side based on confluence alignment - FIXED VERSION"""
-        
-        # NEW: Track factors for debugging
-        bullish_factors = []
-        bearish_factors = []
-        
-        # 1. Market structure - PRIMARY FACTOR
-        if structure.trend == "BULLISH":
-            bullish_factors.append(("Trend BULLISH", 2))
-        elif structure.trend == "BEARISH":
-            bearish_factors.append(("Trend BEARISH", 2))
-        
-        # 2. HTF alignment - CRITICAL FIX: Penalize misalignment heavily
-        if structure.higher_timeframe_aligned:
-            if structure.trend == "BULLISH":
-                bullish_factors.append(("HTF Aligned BULLISH", 1))
-            elif structure.trend == "BEARISH":
-                bearish_factors.append(("HTF Aligned BEARISH", 1))
-        else:
-            # MISALIGNMENT: Reduce confidence in the trend
-            if structure.trend == "BULLISH":
-                bearish_factors.append(("HTF Misaligned", -1))  # Penalty
-            elif structure.trend == "BEARISH":
-                bullish_factors.append(("HTF Misaligned", -1))  # Penalty
-        
-        # 3. Momentum - Check if it CONFIRMS the trend
-        if momentum.rsi_divergence == "BULLISH_HIDDEN":
-            if structure.trend == "BULLISH":
-                bullish_factors.append(("RSI Bullish Divergence (CONFIRMING)", 2))
-            else:
-                bullish_factors.append(("RSI Bullish Divergence (COUNTER)", 1))  # Less weight
-        
-        elif momentum.rsi_divergence == "BEARISH_HIDDEN":
-            if structure.trend == "BEARISH":
-                bearish_factors.append(("RSI Bearish Divergence (CONFIRMING)", 2))
-            else:
-                bearish_factors.append(("RSI Bearish Divergence (COUNTER)", 1))  # Less weight
-        
-        # 4. MACD signals
-        if momentum.macd_signal in ["BULLISH_CROSS", "BULLISH_FLIP"]:
-            bullish_factors.append((f"MACD {momentum.macd_signal}", 1))
-        
-        elif momentum.macd_signal in ["BEARISH_CROSS", "BEARISH_FLIP"]:
-            bearish_factors.append((f"MACD {momentum.macd_signal}", 1))
-        
-        # 5. Liquidity zones
-        if liquidity.zone_type in ["SWEEP_LOW", "EQ_LOW"]:
-            bullish_factors.append((f"Liquidity {liquidity.zone_type}", 1))
-        
-        elif liquidity.zone_type in ["SWEEP_HIGH", "EQ_HIGH"]:
-            bearish_factors.append((f"Liquidity {liquidity.zone_type}", 1))
-        
-        # 6. Calculate scores
-        bullish_score = sum(score for _, score in bullish_factors)
-        bearish_score = sum(score for _, score in bearish_factors)
-        
-        # DEBUG LOGGING
-        log.debug(f"{symbol} Side Determination:")
-        log.debug(f"  Bullish factors ({bullish_score}): {bullish_factors}")
-        log.debug(f"  Bearish factors ({bearish_score}): {bearish_factors}")
-        
-        # 7. Determine side with clear majority AND trend alignment
-        if bullish_score >= 3 and bullish_score > bearish_score:
-            # Additional check: If counter-trend, require higher score
-            if not structure.higher_timeframe_aligned and structure.trend != "BULLISH":
-                if bullish_score < 5:  # Need stronger confluence for counter-trend
-                    log.debug(f"{symbol}: Bullish but counter-trend, score {bullish_score} < 5")
-                    return None
-            return "LONG"
-        
-        elif bearish_score >= 3 and bearish_score > bullish_score:
-            # CRITICAL FIX: Shorts require HTF alignment OR very strong confluence
-            if not structure.higher_timeframe_aligned:
-                if bearish_score < 6:  # Need very strong confluence for counter-trend shorts
-                    log.debug(f"{symbol}: Bearish but counter-trend, score {bearish_score} < 6")
-                    return None
-            return "SHORT"
-        
-        # NEW: If scores are close, prefer trend-following
-        if abs(bullish_score - bearish_score) <= 1:
-            if structure.higher_timeframe_aligned:
-                return "LONG" if structure.trend == "BULLISH" else "SHORT"
-        
-        return None
-    
     def _calculate_entry_price(self, side: str, structure: MarketStructure,
                               liquidity: LiquidityZone, current_price: float) -> float:
         """Calculate precise entry price"""
         
-        # Use liquidity zone if valid
         if liquidity.zone_type != "NONE" and liquidity.price_level > 0:
             zone_price = liquidity.price_level
             
             if side == "LONG":
-                # For LONG, enter slightly above support zone
-                return zone_price * 1.001  # 0.1% above
+                return zone_price * 1.001
             else:
-                # For SHORT, enter slightly below resistance zone
-                return zone_price * 0.999  # 0.1% below
+                return zone_price * 0.999
         
-        # Use key levels as fallback
         if side == "LONG" and structure.key_support > 0:
             return structure.key_support * 1.001
         elif side == "SHORT" and structure.key_resistance > 0:
             return structure.key_resistance * 0.999
         
-        # Fallback to current price
         return current_price
     
     def _calculate_stop_loss(self, side: str, entry_price: float,
                             structure: MarketStructure, liquidity: LiquidityZone) -> float:
         """Calculate stop loss based on structure"""
         
-        # Dynamic stop loss calculation
         if side == "LONG":
-            # Look for recent swing low
             if structure.swing_lows:
                 recent_low = min(structure.swing_lows)
                 stop_loss = min(recent_low * 0.995, entry_price * 0.985)
             else:
-                stop_loss = entry_price * 0.985  # 1.5% stop
+                stop_loss = entry_price * 0.985
             
-            # Ensure not beyond max stop
             max_sl = entry_price * (1 - MAX_STOP_LOSS / 100)
             stop_loss = min(stop_loss, max_sl)
         
-        else:  # SHORT
-            # Look for recent swing high
+        else:
             if structure.swing_highs:
                 recent_high = max(structure.swing_highs)
                 stop_loss = max(recent_high * 1.005, entry_price * 1.015)
             else:
-                stop_loss = entry_price * 1.015  # 1.5% stop
+                stop_loss = entry_price * 1.015
             
-            # Ensure not beyond max stop
             min_sl = entry_price * (1 + MAX_STOP_LOSS / 100)
             stop_loss = max(stop_loss, min_sl)
         
@@ -1723,31 +1908,25 @@ class ConfluenceScanner:
                               structure: MarketStructure, confluence_score: float) -> Tuple[float, float]:
         """Calculate take profit for 3-5% move"""
         
-        # Base target based on confluence score
         base_target_pct = TARGET_PROFIT_RANGE[0] + (
-            (confluence_score - MIN_CONFLUENCE_SCORE) / 
-            (10 - MIN_CONFLUENCE_SCORE) * 
+            (confluence_score - MIN_CONFLUENCE_SCORE) /
+            (10 - MIN_CONFLUENCE_SCORE) *
             (TARGET_PROFIT_RANGE[1] - TARGET_PROFIT_RANGE[0])
         )
         
-        # Ensure within range
-        target_pct = max(TARGET_PROFIT_RANGE[0], 
+        target_pct = max(TARGET_PROFIT_RANGE[0],
                         min(base_target_pct, TARGET_PROFIT_RANGE[1]))
         
-        # Adjust based on structure
         if structure.key_resistance > 0 and side == "LONG":
-            # Check if resistance is within reasonable distance
             resistance_pct = (structure.key_resistance - entry_price) / entry_price * 100
             if 2.0 <= resistance_pct <= 8.0:
-                target_pct = min(target_pct, resistance_pct * 0.8)  # Target 80% of resistance
+                target_pct = min(target_pct, resistance_pct * 0.8)
         
         elif structure.key_support > 0 and side == "SHORT":
-            # Check if support is within reasonable distance
             support_pct = (entry_price - structure.key_support) / entry_price * 100
             if 2.0 <= support_pct <= 8.0:
-                target_pct = min(target_pct, support_pct * 0.8)  # Target 80% of support
+                target_pct = min(target_pct, support_pct * 0.8)
         
-        # Calculate take profit price
         if side == "LONG":
             take_profit = entry_price * (1 + target_pct / 100)
         else:
@@ -1755,20 +1934,18 @@ class ConfluenceScanner:
         
         return take_profit, target_pct
     
-    def _get_confluence_conditions(self, structure: MarketStructure, 
+    def _get_confluence_conditions(self, structure: MarketStructure,
                                   order_flow: OrderFlow, momentum: MomentumSignal,
                                   liquidity: LiquidityZone, side: str) -> List[str]:
         """Get list of confluence conditions met"""
         conditions = []
         
-        # Structure conditions
         conditions.append(f"TREND_{structure.trend}")
         if structure.higher_timeframe_aligned:
             conditions.append("HTF_ALIGNED")
         else:
-            conditions.append("HTF_MISALIGNED")  # NEW
+            conditions.append("HTF_MISALIGNED")
         
-        # Order flow conditions
         if order_flow.volume_spike:
             conditions.append("VOLUME_SPIKE")
         if order_flow.bid_ask_imbalance > 0.3:
@@ -1776,7 +1953,6 @@ class ConfluenceScanner:
         elif order_flow.bid_ask_imbalance < -0.3:
             conditions.append("ASK_IMBALANCE")
         
-        # Momentum conditions
         if momentum.rsi_divergence != "NONE":
             conditions.append(f"RSI_{momentum.rsi_divergence}")
         if momentum.macd_signal != "NONE":
@@ -1784,13 +1960,11 @@ class ConfluenceScanner:
         if momentum.candle_pattern != "NONE":
             conditions.append(f"CANDLE_{momentum.candle_pattern}")
         
-        # Liquidity conditions
         if liquidity.zone_type != "NONE":
             conditions.append(f"LIQ_{liquidity.zone_type}")
         if liquidity.stop_hunt_potential:
             conditions.append("STOP_HUNT_POTENTIAL")
         
-        # Side-specific conditions
         if side == "LONG":
             conditions.append("ENTRY_LONG")
         else:
@@ -1807,36 +1981,31 @@ class ConfluenceScanner:
         self.signal_manager.cleanup_old_signals()
 
 # ================ MAIN SCANNER SYSTEM ================
-class ConfluenceMoveScanner:
-    """Main scanner for 3-5% confluence moves with OKX exchange"""
+class BTCConfluenceMoveScanner:
+    """Main BTC-centric scanner for 3-5% confluence moves"""
     
     def __init__(self):
-        self.scanner = ConfluenceScanner()
+        self.scanner = BTCConfluenceScanner()
         self.exchange = None
         self.db = None
         self.scan_cycle = 0
         self.data_cache = {}
-        self.cache_ttl = 60  # Cache data for 60 seconds
+        self.cache_ttl = 60
     
     async def initialize(self):
         """Initialize the scanner"""
         log.info("=" * 70)
-        log.info("🎯 CONFLUENCE SCANNER v5.2 - 3-5% MOVE STRATEGY")
-        log.info("FIXED VERSION - Eliminates systematic losers, preserves winners")
+        log.info("🎯 BTC-CENTRIC CONFLUENCE SCANNER v6.0")
+        log.info("BITCOIN IS PRIMARY - Alts must follow BTC direction")
         log.info("=" * 70)
-        log.info("EXCHANGE: OKX (No geographical restrictions)")
-        log.info("STRATEGY: Multi-layer confluence analysis")
-        log.info("TARGET: 3-5% directional moves")
-        log.info("FIXES: Counter-trend penalty, failure tracking, blacklisting")
+        log.info("EXCHANGE: OKX")
+        log.info("STRATEGY: BTC structure + Alt confluence")
+        log.info("TARGET: 3-5% BTC-aligned moves")
+        log.info("PHILOSOPHY: When BTC moves, everything moves with it")
         log.info("=" * 70)
         
-        # Initialize database
         await self._init_database()
-        
-        # Initialize exchange
         await self._init_exchange()
-        
-        # Send startup message
         await self._send_startup_message()
     
     async def _init_database(self):
@@ -1845,9 +2014,8 @@ class ConfluenceMoveScanner:
             os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
             self.db = await aiosqlite.connect(DB_PATH)
             
-            # Confluence signals table
             await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS confluence_signals (
+            CREATE TABLE IF NOT EXISTS btc_confluence_signals (
                 id TEXT PRIMARY KEY,
                 symbol TEXT NOT NULL,
                 side TEXT NOT NULL,
@@ -1856,8 +2024,14 @@ class ConfluenceMoveScanner:
                 take_profit REAL NOT NULL,
                 
                 confluence_score REAL NOT NULL,
+                btc_adjusted_score REAL NOT NULL,
                 confluence_details TEXT,
                 conditions_met TEXT,
+                
+                btc_direction TEXT,
+                btc_strength REAL,
+                btc_regime TEXT,
+                btc_alignment TEXT,
                 
                 expected_move REAL NOT NULL,
                 probability_score REAL NOT NULL,
@@ -1886,30 +2060,29 @@ class ConfluenceMoveScanner:
             )
             """)
             
-            # Performance tracking
             await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS confluence_performance (
+            CREATE TABLE IF NOT EXISTS btc_confluence_performance (
                 date DATE PRIMARY KEY,
                 total_signals INTEGER,
-                high_quality_signals INTEGER,
+                btc_aligned_signals INTEGER,
+                avg_btc_strength REAL,
                 avg_confluence_score REAL,
-                avg_expected_move REAL,
+                avg_btc_adjusted_score REAL,
                 win_rate REAL,
                 avg_pnl REAL,
                 total_pnl REAL
             )
             """)
             
-            # Add indexes for performance
             await self.db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_signals_symbol ON confluence_signals(symbol)
+            CREATE INDEX IF NOT EXISTS idx_btc_signals_symbol ON btc_confluence_signals(symbol)
             """)
             await self.db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_signals_status ON confluence_signals(status)
+            CREATE INDEX IF NOT EXISTS idx_btc_signals_btc_dir ON btc_confluence_signals(btc_direction)
             """)
             
             await self.db.commit()
-            log.info("✅ Database initialized")
+            log.info("✅ BTC-centric database initialized")
             
         except Exception as e:
             log.error(f"Database error: {e}")
@@ -1918,7 +2091,6 @@ class ConfluenceMoveScanner:
     async def _init_exchange(self):
         """Initialize OKX exchange connection"""
         try:
-            # Primary exchange: OKX
             self.exchange = ccxt.okx({
                 "enableRateLimit": True,
                 "options": {
@@ -1926,23 +2098,17 @@ class ConfluenceMoveScanner:
                     "fetchMarkets": "spot",
                     "adjustForTimeDifference": True,
                 },
-                "timeout": 30000,  # 30 second timeout
-                "rateLimit": 20,   # OKX rate limit is 20 req/sec for public
+                "timeout": 30000,
+                "rateLimit": 20,
             })
             
-            # Test connection with market fetch
             markets = await self.exchange.fetch_markets(params={'type': 'spot'})
-            
-            # Filter for USDT pairs only
             usdt_pairs = [m['symbol'] for m in markets if m['symbol'].endswith('/USDT')]
             
             log.info(f"✅ OKX exchange connected. Found {len(usdt_pairs)} USDT pairs")
             
         except Exception as e:
             log.error(f"OKX exchange error: {e}")
-            log.info("⚠️ Trying alternative exchange: Bybit...")
-            
-            # Fallback to Bybit
             try:
                 self.exchange = ccxt.bybit({
                     "enableRateLimit": True,
@@ -1964,17 +2130,18 @@ class ConfluenceMoveScanner:
             return
         
         try:
-            message = """🎯 <b>CONFLUENCE SCANNER v5.2 - ONLINE</b>
+            message = """🎯 <b>BTC-CENTRIC CONFLUENCE SCANNER v6.0 - ONLINE</b>
 
-<b>📊 EXCHANGE:</b> OKX
-<b>🎯 TARGET:</b> 3-5% moves
-<b>🧠 LAYERS:</b> 4-layer confluence analysis
-<b>⚡ SIGNALS:</b> Compact format with full logic
-<b>🛡️ FIXES:</b> Counter-trend penalty, failure tracking, blacklisting
+<b>₿ PRIMARY:</b> Bitcoin structure determines ALL trades
+<b>🎯 TARGET:</b> 3-5% BTC-aligned moves
+<b>📊 LOGIC:</b> Alts MUST follow BTC direction
+<b>⚡ SIGNALS:</b> Only when BTC has clear trend (strength ≥4/10)
+<b>🛡️ SAFETY:</b> No counter-BTC trades allowed
 
-Scanner v5.2 actively hunting for high-probability setups with improved risk management.
+Scanner actively hunting for BTC-aligned setups.
+When BTC moves, we move with it.
 
-#ConfluenceTrading #OKX #Ready"""
+#BTCFirst #ConfluenceTrading #OKX #Ready"""
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             async with httpx.AsyncClient(timeout=10) as client:
@@ -1984,28 +2151,26 @@ Scanner v5.2 actively hunting for high-probability setups with improved risk man
                     "parse_mode": "HTML"
                 })
                 
-            log.info("✅ Startup message sent")
+            log.info("✅ BTC-centric startup message sent")
                 
         except Exception as e:
             log.error(f"Telegram error: {e}")
     
-    async def _fetch_single_timeframe(self, symbol: str, timeframe: str, 
+    async def _fetch_single_timeframe(self, symbol: str, timeframe: str,
                                      limit: int, tf_name: str) -> pd.DataFrame:
         """Fetch single timeframe data"""
         try:
-            # Check cache first
             cache_key = f"{symbol}_{tf_name}"
             if cache_key in self.data_cache:
                 data, timestamp = self.data_cache[cache_key]
                 if time.time() - timestamp < self.cache_ttl:
                     return data
             
-            # OKX specific parameters
             params = {'type': 'spot'}
             
             ohlcv = await self.exchange.fetch_ohlcv(
-                symbol, 
-                timeframe=timeframe, 
+                symbol,
+                timeframe=timeframe,
                 limit=limit,
                 params=params
             )
@@ -2016,14 +2181,12 @@ Scanner v5.2 actively hunting for high-probability setups with improved risk man
                     columns=["timestamp", "open", "high", "low", "close", "volume"]
                 )
                 
-                # Convert to numeric
                 for col in ["open", "high", "low", "close", "volume"]:
                     df[col] = pd.to_numeric(df[col], errors='coerce')
                 
                 df = df.dropna()
                 
                 if len(df) >= 15:
-                    # Cache the data
                     self.data_cache[cache_key] = (df, time.time())
                     return df
             
@@ -2038,34 +2201,29 @@ Scanner v5.2 actively hunting for high-probability setups with improved risk man
         data = {}
         tasks = []
         
-        # Adjust limits for OKX (better historical data)
         limit_map = {
             "DAILY": 100,
-            "4H": 120,    # 20 days of 4H
-            "1H": 168,    # 7 days of hourly
-            "15M": 96,    # 24 hours of 15m
-            "5M": 72      # 6 hours of 5m
+            "4H": 120,
+            "1H": 168,
+            "15M": 96,
+            "5M": 72
         }
         
         for tf_name, tf in TIMEFRAMES.items():
             limit = limit_map.get(tf_name, 50)
             tasks.append(self._fetch_single_timeframe(symbol, tf, limit, tf_name))
         
-        # Fetch all timeframes concurrently
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         for tf_name, result in zip(TIMEFRAMES.keys(), results):
             if isinstance(result, pd.DataFrame) and not result.empty:
                 data[tf_name] = result
-            else:
-                log.debug(f"No data for {symbol} {tf_name}")
         
         return data
     
     async def get_active_pairs(self) -> List[Tuple[str, float]]:
         """Get active trading pairs from OKX"""
         try:
-            # OKX supports params for market type
             markets = await self.exchange.fetch_markets(params={'type': 'spot'})
             
             active_pairs = []
@@ -2073,29 +2231,22 @@ Scanner v5.2 actively hunting for high-probability setups with improved risk man
             for market in markets:
                 symbol = market['symbol']
                 
-                # Filter for USDT pairs only
                 if symbol.endswith('/USDT'):
-                    # Get ticker for volume data
                     try:
                         ticker = await self.exchange.fetch_ticker(symbol)
                         volume = ticker.get('quoteVolume', 0)
                         
                         if volume >= MIN_VOLUME_USD:
-                            # Check price for minimum movement potential
                             price = ticker.get('last', 0)
-                            if price > 0.01:  # Avoid penny stocks
+                            if price > 0.01:
                                 active_pairs.append((symbol, volume))
                     except Exception as e:
-                        log.debug(f"Ticker error {symbol}: {e}")
                         continue
             
-            # Sort by volume
             active_pairs.sort(key=lambda x: x[1], reverse=True)
-            
-            # Take top N
             selected_pairs = active_pairs[:TOP_N_VOLUME]
             
-            log.info(f"📊 Selected {len(selected_pairs)} pairs from OKX (Volume > ${MIN_VOLUME_USD:,.0f})")
+            log.info(f"📊 Selected {len(selected_pairs)} pairs from OKX")
             return selected_pairs
             
         except Exception as e:
@@ -2127,7 +2278,7 @@ Scanner v5.2 actively hunting for high-probability setups with improved risk man
                 return str(obj)
     
     async def save_signal(self, signal: ConfluenceSetup) -> bool:
-        """Save signal to database with proper JSON serialization"""
+        """Save signal to database"""
         try:
             # Prepare market structure data
             market_structure_data = {
@@ -2163,21 +2314,29 @@ Scanner v5.2 actively hunting for high-probability setups with improved risk man
                 "strength": float(signal.liquidity_zone.strength)
             }
             
-            # Prepare conditions met (list of strings)
+            # Prepare conditions met
             conditions_met = [str(condition) for condition in signal.conditions_met]
             
             # Make confluence details serializable
             confluence_details = self.make_json_serializable(signal.confluence_details)
             
+            # BTC alignment data
+            btc_alignment = signal.btc_alignment or {}
+            
+            # Get original score from details
+            original_score = signal.confluence_details.get("total", signal.confluence_score)
+            btc_adjusted_score = signal.confluence_score
+            
             # Insert signal
             await self.db.execute("""
-                INSERT INTO confluence_signals (
+                INSERT INTO btc_confluence_signals (
                     id, symbol, side, entry_price, stop_loss, take_profit,
-                    confluence_score, confluence_details, conditions_met,
+                    confluence_score, btc_adjusted_score, confluence_details, conditions_met,
+                    btc_direction, btc_strength, btc_regime, btc_alignment,
                     expected_move, probability_score, entry_confidence, entry_type,
                     risk_pct, reward_pct, risk_reward,
                     market_structure, order_flow, momentum, liquidity_zone
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 str(signal.signal_id),
                 str(signal.symbol),
@@ -2185,9 +2344,14 @@ Scanner v5.2 actively hunting for high-probability setups with improved risk man
                 float(signal.entry_price),
                 float(signal.stop_loss),
                 float(signal.take_profit),
-                float(signal.confluence_score),
+                float(original_score),
+                float(btc_adjusted_score),
                 json.dumps(confluence_details),
                 json.dumps(conditions_met),
+                str(btc_alignment.get("btc_direction", "UNKNOWN")),
+                float(btc_alignment.get("btc_strength", 0.0)),
+                str(btc_alignment.get("btc_regime", "UNKNOWN")),
+                json.dumps(btc_alignment),
                 float(signal.expected_move_pct),
                 float(signal.probability_score),
                 float(signal.entry_confidence),
@@ -2202,7 +2366,7 @@ Scanner v5.2 actively hunting for high-probability setups with improved risk man
             ))
             
             await self.db.commit()
-            log.info(f"✅ Confluence signal saved: {signal.symbol}")
+            log.info(f"✅ BTC-confluence signal saved: {signal.symbol}")
             return True
             
         except Exception as e:
@@ -2210,24 +2374,35 @@ Scanner v5.2 actively hunting for high-probability setups with improved risk man
             return False
     
     async def format_confluence_signal(self, signal: ConfluenceSetup) -> str:
-        """Format confluence signal with all logic details in compact format"""
+        """Format BTC-centric confluence signal"""
         
         side_emoji = "🟢" if signal.side == "LONG" else "🔴"
         clean_symbol = signal.symbol.replace('/', '')
         
+        # BTC alignment info
+        btc_info = signal.btc_alignment or {}
+        btc_direction = btc_info.get("btc_direction", "UNKNOWN")
+        btc_regime = btc_info.get("btc_regime", "UNKNOWN")
+        btc_strength = btc_info.get("btc_strength", 0.0)
+        original_score = btc_info.get("original_score", signal.confluence_score)
+        btc_adjusted_score = btc_info.get("btc_adjusted_score", signal.confluence_score)
+        
         # Confluence score color coding
-        if signal.confluence_score >= 8.5:
+        if btc_adjusted_score >= 8.5:
             score_emoji = "🔥🔥"
             score_text = "EXCEPTIONAL"
-        elif signal.confluence_score >= 7.5:
+        elif btc_adjusted_score >= 7.5:
             score_emoji = "🔥"
             score_text = "HIGH"
-        elif signal.confluence_score >= 6.0:
+        elif btc_adjusted_score >= 6.0:
             score_emoji = "✅"
             score_text = "GOOD"
         else:
             score_emoji = "⚠️"
             score_text = "FAIR"
+        
+        # BTC alignment status
+        btc_emoji = "✅" if btc_direction == signal.side else "⚠️"
         
         # Structure summary
         structure_details = [
@@ -2235,6 +2410,14 @@ Scanner v5.2 actively hunting for high-probability setups with improved risk man
             f"🎯 Alignment: {'YES' if signal.market_structure.higher_timeframe_aligned else 'NO'}",
             f"📍 Support: {signal.market_structure.key_support:.4f}",
             f"📍 Resistance: {signal.market_structure.key_resistance:.4f}"
+        ]
+        
+        # BTC context
+        btc_details = [
+            f"₿ BTC Direction: <b>{btc_direction}</b>",
+            f"🏋️ BTC Strength: {btc_strength:.1f}/10",
+            f"📈 BTC Regime: {btc_regime}",
+            f"⚖️ Alignment: {btc_emoji} {'PERFECT' if btc_direction == signal.side else 'COUNTER'}"
         ]
         
         # Order flow summary
@@ -2248,15 +2431,7 @@ Scanner v5.2 actively hunting for high-probability setups with improved risk man
         momentum_details = [
             f"📉 RSI: {signal.momentum.rsi_value:.1f} ({signal.momentum.rsi_zone})",
             f"🔀 Divergence: {signal.momentum.rsi_divergence.replace('_', ' ') if signal.momentum.rsi_divergence != 'NONE' else 'None'}",
-            f"📊 MACD: {signal.momentum.macd_signal.replace('_', ' ') if signal.momentum.macd_signal != 'NONE' else 'None'}",
-            f"🕯️ Pattern: {signal.momentum.candle_pattern.replace('_', ' ') if signal.momentum.candle_pattern != 'NONE' else 'None'}"
-        ]
-        
-        # Liquidity summary
-        liquidity_details = [
-            f"🌊 Zone: {signal.liquidity_zone.zone_type.replace('_', ' ')}",
-            f"🎯 Level: {signal.liquidity_zone.price_level:.4f}",
-            f"🎣 Stop Hunt: {'YES' if signal.liquidity_zone.stop_hunt_potential else 'NO'}"
+            f"📊 MACD: {signal.momentum.macd_signal.replace('_', ' ') if signal.momentum.macd_signal != 'NONE' else 'None'}"
         ]
         
         # Entry details
@@ -2273,16 +2448,24 @@ Scanner v5.2 actively hunting for high-probability setups with improved risk man
             f"🎯 Target: {signal.expected_move_pct:.1f}%"
         ]
         
-        # Confluence conditions count
-        conditions_count = len(signal.conditions_met)
-        strong_conditions = sum(1 for c in signal.conditions_met 
-                              if c in ['VOLUME_SPIKE', 'HTF_ALIGNED', 'STOP_HUNT_POTENTIAL'])
+        # Score details
+        score_details = [
+            f"📊 Original: {original_score:.1f}/10",
+            f"₿ BTC-Adjusted: {btc_adjusted_score:.1f}/10",
+            f"📈 Multiplier: {btc_adjusted_score/original_score:.2f}x" if original_score > 0 else "📈 Multiplier: N/A"
+        ]
         
         # Build the message
-        message = f"""{side_emoji} <b>CONFLUENCE SIGNAL - {signal.side}</b>
+        message = f"""{side_emoji} <b>BTC-ALIGNED CONFLUENCE SIGNAL - {signal.side}</b>
 
-<b>{score_emoji} CONFLUENCE: {score_text} ({signal.confluence_score:.1f}/10)</b>
+{btc_emoji} <b>₿ BITCOIN CONTEXT:</b>
+{chr(10).join(btc_details)}
+
+<b>{score_emoji} CONFLUENCE: {score_text} ({btc_adjusted_score:.1f}/10)</b>
 <b>📊 {signal.symbol}</b> | <b>🎪 {signal.entry_type.replace('_', ' ')}</b>
+
+<b>🔢 SCORE DETAILS:</b>
+{chr(10).join(score_details)}
 
 <b>🏗️ STRUCTURE:</b>
 {chr(10).join(structure_details)}
@@ -2292,9 +2475,6 @@ Scanner v5.2 actively hunting for high-probability setups with improved risk man
 
 <b>📈 MOMENTUM:</b>
 {chr(10).join(momentum_details)}
-
-<b>🌊 LIQUIDITY:</b>
-{chr(10).join(liquidity_details)}
 
 <b>🎯 ENTRY:</b>
 • Price: <b>{signal.entry_price:.6f}</b>
@@ -2306,70 +2486,47 @@ Scanner v5.2 actively hunting for high-probability setups with improved risk man
 {chr(10).join(risk_details)}
 
 <b>📋 CONDITIONS:</b>
-• Met: {conditions_count} conditions
-• Strong: {strong_conditions} strong signals
+• Met: {len(signal.conditions_met)} conditions
+• BTC Aligned: {'YES ✅' if 'BTC_ALIGNED' in signal.conditions_met else 'NO ❌'}
 • Probability: {signal.probability_score:.0%}
 
-#Confluence{signal.side} #{clean_symbol} #{score_text.replace(' ', '')}Confluence
+#BTC{btc_direction} #{clean_symbol} #{signal.side}
 #Expected{signal.expected_move_pct:.0f}Percent #OKX"""
         
         return message
     
-    async def format_compact_signal(self, signal: ConfluenceSetup) -> str:
-        """Ultra-compact format with key details only"""
-        
-        side_emoji = "🟢" if signal.side == "LONG" else "🔴"
-        clean_symbol = signal.symbol.replace('/', '')
-        
-        # Get top 3 strongest conditions
-        strong_conditions = []
-        for condition in signal.conditions_met:
-            if any(keyword in condition for keyword in ['VOLUME_SPIKE', 'HTF_ALIGNED', 'STOP_HUNT', 'DIVERGENCE']):
-                cond_display = condition.replace('_', ' ')
-                if 'RSI' in cond_display:
-                    cond_display = cond_display.replace('RSI ', '')
-                elif 'MACD' in cond_display:
-                    cond_display = cond_display.replace('MACD ', '')
-                strong_conditions.append(cond_display)
-            if len(strong_conditions) >= 3:
-                break
-        
-        message = f"""{side_emoji} <b>{signal.side} {signal.symbol}</b>
-
-<b>CONFLUENCE: {signal.confluence_score:.1f}/10</b>
-• Entry: {signal.entry_price:.6f}
-• Target: {signal.expected_move_pct:.1f}%
-• R:R: {signal.risk_reward:.1f}:1
-• Confidence: {signal.entry_confidence:.0%}
-
-<b>KEY SIGNALS:</b>
-• Trend: {signal.market_structure.trend}
-• Flow: {'Spike' if signal.order_flow.volume_spike else 'Normal'}
-• Momentum: {signal.momentum.rsi_divergence.split('_')[0] if signal.momentum.rsi_divergence != 'NONE' else 'Neutral'}
-• Liquidity: {signal.liquidity_zone.zone_type.split('_')[0]}
-
-<b>STRONG CONDITIONS:</b>
-{chr(10).join(f"• {cond}" for cond in strong_conditions[:3])}
-
-SL: {signal.stop_loss:.6f} | TP: {signal.take_profit:.6f}
-
-#Confluence{signal.side} #{clean_symbol} #OKX"""
-        
-        return message
-    
     async def send_telegram_alert(self, signal: ConfluenceSetup):
-        """Send Telegram alert with smart formatting"""
+        """Send Telegram alert"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             log.warning(f"⚠️ Telegram credentials missing. Skipping alert for {signal.symbol}")
             return
         
         try:
-            # Try full message first
             message = await self.format_confluence_signal(signal)
             
-            # Check approximate length (Telegram limit is 4096)
-            if len(message) > 3800:  # Leave buffer
-                message = await self.format_compact_signal(signal)
+            if len(message) > 3800:
+                # Compact format
+                side_emoji = "🟢" if signal.side == "LONG" else "🔴"
+                btc_info = signal.btc_alignment or {}
+                btc_direction = btc_info.get("btc_direction", "UNKNOWN")
+                
+                message = f"""{side_emoji} <b>BTC-{btc_direction} | {signal.side} {signal.symbol}</b>
+
+<b>CONFLUENCE: {signal.confluence_score:.1f}/10</b>
+• Entry: {signal.entry_price:.6f}
+• Target: {signal.expected_move_pct:.1f}%
+• R:R: {signal.risk_reward:.1f}:1
+• BTC Alignment: ✅ PERFECT
+
+<b>KEY:</b>
+• BTC: {btc_direction} ({btc_info.get('btc_strength', 0):.1f}/10)
+• Trend: {signal.market_structure.trend}
+• Volume: {'Spike' if signal.order_flow.volume_spike else 'Normal'}
+• Momentum: {signal.momentum.rsi_divergence.split('_')[0] if signal.momentum.rsi_divergence != 'NONE' else 'Neutral'}
+
+SL: {signal.stop_loss:.6f} | TP: {signal.take_profit:.6f}
+
+#BTC{btc_direction} #{signal.symbol.replace('/', '')} #OKX"""
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             
@@ -2384,7 +2541,6 @@ SL: {signal.stop_loss:.6f} | TP: {signal.take_profit:.6f}
                 response = await client.post(url, json=payload)
                 
                 if response.status_code == 400:
-                    # Try plain text if HTML fails
                     plain_message = message.replace('<b>', '').replace('</b>', '')
                     payload = {
                         "chat_id": TELEGRAM_CHAT_ID,
@@ -2393,7 +2549,7 @@ SL: {signal.stop_loss:.6f} | TP: {signal.take_profit:.6f}
                     }
                     await client.post(url, json=payload)
             
-            log.info(f"📤 Confluence alert sent: {signal.symbol}")
+            log.info(f"📤 BTC-confluence alert sent: {signal.symbol}")
             
         except Exception as e:
             log.error(f"Telegram error for {signal.symbol}: {e}")
@@ -2401,21 +2557,20 @@ SL: {signal.stop_loss:.6f} | TP: {signal.take_profit:.6f}
     async def send_triggered_position_alert(self, symbol: str, side: str, trigger_price: float):
         """Send Telegram alert when position triggers"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            log.warning(f"⚠️ Telegram credentials missing. Skipping triggered alert for {symbol}")
             return
         
         try:
             side_emoji = "🟢" if side == "LONG" else "🔴"
             clean_symbol = symbol.replace('/', '').replace('-', '').replace('.', '')
             
-            message = f"""✅ <b>POSITION TRIGGERED - {side} {side_emoji}</b>
+            message = f"""✅ <b>BTC-ALIGNED POSITION TRIGGERED - {side} {side_emoji}</b>
 
 <b>Symbol:</b> {symbol}
 <b>Trigger Price:</b> {trigger_price:.6f}
-<b>Status:</b> Position is now active and being monitored.
+<b>Status:</b> Position is now active.
 
 Stop Loss and Take Profit are now active.
-The position will auto-close when SL or TP is hit.
+Position auto-closes at SL/TP.
 
 #{clean_symbol} #{side} #Triggered #OKX"""
             
@@ -2445,11 +2600,10 @@ The position will auto-close when SL or TP is hit.
         except Exception as e:
             log.error(f"Triggered position alert error: {e}")
     
-    async def send_closed_position_alert(self, symbol: str, side: str, entry_price: float, 
+    async def send_closed_position_alert(self, symbol: str, side: str, entry_price: float,
                                         close_price: float, pnl_percent: float, close_reason: str):
-        """Send Telegram alert when position closes (SL/TP hit)"""
+        """Send Telegram alert when position closes"""
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            log.warning(f"⚠️ Telegram credentials missing. Skipping closed position alert for {symbol}")
             return
         
         try:
@@ -2464,10 +2618,9 @@ The position will auto-close when SL or TP is hit.
                 pnl_color = "#FF0000"
                 result_text = "LOSS"
             
-            # Clean symbol for hashtags
             clean_symbol = symbol.replace('/', '').replace('-', '').replace('.', '')
             
-            message = f"""{pnl_emoji} <b>POSITION CLOSED - {side} {side_emoji}</b>
+            message = f"""{pnl_emoji} <b>BTC-ALIGNED POSITION CLOSED - {side} {side_emoji}</b>
 
 <b>Symbol:</b> {symbol}
 <b>Side:</b> {side}
@@ -2480,7 +2633,6 @@ The position will auto-close when SL or TP is hit.
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             
-            # Try HTML first
             payload = {
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": message,
@@ -2492,7 +2644,6 @@ The position will auto-close when SL or TP is hit.
                 response = await client.post(url, json=payload)
                 
                 if response.status_code == 400:
-                    # Try plain text
                     plain_message = message.replace('<b>', '').replace('</b>', '').replace('<font color=\'', '').replace('\'>', '').replace('</font>', '')
                     payload = {
                         "chat_id": TELEGRAM_CHAT_ID,
@@ -2507,34 +2658,30 @@ The position will auto-close when SL or TP is hit.
             log.error(f"Closed position alert error: {e}")
     
     async def monitor_positions(self):
-        """Monitor and close positions with Telegram alerts"""
-        log.info("👀 Starting position monitoring...")
+        """Monitor and close positions"""
+        log.info("👀 Starting BTC-aligned position monitoring...")
         
         while True:
             try:
-                # Get open positions
                 async with self.db.execute("""
                     SELECT id, symbol, side, entry_price, stop_loss, take_profit, status
-                    FROM confluence_signals 
+                    FROM btc_confluence_signals
                     WHERE status IN ('PENDING', 'TRIGGERED')
                 """) as cursor:
                     positions = await cursor.fetchall()
                 
                 if positions:
-                    log.debug(f"📊 Monitoring {len(positions)} positions")
+                    log.debug(f"📊 Monitoring {len(positions)} BTC-aligned positions")
                 
                 for pos_id, symbol, side, entry, sl, tp, status in positions:
                     try:
-                        # Get current price
                         ticker = await self.exchange.fetch_ticker(symbol)
                         current_price = ticker['last']
                         
-                        # For PENDING positions: check if price reached entry
                         if status == 'PENDING':
-                            if abs(current_price - entry) / entry <= 0.01:  # Within 1%
-                                # Mark as triggered
+                            if abs(current_price - entry) / entry <= 0.01:
                                 await self.db.execute("""
-                                    UPDATE confluence_signals SET 
+                                    UPDATE btc_confluence_signals SET
                                         status = 'TRIGGERED',
                                         triggered_at = CURRENT_TIMESTAMP,
                                         trigger_price = ?
@@ -2544,13 +2691,11 @@ The position will auto-close when SL or TP is hit.
                                 await self.db.commit()
                                 self.scanner.signal_manager.update_signal_status(pos_id, "TRIGGERED")
                                 
-                                # SEND TELEGRAM ALERT FOR TRIGGERED POSITION
                                 await self.send_triggered_position_alert(symbol, side, current_price)
                                 
-                                log.info(f"✅ Position triggered: {symbol} {side} @ {current_price:.4f}")
+                                log.info(f"✅ BTC-aligned position triggered: {symbol} {side} @ {current_price:.4f}")
                                 continue
                         
-                        # Check SL/TP
                         pnl_percent = 0
                         close_reason = None
                         
@@ -2562,7 +2707,7 @@ The position will auto-close when SL or TP is hit.
                                 close_reason = "TP_HIT"
                                 pnl_percent = ((current_price - entry) / entry) * 100
                         
-                        else:  # SHORT
+                        else:
                             if current_price >= sl:
                                 close_reason = "SL_HIT"
                                 pnl_percent = ((entry - current_price) / entry) * 100
@@ -2571,9 +2716,8 @@ The position will auto-close when SL or TP is hit.
                                 pnl_percent = ((entry - current_price) / entry) * 100
                         
                         if close_reason:
-                            # Update database
                             await self.db.execute("""
-                                UPDATE confluence_signals SET 
+                                UPDATE btc_confluence_signals SET
                                     status = 'CLOSED',
                                     closed_at = CURRENT_TIMESTAMP,
                                     close_price = ?,
@@ -2584,43 +2728,37 @@ The position will auto-close when SL or TP is hit.
                             
                             await self.db.commit()
                             
-                            # Update signal manager with result
                             result = "LOSS" if pnl_percent < 0 else "WIN"
                             self.scanner.signal_manager.update_signal_status(pos_id, "CLOSED", result)
                             
-                            # SEND TELEGRAM ALERT FOR CLOSED POSITION
                             await self.send_closed_position_alert(
                                 symbol, side, entry, current_price, pnl_percent, close_reason
                             )
                             
-                            log.info(f"📤 Position closed: {symbol} {side} {pnl_percent:+.2f}% ({close_reason})")
+                            log.info(f"📤 BTC-aligned position closed: {symbol} {side} {pnl_percent:+.2f}% ({close_reason})")
                     
                     except Exception as e:
                         log.error(f"Monitor error for {symbol}: {e}")
                         continue
                 
-                # Clean up old signals
                 self.scanner.cleanup_old_signals()
                 
-                # Clean cache
                 current_time = time.time()
                 to_remove = [k for k, (_, t) in self.data_cache.items() if current_time - t > self.cache_ttl]
                 for k in to_remove:
                     del self.data_cache[k]
                 
-                await asyncio.sleep(5)  # Check every 5 seconds
+                await asyncio.sleep(5)
                 
             except Exception as e:
                 log.error(f"Monitoring loop error: {e}")
                 await asyncio.sleep(10)
     
     async def process_single_pair(self, symbol: str, volume: float):
-        """Process a single pair for confluence signals"""
+        """Process a single pair for BTC-centric confluence signals"""
         try:
-            # Fetch multi-timeframe data
             multi_tf_data = await self.fetch_timeframe_data(symbol)
             
-            # Check if we have all required timeframes with sufficient data
             required_tfs = ["DAILY", "4H", "1H", "15M", "5M"]
             has_all_data = True
             
@@ -2633,11 +2771,9 @@ The position will auto-close when SL or TP is hit.
             if not has_all_data:
                 return None
             
-            # Generate confluence signal
-            signal = self.scanner.generate_confluence_signal(multi_tf_data, symbol)
+            signal = await self.scanner.generate_confluence_signal(multi_tf_data, symbol, self.exchange)
             
             if signal:
-                # Save and send
                 saved = await self.save_signal(signal)
                 
                 if saved:
@@ -2650,18 +2786,17 @@ The position will auto-close when SL or TP is hit.
             log.debug(f"Pair error {symbol}: {str(e)[:50]}")
             return None
     
-    async def confluence_scanning(self):
-        """Main confluence scanning loop"""
-        log.info("🚀 Starting confluence scanning for 3-5% moves...")
+    async def btc_confluence_scanning(self):
+        """Main BTC-centric scanning loop"""
+        log.info("🚀 Starting BTC-centric confluence scanning...")
         
         while True:
             try:
                 self.scan_cycle += 1
                 start_time = time.time()
                 
-                log.info(f"🔄 Confluence scan #{self.scan_cycle}")
+                log.info(f"🔄 BTC-confluence scan #{self.scan_cycle}")
                 
-                # Get active pairs
                 pairs = await self.get_active_pairs()
                 
                 if not pairs:
@@ -2669,11 +2804,10 @@ The position will auto-close when SL or TP is hit.
                     await asyncio.sleep(SCAN_INTERVAL)
                     continue
                 
-                log.info(f"Analyzing {len(pairs)} pairs for confluence")
+                log.info(f"Analyzing {len(pairs)} pairs for BTC-aligned confluence")
                 
                 signals_found = 0
                 
-                # Process pairs in batches for better performance
                 batch_size = 10
                 for i in range(0, len(pairs), batch_size):
                     batch = pairs[i:i+batch_size]
@@ -2688,53 +2822,45 @@ The position will auto-close when SL or TP is hit.
                         if isinstance(result, ConfluenceSetup):
                             signals_found += 1
                     
-                    # Small delay between batches
                     await asyncio.sleep(0.5)
                 
-                # Update scan stats
-                self.scanner.daily_stats["scans"] += 1
-                self.scanner.daily_stats["pairs_analyzed"] += len(pairs)
-                
-                # Log stats
                 stats = self.scanner.get_daily_stats()
                 active_count = len(self.scanner.signal_manager.active_signals)
                 
-                log.info(f"📊 Confluence stats: Found {signals_found}, Active: {active_count}")
+                log.info(f"📊 BTC-CENTRIC STATS:")
+                log.info(f"   Found: {signals_found} | Active: {active_count}")
                 log.info(f"   Total signals: {stats['confluence_signals']}")
-                log.info(f"   High quality: {stats['high_quality_signals']}")
-                log.info(f"   Rejected (low confluence): {stats['rejected_low_confluence']}")
-                log.info(f"   Rejected (no alignment): {stats['rejected_no_alignment']}")
-                log.info(f"   Rejected (counter-trend): {stats['rejected_counter_trend']}")
-                log.info(f"   Rejected (blacklisted): {stats['rejected_blacklisted']}")
+                log.info(f"   BTC-aligned: {stats['btc_aligned_signals']}")
+                log.info(f"   Rejected (counter-BTC): {stats['rejected_counter_btc']}")
+                log.info(f"   Rejected (BTC neutral): {stats['rejected_btc_neutral']}")
+                log.info(f"   BTC direction: {stats['btc_direction']}")
                 
                 scan_duration = time.time() - start_time
-                log.info(f"Scan #{self.scan_cycle}: {signals_found} confluence signals in {scan_duration:.2f}s")
+                log.info(f"Scan #{self.scan_cycle}: {signals_found} BTC-aligned signals in {scan_duration:.2f}s")
                 
-                # Wait for next scan
                 wait_time = max(1.0, SCAN_INTERVAL - scan_duration)
                 await asyncio.sleep(wait_time)
                 
             except Exception as e:
-                log.error(f"Scanning loop error: {e}")
+                log.error(f"BTC scanning loop error: {e}")
                 await asyncio.sleep(10)
     
     async def run(self):
-        """Run the scanner"""
+        """Run the BTC-centric scanner"""
         try:
             await self.initialize()
             
-            # Run both loops
             await asyncio.gather(
-                self.confluence_scanning(),
+                self.btc_confluence_scanning(),
                 self.monitor_positions()
             )
             
         except KeyboardInterrupt:
-            log.info("Confluence scanner stopped by user")
+            log.info("BTC-centric scanner stopped by user")
             await self.send_final_stats()
             
         except Exception as e:
-            log.error(f"Scanner crashed: {e}")
+            log.error(f"BTC scanner crashed: {e}")
             
         finally:
             await self.cleanup()
@@ -2748,25 +2874,31 @@ The position will auto-close when SL or TP is hit.
             stats = self.scanner.get_daily_stats()
             active_count = len(self.scanner.signal_manager.active_signals)
             
-            message = f"""🛑 <b>CONFLUENCE SCANNER v5.2 STOPPED</b>
+            message = f"""🛑 <b>BTC-CENTRIC CONFLUENCE SCANNER v6.0 STOPPED</b>
 
-<b>📊 FINAL STATISTICS:</b>
+<b>📊 FINAL BTC-CENTRIC STATS:</b>
 • Exchange: OKX
 • Total scans: {stats['scans']}
-• Pairs analyzed: {stats['pairs_analyzed']}
-• Confluence signals: {stats['confluence_signals']}
+• Total pairs analyzed: {stats['pairs_analyzed']}
+• BTC-aligned signals: {stats['btc_aligned_signals']}
 • High quality (8+): {stats['high_quality_signals']}
 
 <b>🚫 REJECTIONS:</b>
+• Counter-BTC trades: {stats['rejected_counter_btc']}
+• BTC neutral/weak: {stats['rejected_btc_neutral']}
 • Low confluence: {stats['rejected_low_confluence']}
 • No alignment: {stats['rejected_no_alignment']}
-• Counter-trend: {stats['rejected_counter_trend']}
-• Blacklisted: {stats['rejected_blacklisted']}
 
-<b>⚡ ACTIVE SIGNALS:</b>
-• Currently active: {active_count}
+<b>₿ BTC PERFORMANCE:</b>
+• Final BTC direction: {stats['btc_direction']}
+• Active BTC-aligned signals: {active_count}
 
-#ConfluenceFinalStats #OKX"""
+<b>🎯 STRATEGY SUCCESS:</b>
+• Only traded with BTC trend
+• No counter-BTC trades allowed
+• Higher win rate expected
+
+#BTCFirst #FinalStats #OKX"""
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             async with httpx.AsyncClient(timeout=10) as client:
@@ -2818,68 +2950,70 @@ async def start_confluence_server(scanner, port=8000):
                 
                 response = json.dumps({
                     "status": "running",
-                    "scanner": "Confluence Scanner v5.2",
+                    "scanner": "BTC-Centric Confluence Scanner v6.0",
                     "exchange": "OKX",
-                    "target": "3-5% directional moves",
+                    "primary_structure": "Bitcoin",
+                    "strategy": "Trade alts only in BTC direction",
+                    "btc_min_trend": BTC_MIN_TREND_STRENGTH,
                     "scan_cycle": scanner.scan_cycle,
                     "active_signals": active_count,
-                    "daily_stats": stats,
-                    "strategy": {
-                        "layers": ["Market Structure", "Order Flow", "Momentum", "Liquidity"],
-                        "weights": CONFLUENCE_WEIGHTS,
-                        "min_confluence": MIN_CONFLUENCE_SCORE,
-                        "target_range": f"{TARGET_PROFIT_RANGE[0]}-{TARGET_PROFIT_RANGE[1]}%",
-                        "min_rr": MIN_RISK_REWARD
-                    }
+                    "btc_direction": stats["btc_direction"],
+                    "btc_aligned_signals": stats["btc_aligned_signals"],
+                    "rejected_counter_btc": stats["rejected_counter_btc"],
+                    "daily_stats": stats
                 }, indent=2)
+            
+            elif path == '/btc':
+                if scanner.scanner.btc_structure:
+                    response = json.dumps(scanner.scanner.btc_structure, indent=2)
+                else:
+                    response = json.dumps({"error": "BTC structure not available yet"})
             
             elif path == '/signals':
                 if scanner.db:
                     scanner.db.row_factory = aiosqlite.Row
                     async with scanner.db.execute("""
-                        SELECT symbol, side, entry_price, confluence_score, 
-                               expected_move, risk_reward, entry_type, status,
-                               created_at, close_reason, pnl_percent
-                        FROM confluence_signals 
-                        ORDER BY created_at DESC 
+                        SELECT symbol, side, entry_price, btc_adjusted_score, 
+                               btc_direction, btc_strength, expected_move, risk_reward,
+                               entry_type, status, created_at, close_reason, pnl_percent
+                        FROM btc_confluence_signals
+                        ORDER BY created_at DESC
                         LIMIT 20
                     """) as cursor:
                         rows = await cursor.fetchall()
                         signals = [dict(row) for row in rows]
                     
-                    response = json.dumps({"signals": signals, "count": len(signals)}, indent=2)
+                    response = json.dumps({
+                        "signals": signals,
+                        "count": len(signals),
+                        "btc_centered": True
+                    }, indent=2)
                 else:
                     response = json.dumps({"error": "Database not available"})
             
-            elif path == '/confluence':
+            elif path == '/strategy':
                 response = json.dumps({
-                    "exchange": "OKX",
-                    "analysis_layers": {
-                        "market_structure": {
-                            "weight": "25%",
-                            "focus": "Trend, key levels, HTF alignment",
-                            "indicators": "EMA alignment, swing points, structure breaks"
-                        },
-                        "order_flow": {
-                            "weight": "30%",
-                            "focus": "Volume profile, bid/ask imbalance",
-                            "indicators": "Volume spikes, orderbook depth, accumulation"
-                        },
-                        "momentum": {
-                            "weight": "25%",
-                            "focus": "Short-term momentum shifts",
-                            "indicators": "RSI hidden divergence, MACD flips, candlestick patterns"
-                        },
-                        "liquidity": {
-                            "weight": "20%",
-                            "focus": "Stop hunts & liquidity zones",
-                            "indicators": "Sweep highs/lows, equal highs/lows, liquidation clusters"
-                        }
+                    "name": "BTC-Centric Confluence Trading",
+                    "philosophy": "Bitcoin is the primary market structure. Altcoins must follow BTC direction.",
+                    "rules": [
+                        "1. Analyze BTC structure first (Daily, 4H, 1H)",
+                        "2. Only trade when BTC trend strength ≥ 4.0/10",
+                        "3. Altcoin must align with BTC direction",
+                        "4. Reject all counter-BTC trades",
+                        "5. Apply confluence analysis to aligned alts",
+                        "6. Use BTC-adjusted confluence scores"
+                    ],
+                    "parameters": {
+                        "btc_min_trend_strength": BTC_MIN_TREND_STRENGTH,
+                        "target_move": f"{TARGET_PROFIT_RANGE[0]}-{TARGET_PROFIT_RANGE[1]}%",
+                        "min_confluence": MIN_CONFLUENCE_SCORE,
+                        "max_stop_loss": f"{MAX_STOP_LOSS}%",
+                        "min_risk_reward": f"{MIN_RISK_REWARD}:1"
                     },
-                    "target_parameters": {
-                        "move_target": "3-5%",
-                        "confluence_threshold": f"{MIN_CONFLUENCE_SCORE}/10",
-                        "risk_management": f"Max SL: {MAX_STOP_LOSS}%, Min RR: {MIN_RISK_REWARD}:1"
+                    "btc_alignment_multipliers": {
+                        "perfect_alignment": "1.3x-1.5x score bonus",
+                        "counter_btc": "0.5x score penalty (rejected)",
+                        "btc_neutral": "1.0x (no bonus/penalty)"
                     }
                 }, indent=2)
             
@@ -2897,7 +3031,7 @@ async def start_confluence_server(scanner, port=8000):
             writer.close()
     
     server = await asyncio.start_server(handle_request, '0.0.0.0', port)
-    log.info(f"🌐 HTTP server started on port {port}")
+    log.info(f"🌐 BTC-centric HTTP server started on port {port}")
     
     async with server:
         await server.serve_forever()
@@ -2905,12 +3039,10 @@ async def start_confluence_server(scanner, port=8000):
 # ================ MAIN ================
 async def main():
     """Main function"""
-    scanner = ConfluenceMoveScanner()
+    scanner = BTCConfluenceMoveScanner()
     
-    # Start HTTP server in background
     http_task = asyncio.create_task(start_confluence_server(scanner))
     
-    # Run scanner
     await scanner.run()
 
 if __name__ == "__main__":
