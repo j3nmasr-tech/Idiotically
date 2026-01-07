@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ROMEOTPT SCANNER v4.0 - LIQUIDITY-FOCUSED EDITION
-Professional trading with liquidity-based TP/SL - NO FIXED PERCENTAGES
+ROMEOTPT SCANNER v4.1 - LIQUIDITY-FOCUSED WITH FULL 8-STEP DETAILS
+Professional trading with complete transparency on all 8 steps
 """
 
 import os
@@ -24,22 +24,22 @@ from dataclasses import dataclass
 # ---------------- CONFIG ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v4_0.db")
+DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v4_1.db")
 
 # Scanner settings
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 45))
-TOP_N = int(os.getenv("TOP_N", 5))  # Focus on quality, not quantity
-MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 2))  # Be gentle with API
+TOP_N = int(os.getenv("TOP_N", 5))
+MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 2))
 
 # Signal thresholds
-MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 0.0))  # Higher minimum
+MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 0.0))
 
 # Deduplication settings
-SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 30))  # Longer cooldown
-SIGNAL_VALIDITY_HOURS = int(os.getenv("SIGNAL_VALIDITY_HOURS", 72))  # Shorter validity
+SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 15))
+SIGNAL_VALIDITY_HOURS = int(os.getenv("SIGNAL_VALIDITY_HOURS", 72))
 
 # Rate limiting settings
-MAX_REQUESTS_PER_SECOND = int(os.getenv("MAX_REQUESTS_PER_SECOND", 8))  # Conservative
+MAX_REQUESTS_PER_SECOND = int(os.getenv("MAX_REQUESTS_PER_SECOND", 8))
 RATE_LIMIT_RETRIES = int(os.getenv("RATE_LIMIT_RETRIES", 3))
 RATE_LIMIT_BACKOFF_FACTOR = float(os.getenv("RATE_LIMIT_BACKOFF_FACTOR", 1.8))
 
@@ -49,7 +49,7 @@ logging.basicConfig(
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
-log = logging.getLogger("romeopt_v4_0")
+log = logging.getLogger("romeopt_v4_1")
 
 # ---------------- RATE LIMITER ----------------
 class RateLimiter:
@@ -60,7 +60,7 @@ class RateLimiter:
         self.max_concurrent = MAX_CONCURRENT
         self.semaphore = asyncio.Semaphore(MAX_CONCURRENT)
         self.request_times = []
-        self.min_delay = 0.15  # Increased minimum delay
+        self.min_delay = 0.15
         self.backoff_factor = RATE_LIMIT_BACKOFF_FACTOR
         self.max_retries = RATE_LIMIT_RETRIES
         
@@ -69,13 +69,12 @@ class RateLimiter:
         now = time.time()
         
         # Clean old request times
-        self.request_times = [t for t in self.request_times if now - t < 1.2]  # Slightly longer window
+        self.request_times = [t for t in self.request_times if now - t < 1.2]
         
         # Check if we're at the limit
         if len(self.request_times) >= self.max_rps:
             wait_time = 1.2 - (now - self.request_times[0])
             if wait_time > 0:
-                # Add random jitter
                 wait_time += np.random.uniform(0.05, 0.15)
                 await asyncio.sleep(wait_time)
         
@@ -92,14 +91,13 @@ class RateLimiter:
                 try:
                     await self.wait_if_needed()
                     result = await func(*args, **kwargs)
-                    # Small delay after successful request
                     await asyncio.sleep(0.02)
                     return result
                 except Exception as e:
                     error_str = str(e)
                     if any(phrase in error_str for phrase in ["Too Many Requests", "50011", "429", "rate limit"]):
                         wait_time = self.min_delay * (self.backoff_factor ** attempt)
-                        wait_time += np.random.uniform(0.1, 0.3)  # Random jitter
+                        wait_time += np.random.uniform(0.1, 0.3)
                         log.warning(f"Rate limited, attempt {attempt+1}/{self.max_retries}, waiting {wait_time:.2f}s")
                         await asyncio.sleep(wait_time)
                     else:
@@ -126,10 +124,10 @@ class LiquiditySetup:
     tp_targets: List[float] = None
     liquidity_analysis: Dict = None
     rr_ratio: float = 0.0
-    
+
 @dataclass
 class SetupQuality:
-    """LAYER 2: Quality metrics"""
+    """LAYER 2: Quality metrics with detailed step tracking"""
     sweep_strength: float = 0.0
     structure_shift: bool = False
     from_liquidity_exists: bool = False
@@ -496,7 +494,6 @@ def identify_liquidity_pools(df, timeframe="1h"):
     Find liquidity pools by identifying:
     1. Equal highs/lows (where stops cluster)
     2. Consolidation zones
-    3. Failed breakout areas
     """
     pools = {
         'buy_stops': [],   # Liquidity ABOVE price (shorts have stops here)
@@ -520,7 +517,7 @@ def identify_liquidity_pools(df, timeframe="1h"):
             # Count how many candles have this same high
             same_high_count = (window_highs == current_high).sum()
             
-            if same_high_count >= 2:  # At least 2 candles with same high
+            if same_high_count >= 2:
                 pools['equal_highs'].append({
                     'price': float(current_high),
                     'timeframe': timeframe,
@@ -547,7 +544,7 @@ def identify_liquidity_pools(df, timeframe="1h"):
             # Count how many candles have this same low
             same_low_count = (window_lows == current_low).sum()
             
-            if same_low_count >= 2:  # At least 2 candles with same low
+            if same_low_count >= 2:
                 pools['equal_lows'].append({
                     'price': float(current_low),
                     'timeframe': timeframe,
@@ -576,7 +573,6 @@ def identify_liquidity_pools(df, timeframe="1h"):
         if recent_range / avg_price < 0.01:
             consolidation_high = recent_data['high'].max()
             consolidation_low = recent_data['low'].min()
-            consolidation_mid = (consolidation_high + consolidation_low) / 2
             
             # Consolidation high becomes buy-stop liquidity
             pools['buy_stops'].append({
@@ -1075,7 +1071,7 @@ async def check_eligibility_fast(exchange, symbol: str) -> SetupEligibility:
 # ---------------- LAYER 2: QUALITY ANALYSIS ----------------
 async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility, 
                          liquidity_setup: LiquiditySetup) -> SetupQuality:
-    """LAYER 2: QUALITY ANALYSIS WITH 8-STEP TRACKING"""
+    """LAYER 2: QUALITY ANALYSIS WITH DETAILED 8-STEP TRACKING"""
     
     side = eligibility.side
     entry_type = eligibility.entry_type
@@ -1088,7 +1084,10 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility,
     confirmation_candle = False
     htfc_alignment_score = 0.0
     
-    # Initialize 8-step tracking
+    # Track specific details for each step
+    step_details_dict = {}
+    
+    # Initialize 8-step tracking with detailed info
     eight_steps = {
         'step_1_htf_bias': False,
         'step_2_zone_type': False,
@@ -1099,17 +1098,20 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility,
         'step_7_entry_validity': False,
         'step_8_liquidity_alignment': False,
         
-        'step_details': {
-            '1': 'HTF bias aligned with direction',
-            '2': 'Premium/Discount zone entry',
-            '3': 'Liquidity sweep detected',
-            '4': 'Market structure shift',
-            '5': 'FROM liquidity present',
-            '6': 'Confirmation candle formed',
-            '7': 'Price in valid entry zone',
-            '8': 'TP/SL aligned with liquidity pools'
-        },
-        'rr_ratio': liquidity_setup.rr_ratio
+        'step_details': step_details_dict,  # Will be populated below
+        'rr_ratio': liquidity_setup.rr_ratio,
+        
+        # Additional details for each step
+        'step_specifics': {
+            '1': {'trend': '', 'score': 0.0, 'alignment': ''},
+            '2': {'entry_type': entry_type, 'zone_quality': ''},
+            '3': {'strength': 0.0, 'sweep_type': '', 'details': ''},
+            '4': {'shift_type': '', 'confirmed': False},
+            '5': {'liquidity_type': '', 'present': False},
+            '6': {'candle_type': '', 'direction': ''},
+            '7': {'distance_pct': 0.0, 'in_zone': False},
+            '8': {'pools_analyzed': 0, 'alignment_score': 0}
+        }
     }
     
     try:
@@ -1119,27 +1121,53 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility,
         
         # === STEP 1: HTF Bias Alignment ===
         ohlcv_4h = await fetch_ohlcv(exchange, symbol, "4h", 50)
+        htf_trend = "NEUTRAL"
+        
         if ohlcv_4h:
             df_4h = create_dataframe(ohlcv_4h)
             if df_4h is not None and len(df_4h) >= 20:
                 df_4h['ema_20'] = df_4h['close'].ewm(span=20).mean()
                 df_4h['ema_50'] = df_4h['close'].ewm(span=50).mean()
                 
+                ema20 = df_4h['ema_20'].iloc[-1]
+                ema50 = df_4h['ema_50'].iloc[-1]
+                
                 if side == "BUY":
-                    htfc_alignment_score = 1.0 if df_4h['ema_20'].iloc[-1] > df_4h['ema_50'].iloc[-1] else 0.5
+                    htfc_alignment_score = 1.0 if ema20 > ema50 else 0.5
                     eight_steps['step_1_htf_bias'] = htfc_alignment_score >= 0.7
+                    htf_trend = "BULLISH" if ema20 > ema50 else "BEARISH" if ema20 < ema50 else "NEUTRAL"
                 else:
-                    htfc_alignment_score = 1.0 if df_4h['ema_20'].iloc[-1] < df_4h['ema_50'].iloc[-1] else 0.5
+                    htfc_alignment_score = 1.0 if ema20 < ema50 else 0.5
                     eight_steps['step_1_htf_bias'] = htfc_alignment_score >= 0.7
+                    htf_trend = "BEARISH" if ema20 < ema50 else "BULLISH" if ema20 > ema50 else "NEUTRAL"
+                
+                eight_steps['step_specifics']['1']['trend'] = htf_trend
+                eight_steps['step_specifics']['1']['score'] = htfc_alignment_score
+                eight_steps['step_specifics']['1']['alignment'] = "Aligned" if eight_steps['step_1_htf_bias'] else "Not Aligned"
+        
+        # Step 1 details
+        step_details_dict['1'] = f"Higher Timeframe Bias: {htf_trend} (Score: {htfc_alignment_score:.2f}/1.0)"
         
         # === STEP 2: Premium/Discount Zone ===
         if side == "BUY" and entry_type in ["DISCOUNT_ZONE", "BULLISH_ENGULFING"]:
             eight_steps['step_2_zone_type'] = True
+            zone_quality = "Optimal"
         elif side == "SELL" and entry_type in ["PREMIUM_ZONE", "BEARISH_ENGULFING"]:
             eight_steps['step_2_zone_type'] = True
+            zone_quality = "Optimal"
+        else:
+            zone_quality = "Suboptimal"
+        
+        eight_steps['step_specifics']['2']['entry_type'] = entry_type
+        eight_steps['step_specifics']['2']['zone_quality'] = zone_quality
+        
+        step_details_dict['2'] = f"Entry Type: {entry_type} ({zone_quality})"
         
         # === STEP 3: Liquidity Sweep ===
         ohlcv_15m = await fetch_ohlcv(exchange, symbol, "15m", 50)
+        sweep_type = "None"
+        sweep_details = ""
+        
         if ohlcv_15m:
             df_15m = create_dataframe(ohlcv_15m)
             if df_15m is not None and len(df_15m) >= 20:
@@ -1150,17 +1178,16 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility,
                     
                     if len(prev_lows) > 0:
                         prev_significant_low = prev_lows.min()
-                        if recent_low < prev_significant_low * 0.995:  # Swept below previous low
+                        if recent_low < prev_significant_low * 0.995:
                             sweep_strength = 0.8
                             eight_steps['step_3_liquidity_sweep'] = True
+                            sweep_type = "LOW_SWEEP"
+                            sweep_details = f"Swept low: {prev_significant_low:.8f} → {recent_low:.8f}"
                             
                             # Check if it was a clear wick (liquidity grab)
                             sweep_idx = df_15m['low'].idxmin()
                             if sweep_idx < len(df_15m) - 2:
                                 sweep_candle = df_15m.iloc[sweep_idx]
-                                next_candle = df_15m.iloc[sweep_idx + 1]
-                                
-                                # Wick should be significant compared to body
                                 body_size = abs(sweep_candle['close'] - sweep_candle['open'])
                                 lower_wick = min(sweep_candle['open'], sweep_candle['close']) - sweep_candle['low']
                                 
@@ -1168,6 +1195,7 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility,
                                     sweep_strength = 1.0
                                     from_liquidity_exists = True
                                     eight_steps['step_5_from_liquidity'] = True
+                                    sweep_details += " (Strong wick - smart money entry)"
                 else:
                     # Look for sweep of highs
                     recent_high = df_15m['high'].iloc[-5:].max()
@@ -1175,15 +1203,15 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility,
                     
                     if len(prev_highs) > 0:
                         prev_significant_high = prev_highs.max()
-                        if recent_high > prev_significant_high * 1.005:  # Swept above previous high
+                        if recent_high > prev_significant_high * 1.005:
                             sweep_strength = 0.8
                             eight_steps['step_3_liquidity_sweep'] = True
+                            sweep_type = "HIGH_SWEEP"
+                            sweep_details = f"Swept high: {prev_significant_high:.8f} → {recent_high:.8f}"
                             
                             sweep_idx = df_15m['high'].idxmax()
                             if sweep_idx < len(df_15m) - 2:
                                 sweep_candle = df_15m.iloc[sweep_idx]
-                                next_candle = df_15m.iloc[sweep_idx + 1]
-                                
                                 body_size = abs(sweep_candle['close'] - sweep_candle['open'])
                                 upper_wick = sweep_candle['high'] - max(sweep_candle['open'], sweep_candle['close'])
                                 
@@ -1191,8 +1219,18 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility,
                                     sweep_strength = 1.0
                                     from_liquidity_exists = True
                                     eight_steps['step_5_from_liquidity'] = True
+                                    sweep_details += " (Strong wick - smart money entry)"
+        
+        eight_steps['step_specifics']['3']['strength'] = sweep_strength
+        eight_steps['step_specifics']['3']['sweep_type'] = sweep_type
+        eight_steps['step_specifics']['3']['details'] = sweep_details
+        
+        step_details_dict['3'] = f"Liquidity Sweep: {sweep_type} (Strength: {sweep_strength:.2f}/1.0)"
+        if sweep_details:
+            step_details_dict['3'] += f"\n   {sweep_details}"
         
         # === STEP 4: Structure Shift ===
+        shift_type = "None"
         if ohlcv_4h:
             df_4h = create_dataframe(ohlcv_4h)
             if df_4h is not None and len(df_4h) >= 11:
@@ -1206,6 +1244,7 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility,
                         if current_high > previous_high:
                             structure_shift = True
                             eight_steps['step_4_structure_shift'] = True
+                            shift_type = "HIGHER_HIGH"
                 else:
                     # Check for lower low
                     recent_lows = df_4h['low'].iloc[-10:-1]
@@ -1216,9 +1255,28 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility,
                         if current_low < previous_low:
                             structure_shift = True
                             eight_steps['step_4_structure_shift'] = True
+                            shift_type = "LOWER_LOW"
+        
+        eight_steps['step_specifics']['4']['shift_type'] = shift_type
+        eight_steps['step_specifics']['4']['confirmed'] = structure_shift
+        
+        step_details_dict['4'] = f"Structure Shift: {shift_type} ({'✅ Confirmed' if structure_shift else '❌ Not Confirmed'})"
+        
+        # === STEP 5: FROM Liquidity ===
+        liquidity_type = "None"
+        if from_liquidity_exists:
+            liquidity_type = "Smart Money Entry"
+        
+        eight_steps['step_specifics']['5']['liquidity_type'] = liquidity_type
+        eight_steps['step_specifics']['5']['present'] = from_liquidity_exists
+        
+        step_details_dict['5'] = f"FROM Liquidity: {liquidity_type} ({'✅ Present' if from_liquidity_exists else '❌ Absent'})"
         
         # === STEP 6: Confirmation Candle ===
         ohlcv_5m = await fetch_ohlcv(exchange, symbol, "5m", 10)
+        candle_type = "None"
+        candle_direction = ""
+        
         if ohlcv_5m:
             df_5m = create_dataframe(ohlcv_5m)
             if df_5m is not None and len(df_5m) >= 3:
@@ -1228,25 +1286,56 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility,
                     if last_candle['close'] > last_candle['open']:
                         confirmation_candle = True
                         eight_steps['step_6_confirmation_candle'] = True
+                        candle_type = "BULLISH"
+                        candle_direction = "Up"
                 else:
                     last_candle = df_5m.iloc[-1]
                     if last_candle['close'] < last_candle['open']:
                         confirmation_candle = True
                         eight_steps['step_6_confirmation_candle'] = True
+                        candle_type = "BEARISH"
+                        candle_direction = "Down"
+        
+        eight_steps['step_specifics']['6']['candle_type'] = candle_type
+        eight_steps['step_specifics']['6']['direction'] = candle_direction
+        
+        step_details_dict['6'] = f"Confirmation Candle: {candle_type} ({'✅ Confirmed' if confirmation_candle else '❌ Not Confirmed'})"
         
         # === STEP 7: Entry Validity ===
         # Check if current price is still near entry
         price_diff_pct = abs(current_price - entry_price) / entry_price * 100
-        eight_steps['step_7_entry_validity'] = price_diff_pct <= 1.5  # Within 1.5% of entry
+        in_zone = price_diff_pct <= 1.5
+        eight_steps['step_7_entry_validity'] = in_zone
+        
+        eight_steps['step_specifics']['7']['distance_pct'] = price_diff_pct
+        eight_steps['step_specifics']['7']['in_zone'] = in_zone
+        
+        step_details_dict['7'] = f"Entry Validity: Distance {price_diff_pct:.2f}% ({'✅ In Zone' if in_zone else '❌ Outside Zone'})"
         
         # === STEP 8: Liquidity Alignment ===
         # Check if TP/SL are based on liquidity pools
         liquidity_analysis = liquidity_setup.liquidity_analysis
+        pools_analyzed = 0
+        alignment_score = 0
+        
         if liquidity_analysis:
-            eight_steps['step_8_liquidity_alignment'] = (
-                liquidity_analysis.get('identified_pools', {}).get('buy_stops', 0) > 0 or
-                liquidity_analysis.get('identified_pools', {}).get('sell_stops', 0) > 0
-            )
+            pools = liquidity_analysis.get('identified_pools', {})
+            pools_analyzed = sum(pools.values())
+            
+            # Calculate alignment score based on pools found
+            if pools_analyzed >= 8:
+                alignment_score = 1.0
+            elif pools_analyzed >= 4:
+                alignment_score = 0.7
+            elif pools_analyzed >= 2:
+                alignment_score = 0.5
+            
+            eight_steps['step_8_liquidity_alignment'] = pools_analyzed >= 2
+        
+        eight_steps['step_specifics']['8']['pools_analyzed'] = pools_analyzed
+        eight_steps['step_specifics']['8']['alignment_score'] = alignment_score
+        
+        step_details_dict['8'] = f"Liquidity Alignment: {pools_analyzed} pools analyzed ({'✅ Aligned' if eight_steps['step_8_liquidity_alignment'] else '❌ Weak Alignment'})"
         
     except Exception as e:
         log.debug(f"Quality analysis error for {symbol}: {e}")
@@ -1349,13 +1438,15 @@ async def scan_symbol_fast(exchange, symbol: str) -> Optional[Dict]:
 
 # ---------------- ALERTS ----------------
 async def send_fast_alert(setup: Dict):
-    """Send concise alerts with liquidity analysis"""
+    """Send comprehensive alerts with FULL 8-step details"""
     
     try:
         symbol = setup.get('symbol', 'UNKNOWN')
         quality = setup.get('quality', {})
         liquidity = setup.get('liquidity_analysis', {})
         eight_steps = quality.get('eight_steps', {})
+        step_details = eight_steps.get('step_details', {})
+        step_specifics = eight_steps.get('step_specifics', {})
         
         # Check if this is an update
         is_update = symbol in signal_tracker.active_signals
@@ -1376,87 +1467,207 @@ async def send_fast_alert(setup: Dict):
             old_quality = old_setup.get('quality', {}).get('total_score', 0)
             new_quality = quality.get('total_score', 0)
             if new_quality > old_quality:
-                update_info = f"\n📈 <b>Quality UP:</b> {old_quality:.2f} → {new_quality:.2f}"
+                update_info = f"\n📈 <b>Quality IMPROVED:</b> {old_quality:.2f} → {new_quality:.2f}"
             elif old_quality > 0:
-                update_info = f"\n🔄 <b>Updated signal</b>"
+                update_info = f"\n🔄 <b>Signal Updated</b>"
         
-        # Format TP targets
+        # Format TP targets with distances
         tp_targets = setup.get('tp_targets', [])
+        entry_price = setup.get('entry_price', 0)
         tp_lines = []
         for i, tp in enumerate(tp_targets):
-            if i == 0:
-                tp_lines.append(f"TP{i+1}: {tp:.8f} (<b>main</b>)")
-            else:
-                tp_lines.append(f"TP{i+1}: {tp:.8f}")
+            if entry_price > 0:
+                distance_pct = abs(tp - entry_price) / entry_price * 100
+                if i == 0:
+                    tp_lines.append(f"<b>TP{i+1}:</b> {tp:.8f} (<code>{distance_pct:.2f}%</code>)")
+                elif i == 1:
+                    tp_lines.append(f"<b>TP{i+1}:</b> {tp:.8f} (<code>{distance_pct:.2f}%</code>)")
+                else:
+                    tp_lines.append(f"<b>TP{i+1}:</b> {tp:.8f} (<code>{distance_pct:.2f}%</code>)")
         
-        # Build 8-step checklist
-        checklist_lines = []
-        step_passes = 0
+        # ============ DETAILED 8-STEP ANALYSIS ============
+        checklist_sections = []
         
-        step_names = [
-            ("HTF Bias", 'step_1_htf_bias'),
-            ("Zone Type", 'step_2_zone_type'),
-            ("Liquidity Sweep", 'step_3_liquidity_sweep'),
-            ("Structure Shift", 'step_4_structure_shift'),
-            ("FROM Liquidity", 'step_5_from_liquidity'),
-            ("Confirmation", 'step_6_confirmation_candle'),
-            ("Entry Valid", 'step_7_entry_validity'),
-            ("Liquidity Aligned", 'step_8_liquidity_alignment')
-        ]
+        # Step 1: HTF Bias Alignment
+        step1_passed = eight_steps.get('step_1_htf_bias', False)
+        step1_spec = step_specifics.get('1', {})
+        step1_detail = f"<b>1️⃣ HTF BIAS ALIGNMENT:</b>\n"
+        step1_detail += f"   Status: {'✅ <b>PASS</b>' if step1_passed else '❌ <b>FAIL</b>'}\n"
+        step1_detail += f"   Trend: {step1_spec.get('trend', 'N/A')}\n"
+        step1_detail += f"   Score: {step1_spec.get('score', 0):.2f}/1.0\n"
+        step1_detail += f"   Alignment: {step1_spec.get('alignment', 'N/A')}\n"
+        checklist_sections.append(step1_detail)
         
-        for name, key in step_names:
-            passed = eight_steps.get(key, False)
-            if passed:
-                checklist_lines.append(f"✅ {name}")
-                step_passes += 1
-            else:
-                checklist_lines.append(f"❌ {name}")
+        # Step 2: Premium/Discount Zone
+        step2_passed = eight_steps.get('step_2_zone_type', False)
+        step2_spec = step_specifics.get('2', {})
+        step2_detail = f"<b>2️⃣ ZONE TYPE:</b>\n"
+        step2_detail += f"   Status: {'✅ <b>PASS</b>' if step2_passed else '❌ <b>FAIL</b>'}\n"
+        step2_detail += f"   Type: {step2_spec.get('entry_type', 'N/A')}\n"
+        step2_detail += f"   Quality: {step2_spec.get('zone_quality', 'N/A')}\n"
+        if step2_passed:
+            step2_detail += f"   ✓ Entering at optimal structural zone"
+        else:
+            step2_detail += f"   ✗ Entry type suboptimal"
+        checklist_sections.append(step2_detail)
         
-        checklist = "📋 <b>SETUP CHECKLIST:</b>\n"
-        for line in checklist_lines:
-            checklist += f"   {line}\n"
-        checklist += f"\n   📊 <b>SCORE:</b> {step_passes}/8 steps passed"
+        # Step 3: Liquidity Sweep
+        step3_passed = eight_steps.get('step_3_liquidity_sweep', False)
+        step3_spec = step_specifics.get('3', {})
+        step3_detail = f"<b>3️⃣ LIQUIDITY SWEEP:</b>\n"
+        step3_detail += f"   Status: {'✅ <b>PASS</b>' if step3_passed else '❌ <b>FAIL</b>'}\n"
+        step3_detail += f"   Type: {step3_spec.get('sweep_type', 'None')}\n"
+        step3_detail += f"   Strength: {step3_spec.get('strength', 0):.2f}/1.0\n"
+        if step3_spec.get('details'):
+            step3_detail += f"   Details: {step3_spec.get('details', '')}"
+        checklist_sections.append(step3_detail)
         
-        # Liquidity analysis
-        liquidity_msg = ""
+        # Step 4: Structure Shift
+        step4_passed = eight_steps.get('step_4_structure_shift', False)
+        step4_spec = step_specifics.get('4', {})
+        step4_detail = f"<b>4️⃣ STRUCTURE SHIFT:</b>\n"
+        step4_detail += f"   Status: {'✅ <b>PASS</b>' if step4_passed else '❌ <b>FAIL</b>'}\n"
+        step4_detail += f"   Type: {step4_spec.get('shift_type', 'None')}\n"
+        step4_detail += f"   Confirmed: {'✅ Yes' if step4_spec.get('confirmed', False) else '❌ No'}\n"
+        if step4_passed:
+            step4_detail += f"   ✓ Market structure has shifted"
+        else:
+            step4_detail += f"   ✗ Waiting for structure confirmation"
+        checklist_sections.append(step4_detail)
+        
+        # Step 5: FROM Liquidity
+        step5_passed = eight_steps.get('step_5_from_liquidity', False)
+        step5_spec = step_specifics.get('5', {})
+        step5_detail = f"<b>5️⃣ FROM LIQUIDITY:</b>\n"
+        step5_detail += f"   Status: {'✅ <b>PASS</b>' if step5_passed else '❌ <b>FAIL</b>'}\n"
+        step5_detail += f"   Type: {step5_spec.get('liquidity_type', 'None')}\n"
+        step5_detail += f"   Present: {'✅ Yes' if step5_spec.get('present', False) else '❌ No'}\n"
+        if step5_passed:
+            step5_detail += f"   ✓ Smart money entry detected"
+        else:
+            step5_detail += f"   ✗ No clear smart money activity"
+        checklist_sections.append(step5_detail)
+        
+        # Step 6: Confirmation Candle
+        step6_passed = eight_steps.get('step_6_confirmation_candle', False)
+        step6_spec = step_specifics.get('6', {})
+        step6_detail = f"<b>6️⃣ CONFIRMATION CANDLE:</b>\n"
+        step6_detail += f"   Status: {'✅ <b>PASS</b>' if step6_passed else '❌ <b>FAIL</b>'}\n"
+        step6_detail += f"   Type: {step6_spec.get('candle_type', 'None')}\n"
+        step6_detail += f"   Direction: {step6_spec.get('direction', 'N/A')}\n"
+        step6_detail += f"   Confirmed: {'✅ Yes' if step6_spec.get('direction') else '❌ No'}\n"
+        checklist_sections.append(step6_detail)
+        
+        # Step 7: Entry Validity
+        step7_passed = eight_steps.get('step_7_entry_validity', False)
+        step7_spec = step_specifics.get('7', {})
+        step7_detail = f"<b>7️⃣ ENTRY VALIDITY:</b>\n"
+        step7_detail += f"   Status: {'✅ <b>PASS</b>' if step7_passed else '❌ <b>FAIL</b>'}\n"
+        step7_detail += f"   Distance: {step7_spec.get('distance_pct', 0):.2f}%\n"
+        step7_detail += f"   In Zone: {'✅ Yes' if step7_spec.get('in_zone', False) else '❌ No'}\n"
+        if step7_passed:
+            step7_detail += f"   ✓ Within optimal entry zone (≤1.5%)"
+        else:
+            step7_detail += f"   ⚠️ Outside ideal entry (adjust position)"
+        checklist_sections.append(step7_detail)
+        
+        # Step 8: Liquidity Alignment
+        step8_passed = eight_steps.get('step_8_liquidity_alignment', False)
+        step8_spec = step_specifics.get('8', {})
+        step8_detail = f"<b>8️⃣ LIQUIDITY ALIGNMENT:</b>\n"
+        step8_detail += f"   Status: {'✅ <b>PASS</b>' if step8_passed else '❌ <b>FAIL</b>'}\n"
+        step8_detail += f"   Pools Analyzed: {step8_spec.get('pools_analyzed', 0)}\n"
+        step8_detail += f"   Alignment Score: {step8_spec.get('alignment_score', 0):.2f}/1.0\n"
+        if step8_passed:
+            step8_detail += f"   ✓ TP/SL based on liquidity pools"
+        else:
+            step8_detail += f"   ✗ Weak liquidity alignment"
+        checklist_sections.append(step8_detail)
+        
+        # Build comprehensive checklist
+        checklist = "🔬 <b>DETAILED 8-STEP ANALYSIS:</b>\n"
+        for section in checklist_sections:
+            checklist += f"\n{section}\n"
+        
+        # Count passes and calculate score
+        pass_count = sum([
+            step1_passed, step2_passed, step3_passed, step4_passed,
+            step5_passed, step6_passed, step7_passed, step8_passed
+        ])
+        
+        checklist += f"\n📊 <b>OVERALL SCORE:</b> {pass_count}/8 steps passed"
+        checklist += f"\n🏆 <b>QUALITY SCORE:</b> {quality.get('total_score', 0):.2f}/5.0 ({quality.get('tier', 'C')} {tier_emoji})"
+        
+        # Liquidity analysis summary
+        liquidity_summary = ""
         if liquidity:
             pools = liquidity.get('identified_pools', {})
-            liquidity_msg = f"""
+            liquidity_summary = f"""
 💧 <b>LIQUIDITY ANALYSIS:</b>
-• Buy-stop pools: {pools.get('buy_stops', 0)}
-• Sell-stop pools: {pools.get('sell_stops', 0)}
-• SL based on: {liquidity.get('sl_based_on', 'N/A')}
-• TP based on: {liquidity.get('tp_based_on', 'N/A')}
+• Buy-stop pools: {pools.get('buy_stops', 0)} (shorts' stops)
+• Sell-stop pools: {pools.get('sell_stops', 0)} (longs' stops)
+• Equal highs: {pools.get('equal_highs', 0)} (premium zones)
+• Equal lows: {pools.get('equal_lows', 0)} (discount zones)
+• SL based on: {liquidity.get('sl_based_on', 'N/A').replace('_', ' ').title()}
+• TP based on: {liquidity.get('tp_based_on', 'N/A').replace('_', ' ').title()}
 """
         
-        msg = f"""
-{update_emoji}{tier_emoji} <b>ROMEOTPT v4.0 - LIQUIDITY EDITION</b>
+        # Risk/Reward breakdown
+        risk = setup.get('risk', 0)
+        reward = setup.get('reward', 0)
+        rr_ratio = setup.get('rr_ratio', 0)
+        
+        if entry_price > 0:
+            risk_pct = risk / entry_price * 100
+            reward_pct = reward / entry_price * 100 if reward > 0 else 0
+        else:
+            risk_pct = 0
+            reward_pct = 0
+        
+        risk_reward = f"""
+⚖️ <b>RISK/REWARD ANALYSIS:</b>
+• Risk: {risk:.8f} (<code>{risk_pct:.2f}%</code>)
+• Reward: {reward:.8f} (<code>{reward_pct:.2f}%</code>)
+• Ratio: <b>{rr_ratio:.2f}:1</b>
+• Risk per $1000: <code>${risk_pct * 10:.2f}</code>
+• Reward per $1000: <code>${reward_pct * 10:.2f}</code>
+"""
+        
+        # Signal header
+        current_price = setup.get('current_price', 0)
+        entry_distance_pct = abs(current_price - entry_price) / entry_price * 100 if entry_price > 0 else 0
+        
+        signal_info = f"""
+{update_emoji}{tier_emoji} <b>ROMEOTPT v4.1 - LIQUIDITY EDITION</b>
 
-<b>🎯 {symbol}</b> | {setup.get('side', 'N/A')}
-<b>Entry:</b> {setup.get('entry_price', 0):.8f}
-<b>Current:</b> {setup.get('current_price', 0):.8f}
-<b>Type:</b> {setup.get('entry_type', 'N/A')}{update_info}
+<b>🎯 SIGNAL: {symbol} | {setup.get('side', 'N/A')}</b>
+Entry Price: <code>{entry_price:.8f}</code>
+Current Price: <code>{current_price:.8f}</code>
+Entry Type: {setup.get('entry_type', 'N/A')}
+Entry Distance: <code>{entry_distance_pct:.2f}%</code>
+{update_info}
 
-{checklist}
-
-{liquidity_msg}
 🎯 <b>TARGETS:</b>
 {chr(10).join(tp_lines)}
 
-🛡️ <b>RISK:</b>
-SL: {setup.get('sl_price', 0):.8f}
-RR: {setup.get('rr_ratio', 0):.2f}:1
-Risk: {setup.get('risk', 0):.8f} ({liquidity.get('risk_pct', 0):.1f}%)
-Reward: {setup.get('reward', 0):.8f} ({liquidity.get('reward_pct', 0):.1f}%)
+🛡️ <b>STOP LOSS:</b>
+SL: <code>{setup.get('sl_price', 0):.8f}</code>
+Distance: <code>{abs(setup.get('sl_price', 0) - entry_price) / entry_price * 100:.2f}%</code>
+"""
+        
+        # Compose final message
+        msg = f"""
+{signal_info}
+{risk_reward}
+{liquidity_summary}
+{checklist}
 
-📈 <b>QUALITY:</b> {quality.get('total_score', 0):.2f}/5.0 ({quality.get('tier', 'C')})
-
-<i>Detected: {datetime.datetime.utcnow().strftime('%H:%M:%S UTC')}</i>
+<i>Detected: {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}</i>
 """
         
         await send_telegram(msg)
     except Exception as e:
-        log.error(f"Error sending alert: {e}")
+        log.error(f"Error sending detailed alert: {e}")
 
 async def send_outcome_alert(symbol: str, outcome: Dict):
     """Send alert when signal hits TP or SL"""
@@ -1482,22 +1693,33 @@ async def send_outcome_alert(symbol: str, outcome: Dict):
         tp_hit = outcome.get('tp_level', 0)
         target_hit = tp_targets[tp_hit-1] if tp_hit > 0 and len(tp_targets) >= tp_hit else outcome['price']
         
-        # Get liquidity analysis
-        liquidity = setup.get('liquidity_analysis', {})
-        pools_analyzed = liquidity.get('identified_pools', {})
+        # Get quality info
+        quality = setup.get('quality', {})
+        eight_steps = quality.get('eight_steps', {})
+        step_passes = sum([
+            eight_steps.get('step_1_htf_bias', False),
+            eight_steps.get('step_2_zone_type', False),
+            eight_steps.get('step_3_liquidity_sweep', False),
+            eight_steps.get('step_4_structure_shift', False),
+            eight_steps.get('step_5_from_liquidity', False),
+            eight_steps.get('step_6_confirmation_candle', False),
+            eight_steps.get('step_7_entry_validity', False),
+            eight_steps.get('step_8_liquidity_alignment', False)
+        ])
         
         msg = f"""
 {emoji} <b>{result_text}</b>
 
 <b>{symbol}</b> | {setup.get('side', 'N/A')}
-<b>Entry:</b> {setup.get('entry_price', 0):.8f}
-<b>Exit:</b> {outcome['price']:.8f}
-<b>Target:</b> {target_hit:.8f}
-<b>PnL:</b> {outcome['pnl_pct']:+.2f}%
+Entry: <code>{setup.get('entry_price', 0):.8f}</code>
+Exit: <code>{outcome['price']:.8f}</code>
+Target: <code>{target_hit:.8f}</code>
+PnL: <code>{outcome['pnl_pct']:+.2f}%</code>
 
-⏱️ <b>Held:</b> {time_str}
-📊 <b>Quality was:</b> {setup.get('quality', {}).get('tier', 'N/A')} ({setup.get('quality', {}).get('total_score', 0):.2f})
-🔍 <b>Liquidity pools analyzed:</b> {pools_analyzed.get('buy_stops', 0)} buy / {pools_analyzed.get('sell_stops', 0)} sell
+⏱️ Held: {time_str}
+📊 Quality was: {quality.get('tier', 'N/A')} ({quality.get('total_score', 0):.2f})
+🔍 Steps passed: {step_passes}/8
+🔗 RR Ratio: {setup.get('rr_ratio', 0):.2f}:1
 
 <i>Max favorable: {outcome.get('max_favorable', 0):.2f}%</i>
 <i>Max adverse: {outcome.get('max_adverse', 0):.2f}%</i>
@@ -1525,7 +1747,6 @@ async def send_deduped_alert(setup: Dict):
             return True
         else:
             signal_tracker.update_signal(symbol, setup, alerted=False)
-            # Log only occasionally to avoid spam
             if np.random.random() < 0.05:
                 log.debug(f"⏸️  Skipped alert for {symbol}: {reason}")
             return False
@@ -1539,7 +1760,7 @@ async def init_database():
     try:
         # Create tables
         await db_conn.execute("""
-            CREATE TABLE IF NOT EXISTS signals_v4 (
+            CREATE TABLE IF NOT EXISTS signals_v4_1 (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 symbol TEXT,
                 timestamp TEXT,
@@ -1555,6 +1776,7 @@ async def init_database():
                 current_price REAL,
                 liquidity_buy_stops INTEGER,
                 liquidity_sell_stops INTEGER,
+                eight_steps_passed INTEGER,
                 status TEXT DEFAULT 'active',
                 alert_sent BOOLEAN DEFAULT 1,
                 closed_at TEXT,
@@ -1568,7 +1790,7 @@ async def init_database():
         """)
         
         await db_conn.execute("""
-            CREATE TABLE IF NOT EXISTS signal_outcomes_v4 (
+            CREATE TABLE IF NOT EXISTS signal_outcomes_v4_1 (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 signal_id INTEGER,
                 symbol TEXT,
@@ -1579,6 +1801,8 @@ async def init_database():
                 tp2_price REAL,
                 tp3_price REAL,
                 quality_score REAL,
+                quality_tier TEXT,
+                eight_steps_passed INTEGER,
                 liquidity_buy_stops INTEGER,
                 liquidity_sell_stops INTEGER,
                 created_at TEXT,
@@ -1590,19 +1814,19 @@ async def init_database():
                 hold_time_minutes INTEGER,
                 max_favorable_pct REAL,
                 max_adverse_pct REAL,
-                FOREIGN KEY (signal_id) REFERENCES signals_v4 (id)
+                FOREIGN KEY (signal_id) REFERENCES signals_v4_1 (id)
             )
         """)
         
         # Create indexes
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_signals_symbol_time ON signals_v4 (symbol, timestamp)")
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_signals_status ON signals_v4 (status)")
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_signals_outcome ON signals_v4 (outcome)")
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_outcomes_symbol ON signal_outcomes_v4 (symbol)")
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_outcomes_outcome ON signal_outcomes_v4 (outcome_type)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_1_signals_symbol ON signals_v4_1 (symbol, timestamp)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_1_signals_status ON signals_v4_1 (status)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_1_signals_outcome ON signals_v4_1 (outcome)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_1_outcomes_symbol ON signal_outcomes_v4_1 (symbol)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_1_outcomes_outcome ON signal_outcomes_v4_1 (outcome_type)")
         
         await db_conn.commit()
-        log.info("Database v4 initialized with liquidity tracking")
+        log.info("Database v4.1 initialized with 8-step tracking")
     except Exception as e:
         log.error(f"Error initializing database: {e}")
         raise
@@ -1614,15 +1838,29 @@ async def store_signal(setup: Dict):
             tp_targets = setup.get("tp_targets", [])
             liquidity = setup.get("liquidity_analysis", {})
             pools = liquidity.get("identified_pools", {})
+            quality = setup.get("quality", {})
+            eight_steps = quality.get("eight_steps", {})
+            
+            # Count passed steps
+            step_passes = sum([
+                eight_steps.get('step_1_htf_bias', False),
+                eight_steps.get('step_2_zone_type', False),
+                eight_steps.get('step_3_liquidity_sweep', False),
+                eight_steps.get('step_4_structure_shift', False),
+                eight_steps.get('step_5_from_liquidity', False),
+                eight_steps.get('step_6_confirmation_candle', False),
+                eight_steps.get('step_7_entry_validity', False),
+                eight_steps.get('step_8_liquidity_alignment', False)
+            ])
             
             # Store in signals table
             cursor = await db_conn.execute("""
-                INSERT INTO signals_v4 (
+                INSERT INTO signals_v4_1 (
                     symbol, timestamp, side, entry_price, sl_price, 
                     tp1, tp2, tp3, rr_ratio, quality_tier, quality_score,
                     current_price, liquidity_buy_stops, liquidity_sell_stops,
-                    status, alert_sent
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1)
+                    eight_steps_passed, status, alert_sent
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1)
             """, (
                 setup.get("symbol", ""),
                 setup.get("timestamp", ""),
@@ -1633,11 +1871,12 @@ async def store_signal(setup: Dict):
                 tp_targets[1] if len(tp_targets) > 1 else None,
                 tp_targets[2] if len(tp_targets) > 2 else None,
                 setup.get("rr_ratio", 0),
-                setup.get("quality", {}).get("tier", "C"),
-                setup.get("quality", {}).get("total_score", 0),
+                quality.get("tier", "C"),
+                quality.get("total_score", 0),
                 setup.get("current_price", 0),
                 pools.get("buy_stops", 0),
-                pools.get("sell_stops", 0)
+                pools.get("sell_stops", 0),
+                step_passes
             ))
             
             # Get the inserted ID
@@ -1645,11 +1884,12 @@ async def store_signal(setup: Dict):
             
             # Also store in outcomes table for tracking
             await db_conn.execute("""
-                INSERT INTO signal_outcomes_v4 (
+                INSERT INTO signal_outcomes_v4_1 (
                     signal_id, symbol, side, entry_price, sl_price, tp1_price,
-                    tp2_price, tp3_price, quality_score, liquidity_buy_stops,
-                    liquidity_sell_stops, created_at, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+                    tp2_price, tp3_price, quality_score, quality_tier,
+                    eight_steps_passed, liquidity_buy_stops, liquidity_sell_stops,
+                    created_at, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
             """, (
                 signal_id,
                 setup.get("symbol", ""),
@@ -1659,7 +1899,9 @@ async def store_signal(setup: Dict):
                 tp_targets[0] if len(tp_targets) > 0 else None,
                 tp_targets[1] if len(tp_targets) > 1 else None,
                 tp_targets[2] if len(tp_targets) > 2 else None,
-                setup.get("quality", {}).get("total_score", 0),
+                quality.get("total_score", 0),
+                quality.get("tier", "C"),
+                step_passes,
                 pools.get("buy_stops", 0),
                 pools.get("sell_stops", 0),
                 setup.get("timestamp", "")
@@ -1679,7 +1921,7 @@ async def store_outcome(symbol: str, outcome: Dict):
             
             # Update signals table
             await db_conn.execute("""
-                UPDATE signals_v4 
+                UPDATE signals_v4_1 
                 SET status = 'closed', closed_at = ?, closed_price = ?, outcome = ?,
                     pnl_pct = ?, bars_held = ?, max_favorable_pct = ?, max_adverse_pct = ?
                 WHERE symbol = ? AND status = 'active'
@@ -1697,7 +1939,7 @@ async def store_outcome(symbol: str, outcome: Dict):
             
             # Update signal_outcomes table
             await db_conn.execute("""
-                UPDATE signal_outcomes_v4 
+                UPDATE signal_outcomes_v4_1 
                 SET status = 'closed', closed_at = ?, closed_price = ?, outcome_type = ?,
                     pnl_pct = ?, hold_time_minutes = ?, max_favorable_pct = ?, max_adverse_pct = ?
                 WHERE symbol = ? AND status = 'active'
@@ -1793,24 +2035,23 @@ async def liquidity_scanner(exchange):
     
     # Send startup message
     startup_msg = f"""
-🚀 <b>ROMEOTPT v4.0 - LIQUIDITY EDITION STARTED</b>
+🚀 <b>ROMEOTPT v4.1 - LIQUIDITY EDITION STARTED</b>
 
 <b>Professional Trading System:</b>
 • TP/SL based SOLELY on liquidity pools
-• NO fixed percentages - pure market structure
+• FULL 8-step analysis in every signal
+• Complete transparency on all checks
 • Multi-timeframe liquidity analysis
-• 8-step quality checklist
 
 <b>Settings:</b>
 • Scan: {SCAN_INTERVAL}s
 • Top: {TOP_N} symbols
 • Rate limit: {MAX_REQUESTS_PER_SECOND} req/s
 • Concurrency: {MAX_CONCURRENT}
-• Cooldown: {SIGNAL_COOLDOWN_MINUTES}min
-• Validity: {SIGNAL_VALIDITY_HOURS}h
 • Min quality: {MIN_QUALITY_SCORE}
+• Cooldown: {SIGNAL_COOLDOWN_MINUTES}min
 
-<i>Trading where institutions trade - at liquidity pools</i>
+<i>Now with FULL 8-step details in every alert</i>
 """
     await send_telegram(startup_msg)
     
@@ -1889,7 +2130,7 @@ async def health():
     stats = signal_tracker.get_stats()
     return {
         "status": "healthy", 
-        "version": "4.0 - Liquidity Edition",
+        "version": "4.1 - Full 8-Step Details",
         "active_signals": stats.get('active_signals', 0),
         "outcome_stats": stats.get('outcome_stats', {})
     }
@@ -1900,7 +2141,21 @@ async def get_active_signals():
     active = []
     for symbol, data in signal_tracker.active_signals.items():
         setup = data.get('setup', {})
-        liquidity = setup.get('liquidity_analysis', {})
+        quality = setup.get('quality', {})
+        eight_steps = quality.get('eight_steps', {})
+        
+        # Count passed steps
+        step_passes = sum([
+            eight_steps.get('step_1_htf_bias', False),
+            eight_steps.get('step_2_zone_type', False),
+            eight_steps.get('step_3_liquidity_sweep', False),
+            eight_steps.get('step_4_structure_shift', False),
+            eight_steps.get('step_5_from_liquidity', False),
+            eight_steps.get('step_6_confirmation_candle', False),
+            eight_steps.get('step_7_entry_validity', False),
+            eight_steps.get('step_8_liquidity_alignment', False)
+        ])
+        
         active.append({
             "symbol": symbol,
             "side": setup.get('side', ''),
@@ -1909,17 +2164,17 @@ async def get_active_signals():
             "sl": setup.get('sl_price', 0),
             "tp1": setup.get('tp_targets', [0])[0] if len(setup.get('tp_targets', [])) > 0 else 0,
             "tp2": setup.get('tp_targets', [0, 0])[1] if len(setup.get('tp_targets', [])) > 1 else 0,
-            "quality": setup.get('quality', {}).get('total_score', 0),
-            "tier": setup.get('quality', {}).get('tier', 'C'),
+            "quality_score": quality.get('total_score', 0),
+            "quality_tier": quality.get('tier', 'C'),
+            "steps_passed": step_passes,
             "rr_ratio": setup.get('rr_ratio', 0),
-            "liquidity_pools": liquidity.get('identified_pools', {}),
             "age_minutes": (datetime.datetime.utcnow() - data.get('first_seen', datetime.datetime.utcnow())).total_seconds() / 60
         })
     return {"active_signals": active, "count": len(active)}
 
 @app.get("/outcomes/stats")
 async def get_outcome_stats(hours: int = 24):
-    """Get outcome statistics"""
+    """Get outcome statistics with 8-step analysis"""
     async with db_lock:
         try:
             cursor = await db_conn.execute("""
@@ -1930,8 +2185,9 @@ async def get_outcome_stats(hours: int = 24):
                     AVG(pnl_pct) as avg_pnl,
                     AVG(hold_time_minutes) as avg_hold_time,
                     AVG(liquidity_buy_stops) as avg_buy_stops,
-                    AVG(liquidity_sell_stops) as avg_sell_stops
-                FROM signal_outcomes_v4 
+                    AVG(liquidity_sell_stops) as avg_sell_stops,
+                    AVG(eight_steps_passed) as avg_steps_passed
+                FROM signal_outcomes_v4_1 
                 WHERE status = 'closed' 
                 AND closed_at > datetime('now', ?)
             """, (f"-{hours} hours",))
@@ -1943,11 +2199,13 @@ async def get_outcome_stats(hours: int = 24):
                     COUNT(*) as count,
                     SUM(CASE WHEN outcome LIKE 'TP%' THEN 1 ELSE 0 END) as wins,
                     AVG(pnl_pct) as avg_pnl,
-                    AVG(rr_ratio) as avg_rr
-                FROM signals_v4 
+                    AVG(rr_ratio) as avg_rr,
+                    AVG(eight_steps_passed) as avg_steps_passed
+                FROM signals_v4_1 
                 WHERE status = 'closed' 
                 AND timestamp > datetime('now', ?)
                 GROUP BY quality_tier
+                ORDER BY quality_tier DESC
             """, (f"-{hours} hours",))
             rows = await cursor.fetchall()
             tier_stats = {}
@@ -1957,7 +2215,8 @@ async def get_outcome_stats(hours: int = 24):
                         'count': row[1],
                         'wins': row[2],
                         'avg_pnl': row[3],
-                        'avg_rr': row[4]
+                        'avg_rr': row[4],
+                        'avg_steps_passed': row[5]
                     }
         except Exception as e:
             log.error(f"Error fetching outcome stats: {e}")
@@ -1978,6 +2237,7 @@ async def get_outcome_stats(hours: int = 24):
             'buy_stops': row[5] if row else 0,
             'sell_stops': row[6] if row else 0
         },
+        'avg_steps_passed': row[7] if row else 0,
         'by_tier': tier_stats,
         'memory_stats': signal_tracker.outcome_stats
     }
@@ -1995,16 +2255,15 @@ async def main():
         exchange = ccxt.okx({
             "enableRateLimit": True,
             "options": {"defaultType": "spot"},
-            "rateLimit": 300,  # 300ms between requests
+            "rateLimit": 300,
             "timeout": 15000,
             "verbose": False,
         })
         
-        log.info("🚀 ROMEOTPT v4.0 - LIQUIDITY EDITION")
+        log.info("🚀 ROMEOTPT v4.1 - LIQUIDITY EDITION WITH FULL 8-STEP DETAILS")
         log.info(f"TP/SL: 100% liquidity-based | NO fixed percentages")
         log.info(f"Scan: {SCAN_INTERVAL}s | Top {TOP_N} symbols")
-        log.info(f"Rate limit: {MAX_REQUESTS_PER_SECOND} req/s | Concurrency: {MAX_CONCURRENT}")
-        log.info(f"Min quality: {MIN_QUALITY_SCORE}")
+        log.info(f"Full 8-step analysis displayed in every signal")
         
         await liquidity_scanner(exchange)
         
