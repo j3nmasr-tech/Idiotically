@@ -3,6 +3,7 @@
 """
 ROMEOTPT SCANNER v4.1 - LIQUIDITY-FOCUSED WITH FULL 8-STEP DETAILS
 Professional trading with complete transparency on all 8 steps
+ONE SIGNAL PER COIN POLICY - No updates, no re-entries
 """
 
 import os
@@ -28,7 +29,7 @@ DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v4_1.db")
 
 # Scanner settings
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 45))
-TOP_N = int(os.getenv("TOP_N", 40))
+TOP_N = int(os.getenv("TOP_N", 60))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 2))
 
 # Signal thresholds
@@ -147,9 +148,9 @@ class SetupQuality:
         else:
             return "C"
 
-# ---------------- SIGNAL TRACKER ----------------
+# ---------------- SIGNAL TRACKER (ONE PER COIN) ----------------
 class SignalTracker:
-    """In-memory signal tracking with outcome monitoring"""
+    """In-memory signal tracking with outcome monitoring - ONE SIGNAL PER COIN ONLY"""
     
     def __init__(self):
         self.active_signals = {}
@@ -165,63 +166,37 @@ class SignalTracker:
             'avg_pnl_pct': 0.0
         }
     
-    def is_new_or_updated_signal(self, symbol: str, new_setup: Dict) -> Tuple[bool, str]:
-        """Check if this is a NEW signal or UPDATED existing signal"""
+    def is_new_signal(self, symbol: str) -> Tuple[bool, str]:
+        """Check if this is a COMPLETELY NEW signal (no active signal exists)"""
         now = datetime.datetime.utcnow()
         
-        if symbol not in self.active_signals:
-            return True, "New signal"
-        
-        old_signal = self.active_signals[symbol]
-        old_setup = old_signal.get('setup', {})
-        
-        if not old_setup:
-            return True, "Old signal corrupted"
-        
-        # Has the signal expired?
-        if (now - old_signal['first_seen']).total_seconds() > (SIGNAL_VALIDITY_HOURS * 3600):
-            self.remove_signal(symbol)
-            return True, f"Old signal expired ({SIGNAL_VALIDITY_HOURS}h)"
-        
-        # Check if it's the same side
-        if old_setup.get('side', '') != new_setup.get('side', ''):
-            return True, "Side changed"
-        
-        # Check if price moved significantly (2% threshold)
-        old_entry = old_setup.get('entry_price', 0)
-        new_entry = new_setup.get('entry_price', 0)
-        if old_entry == 0:
-            return True, "Old entry price invalid"
+        # Check if symbol already has an active signal
+        if symbol in self.active_signals:
+            signal = self.active_signals[symbol]
             
-        price_change_pct = abs(new_entry - old_entry) / old_entry * 100
-        if price_change_pct > 2.0:
-            return True, f"Price moved {price_change_pct:.2f}%"
+            # Has the signal expired? (reached validity hours)
+            if (now - signal['first_seen']).total_seconds() > (SIGNAL_VALIDITY_HOURS * 3600):
+                self.remove_signal(symbol, f"Expired after {SIGNAL_VALIDITY_HOURS}h")
+                return True, "Old signal expired, allowing new one"
+            
+            # Signal is still active - DO NOT ALLOW NEW SIGNAL
+            time_active = (now - signal['first_seen']).total_seconds() / 60
+            return False, f"Active signal exists ({time_active:.1f} minutes active)"
         
-        # Check if still in cooldown period
-        if old_signal.get('last_alerted'):
-            time_since_last_alert = (now - old_signal['last_alerted']).total_seconds() / 60
-            if time_since_last_alert < SIGNAL_COOLDOWN_MINUTES:
-                return False, f"In cooldown ({int(SIGNAL_COOLDOWN_MINUTES - time_since_last_alert)}min left)"
-        
-        # Check if quality improved significantly (0.75 threshold)
-        old_quality = old_setup.get('quality', {}).get('total_score', 0)
-        new_quality = new_setup.get('quality', {}).get('total_score', 0)
-        if new_quality - old_quality >= 0.75:
-            return True, f"Quality improved {old_quality:.2f}→{new_quality:.2f}"
-        
-        # Check if RR improved significantly
-        old_rr = old_setup.get('rr_ratio', 0)
-        new_rr = new_setup.get('rr_ratio', 0)
-        if new_rr > old_rr * 1.3:
-            return True, f"RR improved {old_rr:.2f}→{new_rr:.2f}"
-        
-        return False, "Same signal, minimal changes"
+        return True, "No active signal for this symbol"
+    
+    def should_send_alert(self, symbol: str) -> bool:
+        """Check if we should send an alert for this symbol"""
+        # Only send alert if it's a completely new signal
+        is_new, reason = self.is_new_signal(symbol)
+        return is_new
     
     def update_signal(self, symbol: str, setup: Dict, alerted: bool = False):
-        """Update or add signal to tracker"""
+        """Update or add signal to tracker - ONE SIGNAL PER COIN"""
         now = datetime.datetime.utcnow()
         
         if symbol not in self.active_signals:
+            # NEW SIGNAL - store everything
             self.active_signals[symbol] = {
                 'setup': setup,
                 'first_seen': now,
@@ -238,7 +213,7 @@ class SignalTracker:
             self.outcome_stats['total_signals'] += 1
             self.outcome_stats['active'] += 1
         else:
-            # Update price extremes
+            # EXISTING SIGNAL - only update tracking metrics, NOT the setup
             current_price = setup.get('current_price', 0)
             self.active_signals[symbol]['highest_price'] = max(
                 self.active_signals[symbol]['highest_price'],
@@ -248,15 +223,8 @@ class SignalTracker:
                 self.active_signals[symbol]['lowest_price'],
                 current_price
             )
-            
-            self.active_signals[symbol]['setup'] = setup
             self.active_signals[symbol]['last_checked'] = now
-            
-            if alerted:
-                self.active_signals[symbol]['last_alerted'] = now
-                self.active_signals[symbol]['alert_count'] += 1
-                if not self.active_signals[symbol]['price_at_alert']:
-                    self.active_signals[symbol]['price_at_alert'] = current_price
+            # DO NOT update the 'setup' field - keep original TP/SL/entry
     
     def check_signal_outcome(self, symbol: str, current_price: float) -> Optional[Dict]:
         """Check if signal has hit TP or SL"""
@@ -1447,9 +1415,8 @@ async def send_fast_alert(setup: Dict):
         eight_steps = quality.get('eight_steps', {})
         step_specifics = eight_steps.get('step_specifics', {})
         
-        # Check if this is an update
-        is_update = symbol in signal_tracker.active_signals
-        update_emoji = "🔄" if is_update else "🆕"
+        # ALWAYS NEW SIGNAL (due to one-per-coin policy)
+        update_emoji = "🆕"
         
         tier_emoji = {
             "A+": "🔥",
@@ -1457,16 +1424,6 @@ async def send_fast_alert(setup: Dict):
             "B": "⚠️",
             "C": "📊"
         }.get(quality.get("tier", "C"), "📊")
-        
-        # Compact update info
-        update_info = ""
-        if is_update:
-            old_signal = signal_tracker.active_signals.get(symbol, {})
-            old_setup = old_signal.get('setup', {})
-            old_quality = old_setup.get('quality', {}).get('total_score', 0)
-            new_quality = quality.get('total_score', 0)
-            if new_quality > old_quality:
-                update_info = f" | 📈 Improved: {old_quality:.1f}→{new_quality:.1f}"
         
         # Format TP targets compactly
         tp_targets = setup.get('tp_targets', [])
@@ -1563,7 +1520,7 @@ async def send_fast_alert(setup: Dict):
         # Compose compact message
         msg = f"""{update_emoji}{tier_emoji} <b>ROMEOTPT v4.1 - {symbol} | {setup.get('side', 'N/A')}</b>
 Entry: <code>{entry_price:.8f}</code> | Now: <code>{current_price:.8f}</code> ({entry_distance_pct:.1f}%)
-Type: {setup.get('entry_type', 'N/A')}{update_info}
+Type: {setup.get('entry_type', 'N/A')}
 
 🎯 <b>Targets:</b> {' | '.join(tp_lines)}
 🛡️ <b>SL:</b> <code>{setup.get('sl_price', 0):.8f}</code> ({abs(setup.get('sl_price', 0) - entry_price) / entry_price * 100:.1f}%)
@@ -1636,23 +1593,30 @@ PnL: <code>{outcome['pnl_pct']:+.2f}%</code> | RR: {setup.get('rr_ratio', 0):.1f
         log.error(f"Error sending compact outcome alert: {e}")
 
 async def send_deduped_alert(setup: Dict):
-    """Send alert only if it's a new or meaningfully updated signal"""
+    """Send alert ONLY if it's a COMPLETELY NEW signal (one per coin only)"""
     try:
         symbol = setup.get('symbol', '')
         if not symbol:
             return False
         
-        should_alert, reason = signal_tracker.is_new_or_updated_signal(symbol, setup)
+        # ONE SIGNAL PER COIN: Only send if no active signal exists
+        should_alert = signal_tracker.should_send_alert(symbol)
         
         if should_alert:
             await send_fast_alert(setup)
             signal_tracker.update_signal(symbol, setup, alerted=True)
-            log.info(f"📨 Alert sent for {symbol}: {reason}")
+            log.info(f"📨 NEW SIGNAL sent for {symbol} (one per coin policy)")
             return True
         else:
+            # Still update tracking but don't send alert
             signal_tracker.update_signal(symbol, setup, alerted=False)
-            if np.random.random() < 0.05:
-                log.debug(f"⏸️  Skipped alert for {symbol}: {reason}")
+            
+            # Only log occasionally to reduce noise
+            if np.random.random() < 0.01:  # 1% chance to log
+                active_signal = signal_tracker.active_signals.get(symbol, {})
+                time_active = (datetime.datetime.utcnow() - active_signal.get('first_seen', datetime.datetime.utcnow())).total_seconds() / 60
+                log.debug(f"⏸️  Skipping {symbol}: Already has active signal ({time_active:.1f}m)")
+            
             return False
     except Exception as e:
         log.error(f"Error in deduped alert for {setup.get('symbol', 'UNKNOWN')}: {e}")
@@ -1938,10 +1902,10 @@ async def liquidity_scanner(exchange):
     """Main scanner with liquidity-based TP/SL"""
     
     # Send compact startup message
-    startup_msg = f"""🚀 <b>ROMEOTPT v4.1 Started</b>
+    startup_msg = f"""🚀 <b>ROMEOTPT v4.1 Started - ONE SIGNAL PER COIN</b>
 Scan: {SCAN_INTERVAL}s | Top {TOP_N} | Quality ≥{MIN_QUALITY_SCORE}
-Cooldown: {SIGNAL_COOLDOWN_MINUTES}min | Rate: {MAX_REQUESTS_PER_SECOND}/s
-Liquidity-based TP/SL | Full 8-step analysis"""
+Validity: {SIGNAL_VALIDITY_HOURS}h | Rate: {MAX_REQUESTS_PER_SECOND}/s
+ONE SIGNAL PER COIN - No updates, no re-entries"""
     await send_telegram(startup_msg)
     
     # Start outcome checker
@@ -2019,7 +1983,7 @@ async def health():
     stats = signal_tracker.get_stats()
     return {
         "status": "healthy", 
-        "version": "4.1 - Full 8-Step Details",
+        "version": "4.1 - One Signal Per Coin",
         "active_signals": stats.get('active_signals', 0),
         "outcome_stats": stats.get('outcome_stats', {})
     }
@@ -2149,10 +2113,10 @@ async def main():
             "verbose": False,
         })
         
-        log.info("🚀 ROMEOTPT v4.1 - LIQUIDITY EDITION WITH FULL 8-STEP DETAILS")
+        log.info("🚀 ROMEOTPT v4.1 - ONE SIGNAL PER COIN POLICY")
         log.info(f"TP/SL: 100% liquidity-based | NO fixed percentages")
         log.info(f"Scan: {SCAN_INTERVAL}s | Top {TOP_N} symbols")
-        log.info(f"Full 8-step analysis displayed in every signal")
+        log.info(f"ONE SIGNAL PER COIN - No updates, no re-entries")
         
         await liquidity_scanner(exchange)
         
