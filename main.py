@@ -28,7 +28,7 @@ DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v4_1.db")
 
 # Scanner settings
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 45))
-TOP_N = int(os.getenv("TOP_N", 35))
+TOP_N = int(os.getenv("TOP_N", 40))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 2))
 
 # Signal thresholds
