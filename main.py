@@ -1663,11 +1663,148 @@ async def send_deduped_alert(setup: Dict):
         log.error(f"Error in deduped alert: {e}")
         return False
 
-# ---------------- DATABASE ----------------
+# ---------------- DATABASE MIGRATION & INIT ----------------
+async def migrate_database():
+    """Migrate old database to new schema if needed"""
+    try:
+        # Check if old signals table exists without score column
+        cursor = await db_conn.execute("""
+            SELECT name FROM sqlite_master 
+            WHERE type='table' AND name='signals_v4_1'
+        """)
+        table_exists = await cursor.fetchone()
+        
+        if not table_exists:
+            log.info("✅ No old database found, will create fresh")
+            return True
+        
+        # Check if score column exists in old table
+        cursor = await db_conn.execute("PRAGMA table_info(signals_v4_1)")
+        columns = await cursor.fetchall()
+        column_names = [col[1] for col in columns]
+        
+        if 'score' in column_names:
+            log.info("✅ Database already has new schema with score column")
+            return True
+        
+        # OLD SCHEMA DETECTED - need migration
+        log.warning("⚠️  Old database schema detected - migrating to new schema")
+        
+        # Create temporary new table
+        await db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS signals_v4_1_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
+                side TEXT,
+                score REAL DEFAULT 0.0,
+                timestamp TEXT,
+                entry_price REAL,
+                sl_price REAL,
+                tp1 REAL,
+                tp2 REAL,
+                tp3 REAL,
+                rr_ratio REAL,
+                quality_tier TEXT,
+                quality_score REAL,
+                current_price REAL,
+                liquidity_buy_stops INTEGER,
+                liquidity_sell_stops INTEGER,
+                eight_steps_passed INTEGER,
+                status TEXT DEFAULT 'active',
+                alert_sent BOOLEAN DEFAULT 1,
+                closed_at TEXT,
+                closed_price REAL,
+                outcome TEXT,
+                pnl_pct REAL,
+                bars_held INTEGER,
+                max_favorable_pct REAL,
+                max_adverse_pct REAL,
+                UNIQUE(symbol, side, score)
+            )
+        """)
+        
+        # Copy data from old table, adding default score of 0.0
+        await db_conn.execute("""
+            INSERT INTO signals_v4_1_new 
+            (symbol, side, score, timestamp, entry_price, sl_price, tp1, tp2, tp3, 
+             rr_ratio, quality_tier, quality_score, current_price, 
+             liquidity_buy_stops, liquidity_sell_stops, eight_steps_passed,
+             status, alert_sent, closed_at, closed_price, outcome,
+             pnl_pct, bars_held, max_favorable_pct, max_adverse_pct)
+            SELECT 
+            symbol, side, 0.0, timestamp, entry_price, sl_price, tp1, tp2, tp3,
+            rr_ratio, quality_tier, quality_score, current_price,
+            liquidity_buy_stops, liquidity_sell_stops, eight_steps_passed,
+            status, alert_sent, closed_at, closed_price, outcome,
+            pnl_pct, bars_held, max_favorable_pct, max_adverse_pct
+            FROM signals_v4_1
+        """)
+        
+        # Do the same for outcomes table
+        await db_conn.execute("""
+            CREATE TABLE IF NOT EXISTS signal_outcomes_v4_1_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id INTEGER,
+                symbol TEXT,
+                side TEXT,
+                score REAL DEFAULT 0.0,
+                entry_price REAL,
+                sl_price REAL,
+                tp1_price REAL,
+                tp2_price REAL,
+                tp3_price REAL,
+                quality_score REAL,
+                quality_tier TEXT,
+                eight_steps_passed INTEGER,
+                liquidity_buy_stops INTEGER,
+                liquidity_sell_stops INTEGER,
+                created_at TEXT,
+                status TEXT DEFAULT 'active',
+                closed_at TEXT,
+                closed_price REAL,
+                outcome_type TEXT,
+                pnl_pct REAL,
+                hold_time_minutes INTEGER,
+                max_favorable_pct REAL,
+                max_adverse_pct REAL,
+                FOREIGN KEY (signal_id) REFERENCES signals_v4_1_new (id)
+            )
+        """)
+        
+        # Drop old tables
+        await db_conn.execute("DROP TABLE IF EXISTS signal_outcomes_v4_1")
+        await db_conn.execute("DROP TABLE IF EXISTS signals_v4_1")
+        
+        # Rename new tables
+        await db_conn.execute("ALTER TABLE signals_v4_1_new RENAME TO signals_v4_1")
+        await db_conn.execute("ALTER TABLE signal_outcomes_v4_1_new RENAME TO signal_outcomes_v4_1")
+        
+        await db_conn.commit()
+        log.info("✅ Database migrated successfully to new schema")
+        return True
+        
+    except Exception as e:
+        log.error(f"❌ Database migration failed: {e}")
+        # If migration fails, drop tables and start fresh
+        try:
+            await db_conn.execute("DROP TABLE IF EXISTS signals_v4_1")
+            await db_conn.execute("DROP TABLE IF EXISTS signal_outcomes_v4_1")
+            await db_conn.execute("DROP TABLE IF EXISTS signals_v4_1_new")
+            await db_conn.execute("DROP TABLE IF EXISTS signal_outcomes_v4_1_new")
+            await db_conn.commit()
+            log.info("🔄 Dropped old tables, will create fresh")
+            return True
+        except Exception as e2:
+            log.error(f"❌ Failed to drop old tables: {e2}")
+            raise
+
 async def init_database():
     """Initialize database with outcome tracking tables"""
     try:
-        # Create tables
+        # First migrate if needed
+        await migrate_database()
+        
+        # Create tables if they don't exist (they should after migration)
         await db_conn.execute("""
             CREATE TABLE IF NOT EXISTS signals_v4_1 (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1738,9 +1875,9 @@ async def init_database():
         await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_1_outcomes_outcome ON signal_outcomes_v4_1 (outcome_type)")
         
         await db_conn.commit()
-        log.info("Database v4.1 initialized with (symbol, side, score) tracking")
+        log.info("✅ Database v4.1 initialized with (symbol, side, score) tracking")
     except Exception as e:
-        log.error(f"Error initializing database: {e}")
+        log.error(f"❌ Error initializing database: {e}")
         raise
 
 async def store_signal(setup: Dict):
@@ -1826,10 +1963,10 @@ async def store_signal(setup: Dict):
             ))
             
             await db_conn.commit()
-            log.debug(f"Stored signal for {setup.get('symbol', 'UNKNOWN')} {setup.get('side', '')} Score:{rounded_score}")
+            log.debug(f"📊 Stored signal for {setup.get('symbol', 'UNKNOWN')} {setup.get('side', '')} Score:{rounded_score}")
             
         except Exception as e:
-            log.error(f"Error storing signal {setup.get('symbol', 'UNKNOWN')}: {e}")
+            log.error(f"❌ Error storing signal {setup.get('symbol', 'UNKNOWN')}: {e}")
 
 async def store_outcome(symbol: str, outcome: Dict):
     """Store signal outcome in database"""
@@ -1881,10 +2018,10 @@ async def store_outcome(symbol: str, outcome: Dict):
             ))
             
             await db_conn.commit()
-            log.info(f"Stored outcome for {symbol_key} {side_key} Score:{score_key}: {outcome.get('type', 'UNKNOWN')}")
+            log.info(f"📊 Stored outcome for {symbol_key} {side_key} Score:{score_key}: {outcome.get('type', 'UNKNOWN')}")
             
         except Exception as e:
-            log.error(f"Error storing outcome for {symbol}: {e}")
+            log.error(f"❌ Error storing outcome for {symbol}: {e}")
 
 # ---------------- OUTCOME CHECKER ----------------
 async def outcome_checker_task(exchange):
