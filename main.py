@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ROMEOTPT SCANNER v4.2 - SIGNAL-BASED TRACKING WITH UNIQUE IDs
-Each signal has unique ID for clear outcome tracking
+ROMEOTPT SCANNER v4.3 - SIGNAL-BASED TRACKING WITH DATABASE FIXES
+Each signal has unique ID with proper database upsert handling
 """
 
 import os
@@ -26,7 +26,7 @@ from datetime import timezone
 # ---------------- CONFIG ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v4_2.db")
+DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v4_3.db")
 
 # Scanner settings
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 45))
@@ -51,7 +51,7 @@ logging.basicConfig(
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
-log = logging.getLogger("romeopt_v4_2")
+log = logging.getLogger("romeopt_v4_3")
 
 # ---------------- RATE LIMITER ----------------
 class RateLimiter:
@@ -1634,7 +1634,7 @@ async def send_fast_alert(setup: Dict, signal_id: str = None, is_update: bool = 
         entry_distance_pct = abs(current_price - entry_price) / entry_price * 100 if entry_price > 0 else 0
         
         # Compose compact message
-        msg = f"""{update_emoji}{tier_emoji} <b>ROMEOTPT v4.2 - {symbol} | {setup.get('side', 'N/A')}{signal_id_display}</b>
+        msg = f"""{update_emoji}{tier_emoji} <b>ROMEOTPT v4.3 - {symbol} | {setup.get('side', 'N/A')}{signal_id_display}</b>
 Entry: <code>{entry_price:.8f}</code> | Now: <code>{current_price:.8f}</code> ({entry_distance_pct:.1f}%)
 Type: {setup.get('entry_type', 'N/A')}
 
@@ -1763,7 +1763,7 @@ async def init_database():
     try:
         # Create tables with signal_id
         await db_conn.execute("""
-            CREATE TABLE IF NOT EXISTS signals_v4_2 (
+            CREATE TABLE IF NOT EXISTS signals_v4_3 (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 signal_id TEXT UNIQUE,
                 symbol TEXT,
@@ -1789,12 +1789,14 @@ async def init_database():
                 pnl_pct REAL,
                 bars_held INTEGER,
                 max_favorable_pct REAL,
-                max_adverse_pct REAL
+                max_adverse_pct REAL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                last_updated TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
         
         await db_conn.execute("""
-            CREATE TABLE IF NOT EXISTS signal_outcomes_v4_2 (
+            CREATE TABLE IF NOT EXISTS signal_outcomes_v4_3 (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 signal_id TEXT,
                 symbol TEXT,
@@ -1818,25 +1820,25 @@ async def init_database():
                 hold_time_minutes INTEGER,
                 max_favorable_pct REAL,
                 max_adverse_pct REAL,
-                FOREIGN KEY (signal_id) REFERENCES signals_v4_2 (signal_id)
+                FOREIGN KEY (signal_id) REFERENCES signals_v4_3 (signal_id)
             )
         """)
         
         # Create indexes
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_2_signals_signal_id ON signals_v4_2 (signal_id)")
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_2_signals_symbol ON signals_v4_2 (symbol, timestamp)")
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_2_signals_status ON signals_v4_2 (status)")
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_2_outcomes_signal_id ON signal_outcomes_v4_2 (signal_id)")
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_2_outcomes_symbol ON signal_outcomes_v4_2 (symbol)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_3_signals_signal_id ON signals_v4_3 (signal_id)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_3_signals_symbol ON signals_v4_3 (symbol, timestamp)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_3_signals_status ON signals_v4_3 (status)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_3_outcomes_signal_id ON signal_outcomes_v4_3 (signal_id)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_3_outcomes_symbol ON signal_outcomes_v4_3 (symbol)")
         
         await db_conn.commit()
-        log.info("Database v4.2 initialized with signal ID tracking")
+        log.info("Database v4.3 initialized with signal ID tracking")
     except Exception as e:
         log.error(f"Error initializing database: {e}")
         raise
 
-async def store_signal(setup: Dict, signal_id: str):
-    """Store signal in database with signal ID"""
+async def store_or_update_signal(setup: Dict, signal_id: str):
+    """Store or update signal in database with signal ID"""
     async with db_lock:
         try:
             tp_targets = setup.get("tp_targets", [])
@@ -1857,66 +1859,112 @@ async def store_signal(setup: Dict, signal_id: str):
                 eight_steps.get('step_8_liquidity_alignment', False)
             ])
             
-            # Store in signals table
-            cursor = await db_conn.execute("""
-                INSERT INTO signals_v4_2 (
-                    signal_id, symbol, timestamp, side, entry_price, sl_price, 
-                    tp1, tp2, tp3, rr_ratio, quality_tier, quality_score,
-                    current_price, liquidity_buy_stops, liquidity_sell_stops,
-                    eight_steps_passed, status, alert_sent
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1)
-            """, (
-                signal_id,
-                setup.get("symbol", ""),
-                setup.get("timestamp", ""),
-                setup.get("side", ""),
-                setup.get("entry_price", 0),
-                setup.get("sl_price", 0),
-                tp_targets[0] if len(tp_targets) > 0 else None,
-                tp_targets[1] if len(tp_targets) > 1 else None,
-                tp_targets[2] if len(tp_targets) > 2 else None,
-                setup.get("rr_ratio", 0),
-                quality.get("tier", "C"),
-                quality.get("total_score", 0),
-                setup.get("current_price", 0),
-                pools.get("buy_stops", 0),
-                pools.get("sell_stops", 0),
-                step_passes
-            ))
+            # Check if signal already exists in database
+            cursor = await db_conn.execute(
+                "SELECT 1 FROM signals_v4_3 WHERE signal_id = ?",
+                (signal_id,)
+            )
+            exists = await cursor.fetchone()
             
-            # Get the inserted ID
-            db_id = cursor.lastrowid
+            now = datetime.datetime.now(timezone.utc).isoformat()
             
-            # Also store in outcomes table for tracking
-            await db_conn.execute("""
-                INSERT INTO signal_outcomes_v4_2 (
-                    signal_id, symbol, side, entry_price, sl_price, tp1_price,
-                    tp2_price, tp3_price, quality_score, quality_tier,
-                    eight_steps_passed, liquidity_buy_stops, liquidity_sell_stops,
-                    created_at, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
-            """, (
-                signal_id,
-                setup.get("symbol", ""),
-                setup.get("side", ""),
-                setup.get("entry_price", 0),
-                setup.get("sl_price", 0),
-                tp_targets[0] if len(tp_targets) > 0 else None,
-                tp_targets[1] if len(tp_targets) > 1 else None,
-                tp_targets[2] if len(tp_targets) > 2 else None,
-                quality.get("total_score", 0),
-                quality.get("tier", "C"),
-                step_passes,
-                pools.get("buy_stops", 0),
-                pools.get("sell_stops", 0),
-                setup.get("timestamp", "")
-            ))
+            if exists:
+                # UPDATE existing signal
+                await db_conn.execute("""
+                    UPDATE signals_v4_3 
+                    SET symbol = ?, timestamp = ?, side = ?, entry_price = ?, sl_price = ?,
+                        tp1 = ?, tp2 = ?, tp3 = ?, rr_ratio = ?, quality_tier = ?, quality_score = ?,
+                        current_price = ?, liquidity_buy_stops = ?, liquidity_sell_stops = ?,
+                        eight_steps_passed = ?, last_updated = ?, alert_sent = 1
+                    WHERE signal_id = ?
+                """, (
+                    setup.get("symbol", ""),
+                    setup.get("timestamp", ""),
+                    setup.get("side", ""),
+                    setup.get("entry_price", 0),
+                    setup.get("sl_price", 0),
+                    tp_targets[0] if len(tp_targets) > 0 else None,
+                    tp_targets[1] if len(tp_targets) > 1 else None,
+                    tp_targets[2] if len(tp_targets) > 2 else None,
+                    setup.get("rr_ratio", 0),
+                    quality.get("tier", "C"),
+                    quality.get("total_score", 0),
+                    setup.get("current_price", 0),
+                    pools.get("buy_stops", 0),
+                    pools.get("sell_stops", 0),
+                    step_passes,
+                    now,
+                    signal_id
+                ))
+                
+                log.debug(f"Updated signal {signal_id[:12]}... in database")
+            else:
+                # INSERT new signal
+                cursor = await db_conn.execute("""
+                    INSERT INTO signals_v4_3 (
+                        signal_id, symbol, timestamp, side, entry_price, sl_price, 
+                        tp1, tp2, tp3, rr_ratio, quality_tier, quality_score,
+                        current_price, liquidity_buy_stops, liquidity_sell_stops,
+                        eight_steps_passed, status, alert_sent, created_at, last_updated
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)
+                """, (
+                    signal_id,
+                    setup.get("symbol", ""),
+                    setup.get("timestamp", ""),
+                    setup.get("side", ""),
+                    setup.get("entry_price", 0),
+                    setup.get("sl_price", 0),
+                    tp_targets[0] if len(tp_targets) > 0 else None,
+                    tp_targets[1] if len(tp_targets) > 1 else None,
+                    tp_targets[2] if len(tp_targets) > 2 else None,
+                    setup.get("rr_ratio", 0),
+                    quality.get("tier", "C"),
+                    quality.get("total_score", 0),
+                    setup.get("current_price", 0),
+                    pools.get("buy_stops", 0),
+                    pools.get("sell_stops", 0),
+                    step_passes,
+                    now,
+                    now
+                ))
+                
+                # Get the inserted ID
+                db_id = cursor.lastrowid
+                
+                # Also store in outcomes table for tracking
+                await db_conn.execute("""
+                    INSERT INTO signal_outcomes_v4_3 (
+                        signal_id, symbol, side, entry_price, sl_price, tp1_price,
+                        tp2_price, tp3_price, quality_score, quality_tier,
+                        eight_steps_passed, liquidity_buy_stops, liquidity_sell_stops,
+                        created_at, status
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+                """, (
+                    signal_id,
+                    setup.get("symbol", ""),
+                    setup.get("side", ""),
+                    setup.get("entry_price", 0),
+                    setup.get("sl_price", 0),
+                    tp_targets[0] if len(tp_targets) > 0 else None,
+                    tp_targets[1] if len(tp_targets) > 1 else None,
+                    tp_targets[2] if len(tp_targets) > 2 else None,
+                    quality.get("total_score", 0),
+                    quality.get("tier", "C"),
+                    step_passes,
+                    pools.get("buy_stops", 0),
+                    pools.get("sell_stops", 0),
+                    setup.get("timestamp", "")
+                ))
+                
+                log.debug(f"Inserted new signal {signal_id[:12]}... with DB ID {db_id}")
             
             await db_conn.commit()
-            log.debug(f"Stored signal {signal_id[:12]}... with DB ID {db_id}")
             
         except Exception as e:
-            log.error(f"Error storing signal {signal_id[:12]}...: {e}")
+            log.error(f"Error storing/updating signal {signal_id[:12]}...: {e}")
+            # Log the full error for debugging
+            import traceback
+            log.error(f"Traceback: {traceback.format_exc()}")
 
 async def store_outcome(symbol: str, outcome: Dict):
     """Store signal outcome in database"""
@@ -1931,9 +1979,10 @@ async def store_outcome(symbol: str, outcome: Dict):
             
             # Update signals table
             await db_conn.execute("""
-                UPDATE signals_v4_2 
+                UPDATE signals_v4_3 
                 SET status = 'closed', closed_at = ?, closed_price = ?, outcome = ?,
-                    pnl_pct = ?, bars_held = ?, max_favorable_pct = ?, max_adverse_pct = ?
+                    pnl_pct = ?, bars_held = ?, max_favorable_pct = ?, max_adverse_pct = ?,
+                    last_updated = ?
                 WHERE signal_id = ?
             """, (
                 now,
@@ -1943,12 +1992,13 @@ async def store_outcome(symbol: str, outcome: Dict):
                 outcome.get('bars_held', 0),
                 outcome.get('max_favorable', 0),
                 outcome.get('max_adverse', 0),
+                now,
                 signal_id
             ))
             
             # Update signal_outcomes table
             await db_conn.execute("""
-                UPDATE signal_outcomes_v4_2 
+                UPDATE signal_outcomes_v4_3 
                 SET status = 'closed', closed_at = ?, closed_price = ?, outcome_type = ?,
                     pnl_pct = ?, hold_time_minutes = ?, max_favorable_pct = ?, max_adverse_pct = ?
                 WHERE signal_id = ?
@@ -2039,7 +2089,7 @@ async def process_deduped_results(results) -> int:
                     alerted, reason, signal_id = await send_deduped_alert(result)
                     if alerted and signal_id:
                         alerts_sent += 1
-                        await store_signal(result, signal_id)
+                        await store_or_update_signal(result, signal_id)
             except Exception as e:
                 log.error(f"Error processing result: {e}")
     
@@ -2049,7 +2099,7 @@ async def liquidity_scanner(exchange):
     """Main scanner with liquidity-based TP/SL"""
     
     # Send compact startup message
-    startup_msg = f"""🚀 <b>ROMEOTPT v4.2 Started (Signal-Based Tracking)</b>
+    startup_msg = f"""🚀 <b>ROMEOTPT v4.3 Started (Signal-Based Tracking)</b>
 Scan: {SCAN_INTERVAL}s | Top {TOP_N} | Quality ≥{MIN_QUALITY_SCORE}
 Cooldown: {SIGNAL_COOLDOWN_MINUTES}min | Rate: {MAX_REQUESTS_PER_SECOND}/s
 Liquidity-based TP/SL | Each signal has unique ID"""
@@ -2133,7 +2183,7 @@ async def health():
     stats = signal_tracker.get_stats()
     return {
         "status": "healthy", 
-        "version": "4.2 - Signal-Based Tracking",
+        "version": "4.3 - Signal-Based Tracking with DB Fixes",
         "active_signals": stats.get('active_signals', 0),
         "total_signals": stats.get('total_signals', 0),
         "outcome_stats": stats.get('outcome_stats', {})
@@ -2223,7 +2273,7 @@ async def get_outcome_stats(hours: int = 24):
                     AVG(liquidity_buy_stops) as avg_buy_stops,
                     AVG(liquidity_sell_stops) as avg_sell_stops,
                     AVG(eight_steps_passed) as avg_steps_passed
-                FROM signal_outcomes_v4_2 
+                FROM signal_outcomes_v4_3 
                 WHERE status = 'closed' 
                 AND closed_at > datetime('now', ?)
             """, (f"-{hours} hours",))
@@ -2237,7 +2287,7 @@ async def get_outcome_stats(hours: int = 24):
                     AVG(pnl_pct) as avg_pnl,
                     AVG(rr_ratio) as avg_rr,
                     AVG(eight_steps_passed) as avg_steps_passed
-                FROM signals_v4_2 
+                FROM signals_v4_3 
                 WHERE status = 'closed' 
                 AND timestamp > datetime('now', ?)
                 GROUP BY quality_tier
@@ -2296,7 +2346,7 @@ async def main():
             "verbose": False,
         })
         
-        log.info("🚀 ROMEOTPT v4.2 - SIGNAL-BASED TRACKING WITH UNIQUE IDs")
+        log.info("🚀 ROMEOTPT v4.3 - SIGNAL-BASED TRACKING WITH DATABASE FIXES")
         log.info(f"TP/SL: 100% liquidity-based | NO fixed percentages")
         log.info(f"Scan: {SCAN_INTERVAL}s | Top {TOP_N} symbols")
         log.info(f"Each signal has unique ID for clear outcome tracking")
