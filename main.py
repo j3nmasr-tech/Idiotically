@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ROMEOTPT SCANNER v4.3 - SIGNAL-BASED TRACKING WITH DATABASE FIXES
-Each signal has unique ID with proper database upsert handling
+ROMEOTPT SCANNER v4.1 - LIQUIDITY-FOCUSED WITH FULL 8-STEP DETAILS
+Professional trading with complete transparency on all 8 steps
 """
 
 import os
 import time
-import uuid
 import asyncio
 import logging
 import datetime
@@ -21,12 +20,11 @@ from fastapi import FastAPI
 import uvicorn
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass
-from datetime import timezone
 
 # ---------------- CONFIG ----------------
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v4_3.db")
+DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v4_1.db")
 
 # Scanner settings
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 45))
@@ -34,7 +32,7 @@ TOP_N = int(os.getenv("TOP_N", 35))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 2))
 
 # Signal thresholds
-MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 1.5))
+MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 2.5))
 
 # Deduplication settings
 SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 15))
@@ -51,7 +49,7 @@ logging.basicConfig(
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
-log = logging.getLogger("romeopt_v4_3")
+log = logging.getLogger("romeopt_v4_1")
 
 # ---------------- RATE LIMITER ----------------
 class RateLimiter:
@@ -149,14 +147,12 @@ class SetupQuality:
         else:
             return "C"
 
-# ---------------- SIGNAL TRACKER WITH UNIQUE IDs ----------------
+# ---------------- SIGNAL TRACKER ----------------
 class SignalTracker:
-    """In-memory signal tracking with unique signal IDs"""
+    """In-memory signal tracking with outcome monitoring"""
     
     def __init__(self):
-        self.active_signals = {}  # Format: {signal_id: signal_data}
-        self.symbol_to_signal = {}  # Map symbol -> latest active signal_id
-        self.signal_ids = {}  # Map signal_id -> symbol
+        self.active_signals = {}
         self.outcome_stats = {
             'total_signals': 0,
             'tp1_hits': 0,
@@ -169,151 +165,114 @@ class SignalTracker:
             'avg_pnl_pct': 0.0
         }
     
-    def generate_signal_id(self, symbol: str) -> str:
-        """Generate unique signal ID"""
-        timestamp = int(time.time())
-        uuid_part = uuid.uuid4().hex[:8]
-        clean_symbol = symbol.replace("/", "").replace("-", "")
-        return f"{clean_symbol}_{uuid_part}_{timestamp}"
-    
-    def get_latest_signal_id(self, symbol: str) -> Optional[str]:
-        """Get latest active signal ID for a symbol"""
-        return self.symbol_to_signal.get(symbol)
-    
-    def is_new_signal_needed(self, symbol: str, new_setup: Dict) -> Tuple[bool, str, Optional[str]]:
-        """
-        Check if we need a NEW signal (new signal ID) or just update existing
+    def is_new_or_updated_signal(self, symbol: str, new_setup: Dict) -> Tuple[bool, str]:
+        """Check if this is a NEW signal or UPDATED existing signal"""
+        now = datetime.datetime.utcnow()
         
-        Returns: (needs_new_signal, reason, old_signal_id_if_exists)
-        """
-        current_signal_id = self.get_latest_signal_id(symbol)
+        if symbol not in self.active_signals:
+            return True, "New signal"
         
-        # If no current signal, definitely need new one
-        if not current_signal_id:
-            return True, "First signal for symbol", None
+        old_signal = self.active_signals[symbol]
+        old_setup = old_signal.get('setup', {})
         
-        # Get current signal
-        current_signal = self.active_signals.get(current_signal_id)
-        if not current_signal:
-            # Clean up orphaned mapping
-            self.symbol_to_signal.pop(symbol, None)
-            return True, "Current signal not found", None
+        if not old_setup:
+            return True, "Old signal corrupted"
         
-        current_setup = current_signal.get('setup', {})
+        # Has the signal expired?
+        if (now - old_signal['first_seen']).total_seconds() > (SIGNAL_VALIDITY_HOURS * 3600):
+            self.remove_signal(symbol)
+            return True, f"Old signal expired ({SIGNAL_VALIDITY_HOURS}h)"
         
-        # Check if current signal is still active
-        if current_signal.get('status') != 'active':
-            # Signal is closed/expired, need new one
-            self.symbol_to_signal.pop(symbol, None)
-            return True, f"Current signal status: {current_signal.get('status')}", current_signal_id
+        # Check if it's the same side
+        if old_setup.get('side', '') != new_setup.get('side', ''):
+            return True, "Side changed"
         
-        # Check if side changed
-        old_side = current_setup.get('side', '')
-        new_side = new_setup.get('side', '')
-        
-        if old_side and new_side and old_side != new_side:
-            # Side changed, close old signal and create new one
-            self.remove_signal(current_signal_id, f"Side changed to {new_side}")
-            return True, f"Side changed: {old_side} → {new_side}", current_signal_id
-        
-        # Check if price moved significantly (3% threshold)
-        old_entry = current_setup.get('entry_price', 0)
+        # Check if price moved significantly (2% threshold)
+        old_entry = old_setup.get('entry_price', 0)
         new_entry = new_setup.get('entry_price', 0)
-        
-        if old_entry == 0 or new_entry == 0:
-            return True, "Invalid entry price", current_signal_id
+        if old_entry == 0:
+            return True, "Old entry price invalid"
             
         price_change_pct = abs(new_entry - old_entry) / old_entry * 100
-        if price_change_pct > 3.0:
-            # Price moved too much, new signal
-            self.remove_signal(current_signal_id, f"Price moved {price_change_pct:.2f}%")
-            return True, f"Price moved {price_change_pct:.2f}%", current_signal_id
+        if price_change_pct > 2.0:
+            return True, f"Price moved {price_change_pct:.2f}%"
         
-        # Check cooldown period for alerts
-        if current_signal.get('last_alerted'):
-            now = datetime.datetime.now(timezone.utc)
-            time_since_last_alert = (now - current_signal['last_alerted']).total_seconds() / 60
+        # Check if still in cooldown period
+        if old_signal.get('last_alerted'):
+            time_since_last_alert = (now - old_signal['last_alerted']).total_seconds() / 60
             if time_since_last_alert < SIGNAL_COOLDOWN_MINUTES:
-                return False, f"In cooldown ({int(SIGNAL_COOLDOWN_MINUTES - time_since_last_alert)}min left)", current_signal_id
+                return False, f"In cooldown ({int(SIGNAL_COOLDOWN_MINUTES - time_since_last_alert)}min left)"
         
-        # If we get here, update existing signal
-        return False, "Update existing signal", current_signal_id
+        # Check if quality improved significantly (0.75 threshold)
+        old_quality = old_setup.get('quality', {}).get('total_score', 0)
+        new_quality = new_setup.get('quality', {}).get('total_score', 0)
+        if new_quality - old_quality >= 0.75:
+            return True, f"Quality improved {old_quality:.2f}→{new_quality:.2f}"
+        
+        # Check if RR improved significantly
+        old_rr = old_setup.get('rr_ratio', 0)
+        new_rr = new_setup.get('rr_ratio', 0)
+        if new_rr > old_rr * 1.3:
+            return True, f"RR improved {old_rr:.2f}→{new_rr:.2f}"
+        
+        return False, "Same signal, minimal changes"
     
-    def create_new_signal(self, symbol: str, setup: Dict, alerted: bool = False) -> str:
-        """Create new signal with unique ID"""
-        signal_id = self.generate_signal_id(symbol)
-        now = datetime.datetime.now(timezone.utc)
+    def update_signal(self, symbol: str, setup: Dict, alerted: bool = False):
+        """Update or add signal to tracker"""
+        now = datetime.datetime.utcnow()
         
-        self.active_signals[signal_id] = {
-            'signal_id': signal_id,
-            'symbol': symbol,
-            'setup': setup,
-            'first_seen': now,
-            'last_alerted': now if alerted else None,
-            'last_checked': now,
-            'alert_count': 1 if alerted else 0,
-            'status': 'active',
-            'outcome': 'active',
-            'highest_price': setup.get('current_price', 0),
-            'lowest_price': setup.get('current_price', 0),
-            'price_at_alert': setup.get('current_price', 0) if alerted else None,
-            'outcome_details': None,
-            'closed_at': None,
-            'closed_price': None
-        }
-        
-        # Update mappings
-        self.symbol_to_signal[symbol] = signal_id
-        self.signal_ids[signal_id] = symbol
-        
-        self.outcome_stats['total_signals'] += 1
-        self.outcome_stats['active'] += 1
-        
-        log.info(f"📝 Created NEW signal {signal_id[:12]}... for {symbol}")
-        return signal_id
+        if symbol not in self.active_signals:
+            self.active_signals[symbol] = {
+                'setup': setup,
+                'first_seen': now,
+                'last_alerted': now if alerted else None,
+                'last_checked': now,
+                'alert_count': 1 if alerted else 0,
+                'status': 'active',
+                'outcome': 'active',
+                'highest_price': setup.get('current_price', 0),
+                'lowest_price': setup.get('current_price', 0),
+                'price_at_alert': setup.get('current_price', 0) if alerted else None,
+                'outcome_details': None
+            }
+            self.outcome_stats['total_signals'] += 1
+            self.outcome_stats['active'] += 1
+        else:
+            # Update price extremes
+            current_price = setup.get('current_price', 0)
+            self.active_signals[symbol]['highest_price'] = max(
+                self.active_signals[symbol]['highest_price'],
+                current_price
+            )
+            self.active_signals[symbol]['lowest_price'] = min(
+                self.active_signals[symbol]['lowest_price'],
+                current_price
+            )
+            
+            self.active_signals[symbol]['setup'] = setup
+            self.active_signals[symbol]['last_checked'] = now
+            
+            if alerted:
+                self.active_signals[symbol]['last_alerted'] = now
+                self.active_signals[symbol]['alert_count'] += 1
+                if not self.active_signals[symbol]['price_at_alert']:
+                    self.active_signals[symbol]['price_at_alert'] = current_price
     
-    def update_existing_signal(self, signal_id: str, setup: Dict, alerted: bool = False):
-        """Update existing signal"""
-        if signal_id not in self.active_signals:
-            log.warning(f"Cannot update non-existent signal {signal_id}")
-            return
-        
-        signal = self.active_signals[signal_id]
-        current_price = setup.get('current_price', 0)
-        
-        # Update price extremes
-        signal['highest_price'] = max(signal['highest_price'], current_price)
-        signal['lowest_price'] = min(signal['lowest_price'], current_price)
-        
-        signal['setup'] = setup
-        signal['last_checked'] = datetime.datetime.now(timezone.utc)
-        
-        if alerted:
-            signal['last_alerted'] = datetime.datetime.now(timezone.utc)
-            signal['alert_count'] += 1
-            if not signal['price_at_alert']:
-                signal['price_at_alert'] = current_price
-    
-    def check_signal_outcome(self, signal_id: str, current_price: float) -> Optional[Dict]:
-        """Check if specific signal has hit TP or SL"""
-        if signal_id not in self.active_signals:
+    def check_signal_outcome(self, symbol: str, current_price: float) -> Optional[Dict]:
+        """Check if signal has hit TP or SL"""
+        if symbol not in self.active_signals:
             return None
         
-        signal = self.active_signals[signal_id]
-        
-        # Only check active signals
-        if signal.get('status') != 'active':
-            return None
-        
+        signal = self.active_signals[symbol]
         setup = signal.get('setup', {})
         
         if not setup:
             return None
         
-        # Don't check too soon (minimum 3 minutes)
-        now = datetime.datetime.now(timezone.utc)
+        # Don't check too soon (minimum 5 minutes)
+        now = datetime.datetime.utcnow()
         time_since_alert = (now - signal['first_seen']).total_seconds()
-        if time_since_alert < 180:  # 3 minutes
+        if time_since_alert < 300:
             return None
         
         side = setup.get('side', '')
@@ -334,8 +293,6 @@ class SignalTracker:
             if side == "BUY" and current_price >= tp:
                 pnl_pct = (current_price - entry) / entry * 100
                 outcome = {
-                    'signal_id': signal_id,
-                    'symbol': signal['symbol'],
                     'type': f'TP{i+1}_HIT',
                     'price': current_price,
                     'pnl_pct': pnl_pct,
@@ -348,8 +305,6 @@ class SignalTracker:
             elif side == "SELL" and current_price <= tp:
                 pnl_pct = (entry - current_price) / entry * 100
                 outcome = {
-                    'signal_id': signal_id,
-                    'symbol': signal['symbol'],
                     'type': f'TP{i+1}_HIT',
                     'price': current_price,
                     'pnl_pct': pnl_pct,
@@ -371,8 +326,6 @@ class SignalTracker:
                     max_fav = (entry - signal['lowest_price']) / entry * 100
                 
                 outcome = {
-                    'signal_id': signal_id,
-                    'symbol': signal['symbol'],
                     'type': 'SL_HIT',
                     'price': current_price,
                     'pnl_pct': pnl_pct,
@@ -383,20 +336,11 @@ class SignalTracker:
                 }
         
         if outcome:
-            # Mark signal as closed
-            signal['status'] = 'closed'
             signal['outcome'] = outcome['type'].lower()
             signal['outcome_details'] = outcome
             signal['closed_at'] = now
             signal['closed_price'] = current_price
-            
-            # Remove from symbol mapping (allow new signals)
-            symbol = signal['symbol']
-            if self.symbol_to_signal.get(symbol) == signal_id:
-                self.symbol_to_signal.pop(symbol, None)
-            
-            # Remove from signal_ids mapping
-            self.signal_ids.pop(signal_id, None)
+            signal['status'] = 'closed'
             
             # Update stats
             self.outcome_stats['active'] -= 1
@@ -426,58 +370,45 @@ class SignalTracker:
                         self.outcome_stats['avg_pnl_pct'] * (total_closed - 1) + outcome['pnl_pct']
                     ) / total_closed
             
-            log.info(f"📊 Signal {signal_id[:12]}... {outcome['type']} | PnL: {outcome['pnl_pct']:+.2f}%")
             return outcome
         
         return None
     
-    def remove_signal(self, signal_id: str, reason: str = "expired"):
+    def remove_signal(self, symbol: str, reason: str = "expired"):
         """Remove signal and mark as expired"""
-        if signal_id in self.active_signals:
-            signal = self.active_signals.pop(signal_id)
+        if symbol in self.active_signals:
+            signal = self.active_signals.pop(symbol)
             signal['status'] = 'expired'
-            signal['expired_at'] = datetime.datetime.now(timezone.utc)
+            signal['expired_at'] = datetime.datetime.utcnow()
             signal['expired_reason'] = reason
-            
-            # Remove from mappings
-            symbol = self.signal_ids.pop(signal_id, None)
-            if symbol and self.symbol_to_signal.get(symbol) == signal_id:
-                self.symbol_to_signal.pop(symbol, None)
             
             self.outcome_stats['active'] -= 1
             self.outcome_stats['expired'] += 1
-            
-            log.info(f"🗑️  Signal {signal_id[:12]}... expired: {reason}")
     
     def cleanup_old_signals(self):
-        """Remove expired signals (based on age)"""
-        now = datetime.datetime.now(timezone.utc)
-        expired_signal_ids = []
+        """Remove expired signals"""
+        now = datetime.datetime.utcnow()
+        expired_symbols = []
         
-        for signal_id, data in self.active_signals.items():
-            if data.get('status') != 'active':
-                continue
-                
+        for symbol, data in self.active_signals.items():
             age_minutes = (now - data['first_seen']).total_seconds() / 60
             if age_minutes > (SIGNAL_VALIDITY_HOURS * 60):
-                expired_signal_ids.append(signal_id)
+                expired_symbols.append(symbol)
         
-        for signal_id in expired_signal_ids:
-            self.remove_signal(signal_id, f"Expired after {SIGNAL_VALIDITY_HOURS}h")
+        for symbol in expired_symbols:
+            self.remove_signal(symbol, f"Expired after {SIGNAL_VALIDITY_HOURS}h")
         
-        if expired_signal_ids:
-            log.info(f"🧹 Cleaned up {len(expired_signal_ids)} expired signals")
+        if expired_symbols:
+            log.info(f"Cleaned up {len(expired_symbols)} expired signals")
     
     def get_stats(self) -> Dict:
         """Get tracking statistics"""
-        active_count = len([s for s in self.active_signals.values() if s.get('status') == 'active'])
+        active_count = len(self.active_signals)
         
         buy_signals = 0
         sell_signals = 0
         
         for signal in self.active_signals.values():
-            if signal.get('status') != 'active':
-                continue
             setup = signal.get('setup', {})
             if setup.get('side') == 'BUY':
                 buy_signals += 1
@@ -485,7 +416,6 @@ class SignalTracker:
                 sell_signals += 1
         
         return {
-            'total_signals': len(self.active_signals),
             'active_signals': active_count,
             'signals_by_side': {
                 'BUY': buy_signals,
@@ -493,18 +423,6 @@ class SignalTracker:
             },
             'outcome_stats': self.outcome_stats
         }
-    
-    def get_active_signal_for_symbol(self, symbol: str) -> Optional[Dict]:
-        """Get active signal for a symbol"""
-        signal_id = self.symbol_to_signal.get(symbol)
-        if not signal_id:
-            return None
-        
-        signal = self.active_signals.get(signal_id)
-        if signal and signal.get('status') == 'active':
-            return signal
-        
-        return None
 
 # Initialize tracker globally
 signal_tracker = SignalTracker()
@@ -1488,7 +1406,7 @@ async def scan_symbol_fast(exchange, symbol: str) -> Optional[Dict]:
         
         setup = {
             "symbol": symbol,
-            "timestamp": datetime.datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.datetime.utcnow().isoformat(),
             "side": eligibility.side,
             "current_price": current_price,
             "entry_price": eligibility.entry_price,
@@ -1519,8 +1437,8 @@ async def scan_symbol_fast(exchange, symbol: str) -> Optional[Dict]:
         return None
 
 # ---------------- ALERTS (COMPACT FORMAT) ----------------
-async def send_fast_alert(setup: Dict, signal_id: str = None, is_update: bool = False):
-    """Send comprehensive alerts with signal ID"""
+async def send_fast_alert(setup: Dict):
+    """Send comprehensive alerts with FULL 8-step details (COMPACT VERSION)"""
     
     try:
         symbol = setup.get('symbol', 'UNKNOWN')
@@ -1529,12 +1447,8 @@ async def send_fast_alert(setup: Dict, signal_id: str = None, is_update: bool = 
         eight_steps = quality.get('eight_steps', {})
         step_specifics = eight_steps.get('step_specifics', {})
         
-        # Signal ID display
-        signal_id_display = ""
-        if signal_id:
-            signal_short = signal_id.split('_')[-2][:6] if '_' in signal_id else signal_id[:6]
-            signal_id_display = f" | ID: {signal_short}"
-        
+        # Check if this is an update
+        is_update = symbol in signal_tracker.active_signals
         update_emoji = "🔄" if is_update else "🆕"
         
         tier_emoji = {
@@ -1543,6 +1457,16 @@ async def send_fast_alert(setup: Dict, signal_id: str = None, is_update: bool = 
             "B": "⚠️",
             "C": "📊"
         }.get(quality.get("tier", "C"), "📊")
+        
+        # Compact update info
+        update_info = ""
+        if is_update:
+            old_signal = signal_tracker.active_signals.get(symbol, {})
+            old_setup = old_signal.get('setup', {})
+            old_quality = old_setup.get('quality', {}).get('total_score', 0)
+            new_quality = quality.get('total_score', 0)
+            if new_quality > old_quality:
+                update_info = f" | 📈 Improved: {old_quality:.1f}→{new_quality:.1f}"
         
         # Format TP targets compactly
         tp_targets = setup.get('tp_targets', [])
@@ -1553,7 +1477,11 @@ async def send_fast_alert(setup: Dict, signal_id: str = None, is_update: bool = 
                 distance_pct = abs(tp - entry_price) / entry_price * 100
                 tp_lines.append(f"TP{i+1}: {tp:.8f} ({distance_pct:.1f}%)")
         
+        # ============ COMPACT 8-STEP ANALYSIS ============
+        step_checks = []
+        
         # Count passed steps
+        pass_count = 0
         step_passes = sum([
             eight_steps.get('step_1_htf_bias', False),
             eight_steps.get('step_2_zone_type', False),
@@ -1566,7 +1494,6 @@ async def send_fast_alert(setup: Dict, signal_id: str = None, is_update: bool = 
         ])
         
         # Build step checks emojis
-        step_checks = []
         step_checks.append("✅" if eight_steps.get('step_1_htf_bias', False) else "❌")
         step_checks.append("✅" if eight_steps.get('step_2_zone_type', False) else "❌")
         step_checks.append("✅" if eight_steps.get('step_3_liquidity_sweep', False) else "❌")
@@ -1634,9 +1561,9 @@ async def send_fast_alert(setup: Dict, signal_id: str = None, is_update: bool = 
         entry_distance_pct = abs(current_price - entry_price) / entry_price * 100 if entry_price > 0 else 0
         
         # Compose compact message
-        msg = f"""{update_emoji}{tier_emoji} <b>ROMEOTPT v4.3 - {symbol} | {setup.get('side', 'N/A')}{signal_id_display}</b>
+        msg = f"""{update_emoji}{tier_emoji} <b>ROMEOTPT v4.1 - {symbol} | {setup.get('side', 'N/A')}</b>
 Entry: <code>{entry_price:.8f}</code> | Now: <code>{current_price:.8f}</code> ({entry_distance_pct:.1f}%)
-Type: {setup.get('entry_type', 'N/A')}
+Type: {setup.get('entry_type', 'N/A')}{update_info}
 
 🎯 <b>Targets:</b> {' | '.join(tp_lines)}
 🛡️ <b>SL:</b> <code>{setup.get('sl_price', 0):.8f}</code> ({abs(setup.get('sl_price', 0) - entry_price) / entry_price * 100:.1f}%)
@@ -1649,7 +1576,7 @@ Type: {setup.get('entry_type', 'N/A')}
 
 🏆 <b>Quality:</b> {quality.get('total_score', 0):.1f}/5.0 ({quality.get('tier', 'C')}) | {step_passes}/8 steps
 
-<i>{datetime.datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}</i>
+<i>{datetime.datetime.utcnow().strftime('%H:%M:%S UTC')}</i>
 """
         
         await send_telegram(msg)
@@ -1660,29 +1587,8 @@ async def send_outcome_alert(symbol: str, outcome: Dict):
     """Send compact alert when signal hits TP or SL"""
     
     try:
-        signal_id = outcome.get('signal_id', 'Unknown')
-        signal_short = signal_id.split('_')[-2][:6] if '_' in signal_id else signal_id[:6]
-        
-        # Get signal data
-        signal = None
-        for sig_id, sig_data in signal_tracker.active_signals.items():
-            if sig_id == signal_id or sig_data.get('signal_id') == signal_id:
-                signal = sig_data
-                break
-        
-        if not signal:
-            # Try to find by symbol and outcome details
-            for sig_id, sig_data in signal_tracker.active_signals.items():
-                if sig_data.get('symbol') == symbol and sig_data.get('outcome_details', {}).get('type') == outcome.get('type'):
-                    signal = sig_data
-                    break
-        
-        if not signal:
-            log.warning(f"No signal found for outcome: {outcome}")
-            return
-        
+        signal = signal_tracker.active_signals.get(symbol, {})
         setup = signal.get('setup', {})
-        quality = setup.get('quality', {})
         
         if 'TP' in outcome['type']:
             emoji = "✅" if outcome['tp_level'] == 1 else "🎯" if outcome['tp_level'] == 2 else "🏆"
@@ -1697,6 +1603,9 @@ async def send_outcome_alert(symbol: str, outcome: Dict):
         else:
             time_str = f"{bars_held//60}h{bars_held%60}m"
         
+        # Get quality info
+        quality = setup.get('quality', {})
+        
         # Count passed steps
         eight_steps = quality.get('eight_steps', {})
         step_passes = sum([
@@ -1710,7 +1619,7 @@ async def send_outcome_alert(symbol: str, outcome: Dict):
             eight_steps.get('step_8_liquidity_alignment', False)
         ])
         
-        msg = f"""{emoji} <b>{result_text} - {symbol} | ID: {signal_short}</b>
+        msg = f"""{emoji} <b>{result_text} - {symbol}</b>
 Side: {setup.get('side', 'N/A')} | Quality: {quality.get('tier', 'N/A')} ({step_passes}/8)
 
 Entry: <code>{setup.get('entry_price', 0):.8f}</code>
@@ -1719,53 +1628,44 @@ PnL: <code>{outcome['pnl_pct']:+.2f}%</code> | RR: {setup.get('rr_ratio', 0):.1f
 
 ⏱️ {time_str} | Fav: {outcome.get('max_favorable', 0):.1f}% | Adv: {outcome.get('max_adverse', 0):.1f}%
 
-<i>{datetime.datetime.now(timezone.utc).strftime('%H:%M')}</i>
+<i>{datetime.datetime.utcnow().strftime('%H:%M')}</i>
 """
         
         await send_telegram(msg)
     except Exception as e:
         log.error(f"Error sending compact outcome alert: {e}")
 
-async def send_deduped_alert(setup: Dict) -> Tuple[bool, str, Optional[str]]:
+async def send_deduped_alert(setup: Dict):
     """Send alert only if it's a new or meaningfully updated signal"""
     try:
         symbol = setup.get('symbol', '')
         if not symbol:
-            return False, "No symbol", None
+            return False
         
-        needs_new_signal, reason, existing_signal_id = signal_tracker.is_new_signal_needed(symbol, setup)
+        should_alert, reason = signal_tracker.is_new_or_updated_signal(symbol, setup)
         
-        if needs_new_signal:
-            # Create NEW signal with new ID
-            signal_id = signal_tracker.create_new_signal(symbol, setup, alerted=True)
-            await send_fast_alert(setup, signal_id, is_update=False)
-            log.info(f"📨 NEW signal {signal_id[:12]}... for {symbol}: {reason}")
-            return True, f"New signal: {reason}", signal_id
+        if should_alert:
+            await send_fast_alert(setup)
+            signal_tracker.update_signal(symbol, setup, alerted=True)
+            log.info(f"📨 Alert sent for {symbol}: {reason}")
+            return True
         else:
-            # Update EXISTING signal
-            if existing_signal_id:
-                signal_tracker.update_existing_signal(existing_signal_id, setup, alerted=True)
-                await send_fast_alert(setup, existing_signal_id, is_update=True)
-                log.info(f"🔄 UPDATED signal {existing_signal_id[:12]}... for {symbol}")
-                return True, f"Updated existing signal", existing_signal_id
-            else:
-                # Just update without alert
-                signal_tracker.update_existing_signal(existing_signal_id, setup, alerted=False)
-                return False, "Updated without alert", existing_signal_id
-                
+            signal_tracker.update_signal(symbol, setup, alerted=False)
+            if np.random.random() < 0.05:
+                log.debug(f"⏸️  Skipped alert for {symbol}: {reason}")
+            return False
     except Exception as e:
         log.error(f"Error in deduped alert for {setup.get('symbol', 'UNKNOWN')}: {e}")
-        return False, str(e), None
+        return False
 
 # ---------------- DATABASE ----------------
 async def init_database():
-    """Initialize database with signal ID tracking tables"""
+    """Initialize database with outcome tracking tables"""
     try:
-        # Create tables with signal_id
+        # Create tables
         await db_conn.execute("""
-            CREATE TABLE IF NOT EXISTS signals_v4_3 (
+            CREATE TABLE IF NOT EXISTS signals_v4_1 (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                signal_id TEXT UNIQUE,
                 symbol TEXT,
                 timestamp TEXT,
                 side TEXT,
@@ -1789,16 +1689,14 @@ async def init_database():
                 pnl_pct REAL,
                 bars_held INTEGER,
                 max_favorable_pct REAL,
-                max_adverse_pct REAL,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                last_updated TEXT DEFAULT CURRENT_TIMESTAMP
+                max_adverse_pct REAL
             )
         """)
         
         await db_conn.execute("""
-            CREATE TABLE IF NOT EXISTS signal_outcomes_v4_3 (
+            CREATE TABLE IF NOT EXISTS signal_outcomes_v4_1 (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                signal_id TEXT,
+                signal_id INTEGER,
                 symbol TEXT,
                 side TEXT,
                 entry_price REAL,
@@ -1820,25 +1718,25 @@ async def init_database():
                 hold_time_minutes INTEGER,
                 max_favorable_pct REAL,
                 max_adverse_pct REAL,
-                FOREIGN KEY (signal_id) REFERENCES signals_v4_3 (signal_id)
+                FOREIGN KEY (signal_id) REFERENCES signals_v4_1 (id)
             )
         """)
         
         # Create indexes
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_3_signals_signal_id ON signals_v4_3 (signal_id)")
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_3_signals_symbol ON signals_v4_3 (symbol, timestamp)")
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_3_signals_status ON signals_v4_3 (status)")
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_3_outcomes_signal_id ON signal_outcomes_v4_3 (signal_id)")
-        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_3_outcomes_symbol ON signal_outcomes_v4_3 (symbol)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_1_signals_symbol ON signals_v4_1 (symbol, timestamp)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_1_signals_status ON signals_v4_1 (status)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_1_signals_outcome ON signals_v4_1 (outcome)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_1_outcomes_symbol ON signal_outcomes_v4_1 (symbol)")
+        await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v4_1_outcomes_outcome ON signal_outcomes_v4_1 (outcome_type)")
         
         await db_conn.commit()
-        log.info("Database v4.3 initialized with signal ID tracking")
+        log.info("Database v4.1 initialized with 8-step tracking")
     except Exception as e:
         log.error(f"Error initializing database: {e}")
         raise
 
-async def store_or_update_signal(setup: Dict, signal_id: str):
-    """Store or update signal in database with signal ID"""
+async def store_signal(setup: Dict):
+    """Store signal in database"""
     async with db_lock:
         try:
             tp_targets = setup.get("tp_targets", [])
@@ -1859,131 +1757,79 @@ async def store_or_update_signal(setup: Dict, signal_id: str):
                 eight_steps.get('step_8_liquidity_alignment', False)
             ])
             
-            # Check if signal already exists in database
-            cursor = await db_conn.execute(
-                "SELECT 1 FROM signals_v4_3 WHERE signal_id = ?",
-                (signal_id,)
-            )
-            exists = await cursor.fetchone()
+            # Store in signals table
+            cursor = await db_conn.execute("""
+                INSERT INTO signals_v4_1 (
+                    symbol, timestamp, side, entry_price, sl_price, 
+                    tp1, tp2, tp3, rr_ratio, quality_tier, quality_score,
+                    current_price, liquidity_buy_stops, liquidity_sell_stops,
+                    eight_steps_passed, status, alert_sent
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1)
+            """, (
+                setup.get("symbol", ""),
+                setup.get("timestamp", ""),
+                setup.get("side", ""),
+                setup.get("entry_price", 0),
+                setup.get("sl_price", 0),
+                tp_targets[0] if len(tp_targets) > 0 else None,
+                tp_targets[1] if len(tp_targets) > 1 else None,
+                tp_targets[2] if len(tp_targets) > 2 else None,
+                setup.get("rr_ratio", 0),
+                quality.get("tier", "C"),
+                quality.get("total_score", 0),
+                setup.get("current_price", 0),
+                pools.get("buy_stops", 0),
+                pools.get("sell_stops", 0),
+                step_passes
+            ))
             
-            now = datetime.datetime.now(timezone.utc).isoformat()
+            # Get the inserted ID
+            signal_id = cursor.lastrowid
             
-            if exists:
-                # UPDATE existing signal
-                await db_conn.execute("""
-                    UPDATE signals_v4_3 
-                    SET symbol = ?, timestamp = ?, side = ?, entry_price = ?, sl_price = ?,
-                        tp1 = ?, tp2 = ?, tp3 = ?, rr_ratio = ?, quality_tier = ?, quality_score = ?,
-                        current_price = ?, liquidity_buy_stops = ?, liquidity_sell_stops = ?,
-                        eight_steps_passed = ?, last_updated = ?, alert_sent = 1
-                    WHERE signal_id = ?
-                """, (
-                    setup.get("symbol", ""),
-                    setup.get("timestamp", ""),
-                    setup.get("side", ""),
-                    setup.get("entry_price", 0),
-                    setup.get("sl_price", 0),
-                    tp_targets[0] if len(tp_targets) > 0 else None,
-                    tp_targets[1] if len(tp_targets) > 1 else None,
-                    tp_targets[2] if len(tp_targets) > 2 else None,
-                    setup.get("rr_ratio", 0),
-                    quality.get("tier", "C"),
-                    quality.get("total_score", 0),
-                    setup.get("current_price", 0),
-                    pools.get("buy_stops", 0),
-                    pools.get("sell_stops", 0),
-                    step_passes,
-                    now,
-                    signal_id
-                ))
-                
-                log.debug(f"Updated signal {signal_id[:12]}... in database")
-            else:
-                # INSERT new signal
-                cursor = await db_conn.execute("""
-                    INSERT INTO signals_v4_3 (
-                        signal_id, symbol, timestamp, side, entry_price, sl_price, 
-                        tp1, tp2, tp3, rr_ratio, quality_tier, quality_score,
-                        current_price, liquidity_buy_stops, liquidity_sell_stops,
-                        eight_steps_passed, status, alert_sent, created_at, last_updated
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1, ?, ?)
-                """, (
-                    signal_id,
-                    setup.get("symbol", ""),
-                    setup.get("timestamp", ""),
-                    setup.get("side", ""),
-                    setup.get("entry_price", 0),
-                    setup.get("sl_price", 0),
-                    tp_targets[0] if len(tp_targets) > 0 else None,
-                    tp_targets[1] if len(tp_targets) > 1 else None,
-                    tp_targets[2] if len(tp_targets) > 2 else None,
-                    setup.get("rr_ratio", 0),
-                    quality.get("tier", "C"),
-                    quality.get("total_score", 0),
-                    setup.get("current_price", 0),
-                    pools.get("buy_stops", 0),
-                    pools.get("sell_stops", 0),
-                    step_passes,
-                    now,
-                    now
-                ))
-                
-                # Get the inserted ID
-                db_id = cursor.lastrowid
-                
-                # Also store in outcomes table for tracking
-                await db_conn.execute("""
-                    INSERT INTO signal_outcomes_v4_3 (
-                        signal_id, symbol, side, entry_price, sl_price, tp1_price,
-                        tp2_price, tp3_price, quality_score, quality_tier,
-                        eight_steps_passed, liquidity_buy_stops, liquidity_sell_stops,
-                        created_at, status
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
-                """, (
-                    signal_id,
-                    setup.get("symbol", ""),
-                    setup.get("side", ""),
-                    setup.get("entry_price", 0),
-                    setup.get("sl_price", 0),
-                    tp_targets[0] if len(tp_targets) > 0 else None,
-                    tp_targets[1] if len(tp_targets) > 1 else None,
-                    tp_targets[2] if len(tp_targets) > 2 else None,
-                    quality.get("total_score", 0),
-                    quality.get("tier", "C"),
-                    step_passes,
-                    pools.get("buy_stops", 0),
-                    pools.get("sell_stops", 0),
-                    setup.get("timestamp", "")
-                ))
-                
-                log.debug(f"Inserted new signal {signal_id[:12]}... with DB ID {db_id}")
+            # Also store in outcomes table for tracking
+            await db_conn.execute("""
+                INSERT INTO signal_outcomes_v4_1 (
+                    signal_id, symbol, side, entry_price, sl_price, tp1_price,
+                    tp2_price, tp3_price, quality_score, quality_tier,
+                    eight_steps_passed, liquidity_buy_stops, liquidity_sell_stops,
+                    created_at, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+            """, (
+                signal_id,
+                setup.get("symbol", ""),
+                setup.get("side", ""),
+                setup.get("entry_price", 0),
+                setup.get("sl_price", 0),
+                tp_targets[0] if len(tp_targets) > 0 else None,
+                tp_targets[1] if len(tp_targets) > 1 else None,
+                tp_targets[2] if len(tp_targets) > 2 else None,
+                quality.get("total_score", 0),
+                quality.get("tier", "C"),
+                step_passes,
+                pools.get("buy_stops", 0),
+                pools.get("sell_stops", 0),
+                setup.get("timestamp", "")
+            ))
             
             await db_conn.commit()
+            log.debug(f"Stored signal for {setup.get('symbol', 'UNKNOWN')} with ID {signal_id}")
             
         except Exception as e:
-            log.error(f"Error storing/updating signal {signal_id[:12]}...: {e}")
-            # Log the full error for debugging
-            import traceback
-            log.error(f"Traceback: {traceback.format_exc()}")
+            log.error(f"Error storing signal {setup.get('symbol', 'UNKNOWN')}: {e}")
 
 async def store_outcome(symbol: str, outcome: Dict):
     """Store signal outcome in database"""
     async with db_lock:
         try:
-            signal_id = outcome.get('signal_id')
-            now = datetime.datetime.now(timezone.utc).isoformat()
-            
-            if not signal_id:
-                log.error(f"No signal ID in outcome for {symbol}")
-                return
+            now = datetime.datetime.utcnow().isoformat()
             
             # Update signals table
             await db_conn.execute("""
-                UPDATE signals_v4_3 
+                UPDATE signals_v4_1 
                 SET status = 'closed', closed_at = ?, closed_price = ?, outcome = ?,
-                    pnl_pct = ?, bars_held = ?, max_favorable_pct = ?, max_adverse_pct = ?,
-                    last_updated = ?
-                WHERE signal_id = ?
+                    pnl_pct = ?, bars_held = ?, max_favorable_pct = ?, max_adverse_pct = ?
+                WHERE symbol = ? AND status = 'active'
+                ORDER BY timestamp DESC LIMIT 1
             """, (
                 now,
                 outcome.get('price', 0),
@@ -1992,16 +1838,16 @@ async def store_outcome(symbol: str, outcome: Dict):
                 outcome.get('bars_held', 0),
                 outcome.get('max_favorable', 0),
                 outcome.get('max_adverse', 0),
-                now,
-                signal_id
+                symbol
             ))
             
             # Update signal_outcomes table
             await db_conn.execute("""
-                UPDATE signal_outcomes_v4_3 
+                UPDATE signal_outcomes_v4_1 
                 SET status = 'closed', closed_at = ?, closed_price = ?, outcome_type = ?,
                     pnl_pct = ?, hold_time_minutes = ?, max_favorable_pct = ?, max_adverse_pct = ?
-                WHERE signal_id = ?
+                WHERE symbol = ? AND status = 'active'
+                ORDER BY created_at DESC LIMIT 1
             """, (
                 now,
                 outcome.get('price', 0),
@@ -2010,58 +1856,51 @@ async def store_outcome(symbol: str, outcome: Dict):
                 outcome.get('bars_held', 0),
                 outcome.get('max_favorable', 0),
                 outcome.get('max_adverse', 0),
-                signal_id
+                symbol
             ))
             
             await db_conn.commit()
-            log.info(f"Stored outcome for signal {signal_id[:12]}...: {outcome.get('type', 'UNKNOWN')}")
+            log.info(f"Stored outcome for {symbol}: {outcome.get('type', 'UNKNOWN')}")
             
         except Exception as e:
-            log.error(f"Error storing outcome for {signal_id[:12]}...: {e}")
+            log.error(f"Error storing outcome for {symbol}: {e}")
 
 # ---------------- OUTCOME CHECKER ----------------
 async def outcome_checker_task(exchange):
     """Background task to check signal outcomes"""
-    log.info("🔄 Outcome checker started (signal-based)")
+    log.info("🔄 Outcome checker started")
     
     while True:
         try:
-            # Get active signal IDs
-            active_signal_ids = [
-                signal_id for signal_id, data in signal_tracker.active_signals.items()
-                if data.get('status') == 'active'
-            ]
+            active_symbols = list(signal_tracker.active_signals.keys())
             
-            if active_signal_ids:
+            if active_symbols:
+                # Fetch tickers in batches to avoid rate limits
                 outcomes_found = 0
+                batch_size = 5
                 
-                # Group by symbol for efficient ticker fetching
-                symbol_to_signal_ids = {}
-                for signal_id in active_signal_ids:
-                    signal = signal_tracker.active_signals.get(signal_id)
-                    if signal:
-                        symbol = signal.get('symbol')
-                        if symbol:
-                            if symbol not in symbol_to_signal_ids:
-                                symbol_to_signal_ids[symbol] = []
-                            symbol_to_signal_ids[symbol].append(signal_id)
-                
-                # Check each symbol's signals
-                for symbol, signal_ids in symbol_to_signal_ids.items():
+                for i in range(0, len(active_symbols), batch_size):
+                    batch = active_symbols[i:i+batch_size]
+                    
                     try:
-                        ticker = await safe_fetch_ticker(exchange, symbol)
-                        current_price = ticker.get('last', 0) if ticker else 0
+                        tickers = await safe_fetch_tickers(exchange)
                         
-                        if current_price > 0:
-                            for signal_id in signal_ids:
-                                outcome = signal_tracker.check_signal_outcome(signal_id, current_price)
-                                if outcome:
-                                    await send_outcome_alert(symbol, outcome)
-                                    await store_outcome(symbol, outcome)
-                                    outcomes_found += 1
+                        for symbol in batch:
+                            if symbol in tickers:
+                                current_price = tickers[symbol].get('last', 0)
+                                if current_price > 0:
+                                    outcome = signal_tracker.check_signal_outcome(symbol, current_price)
+                                    if outcome:
+                                        await send_outcome_alert(symbol, outcome)
+                                        await store_outcome(symbol, outcome)
+                                        outcomes_found += 1
                     
                     except Exception as e:
-                        log.error(f"Error checking outcomes for {symbol}: {e}")
+                        log.error(f"Error checking outcomes batch: {e}")
+                    
+                    # Small delay between batches
+                    if i + batch_size < len(active_symbols):
+                        await asyncio.sleep(1)
                 
                 if outcomes_found:
                     log.info(f"📊 Found {outcomes_found} signal outcomes")
@@ -2086,10 +1925,10 @@ async def process_deduped_results(results) -> int:
             try:
                 quality_score = result.get("quality", {}).get("total_score", 0)
                 if quality_score >= MIN_QUALITY_SCORE:
-                    alerted, reason, signal_id = await send_deduped_alert(result)
-                    if alerted and signal_id:
+                    alerted = await send_deduped_alert(result)
+                    if alerted:
                         alerts_sent += 1
-                        await store_or_update_signal(result, signal_id)
+                    await store_signal(result)
             except Exception as e:
                 log.error(f"Error processing result: {e}")
     
@@ -2099,10 +1938,10 @@ async def liquidity_scanner(exchange):
     """Main scanner with liquidity-based TP/SL"""
     
     # Send compact startup message
-    startup_msg = f"""🚀 <b>ROMEOTPT v4.3 Started (Signal-Based Tracking)</b>
+    startup_msg = f"""🚀 <b>ROMEOTPT v4.1 Started</b>
 Scan: {SCAN_INTERVAL}s | Top {TOP_N} | Quality ≥{MIN_QUALITY_SCORE}
 Cooldown: {SIGNAL_COOLDOWN_MINUTES}min | Rate: {MAX_REQUESTS_PER_SECOND}/s
-Liquidity-based TP/SL | Each signal has unique ID"""
+Liquidity-based TP/SL | Full 8-step analysis"""
     await send_telegram(startup_msg)
     
     # Start outcome checker
@@ -2129,7 +1968,7 @@ Liquidity-based TP/SL | Each signal has unique ID"""
             
             stats = signal_tracker.get_stats()
             
-            log.info(f"🔄 Scan #{scan_cycle}: {len(symbols_to_scan)} symbols | Active: {stats.get('active_signals', 0)} | Total: {stats.get('total_signals', 0)}")
+            log.info(f"🔄 Scan #{scan_cycle}: {len(symbols_to_scan)} symbols | Active: {stats.get('active_signals', 0)}")
             
             # Log stats periodically
             if scan_cycle % 5 == 0:
@@ -2138,7 +1977,7 @@ Liquidity-based TP/SL | Each signal has unique ID"""
                 if total_closed > 0:
                     win_rate = outcome_stats.get('win_rate', 0)
                     avg_pnl = outcome_stats.get('avg_pnl_pct', 0)
-                    log.info(f"📈 Stats: WR={win_rate:.1f}% | Avg PnL={avg_pnl:+.2f}% | Active={outcome_stats.get('active', 0)} | Total={total_closed}")
+                    log.info(f"📈 Stats: WR={win_rate:.1f}% | Avg PnL={avg_pnl:+.2f}% | Active={outcome_stats.get('active', 0)}")
             
             # Scan symbols WITH CONCURRENCY CONTROL
             alerts_this_scan = 0
@@ -2166,9 +2005,6 @@ Liquidity-based TP/SL | Each signal has unique ID"""
             # Clean up old signals
             signal_tracker.cleanup_old_signals()
             
-            if alerts_this_scan > 0:
-                log.info(f"📨 Scan #{scan_cycle} complete: {alerts_this_scan} alerts sent")
-            
             await asyncio.sleep(SCAN_INTERVAL)
             
         except Exception as e:
@@ -2183,9 +2019,8 @@ async def health():
     stats = signal_tracker.get_stats()
     return {
         "status": "healthy", 
-        "version": "4.3 - Signal-Based Tracking with DB Fixes",
+        "version": "4.1 - Full 8-Step Details",
         "active_signals": stats.get('active_signals', 0),
-        "total_signals": stats.get('total_signals', 0),
         "outcome_stats": stats.get('outcome_stats', {})
     }
 
@@ -2193,10 +2028,7 @@ async def health():
 async def get_active_signals():
     """Get currently active signals"""
     active = []
-    for signal_id, data in signal_tracker.active_signals.items():
-        if data.get('status') != 'active':
-            continue
-            
+    for symbol, data in signal_tracker.active_signals.items():
         setup = data.get('setup', {})
         quality = setup.get('quality', {})
         eight_steps = quality.get('eight_steps', {})
@@ -2214,8 +2046,7 @@ async def get_active_signals():
         ])
         
         active.append({
-            "signal_id": signal_id,
-            "symbol": data.get('symbol', ''),
+            "symbol": symbol,
             "side": setup.get('side', ''),
             "entry_price": setup.get('entry_price', 0),
             "current_price": setup.get('current_price', 0),
@@ -2226,41 +2057,13 @@ async def get_active_signals():
             "quality_tier": quality.get('tier', 'C'),
             "steps_passed": step_passes,
             "rr_ratio": setup.get('rr_ratio', 0),
-            "age_minutes": (datetime.datetime.now(timezone.utc) - data.get('first_seen', datetime.datetime.now(timezone.utc))).total_seconds() / 60
+            "age_minutes": (datetime.datetime.utcnow() - data.get('first_seen', datetime.datetime.utcnow())).total_seconds() / 60
         })
     return {"active_signals": active, "count": len(active)}
 
-@app.get("/signals/all")
-async def get_all_signals(limit: int = 50):
-    """Get all signals (active and closed)"""
-    all_signals = []
-    for signal_id, data in signal_tracker.active_signals.items():
-        setup = data.get('setup', {})
-        quality = setup.get('quality', {})
-        
-        signal_info = {
-            "signal_id": signal_id,
-            "symbol": data.get('symbol', ''),
-            "status": data.get('status', ''),
-            "side": setup.get('side', ''),
-            "entry_price": setup.get('entry_price', 0),
-            "sl": setup.get('sl_price', 0),
-            "quality_score": quality.get('total_score', 0),
-            "quality_tier": quality.get('tier', 'C'),
-            "first_seen": data.get('first_seen').isoformat() if data.get('first_seen') else None,
-            "outcome": data.get('outcome'),
-            "closed_at": data.get('closed_at').isoformat() if data.get('closed_at') else None
-        }
-        all_signals.append(signal_info)
-    
-    # Sort by newest first
-    all_signals.sort(key=lambda x: x.get('first_seen', ''), reverse=True)
-    
-    return {"signals": all_signals[:limit], "total": len(all_signals)}
-
 @app.get("/outcomes/stats")
 async def get_outcome_stats(hours: int = 24):
-    """Get outcome statistics"""
+    """Get outcome statistics with 8-step analysis"""
     async with db_lock:
         try:
             cursor = await db_conn.execute("""
@@ -2273,7 +2076,7 @@ async def get_outcome_stats(hours: int = 24):
                     AVG(liquidity_buy_stops) as avg_buy_stops,
                     AVG(liquidity_sell_stops) as avg_sell_stops,
                     AVG(eight_steps_passed) as avg_steps_passed
-                FROM signal_outcomes_v4_3 
+                FROM signal_outcomes_v4_1 
                 WHERE status = 'closed' 
                 AND closed_at > datetime('now', ?)
             """, (f"-{hours} hours",))
@@ -2287,7 +2090,7 @@ async def get_outcome_stats(hours: int = 24):
                     AVG(pnl_pct) as avg_pnl,
                     AVG(rr_ratio) as avg_rr,
                     AVG(eight_steps_passed) as avg_steps_passed
-                FROM signals_v4_3 
+                FROM signals_v4_1 
                 WHERE status = 'closed' 
                 AND timestamp > datetime('now', ?)
                 GROUP BY quality_tier
@@ -2295,14 +2098,14 @@ async def get_outcome_stats(hours: int = 24):
             """, (f"-{hours} hours",))
             rows = await cursor.fetchall()
             tier_stats = {}
-            for row_data in rows:
-                if row_data[0]:  # Only add if tier is not None
-                    tier_stats[row_data[0]] = {
-                        'count': row_data[1],
-                        'wins': row_data[2],
-                        'avg_pnl': row_data[3],
-                        'avg_rr': row_data[4],
-                        'avg_steps_passed': row_data[5]
+            for row in rows:
+                if row[0]:  # Only add if tier is not None
+                    tier_stats[row[0]] = {
+                        'count': row[1],
+                        'wins': row[2],
+                        'avg_pnl': row[3],
+                        'avg_rr': row[4],
+                        'avg_steps_passed': row[5]
                     }
         except Exception as e:
             log.error(f"Error fetching outcome stats: {e}")
@@ -2346,10 +2149,10 @@ async def main():
             "verbose": False,
         })
         
-        log.info("🚀 ROMEOTPT v4.3 - SIGNAL-BASED TRACKING WITH DATABASE FIXES")
+        log.info("🚀 ROMEOTPT v4.1 - LIQUIDITY EDITION WITH FULL 8-STEP DETAILS")
         log.info(f"TP/SL: 100% liquidity-based | NO fixed percentages")
         log.info(f"Scan: {SCAN_INTERVAL}s | Top {TOP_N} symbols")
-        log.info(f"Each signal has unique ID for clear outcome tracking")
+        log.info(f"Full 8-step analysis displayed in every signal")
         
         await liquidity_scanner(exchange)
         
