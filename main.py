@@ -33,7 +33,7 @@ TOP_N = int(os.getenv("TOP_N", 30))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 2))
 
 # Signal thresholds
-MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 2.0))
+MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 1.5))
 
 # Deduplication settings
 SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 15))
@@ -123,6 +123,7 @@ class LiquiditySetup:
     """Liquidity-based setup details"""
     sl_price: float = 0.0
     tp_targets: List[float] = None
+    tp_sources: List[Dict] = None  # NEW: Source info for each TP
     liquidity_analysis: Dict = None
     rr_ratio: float = 0.0
 
@@ -615,10 +616,10 @@ def identify_liquidity_pools(df, timeframe="1h"):
 
 # ---------------- LIQUIDITY-BASED TP/SL CALCULATION ----------------
 async def calculate_liquidity_tp_sl(exchange, symbol: str, side: str, entry_price: float, 
-                                   entry_type: str) -> Tuple[float, List[float], Dict]:
+                                   entry_type: str) -> Tuple[float, List[float], List[Dict], Dict]:
     """
     TP/SL based PURELY on liquidity pools
-    NO FIXED PERCENTAGES - ALL BASED ON MARKET STRUCTURE
+    Returns: (sl_price, tp_targets, tp_sources, liquidity_analysis)
     """
     
     # Get multi-timeframe data for liquidity analysis
@@ -678,14 +679,13 @@ async def calculate_liquidity_tp_sl(exchange, symbol: str, side: str, entry_pric
     
     current_price = entry_price
     tp_targets = []
+    tp_sources = []  # NEW: Store source info for each TP
     sl_price = 0.0
+    sl_source = {}  # NEW: Store SL source info
     
     # ========== BUY SIGNAL LOGIC ==========
     if side == "BUY":
         # ----- STOP LOSS: Below nearest sell-stop liquidity -----
-        # We want SL to be where weak longs have their stops
-        
-        # Find all sell-stop pools below current price
         sell_stops_below = [p for p in all_pools['sell_stops'] if p['price'] < current_price]
         
         if sell_stops_below:
@@ -693,61 +693,128 @@ async def calculate_liquidity_tp_sl(exchange, symbol: str, side: str, entry_pric
             for timeframe_weight in [3.0, 2.0, 1.0]:
                 timeframe_pools = [p for p in sell_stops_below if p.get('weight', 1.0) == timeframe_weight]
                 if timeframe_pools:
-                    # Take the LOWEST pool in this timeframe (strongest sell-stop)
+                    # Take the LOWEST pool in this timeframe
                     strongest_pool = min(timeframe_pools, key=lambda x: x['price'])
-                    sl_price = strongest_pool['price'] * 0.997  # Slightly below the pool
+                    sl_price = strongest_pool['price'] * 0.997
+                    sl_source = {
+                        'type': 'sell_stop_pool',
+                        'timeframe': strongest_pool.get('timeframe', 'unknown'),
+                        'reason': strongest_pool.get('reason', 'equal_high'),
+                        'strength': strongest_pool.get('strength', 1),
+                        'original_price': strongest_pool['price']
+                    }
                     break
             
-            # If no timeframe-specific pool found, use lowest overall
             if sl_price == 0:
                 strongest_pool = min(sell_stops_below, key=lambda x: x['price'])
                 sl_price = strongest_pool['price'] * 0.995
+                sl_source = {
+                    'type': 'sell_stop_pool',
+                    'timeframe': strongest_pool.get('timeframe', 'unknown'),
+                    'reason': strongest_pool.get('reason', 'equal_high'),
+                    'strength': strongest_pool.get('strength', 1),
+                    'original_price': strongest_pool['price']
+                }
         else:
-            # No sell-stop pools found - look for equal lows instead
+            # No sell-stop pools found
             equal_lows_below = [p for p in all_pools['equal_lows'] if p['price'] < current_price]
             if equal_lows_below:
-                # Use the most recent equal low
                 most_recent_low = max(equal_lows_below, key=lambda x: x.get('candle_index', 0))
                 sl_price = most_recent_low['price'] * 0.99
+                sl_source = {
+                    'type': 'equal_low',
+                    'timeframe': most_recent_low.get('timeframe', 'unknown'),
+                    'reason': 'recent_equal_low',
+                    'strength': most_recent_low.get('count', 1),
+                    'original_price': most_recent_low['price']
+                }
             else:
-                # Emergency: Use recent low from 15m chart
                 if df_15m is not None and len(df_15m) >= 10:
                     recent_low = df_15m['low'].iloc[-10:].min()
                     sl_price = float(recent_low) * 0.985
+                    sl_source = {
+                        'type': 'recent_low',
+                        'timeframe': '15m',
+                        'reason': 'recent_swing_low',
+                        'strength': 1,
+                        'original_price': float(recent_low)
+                    }
                 else:
-                    # Last resort: 3% stop (should rarely happen)
                     sl_price = current_price * 0.97
+                    sl_source = {
+                        'type': 'fixed_percentage',
+                        'timeframe': 'N/A',
+                        'reason': 'emergency_3pct',
+                        'strength': 0,
+                        'original_price': sl_price / 0.97
+                    }
         
-        # Ensure SL is reasonable (not too close or too far)
-        if sl_price > current_price * 0.995:  # SL less than 0.5% away
-            sl_price = current_price * 0.985  # Move to 1.5%
+        # Ensure SL is reasonable
+        if sl_price > current_price * 0.995:
+            sl_price = current_price * 0.985
+            sl_source = {
+                'type': 'adjusted',
+                'timeframe': 'N/A',
+                'reason': 'too_close_adjusted',
+                'strength': 0,
+                'original_price': current_price * 0.995
+            }
         
         # ----- TAKE PROFIT: At buy-stop liquidity -----
         # TP1: Nearest buy-stop pool above entry
         buy_stops_above = [p for p in all_pools['buy_stops'] if p['price'] > current_price]
         
         if buy_stops_above:
-            # Find closest buy-stop pool
             closest_buy_stop = min(buy_stops_above, key=lambda x: x['price'])
             tp1 = closest_buy_stop['price']
+            tp_sources.append({
+                'tp_level': 1,
+                'type': 'buy_stop_pool',
+                'timeframe': closest_buy_stop.get('timeframe', 'unknown'),
+                'reason': closest_buy_stop.get('reason', 'equal_low'),
+                'strength': closest_buy_stop.get('strength', 1),
+                'original_price': closest_buy_stop['price']
+            })
             
-            # If entry is discount zone, also check equal highs (premium zones)
+            # Check for equal highs as alternative
             if entry_type == "DISCOUNT_ZONE":
                 equal_highs_above = [p for p in all_pools['equal_highs'] if p['price'] > current_price]
                 if equal_highs_above:
                     closest_equal_high = min(equal_highs_above, key=lambda x: x['price'])
-                    # Use whichever is closer but reasonable
                     if abs(closest_equal_high['price'] - current_price) < abs(tp1 - current_price) * 1.5:
                         tp1 = closest_equal_high['price']
+                        tp_sources[-1] = {
+                            'tp_level': 1,
+                            'type': 'equal_high',
+                            'timeframe': closest_equal_high.get('timeframe', 'unknown'),
+                            'reason': 'premium_zone',
+                            'strength': closest_equal_high.get('count', 1),
+                            'original_price': closest_equal_high['price']
+                        }
         else:
-            # No buy-stop pools - look for equal highs
+            # No buy-stop pools
             equal_highs_above = [p for p in all_pools['equal_highs'] if p['price'] > current_price]
             if equal_highs_above:
                 tp1 = min(equal_highs_above, key=lambda x: x['price'])['price']
+                tp_sources.append({
+                    'tp_level': 1,
+                    'type': 'equal_high',
+                    'timeframe': min(equal_highs_above, key=lambda x: x['price']).get('timeframe', 'unknown'),
+                    'reason': 'premium_zone',
+                    'strength': min(equal_highs_above, key=lambda x: x['price']).get('count', 1),
+                    'original_price': min(equal_highs_above, key=lambda x: x['price'])['price']
+                })
             else:
-                # Calculate based on risk (but not fixed %)
                 risk = current_price - sl_price
-                tp1 = current_price + (risk * 1.2)  # Small 1.2:1 R:R minimum
+                tp1 = current_price + (risk * 1.2)
+                tp_sources.append({
+                    'tp_level': 1,
+                    'type': 'risk_based',
+                    'timeframe': 'N/A',
+                    'reason': 'no_pool_found',
+                    'strength': 0,
+                    'original_price': tp1
+                })
         
         # TP2: Next significant liquidity pool above TP1
         buy_stops_above_tp1 = [p for p in all_pools['buy_stops'] if p['price'] > tp1]
@@ -757,169 +824,310 @@ async def calculate_liquidity_tp_sl(exchange, symbol: str, side: str, entry_pric
             significant_pools = [p for p in buy_stops_above_tp1 if p.get('weight', 1.0) >= 2.0]
             if significant_pools:
                 tp2 = min(significant_pools, key=lambda x: x['price'])['price']
+                tp_sources.append({
+                    'tp_level': 2,
+                    'type': 'buy_stop_pool',
+                    'timeframe': min(significant_pools, key=lambda x: x['price']).get('timeframe', 'unknown'),
+                    'reason': 'higher_timeframe_pool',
+                    'strength': min(significant_pools, key=lambda x: x['price']).get('strength', 1),
+                    'original_price': min(significant_pools, key=lambda x: x['price'])['price']
+                })
             else:
                 tp2 = min(buy_stops_above_tp1, key=lambda x: x['price'])['price']
+                tp_sources.append({
+                    'tp_level': 2,
+                    'type': 'buy_stop_pool',
+                    'timeframe': min(buy_stops_above_tp1, key=lambda x: x['price']).get('timeframe', 'unknown'),
+                    'reason': 'next_pool',
+                    'strength': min(buy_stops_above_tp1, key=lambda x: x['price']).get('strength', 1),
+                    'original_price': min(buy_stops_above_tp1, key=lambda x: x['price'])['price']
+                })
         else:
             # Look for equal highs above TP1
             equal_highs_above_tp1 = [p for p in all_pools['equal_highs'] if p['price'] > tp1]
             if equal_highs_above_tp1:
                 tp2 = min(equal_highs_above_tp1, key=lambda x: x['price'])['price']
+                tp_sources.append({
+                    'tp_level': 2,
+                    'type': 'equal_high',
+                    'timeframe': min(equal_highs_above_tp1, key=lambda x: x['price']).get('timeframe', 'unknown'),
+                    'reason': 'premium_zone',
+                    'strength': min(equal_highs_above_tp1, key=lambda x: x['price']).get('count', 1),
+                    'original_price': min(equal_highs_above_tp1, key=lambda x: x['price'])['price']
+                })
             else:
-                # Use risk-based calculation
                 risk = current_price - sl_price
                 tp2 = current_price + (risk * 2.0)
+                tp_sources.append({
+                    'tp_level': 2,
+                    'type': 'risk_based',
+                    'timeframe': 'N/A',
+                    'reason': 'no_pool_found',
+                    'strength': 0,
+                    'original_price': tp2
+                })
         
         tp_targets = [tp1, tp2]
         
         # TP3: Major liquidity pool (only for strong setups)
         if entry_type == "DISCOUNT_ZONE" and len(all_pools['equal_highs']) >= 2:
-            # Find a major equal high (highest in last 50% of data)
             if df_4h is not None and len(df_4h) >= 10:
                 major_high_idx = df_4h['high'].iloc[-int(len(df_4h)*0.5):].idxmax()
                 major_high = df_4h['high'].iloc[major_high_idx]
                 
-                if major_high > tp2 * 1.05:  # Only if significantly above TP2
+                if major_high > tp2 * 1.05:
                     tp_targets.append(float(major_high))
+                    tp_sources.append({
+                        'tp_level': 3,
+                        'type': 'major_swing_high',
+                        'timeframe': '4h',
+                        'reason': 'major_structure',
+                        'strength': 3,
+                        'original_price': float(major_high)
+                    })
     
     # ========== SELL SIGNAL LOGIC ==========
     else:
         # ----- STOP LOSS: Above nearest buy-stop liquidity -----
-        # We want SL to be where weak shorts have their stops
-        
-        # Find all buy-stop pools above current price
         buy_stops_above = [p for p in all_pools['buy_stops'] if p['price'] > current_price]
         
         if buy_stops_above:
-            # Prioritize 4H pools, then 1H, then 15M
             for timeframe_weight in [3.0, 2.0, 1.0]:
                 timeframe_pools = [p for p in buy_stops_above if p.get('weight', 1.0) == timeframe_weight]
                 if timeframe_pools:
-                    # Take the HIGHEST pool in this timeframe (strongest buy-stop)
                     strongest_pool = max(timeframe_pools, key=lambda x: x['price'])
-                    sl_price = strongest_pool['price'] * 1.003  # Slightly above the pool
+                    sl_price = strongest_pool['price'] * 1.003
+                    sl_source = {
+                        'type': 'buy_stop_pool',
+                        'timeframe': strongest_pool.get('timeframe', 'unknown'),
+                        'reason': strongest_pool.get('reason', 'equal_low'),
+                        'strength': strongest_pool.get('strength', 1),
+                        'original_price': strongest_pool['price']
+                    }
                     break
             
-            # If no timeframe-specific pool found, use highest overall
             if sl_price == 0:
                 strongest_pool = max(buy_stops_above, key=lambda x: x['price'])
                 sl_price = strongest_pool['price'] * 1.005
+                sl_source = {
+                    'type': 'buy_stop_pool',
+                    'timeframe': strongest_pool.get('timeframe', 'unknown'),
+                    'reason': strongest_pool.get('reason', 'equal_low'),
+                    'strength': strongest_pool.get('strength', 1),
+                    'original_price': strongest_pool['price']
+                }
         else:
-            # No buy-stop pools found - look for equal highs instead
             equal_highs_above = [p for p in all_pools['equal_highs'] if p['price'] > current_price]
             if equal_highs_above:
-                # Use the most recent equal high
                 most_recent_high = max(equal_highs_above, key=lambda x: x.get('candle_index', 0))
                 sl_price = most_recent_high['price'] * 1.01
+                sl_source = {
+                    'type': 'equal_high',
+                    'timeframe': most_recent_high.get('timeframe', 'unknown'),
+                    'reason': 'recent_equal_high',
+                    'strength': most_recent_high.get('count', 1),
+                    'original_price': most_recent_high['price']
+                }
             else:
-                # Emergency: Use recent high from 15m chart
                 if df_15m is not None and len(df_15m) >= 10:
                     recent_high = df_15m['high'].iloc[-10:].max()
                     sl_price = float(recent_high) * 1.015
+                    sl_source = {
+                        'type': 'recent_high',
+                        'timeframe': '15m',
+                        'reason': 'recent_swing_high',
+                        'strength': 1,
+                        'original_price': float(recent_high)
+                    }
                 else:
-                    # Last resort: 3% stop
                     sl_price = current_price * 1.03
+                    sl_source = {
+                        'type': 'fixed_percentage',
+                        'timeframe': 'N/A',
+                        'reason': 'emergency_3pct',
+                        'strength': 0,
+                        'original_price': sl_price / 1.03
+                    }
         
         # Ensure SL is reasonable
-        if sl_price < current_price * 1.005:  # SL less than 0.5% away
-            sl_price = current_price * 1.015  # Move to 1.5%
+        if sl_price < current_price * 1.005:
+            sl_price = current_price * 1.015
+            sl_source = {
+                'type': 'adjusted',
+                'timeframe': 'N/A',
+                'reason': 'too_close_adjusted',
+                'strength': 0,
+                'original_price': current_price * 1.005
+            }
         
         # ----- TAKE PROFIT: At sell-stop liquidity -----
         # TP1: Nearest sell-stop pool below entry
         sell_stops_below = [p for p in all_pools['sell_stops'] if p['price'] < current_price]
         
         if sell_stops_below:
-            # Find closest sell-stop pool
             closest_sell_stop = max(sell_stops_below, key=lambda x: x['price'])
             tp1 = closest_sell_stop['price']
+            tp_sources.append({
+                'tp_level': 1,
+                'type': 'sell_stop_pool',
+                'timeframe': closest_sell_stop.get('timeframe', 'unknown'),
+                'reason': closest_sell_stop.get('reason', 'equal_high'),
+                'strength': closest_sell_stop.get('strength', 1),
+                'original_price': closest_sell_stop['price']
+            })
             
-            # If entry is premium zone, also check equal lows (discount zones)
             if entry_type == "PREMIUM_ZONE":
                 equal_lows_below = [p for p in all_pools['equal_lows'] if p['price'] < current_price]
                 if equal_lows_below:
                     closest_equal_low = max(equal_lows_below, key=lambda x: x['price'])
-                    # Use whichever is closer but reasonable
                     if abs(current_price - closest_equal_low['price']) < abs(current_price - tp1) * 1.5:
                         tp1 = closest_equal_low['price']
+                        tp_sources[-1] = {
+                            'tp_level': 1,
+                            'type': 'equal_low',
+                            'timeframe': closest_equal_low.get('timeframe', 'unknown'),
+                            'reason': 'discount_zone',
+                            'strength': closest_equal_low.get('count', 1),
+                            'original_price': closest_equal_low['price']
+                        }
         else:
-            # No sell-stop pools - look for equal lows
             equal_lows_below = [p for p in all_pools['equal_lows'] if p['price'] < current_price]
             if equal_lows_below:
                 tp1 = max(equal_lows_below, key=lambda x: x['price'])['price']
+                tp_sources.append({
+                    'tp_level': 1,
+                    'type': 'equal_low',
+                    'timeframe': max(equal_lows_below, key=lambda x: x['price']).get('timeframe', 'unknown'),
+                    'reason': 'discount_zone',
+                    'strength': max(equal_lows_below, key=lambda x: x['price']).get('count', 1),
+                    'original_price': max(equal_lows_below, key=lambda x: x['price'])['price']
+                })
             else:
-                # Use recent structure: look for recent swing low
                 if df_1h is not None and len(df_1h) >= 20:
                     recent_low = df_1h['low'].iloc[-20:].min()
                     tp1 = float(recent_low)
+                    tp_sources.append({
+                        'tp_level': 1,
+                        'type': 'recent_swing',
+                        'timeframe': '1h',
+                        'reason': 'recent_low',
+                        'strength': 1,
+                        'original_price': float(recent_low)
+                    })
                 else:
-                    # Calculate based on risk
                     risk = sl_price - current_price
-                    tp1 = current_price - (risk * 1.2)  # Small 1.2:1 R:R minimum
+                    tp1 = current_price - (risk * 1.2)
+                    tp_sources.append({
+                        'tp_level': 1,
+                        'type': 'risk_based',
+                        'timeframe': 'N/A',
+                        'reason': 'no_pool_found',
+                        'strength': 0,
+                        'original_price': tp1
+                    })
         
         # TP2: Next significant liquidity pool below TP1
         sell_stops_below_tp1 = [p for p in all_pools['sell_stops'] if p['price'] < tp1]
         
         if sell_stops_below_tp1:
-            # Look for a pool with higher timeframe weight
             significant_pools = [p for p in sell_stops_below_tp1 if p.get('weight', 1.0) >= 2.0]
             if significant_pools:
                 tp2 = max(significant_pools, key=lambda x: x['price'])['price']
+                tp_sources.append({
+                    'tp_level': 2,
+                    'type': 'sell_stop_pool',
+                    'timeframe': max(significant_pools, key=lambda x: x['price']).get('timeframe', 'unknown'),
+                    'reason': 'higher_timeframe_pool',
+                    'strength': max(significant_pools, key=lambda x: x['price']).get('strength', 1),
+                    'original_price': max(significant_pools, key=lambda x: x['price'])['price']
+                })
             else:
                 tp2 = max(sell_stops_below_tp1, key=lambda x: x['price'])['price']
+                tp_sources.append({
+                    'tp_level': 2,
+                    'type': 'sell_stop_pool',
+                    'timeframe': max(sell_stops_below_tp1, key=lambda x: x['price']).get('timeframe', 'unknown'),
+                    'reason': 'next_pool',
+                    'strength': max(sell_stops_below_tp1, key=lambda x: x['price']).get('strength', 1),
+                    'original_price': max(sell_stops_below_tp1, key=lambda x: x['price'])['price']
+                })
         else:
-            # Look for equal lows below TP1
             equal_lows_below_tp1 = [p for p in all_pools['equal_lows'] if p['price'] < tp1]
             if equal_lows_below_tp1:
                 tp2 = max(equal_lows_below_tp1, key=lambda x: x['price'])['price']
+                tp_sources.append({
+                    'tp_level': 2,
+                    'type': 'equal_low',
+                    'timeframe': max(equal_lows_below_tp1, key=lambda x: x['price']).get('timeframe', 'unknown'),
+                    'reason': 'discount_zone',
+                    'strength': max(equal_lows_below_tp1, key=lambda x: x['price']).get('count', 1),
+                    'original_price': max(equal_lows_below_tp1, key=lambda x: x['price'])['price']
+                })
             else:
-                # Use risk-based calculation
                 risk = sl_price - current_price
                 tp2 = current_price - (risk * 2.0)
+                tp_sources.append({
+                    'tp_level': 2,
+                    'type': 'risk_based',
+                    'timeframe': 'N/A',
+                    'reason': 'no_pool_found',
+                    'strength': 0,
+                    'original_price': tp2
+                })
         
         tp_targets = [tp1, tp2]
         
-        # TP3: Major liquidity pool (only for strong setups)
+        # TP3: Major liquidity pool
         if entry_type == "PREMIUM_ZONE" and len(all_pools['equal_lows']) >= 2:
-            # Find a major equal low (lowest in last 50% of data)
             if df_4h is not None and len(df_4h) >= 10:
                 major_low_idx = df_4h['low'].iloc[-int(len(df_4h)*0.5):].idxmin()
                 major_low = df_4h['low'].iloc[major_low_idx]
                 
-                if major_low < tp2 * 0.95:  # Only if significantly below TP2
+                if major_low < tp2 * 0.95:
                     tp_targets.append(float(major_low))
+                    tp_sources.append({
+                        'tp_level': 3,
+                        'type': 'major_swing_low',
+                        'timeframe': '4h',
+                        'reason': 'major_structure',
+                        'strength': 3,
+                        'original_price': float(major_low)
+                    })
     
     # ========== FINAL VALIDATION ==========
-    # Ensure TP/SL make sense
     if side == "BUY":
         if sl_price >= current_price:
             sl_price = current_price * 0.99
         
-        # Ensure TPs are above entry
         tp_targets = [max(tp, current_price * 1.005) for tp in tp_targets]
         
-        # Remove duplicate or too-close TPs
         filtered_tps = []
+        filtered_sources = []
         prev_tp = 0
-        for tp in tp_targets:
-            if prev_tp == 0 or tp > prev_tp * 1.02:  # At least 2% apart
+        for tp, source in zip(tp_targets, tp_sources):
+            if prev_tp == 0 or tp > prev_tp * 1.02:
                 filtered_tps.append(tp)
+                filtered_sources.append(source)
                 prev_tp = tp
-        tp_targets = filtered_tps[:3]  # Keep max 3 TPs
+        tp_targets = filtered_tps[:3]
+        tp_sources = filtered_sources[:3]
         
-    else:  # SELL
+    else:
         if sl_price <= current_price:
             sl_price = current_price * 1.01
         
-        # Ensure TPs are below entry
         tp_targets = [min(tp, current_price * 0.995) for tp in tp_targets]
         
-        # Remove duplicate or too-close TPs
         filtered_tps = []
+        filtered_sources = []
         prev_tp = float('inf')
-        for tp in tp_targets:
-            if prev_tp == float('inf') or tp < prev_tp * 0.98:  # At least 2% apart
+        for tp, source in zip(tp_targets, tp_sources):
+            if prev_tp == float('inf') or tp < prev_tp * 0.98:
                 filtered_tps.append(tp)
+                filtered_sources.append(source)
                 prev_tp = tp
         tp_targets = filtered_tps[:3]
+        tp_sources = filtered_sources[:3]
     
     # Calculate R:R ratio
     risk = abs(current_price - sl_price)
@@ -939,14 +1147,14 @@ async def calculate_liquidity_tp_sl(exchange, symbol: str, side: str, entry_pric
             'equal_highs': len(all_pools['equal_highs']),
             'equal_lows': len(all_pools['equal_lows'])
         },
-        'sl_based_on': 'sell_stop_pool' if side == 'BUY' else 'buy_stop_pool',
-        'tp_based_on': 'buy_stop_pool' if side == 'BUY' else 'sell_stop_pool',
+        'sl_source': sl_source,  # NEW: Include SL source
+        'tp_sources': tp_sources,  # NEW: Include TP sources
         'rr_ratio': rr_ratio,
         'risk_pct': risk / current_price * 100,
         'reward_pct': abs(tp_targets[0] - current_price) / current_price * 100 if tp_targets else 0
     }
     
-    return sl_price, tp_targets, liquidity_analysis
+    return sl_price, tp_targets, tp_sources, liquidity_analysis
 
 # ---------------- LAYER 1: FAST ELIGIBILITY CHECK ----------------
 async def check_eligibility_fast(exchange, symbol: str) -> SetupEligibility:
@@ -1370,8 +1578,8 @@ async def scan_symbol_fast(exchange, symbol: str) -> Optional[Dict]:
         if not eligibility.eligible:
             return None
         
-        # Calculate liquidity-based TP/SL
-        sl_price, tp_targets, liquidity_analysis = await calculate_liquidity_tp_sl(
+        # Calculate liquidity-based TP/SL WITH SOURCE INFO
+        sl_price, tp_targets, tp_sources, liquidity_analysis = await calculate_liquidity_tp_sl(
             exchange, symbol, eligibility.side, eligibility.entry_price, eligibility.entry_type
         )
         
@@ -1379,7 +1587,7 @@ async def scan_symbol_fast(exchange, symbol: str) -> Optional[Dict]:
         if sl_price == 0 or not tp_targets:
             return None
         
-        # Create liquidity setup
+        # Create liquidity setup WITH SOURCE INFO
         risk = abs(eligibility.entry_price - sl_price)
         reward = abs(tp_targets[0] - eligibility.entry_price) if tp_targets else 0
         rr_ratio = reward / risk if risk > 0 else 0
@@ -1387,6 +1595,7 @@ async def scan_symbol_fast(exchange, symbol: str) -> Optional[Dict]:
         liquidity_setup = LiquiditySetup(
             sl_price=sl_price,
             tp_targets=tp_targets,
+            tp_sources=tp_sources,  # NEW: Include TP sources
             liquidity_analysis=liquidity_analysis,
             rr_ratio=rr_ratio
         )
@@ -1411,6 +1620,7 @@ async def scan_symbol_fast(exchange, symbol: str) -> Optional[Dict]:
             "entry_type": eligibility.entry_type,
             "sl_price": sl_price,
             "tp_targets": tp_targets,
+            "tp_sources": tp_sources,  # NEW: Include TP sources in setup
             "risk": risk,
             "reward": reward,
             "rr_ratio": rr_ratio,
@@ -1459,14 +1669,46 @@ async def send_fast_alert(setup: Dict):
             "C": "📊"
         }.get(quality.get("tier", "C"), "📊")
         
-        # Format TP targets compactly
+        # Format TP targets with SOURCE INFO
         tp_targets = setup.get('tp_targets', [])
+        tp_sources = setup.get('tp_sources', [])  # NEW: Get TP sources
         entry_price = setup.get('entry_price', 0)
+        
         tp_lines = []
         for i, tp in enumerate(tp_targets):
             if entry_price > 0:
                 distance_pct = abs(tp - entry_price) / entry_price * 100
-                tp_lines.append(f"TP{i+1}: {tp:.8f} ({distance_pct:.1f}%)")
+                
+                # Get source info for this TP
+                source_info = ""
+                if i < len(tp_sources):
+                    source = tp_sources[i]
+                    source_type = source.get('type', 'unknown')
+                    timeframe = source.get('timeframe', 'N/A')
+                    reason = source.get('reason', 'unknown')
+                    
+                    # Map source types to emojis
+                    source_emoji = {
+                        'buy_stop_pool': '🛑',  # Buy stop liquidity
+                        'sell_stop_pool': '🛑',  # Sell stop liquidity
+                        'equal_high': '🏔️',     # Equal high
+                        'equal_low': '🏞️',      # Equal low
+                        'major_swing_high': '⛰️', # Major swing high
+                        'major_swing_low': '🗻',  # Major swing low
+                        'recent_swing': '↕️',    # Recent swing
+                        'risk_based': '🎯',      # Risk-based
+                        'recent_low': '📉',      # Recent low
+                        'recent_high': '📈',     # Recent high
+                        'premium_zone': '💰',    # Premium zone
+                        'discount_zone': '💸',   # Discount zone
+                        'higher_timeframe_pool': '🕒',  # Higher TF pool
+                        'next_pool': '➡️',       # Next pool
+                        'major_structure': '🏛️', # Major structure
+                    }.get(source_type, '📌')
+                    
+                    source_info = f" {source_emoji}{timeframe}:{reason}"
+                
+                tp_lines.append(f"TP{i+1}: {tp:.8f} ({distance_pct:.1f}%){source_info}")
         
         # ============ COMPACT 8-STEP ANALYSIS ============
         step_checks = []
@@ -1534,6 +1776,26 @@ async def send_fast_alert(setup: Dict):
         if liquidity:
             pools = liquidity.get('identified_pools', {})
             liquidity_summary = f"💧 Pools: B{pools.get('buy_stops', 0)}/S{pools.get('sell_stops', 0)}/H{pools.get('equal_highs', 0)}/L{pools.get('equal_lows', 0)}"
+            
+            # Show SL source if available
+            sl_source = liquidity.get('sl_source', {})
+            if sl_source:
+                sl_type = sl_source.get('type', 'unknown')
+                sl_timeframe = sl_source.get('timeframe', 'N/A')
+                sl_reason = sl_source.get('reason', 'unknown')
+                
+                sl_source_emoji = {
+                    'buy_stop_pool': '🛑',
+                    'sell_stop_pool': '🛑',
+                    'equal_high': '🏔️',
+                    'equal_low': '🏞️',
+                    'recent_high': '📈',
+                    'recent_low': '📉',
+                    'fixed_percentage': '⚠️',
+                    'adjusted': '⚙️'
+                }.get(sl_type, '🛡️')
+                
+                liquidity_summary += f" | SL: {sl_source_emoji}{sl_timeframe}:{sl_reason}"
         
         # Risk/Reward compact
         risk = setup.get('risk', 0)
@@ -1556,7 +1818,8 @@ async def send_fast_alert(setup: Dict):
 Entry: <code>{entry_price:.8f}</code> | Now: <code>{current_price:.8f}</code> ({entry_distance_pct:.1f}%)
 Type: {setup.get('entry_type', 'N/A')}
 
-🎯 <b>Targets:</b> {' | '.join(tp_lines)}
+🎯 <b>Targets:</b>
+{chr(10).join(tp_lines)}
 🛡️ <b>SL:</b> <code>{setup.get('sl_price', 0):.8f}</code> ({abs(setup.get('sl_price', 0) - entry_price) / entry_price * 100:.1f}%)
 
 ⚖️ <b>Risk/Reward:</b> {risk_pct:.1f}% risk | {reward_pct:.1f}% reward | <b>{rr_ratio:.1f}:1</b>
@@ -1589,9 +1852,21 @@ async def send_outcome_alert(symbol: str, outcome: Dict):
         if 'TP' in outcome['type']:
             emoji = "✅" if outcome['tp_level'] == 1 else "🎯" if outcome['tp_level'] == 2 else "🏆"
             result_text = f"TP{outcome['tp_level']} HIT"
+            
+            # Get TP source info for this TP level
+            tp_sources = setup.get('tp_sources', [])
+            tp_source_info = ""
+            for source in tp_sources:
+                if source.get('tp_level') == outcome['tp_level']:
+                    source_type = source.get('type', 'unknown')
+                    timeframe = source.get('timeframe', 'N/A')
+                    reason = source.get('reason', 'unknown')
+                    tp_source_info = f" | Source: {timeframe}:{reason}"
+                    break
         else:
             emoji = "❌"
             result_text = "SL HIT"
+            tp_source_info = ""
         
         bars_held = outcome.get('bars_held', 0)
         if bars_held < 60:
@@ -1616,7 +1891,7 @@ async def send_outcome_alert(symbol: str, outcome: Dict):
         ])
         
         msg = f"""{emoji} <b>{result_text} - {symbol}</b>
-Signal: {setup.get('side', 'N/A')} | Score: {quality.get('total_score', 0):.1f} | Steps: {step_passes}/8
+Signal: {setup.get('side', 'N/A')} | Score: {quality.get('total_score', 0):.1f} | Steps: {step_passes}/8{tp_source_info}
 
 Entry: <code>{setup.get('entry_price', 0):.8f}</code>
 Exit: <code>{outcome['price']:.8f}</code>
@@ -2106,7 +2381,8 @@ async def liquidity_scanner(exchange):
     startup_msg = f"""🚀 <b>ROMEOTPT v4.1 Started - SIMPLE SIGNAL TRACKING</b>
 Scan: {SCAN_INTERVAL}s | Top {TOP_N} | Quality ≥{MIN_QUALITY_SCORE}
 Validity: {SIGNAL_VALIDITY_HOURS}h | Rate: {MAX_REQUESTS_PER_SECOND}/s
-SIGNAL ID = (Symbol, Side, Rounded_Score)"""
+SIGNAL ID = (Symbol, Side, Rounded_Score)
+TP SOURCES NOW SHOWN!"""
     await send_telegram(startup_msg)
     
     # Start outcome checker
@@ -2213,6 +2489,17 @@ async def get_active_signals():
                 eight_steps.get('step_8_liquidity_alignment', False)
             ])
             
+            # Get TP sources
+            tp_sources = setup.get('tp_sources', [])
+            tp_source_info = []
+            for source in tp_sources:
+                tp_source_info.append({
+                    'tp_level': source.get('tp_level', 0),
+                    'type': source.get('type', 'unknown'),
+                    'timeframe': source.get('timeframe', 'N/A'),
+                    'reason': source.get('reason', 'unknown')
+                })
+            
             active.append({
                 "symbol": symbol,
                 "side": side,
@@ -2222,6 +2509,7 @@ async def get_active_signals():
                 "sl": setup.get('sl_price', 0),
                 "tp1": setup.get('tp_targets', [0])[0] if len(setup.get('tp_targets', [])) > 0 else 0,
                 "tp2": setup.get('tp_targets', [0, 0])[1] if len(setup.get('tp_targets', [])) > 1 else 0,
+                "tp_sources": tp_source_info,
                 "quality_score": quality.get('total_score', 0),
                 "quality_tier": quality.get('tier', 'C'),
                 "steps_passed": step_passes,
@@ -2321,6 +2609,7 @@ async def main():
         log.info("🚀 ROMEOTPT v4.1 - SIMPLE SIGNAL TRACKING (Symbol, Side, Score)")
         log.info(f"Signal ID = (Symbol, Side, Rounded_Score)")
         log.info(f"TP/SL: 100% liquidity-based | NO fixed percentages")
+        log.info(f"TP SOURCES NOW SHOWN in alerts!")
         log.info(f"Scan: {SCAN_INTERVAL}s | Top {TOP_N} symbols")
         log.info(f"Score changes = NEW SIGNAL | Price changes = SAME SIGNAL")
         
