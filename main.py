@@ -37,7 +37,7 @@ MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 1.5))
 
 # Deduplication settings
 SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 15))
-SIGNAL_VALIDITY_HOURS = int(os.getenv("SIGNAL_VALIDITY_HOURS", 72))
+SIGNAL_VALIDITY_HOURS = int(os.getenv("SIGNAL_VALIDITY_HOURS", 12))
 
 # Rate limiting settings
 MAX_REQUESTS_PER_SECOND = int(os.getenv("MAX_REQUESTS_PER_SECOND", 8))
