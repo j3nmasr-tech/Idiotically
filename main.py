@@ -33,11 +33,11 @@ TOP_N = int(os.getenv("TOP_N", 60))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 2))
 
 # Signal thresholds
-MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 3.0))
+MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 3.5))
 
 # Deduplication settings
 SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 15))
-SIGNAL_VALIDITY_HOURS = int(os.getenv("SIGNAL_VALIDITY_HOURS", 12))
+SIGNAL_VALIDITY_HOURS = int(os.getenv("SIGNAL_VALIDITY_HOURS", 24))
 
 # Rate limiting settings
 MAX_REQUESTS_PER_SECOND = int(os.getenv("MAX_REQUESTS_PER_SECOND", 8))
