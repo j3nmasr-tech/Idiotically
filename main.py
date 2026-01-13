@@ -3,7 +3,7 @@
 """
 ROMEOTPT SCANNER v4.1 - LIQUIDITY-FOCUSED WITH FULL 8-STEP DETAILS
 Professional trading with complete transparency on all 8 steps
-SIMPLE SIGNAL TRACKING: Unique by (Symbol, Side, Rounded_Score)
+SIMPLE SIGNAL TRACKING: One signal per 0.5 score bracket
 """
 
 import os
@@ -12,6 +12,7 @@ import asyncio
 import logging
 import datetime
 import json
+import math  # ADDED FOR FLOOR FUNCTION
 import aiosqlite
 import httpx
 import ccxt.async_support as ccxt
@@ -29,11 +30,11 @@ DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v4_1.db")
 
 # Scanner settings
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 45))
-TOP_N = int(os.getenv("TOP_N", 70))
+TOP_N = int(os.getenv("TOP_N", 50))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 2))
 
 # Signal thresholds
-MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 3.5))
+MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 0.5))
 
 # Deduplication settings
 SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 15))
@@ -149,12 +150,12 @@ class SetupQuality:
         else:
             return "C"
 
-# ---------------- SIGNAL TRACKER (SYMBOL + SIDE + SCORE) ----------------
+# ---------------- SIGNAL TRACKER (ONE SIGNAL PER 0.5 SCORE BRACKET) ----------------
 class SignalTracker:
-    """Track signals by (Symbol, Side, Rounded_Score) only"""
+    """Track signals by (Symbol, Side, 0.5-Score-Buckets) - ONE SIGNAL PER 0.5 BRACKET"""
     
     def __init__(self):
-        self.active_signals = {}  # key: (symbol, side, rounded_score) -> signal data
+        self.active_signals = {}  # key: (symbol, side, 0.5_bucket) -> signal data
         self.outcome_stats = {
             'total_signals': 0,
             'tp1_hits': 0,
@@ -166,20 +167,40 @@ class SignalTracker:
             'win_rate': 0.0,
             'avg_pnl_pct': 0.0
         }
+        self.bucket_hits = {}  # Track which buckets we've seen
     
     def get_signal_key(self, setup: Dict) -> tuple:
-        """Create unique key: (symbol, side, rounded_score)"""
+        """Create unique key: (symbol, side, 0.5_increment_bucket)"""
         symbol = setup.get('symbol', '')
         side = setup.get('side', '')
         quality_score = setup.get('quality', {}).get('total_score', 0)
         
-        # Round score to nearest 0.25 (1.0, 1.25, 1.5, 1.75, 2.0, etc.)
-        rounded_score = round(quality_score * 4) / 4
+        # ONE SIGNAL PER 0.5 BRACKET:
+        # Score 0.5-0.99 → bucket 0.5
+        # Score 1.0-1.49 → bucket 1.0  
+        # Score 1.5-1.99 → bucket 1.5
+        # Score 2.0-2.49 → bucket 2.0
+        # Score 2.5-2.99 → bucket 2.5
+        # Score 3.0-3.49 → bucket 3.0
+        # Score 3.5-3.99 → bucket 3.5
+        # Score 4.0-4.49 → bucket 4.0
+        # Score 4.5-4.99 → bucket 4.5
+        # Score 5.0-5.49 → bucket 5.0
         
-        return (symbol, side, rounded_score)
+        bucket = math.floor(quality_score * 2) / 2
+        
+        # Track bucket usage for logging
+        bucket_key = f"{symbol}_{side}_{bucket}"
+        if bucket_key not in self.bucket_hits:
+            self.bucket_hits[bucket_key] = 0
+        self.bucket_hits[bucket_key] += 1
+        
+        log.debug(f"📊 Signal bucketing: {symbol} {side} | Score:{quality_score:.2f} → Bucket:{bucket}")
+        
+        return (symbol, side, bucket)
     
     def is_new_signal(self, setup: Dict) -> Tuple[bool, str]:
-        """Check if this (symbol, side, rounded_score) is NEW"""
+        """Check if this (symbol, side, 0.5_bucket) is NEW"""
         key = self.get_signal_key(setup)
         
         if key in self.active_signals:
@@ -196,13 +217,19 @@ class SignalTracker:
                     self.remove_signal_by_key(key, f"Expired after {SIGNAL_VALIDITY_HOURS}h")
                     return True, "Old signal expired, allowing new one"
                 
-                # Signal still active - DO NOT SEND
-                return False, f"Active signal exists (Score: {key[2]}, {age_minutes:.1f}m old)"
+                # Signal still active in this 0.5 bucket - DO NOT SEND
+                symbol, side, bucket = key
+                current_score = setup.get('quality', {}).get('total_score', 0)
+                signal_score = signal.get('setup', {}).get('quality', {}).get('total_score', 0)
+                
+                log.debug(f"⏸️  Skipping {symbol} {side}: Already active in bucket {bucket} "
+                         f"(Score: {signal_score:.2f}→{current_score:.2f}, {age_minutes:.1f}m old)")
+                return False, f"Active signal in bucket {bucket} (Score: {current_score:.2f}, {age_minutes:.1f}m old)"
             
             # Signal exists but is closed (hit TP/SL)
             return True, "Previous signal closed, allowing new one"
         
-        return True, "No active signal for this symbol+side+score"
+        return True, "No active signal for this symbol+side+0.5_bucket"
     
     def should_send_alert(self, setup: Dict) -> bool:
         """Should we send alert for this setup?"""
@@ -215,7 +242,10 @@ class SignalTracker:
         now = datetime.datetime.utcnow()
         
         if key not in self.active_signals:
-            # NEW SIGNAL
+            # NEW SIGNAL IN THIS 0.5 BUCKET
+            symbol, side, bucket = key
+            quality_score = setup.get('quality', {}).get('total_score', 0)
+            
             self.active_signals[key] = {
                 'setup': setup,
                 'first_seen': now,
@@ -228,15 +258,16 @@ class SignalTracker:
                 'lowest_price': setup.get('current_price', 0),
                 'price_at_alert': setup.get('current_price', 0) if alerted else None,
                 'outcome_details': None,
-                'signal_key': key  # Store the key for reference
+                'signal_key': key
             }
             self.outcome_stats['total_signals'] += 1
             self.outcome_stats['active'] += 1
             
-            symbol, side, score = key
-            log.info(f"📝 New signal registered: {symbol} {side} Score:{score}")
+            log.info(f"📝 NEW 0.5-BUCKET SIGNAL: {symbol} {side} | "
+                    f"Score:{quality_score:.2f} → Bucket:{bucket} | "
+                    f"TP1: {setup.get('tp_targets', [0])[0]:.8f}")
         else:
-            # EXISTING SIGNAL - update tracking metrics only
+            # EXISTING SIGNAL IN THIS BUCKET - update tracking metrics only
             current_price = setup.get('current_price', 0)
             self.active_signals[key]['highest_price'] = max(
                 self.active_signals[key]['highest_price'],
@@ -247,9 +278,14 @@ class SignalTracker:
                 current_price
             )
             self.active_signals[key]['last_checked'] = now
+            
+            # Debug logging for bucket updates
+            if np.random.random() < 0.05:  # 5% chance to log updates
+                symbol, side, bucket = key
+                log.debug(f"🔄 Updating bucket {bucket} signal: {symbol} {side}")
     
     def check_signal_outcome(self, setup: Dict, current_price: float) -> Optional[Dict]:
-        """Check if THIS SPECIFIC SIGNAL has hit TP or SL"""
+        """Check if THIS SPECIFIC 0.5-BUCKET SIGNAL has hit TP or SL"""
         key = self.get_signal_key(setup)
         
         if key not in self.active_signals:
@@ -384,8 +420,8 @@ class SignalTracker:
             self.outcome_stats['active'] -= 1
             self.outcome_stats['expired'] += 1
             
-            symbol, side, score = key
-            log.debug(f"Removed signal: {symbol} {side} Score:{score} - {reason}")
+            symbol, side, bucket = key
+            log.info(f"🗑️  Removed 0.5-bucket signal: {symbol} {side} | Bucket:{bucket} - {reason}")
     
     def cleanup_old_signals(self):
         """Remove expired signals"""
@@ -402,7 +438,7 @@ class SignalTracker:
             self.remove_signal_by_key(key, f"Expired after {SIGNAL_VALIDITY_HOURS}h")
         
         if expired_keys:
-            log.info(f"Cleaned up {len(expired_keys)} expired signals")
+            log.info(f"🧹 Cleaned up {len(expired_keys)} expired 0.5-bucket signals")
     
     def get_stats(self) -> Dict:
         """Get tracking statistics"""
@@ -419,12 +455,20 @@ class SignalTracker:
                 elif setup.get('side') == 'SELL':
                     sell_signals += 1
         
+        # Calculate bucket distribution
+        bucket_distribution = {}
+        for key in self.active_signals.keys():
+            if self.active_signals[key].get('status') == 'active':
+                bucket = key[2]
+                bucket_distribution[bucket] = bucket_distribution.get(bucket, 0) + 1
+        
         return {
             'active_signals': active_count,
             'signals_by_side': {
                 'BUY': buy_signals,
                 'SELL': sell_signals
             },
+            'bucket_distribution': bucket_distribution,
             'outcome_stats': self.outcome_stats
         }
 
@@ -1657,7 +1701,7 @@ async def send_fast_alert(setup: Dict):
         
         # Signal key for tracking
         key = signal_tracker.get_signal_key(setup)
-        symbol, side, rounded_score = key
+        symbol, side, bucket = key
         
         # Always NEW SIGNAL due to our tracking logic
         update_emoji = "🆕"
@@ -1814,7 +1858,7 @@ async def send_fast_alert(setup: Dict):
         entry_distance_pct = abs(current_price - entry_price) / entry_price * 100 if entry_price > 0 else 0
         
         # Compose compact message
-        msg = f"""{update_emoji}{tier_emoji} <b>ROMEOTPT v4.1 - {symbol} | {setup.get('side', 'N/A')} | Score:{rounded_score}</b>
+        msg = f"""{update_emoji}{tier_emoji} <b>ROMEOTPT v4.1 - {symbol} | {setup.get('side', 'N/A')} | 0.5-Bucket:{bucket}</b>
 Entry: <code>{entry_price:.8f}</code> | Now: <code>{current_price:.8f}</code> ({entry_distance_pct:.1f}%)
 Type: {setup.get('entry_type', 'N/A')}
 
@@ -1907,7 +1951,7 @@ PnL: <code>{outcome['pnl_pct']:+.2f}%</code> | RR: {setup.get('rr_ratio', 0):.1f
         log.error(f"Error sending compact outcome alert: {e}")
 
 async def send_deduped_alert(setup: Dict):
-    """Send alert ONLY if it's a NEW (symbol, side, rounded_score) combination"""
+    """Send alert ONLY if it's a NEW (symbol, side, 0.5-bucket) combination"""
     try:
         # Check if this is a new signal
         should_alert = signal_tracker.should_send_alert(setup)
@@ -1917,21 +1961,26 @@ async def send_deduped_alert(setup: Dict):
             signal_tracker.update_signal(setup, alerted=True)
             
             key = signal_tracker.get_signal_key(setup)
-            symbol, side, score = key
-            log.info(f"📨 NEW SIGNAL sent: {symbol} {side} Score:{score}")
+            symbol, side, bucket = key
+            quality_score = setup.get('quality', {}).get('total_score', 0)
+            log.info(f"📨 NEW 0.5-BUCKET SIGNAL sent: {symbol} {side} | "
+                    f"Score:{quality_score:.2f} → Bucket:{bucket} | "
+                    f"TP1: {setup.get('tp_targets', [0])[0]:.8f}")
             return True
         else:
             # Update tracking without alerting
             signal_tracker.update_signal(setup, alerted=False)
             
             # Log occasionally to reduce noise
-            if np.random.random() < 0.01:  # 1% chance to log
+            if np.random.random() < 0.05:  # 5% chance to log
                 key = signal_tracker.get_signal_key(setup)
                 if key in signal_tracker.active_signals:
                     signal = signal_tracker.active_signals[key]
                     time_active = (datetime.datetime.utcnow() - signal.get('first_seen', datetime.datetime.utcnow())).total_seconds() / 60
-                    symbol, side, score = key
-                    log.debug(f"⏸️  Skipping {symbol} {side} Score:{score}: Already has active signal ({time_active:.1f}m)")
+                    symbol, side, bucket = key
+                    quality_score = setup.get('quality', {}).get('total_score', 0)
+                    log.debug(f"⏸️  Skipping {symbol} {side}: Already has active signal in bucket {bucket} "
+                             f"(Score:{quality_score:.2f}, {time_active:.1f}m old)")
             
             return False
     except Exception as e:
@@ -2177,9 +2226,9 @@ async def store_signal(setup: Dict):
                 eight_steps.get('step_8_liquidity_alignment', False)
             ])
             
-            # Get rounded score for database
+            # Get bucket for database (0.5 increment)
             key = signal_tracker.get_signal_key(setup)
-            _, _, rounded_score = key
+            _, _, bucket = key
             
             # Store in signals table with UNIQUE constraint
             cursor = await db_conn.execute("""
@@ -2192,7 +2241,7 @@ async def store_signal(setup: Dict):
             """, (
                 setup.get("symbol", ""),
                 setup.get("side", ""),
-                rounded_score,
+                bucket,
                 setup.get("timestamp", ""),
                 setup.get("entry_price", 0),
                 setup.get("sl_price", 0),
@@ -2223,7 +2272,7 @@ async def store_signal(setup: Dict):
                 signal_id,
                 setup.get("symbol", ""),
                 setup.get("side", ""),
-                rounded_score,
+                bucket,
                 setup.get("entry_price", 0),
                 setup.get("sl_price", 0),
                 tp_targets[0] if len(tp_targets) > 0 else None,
@@ -2238,7 +2287,7 @@ async def store_signal(setup: Dict):
             ))
             
             await db_conn.commit()
-            log.debug(f"📊 Stored signal for {setup.get('symbol', 'UNKNOWN')} {setup.get('side', '')} Score:{rounded_score}")
+            log.debug(f"📊 Stored 0.5-bucket signal for {setup.get('symbol', 'UNKNOWN')} {setup.get('side', '')} Bucket:{bucket}")
             
         except Exception as e:
             log.error(f"❌ Error storing signal {setup.get('symbol', 'UNKNOWN')}: {e}")
@@ -2251,7 +2300,7 @@ async def store_outcome(symbol: str, outcome: Dict):
             if not signal_key:
                 return
             
-            symbol_key, side_key, score_key = signal_key
+            symbol_key, side_key, bucket_key = signal_key
             now = datetime.datetime.utcnow().isoformat()
             
             # Update signals table
@@ -2270,7 +2319,7 @@ async def store_outcome(symbol: str, outcome: Dict):
                 outcome.get('max_adverse', 0),
                 symbol_key,
                 side_key,
-                score_key
+                bucket_key
             ))
             
             # Update signal_outcomes table
@@ -2289,11 +2338,11 @@ async def store_outcome(symbol: str, outcome: Dict):
                 outcome.get('max_adverse', 0),
                 symbol_key,
                 side_key,
-                score_key
+                bucket_key
             ))
             
             await db_conn.commit()
-            log.info(f"📊 Stored outcome for {symbol_key} {side_key} Score:{score_key}: {outcome.get('type', 'UNKNOWN')}")
+            log.info(f"📊 Stored outcome for {symbol_key} {side_key} Bucket:{bucket_key}: {outcome.get('type', 'UNKNOWN')}")
             
         except Exception as e:
             log.error(f"❌ Error storing outcome for {symbol}: {e}")
@@ -2332,8 +2381,8 @@ async def outcome_checker_task(exchange):
                         await store_outcome(symbol, outcome)
                         outcomes_found += 1
                         
-                        symbol_key, side_key, score_key = key
-                        log.info(f"📊 Outcome: {symbol_key} {side_key} Score:{score_key} - {outcome.get('type', '')} | PnL: {outcome.get('pnl_pct', 0):+.2f}%")
+                        symbol_key, side_key, bucket_key = key
+                        log.info(f"📊 Outcome: {symbol_key} {side_key} Bucket:{bucket_key} - {outcome.get('type', '')} | PnL: {outcome.get('pnl_pct', 0):+.2f}%")
                         
                 except Exception as e:
                     log.debug(f"Error checking outcome for {symbol}: {e}")
@@ -2378,10 +2427,10 @@ async def liquidity_scanner(exchange):
     """Main scanner with liquidity-based TP/SL"""
     
     # Send compact startup message
-    startup_msg = f"""🚀 <b>ROMEOTPT v4.1 Started - SIMPLE SIGNAL TRACKING</b>
+    startup_msg = f"""🚀 <b>ROMEOTPT v4.1 Started - ONE SIGNAL PER 0.5 SCORE BRACKET</b>
 Scan: {SCAN_INTERVAL}s | Top {TOP_N} | Quality ≥{MIN_QUALITY_SCORE}
 Validity: {SIGNAL_VALIDITY_HOURS}h | Rate: {MAX_REQUESTS_PER_SECOND}/s
-SIGNAL ID = (Symbol, Side, Rounded_Score)
+ONE SIGNAL PER: (Symbol, Side, 0.5-Bucket)
 TP SOURCES NOW SHOWN!"""
     await send_telegram(startup_msg)
     
@@ -2410,6 +2459,13 @@ TP SOURCES NOW SHOWN!"""
             stats = signal_tracker.get_stats()
             
             log.info(f"🔄 Scan #{scan_cycle}: {len(symbols_to_scan)} symbols | Active: {stats.get('active_signals', 0)}")
+            
+            # Log bucket distribution periodically
+            if scan_cycle % 3 == 0 and stats.get('bucket_distribution'):
+                bucket_stats = stats.get('bucket_distribution', {})
+                if bucket_stats:
+                    bucket_str = ", ".join([f"{bucket}:{count}" for bucket, count in sorted(bucket_stats.items())])
+                    log.info(f"📊 0.5-Bucket Distribution: {bucket_str}")
             
             # Log stats periodically
             if scan_cycle % 5 == 0:
@@ -2460,9 +2516,10 @@ async def health():
     stats = signal_tracker.get_stats()
     return {
         "status": "healthy", 
-        "version": "4.1 - Simple Signal Tracking (Symbol, Side, Score)",
+        "version": "4.1 - ONE SIGNAL PER 0.5 SCORE BRACKET",
         "active_signals": stats.get('active_signals', 0),
         "signals_by_side": stats.get('signals_by_side', {}),
+        "bucket_distribution": stats.get('bucket_distribution', {}),
         "outcome_stats": stats.get('outcome_stats', {})
     }
 
@@ -2472,7 +2529,7 @@ async def get_active_signals():
     active = []
     for key, data in signal_tracker.active_signals.items():
         if data.get('status') == 'active':
-            symbol, side, score = key
+            symbol, side, bucket = key
             setup = data.get('setup', {})
             quality = setup.get('quality', {})
             eight_steps = quality.get('eight_steps', {})
@@ -2503,7 +2560,8 @@ async def get_active_signals():
             active.append({
                 "symbol": symbol,
                 "side": side,
-                "score": score,
+                "bucket": bucket,
+                "actual_score": quality.get('total_score', 0),
                 "entry_price": setup.get('entry_price', 0),
                 "current_price": setup.get('current_price', 0),
                 "sl": setup.get('sl_price', 0),
@@ -2606,12 +2664,13 @@ async def main():
             "verbose": False,
         })
         
-        log.info("🚀 ROMEOTPT v4.1 - SIMPLE SIGNAL TRACKING (Symbol, Side, Score)")
-        log.info(f"Signal ID = (Symbol, Side, Rounded_Score)")
+        log.info("🚀 ROMEOTPT v4.1 - ONE SIGNAL PER 0.5 SCORE BRACKET")
+        log.info(f"Signal ID = (Symbol, Side, 0.5-Bucket)")
+        log.info(f"0.5 Buckets: 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0")
         log.info(f"TP/SL: 100% liquidity-based | NO fixed percentages")
         log.info(f"TP SOURCES NOW SHOWN in alerts!")
         log.info(f"Scan: {SCAN_INTERVAL}s | Top {TOP_N} symbols")
-        log.info(f"Score changes = NEW SIGNAL | Price changes = SAME SIGNAL")
+        log.info(f"Score 0.5-0.99 → Bucket 0.5 | Score 1.0-1.49 → Bucket 1.0 | etc.")
         
         await liquidity_scanner(exchange)
         
