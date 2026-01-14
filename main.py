@@ -30,7 +30,7 @@ DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v4_1.db")
 
 # Scanner settings
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 45))
-TOP_N = int(os.getenv("TOP_N", 20))
+TOP_N = int(os.getenv("TOP_N", 60))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 2))
 
 # Signal thresholds
@@ -662,8 +662,8 @@ def identify_liquidity_pools(df, timeframe="1h"):
 async def calculate_liquidity_tp_sl(exchange, symbol: str, side: str, entry_price: float, 
                                    entry_type: str) -> Tuple[float, List[float], List[Dict], Dict]:
     """
-    TP/SL based PURELY on liquidity pools
-    Returns: (sl_price, tp_targets, tp_sources, liquidity_analysis)
+    TP/SL based PURELY on liquidity pools - NO FALLBACK PERCENTAGES
+    Returns: (sl_price, tp_targets, tp_sources, liquidity_analysis) or (None, [], [], None) if no valid pools
     """
     
     # Get multi-timeframe data for liquidity analysis
@@ -760,7 +760,7 @@ async def calculate_liquidity_tp_sl(exchange, symbol: str, side: str, entry_pric
                     'original_price': strongest_pool['price']
                 }
         else:
-            # No sell-stop pools found
+            # No sell-stop pools found - check equal lows as alternative
             equal_lows_below = [p for p in all_pools['equal_lows'] if p['price'] < current_price]
             if equal_lows_below:
                 most_recent_low = max(equal_lows_below, key=lambda x: x.get('candle_index', 0))
@@ -773,25 +773,9 @@ async def calculate_liquidity_tp_sl(exchange, symbol: str, side: str, entry_pric
                     'original_price': most_recent_low['price']
                 }
             else:
-                if df_15m is not None and len(df_15m) >= 10:
-                    recent_low = df_15m['low'].iloc[-10:].min()
-                    sl_price = float(recent_low) * 0.985
-                    sl_source = {
-                        'type': 'recent_low',
-                        'timeframe': '15m',
-                        'reason': 'recent_swing_low',
-                        'strength': 1,
-                        'original_price': float(recent_low)
-                    }
-                else:
-                    sl_price = current_price * 0.97
-                    sl_source = {
-                        'type': 'fixed_percentage',
-                        'timeframe': 'N/A',
-                        'reason': 'emergency_3pct',
-                        'strength': 0,
-                        'original_price': sl_price / 0.97
-                    }
+                # NO VALID LIQUIDITY-BASED SL FOUND - REJECT SETUP
+                log.debug(f"No valid liquidity-based SL found for {symbol} BUY")
+                return None, [], [], None
         
         # Ensure SL is reasonable
         if sl_price > current_price * 0.995:
@@ -836,7 +820,7 @@ async def calculate_liquidity_tp_sl(exchange, symbol: str, side: str, entry_pric
                             'original_price': closest_equal_high['price']
                         }
         else:
-            # No buy-stop pools
+            # No buy-stop pools - check equal highs
             equal_highs_above = [p for p in all_pools['equal_highs'] if p['price'] > current_price]
             if equal_highs_above:
                 tp1 = min(equal_highs_above, key=lambda x: x['price'])['price']
@@ -849,16 +833,9 @@ async def calculate_liquidity_tp_sl(exchange, symbol: str, side: str, entry_pric
                     'original_price': min(equal_highs_above, key=lambda x: x['price'])['price']
                 })
             else:
-                risk = current_price - sl_price
-                tp1 = current_price + (risk * 1.2)
-                tp_sources.append({
-                    'tp_level': 1,
-                    'type': 'risk_based',
-                    'timeframe': 'N/A',
-                    'reason': 'no_pool_found',
-                    'strength': 0,
-                    'original_price': tp1
-                })
+                # NO VALID LIQUIDITY-BASED TP1 FOUND - REJECT SETUP
+                log.debug(f"No valid liquidity-based TP1 found for {symbol} BUY")
+                return None, [], [], None
         
         # TP2: Next significant liquidity pool above TP1
         buy_stops_above_tp1 = [p for p in all_pools['buy_stops'] if p['price'] > tp1]
@@ -900,18 +877,12 @@ async def calculate_liquidity_tp_sl(exchange, symbol: str, side: str, entry_pric
                     'original_price': min(equal_highs_above_tp1, key=lambda x: x['price'])['price']
                 })
             else:
-                risk = current_price - sl_price
-                tp2 = current_price + (risk * 2.0)
-                tp_sources.append({
-                    'tp_level': 2,
-                    'type': 'risk_based',
-                    'timeframe': 'N/A',
-                    'reason': 'no_pool_found',
-                    'strength': 0,
-                    'original_price': tp2
-                })
+                # No liquidity pool above TP1 - only use TP1
+                log.debug(f"No valid liquidity-based TP2 found for {symbol} BUY, using TP1 only")
+                tp_targets = [tp1]
         
-        tp_targets = [tp1, tp2]
+        if 'tp2' in locals():
+            tp_targets = [tp1, tp2]
         
         # TP3: Major liquidity pool (only for strong setups)
         if entry_type == "DISCOUNT_ZONE" and len(all_pools['equal_highs']) >= 2:
@@ -919,7 +890,7 @@ async def calculate_liquidity_tp_sl(exchange, symbol: str, side: str, entry_pric
                 major_high_idx = df_4h['high'].iloc[-int(len(df_4h)*0.5):].idxmax()
                 major_high = df_4h['high'].iloc[major_high_idx]
                 
-                if major_high > tp2 * 1.05:
+                if major_high > tp_targets[-1] * 1.05:
                     tp_targets.append(float(major_high))
                     tp_sources.append({
                         'tp_level': 3,
@@ -973,25 +944,9 @@ async def calculate_liquidity_tp_sl(exchange, symbol: str, side: str, entry_pric
                     'original_price': most_recent_high['price']
                 }
             else:
-                if df_15m is not None and len(df_15m) >= 10:
-                    recent_high = df_15m['high'].iloc[-10:].max()
-                    sl_price = float(recent_high) * 1.015
-                    sl_source = {
-                        'type': 'recent_high',
-                        'timeframe': '15m',
-                        'reason': 'recent_swing_high',
-                        'strength': 1,
-                        'original_price': float(recent_high)
-                    }
-                else:
-                    sl_price = current_price * 1.03
-                    sl_source = {
-                        'type': 'fixed_percentage',
-                        'timeframe': 'N/A',
-                        'reason': 'emergency_3pct',
-                        'strength': 0,
-                        'original_price': sl_price / 1.03
-                    }
+                # NO VALID LIQUIDITY-BASED SL FOUND - REJECT SETUP
+                log.debug(f"No valid liquidity-based SL found for {symbol} SELL")
+                return None, [], [], None
         
         # Ensure SL is reasonable
         if sl_price < current_price * 1.005:
@@ -1047,28 +1002,9 @@ async def calculate_liquidity_tp_sl(exchange, symbol: str, side: str, entry_pric
                     'original_price': max(equal_lows_below, key=lambda x: x['price'])['price']
                 })
             else:
-                if df_1h is not None and len(df_1h) >= 20:
-                    recent_low = df_1h['low'].iloc[-20:].min()
-                    tp1 = float(recent_low)
-                    tp_sources.append({
-                        'tp_level': 1,
-                        'type': 'recent_swing',
-                        'timeframe': '1h',
-                        'reason': 'recent_low',
-                        'strength': 1,
-                        'original_price': float(recent_low)
-                    })
-                else:
-                    risk = sl_price - current_price
-                    tp1 = current_price - (risk * 1.2)
-                    tp_sources.append({
-                        'tp_level': 1,
-                        'type': 'risk_based',
-                        'timeframe': 'N/A',
-                        'reason': 'no_pool_found',
-                        'strength': 0,
-                        'original_price': tp1
-                    })
+                # NO VALID LIQUIDITY-BASED TP1 FOUND - REJECT SETUP
+                log.debug(f"No valid liquidity-based TP1 found for {symbol} SELL")
+                return None, [], [], None
         
         # TP2: Next significant liquidity pool below TP1
         sell_stops_below_tp1 = [p for p in all_pools['sell_stops'] if p['price'] < tp1]
@@ -1108,18 +1044,12 @@ async def calculate_liquidity_tp_sl(exchange, symbol: str, side: str, entry_pric
                     'original_price': max(equal_lows_below_tp1, key=lambda x: x['price'])['price']
                 })
             else:
-                risk = sl_price - current_price
-                tp2 = current_price - (risk * 2.0)
-                tp_sources.append({
-                    'tp_level': 2,
-                    'type': 'risk_based',
-                    'timeframe': 'N/A',
-                    'reason': 'no_pool_found',
-                    'strength': 0,
-                    'original_price': tp2
-                })
+                # No liquidity pool below TP1 - only use TP1
+                log.debug(f"No valid liquidity-based TP2 found for {symbol} SELL, using TP1 only")
+                tp_targets = [tp1]
         
-        tp_targets = [tp1, tp2]
+        if 'tp2' in locals():
+            tp_targets = [tp1, tp2]
         
         # TP3: Major liquidity pool
         if entry_type == "PREMIUM_ZONE" and len(all_pools['equal_lows']) >= 2:
@@ -1127,7 +1057,7 @@ async def calculate_liquidity_tp_sl(exchange, symbol: str, side: str, entry_pric
                 major_low_idx = df_4h['low'].iloc[-int(len(df_4h)*0.5):].idxmin()
                 major_low = df_4h['low'].iloc[major_low_idx]
                 
-                if major_low < tp2 * 0.95:
+                if major_low < tp_targets[-1] * 0.95:
                     tp_targets.append(float(major_low))
                     tp_sources.append({
                         'tp_level': 3,
@@ -1613,7 +1543,7 @@ async def analyze_quality(exchange, symbol: str, eligibility: SetupEligibility,
 
 # ---------------- FAST SCANNING ----------------
 async def scan_symbol_fast(exchange, symbol: str) -> Optional[Dict]:
-    """ULTRA-FAST scanning with liquidity-based TP/SL"""
+    """ULTRA-FAST scanning with STRICTLY liquidity-based TP/SL - NO FALLBACKS"""
     
     try:
         # LAYER 1: Eligibility check
@@ -1627,9 +1557,37 @@ async def scan_symbol_fast(exchange, symbol: str) -> Optional[Dict]:
             exchange, symbol, eligibility.side, eligibility.entry_price, eligibility.entry_type
         )
         
-        # Skip if no valid TP/SL
-        if sl_price == 0 or not tp_targets:
+        # ===== STRICT VALIDATION: NO FALLBACKS ALLOWED =====
+        # 1. Check if calculation failed (returns None)
+        if sl_price is None or tp_targets is None:
+            log.debug(f"Rejecting {symbol}: No valid liquidity pools found for TP/SL")
             return None
+        
+        # 2. Check SL is based on liquidity (not percentage or adjusted)
+        if liquidity_analysis and liquidity_analysis.get('sl_source', {}).get('type') in ['fixed_percentage', 'adjusted']:
+            log.debug(f"Rejecting {symbol}: SL is not pure liquidity-based")
+            return None
+        
+        # 3. Check TP sources are liquidity-based
+        for source in tp_sources:
+            if source.get('type') in ['risk_based', 'fixed_percentage', 'recent_swing']:
+                log.debug(f"Rejecting {symbol}: TP{source.get('tp_level')} is not pure liquidity-based")
+                return None
+        
+        # 4. Ensure at least one TP target exists
+        if not tp_targets:
+            log.debug(f"Rejecting {symbol}: No TP targets")
+            return None
+        
+        # 5. Validate TP distances (not too close to entry)
+        entry_price = eligibility.entry_price
+        min_distance_pct = 0.5  # At least 0.5% from entry
+        
+        for tp in tp_targets:
+            distance_pct = abs(tp - entry_price) / entry_price * 100
+            if distance_pct < min_distance_pct:
+                log.debug(f"Rejecting {symbol}: TP too close to entry ({distance_pct:.2f}%)")
+                return None
         
         # Create liquidity setup WITH SOURCE INFO
         risk = abs(eligibility.entry_price - sl_price)
@@ -2424,14 +2382,14 @@ async def process_deduped_results(results) -> int:
     return alerts_sent
 
 async def liquidity_scanner(exchange):
-    """Main scanner with liquidity-based TP/SL"""
+    """Main scanner with STRICTLY liquidity-based TP/SL - NO FALLBACKS"""
     
     # Send compact startup message
     startup_msg = f"""🚀 <b>ROMEOTPT v4.1 Started - ONE SIGNAL PER 0.5 SCORE BRACKET</b>
 Scan: {SCAN_INTERVAL}s | Top {TOP_N} | Quality ≥{MIN_QUALITY_SCORE}
 Validity: {SIGNAL_VALIDITY_HOURS}h | Rate: {MAX_REQUESTS_PER_SECOND}/s
 ONE SIGNAL PER: (Symbol, Side, 0.5-Bucket)
-TP SOURCES NOW SHOWN!"""
+TP/SL: 100% LIQUIDITY-BASED - NO FALLBACK PERCENTAGES!"""
     await send_telegram(startup_msg)
     
     # Start outcome checker
@@ -2667,7 +2625,7 @@ async def main():
         log.info("🚀 ROMEOTPT v4.1 - ONE SIGNAL PER 0.5 SCORE BRACKET")
         log.info(f"Signal ID = (Symbol, Side, 0.5-Bucket)")
         log.info(f"0.5 Buckets: 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0")
-        log.info(f"TP/SL: 100% liquidity-based | NO fixed percentages")
+        log.info(f"TP/SL: 100% STRICTLY LIQUIDITY-BASED - NO FALLBACK PERCENTAGES!")
         log.info(f"TP SOURCES NOW SHOWN in alerts!")
         log.info(f"Scan: {SCAN_INTERVAL}s | Top {TOP_N} symbols")
         log.info(f"Score 0.5-0.99 → Bucket 0.5 | Score 1.0-1.49 → Bucket 1.0 | etc.")
