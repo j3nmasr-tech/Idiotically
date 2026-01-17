@@ -49,7 +49,7 @@ DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v5_0.db")
 
 # Scanner settings
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 45))
-TOP_N = int(os.getenv("TOP_N", 80))
+TOP_N = int(os.getenv("TOP_N", 70))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 1))
 
 # Direction Engine thresholds
@@ -2683,6 +2683,7 @@ async def init_database():
         log.error(f"❌ Error initializing database: {e}")
         raise
 
+# ============ FIXED STORE_SIGNAL FUNCTION ============
 async def store_signal(setup: Dict):
     async with db_lock:
         try:
@@ -2709,6 +2710,9 @@ async def store_signal(setup: Dict):
             
             conflict_count = len(direction.get('conflict_warnings', []))
             
+            # COUNT THE COLUMNS: We have 26 columns in the INSERT statement
+            # Let's match them exactly with 26 values
+            
             cursor = await db_conn.execute("""
                 INSERT OR REPLACE INTO signals_v5_0 (
                     symbol, side, score, timestamp, entry_price, sl_price, 
@@ -2717,36 +2721,39 @@ async def store_signal(setup: Dict):
                     eight_steps_passed, direction_confidence_tier, direction_score,
                     trapped_side, trapped_confidence, bleeding_side, funding_extreme,
                     micro_confirmation, conflict_count, status, alert_sent
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 1)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 setup.get("symbol", ""),
                 setup.get("side", ""),
-                bucket,
+                float(bucket),
                 setup.get("timestamp", ""),
-                setup.get("entry_price", 0),
-                setup.get("sl_price", 0),
-                tp_targets[0] if len(tp_targets) > 0 else None,
-                tp_targets[1] if len(tp_targets) > 1 else None,
-                tp_targets[2] if len(tp_targets) > 2 else None,
-                setup.get("rr_ratio", 0),
+                float(setup.get("entry_price", 0)),
+                float(setup.get("sl_price", 0)),
+                float(tp_targets[0]) if len(tp_targets) > 0 else None,
+                float(tp_targets[1]) if len(tp_targets) > 1 else None,
+                float(tp_targets[2]) if len(tp_targets) > 2 else None,
+                float(setup.get("rr_ratio", 0)),
                 quality.get("tier", "C"),
-                quality.get("total_score", 0),
-                setup.get("current_price", 0),
-                pools.get("buy_stops", 0),
-                pools.get("sell_stops", 0),
-                step_passes,
+                float(quality.get("total_score", 0)),
+                float(setup.get("current_price", 0)),
+                int(pools.get("buy_stops", 0)),
+                int(pools.get("sell_stops", 0)),
+                int(step_passes),
                 direction.get("confidence_tier", "LOW"),
-                direction.get("direction_score", 0),
+                float(direction.get("direction_score", 0)),
                 direction.get("trapped_side", "NONE"),
-                direction.get("trapped_confidence", 0),
+                float(direction.get("trapped_confidence", 0)),
                 direction.get("bleeding_side", ""),
-                direction.get("funding_extreme", 0),
+                float(direction.get("funding_extreme", 0)),
                 1 if direction.get("micro_confirmation", False) else 0,
-                conflict_count
+                int(conflict_count),
+                'active',
+                1
             ))
             
             signal_id = cursor.lastrowid
             
+            # Also fix the outcomes table insert
             await db_conn.execute("""
                 INSERT INTO signal_outcomes_v5_0 (
                     signal_id, symbol, side, score, entry_price, sl_price, tp1_price,
@@ -2754,35 +2761,39 @@ async def store_signal(setup: Dict):
                     eight_steps_passed, liquidity_buy_stops, liquidity_sell_stops,
                     direction_confidence_tier, direction_score, trapped_side, trapped_confidence,
                     created_at, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 signal_id,
                 setup.get("symbol", ""),
                 setup.get("side", ""),
-                bucket,
-                setup.get("entry_price", 0),
-                setup.get("sl_price", 0),
-                tp_targets[0] if len(tp_targets) > 0 else None,
-                tp_targets[1] if len(tp_targets) > 1 else None,
-                tp_targets[2] if len(tp_targets) > 2 else None,
-                quality.get("total_score", 0),
+                float(bucket),
+                float(setup.get("entry_price", 0)),
+                float(setup.get("sl_price", 0)),
+                float(tp_targets[0]) if len(tp_targets) > 0 else None,
+                float(tp_targets[1]) if len(tp_targets) > 1 else None,
+                float(tp_targets[2]) if len(tp_targets) > 2 else None,
+                float(quality.get("total_score", 0)),
                 quality.get("tier", "C"),
-                step_passes,
-                pools.get("buy_stops", 0),
-                pools.get("sell_stops", 0),
+                int(step_passes),
+                int(pools.get("buy_stops", 0)),
+                int(pools.get("sell_stops", 0)),
                 direction.get("confidence_tier", "LOW"),
-                direction.get("direction_score", 0),
+                float(direction.get("direction_score", 0)),
                 direction.get("trapped_side", "NONE"),
-                direction.get("trapped_confidence", 0),
-                setup.get("timestamp", "")
+                float(direction.get("trapped_confidence", 0)),
+                setup.get("timestamp", ""),
+                'active'
             ))
             
             await db_conn.commit()
-            log.debug(f"📊 Stored v5.0 signal for {setup.get('symbol', 'UNKNOWN')} {setup.get('side', '')} Bucket:{bucket}")
+            log.info(f"📊 Stored v5.0 signal for {setup.get('symbol', 'UNKNOWN')} {setup.get('side', '')} Bucket:{bucket}")
             
         except Exception as e:
             log.error(f"❌ Error storing signal {setup.get('symbol', 'UNKNOWN')}: {e}")
+            import traceback
+            log.error(f"❌ Traceback: {traceback.format_exc()}")
 
+# ============ FIXED STORE_OUTCOME FUNCTION ============
 async def store_outcome(symbol: str, outcome: Dict):
     async with db_lock:
         try:
@@ -2800,15 +2811,15 @@ async def store_outcome(symbol: str, outcome: Dict):
                 WHERE symbol = ? AND side = ? AND score = ? AND status = 'active'
             """, (
                 now,
-                outcome.get('price', 0),
+                float(outcome.get('price', 0)),
                 outcome.get('type', ''),
-                outcome.get('pnl_pct', 0),
-                outcome.get('bars_held', 0),
-                outcome.get('max_favorable', 0),
-                outcome.get('max_adverse', 0),
+                float(outcome.get('pnl_pct', 0)),
+                int(outcome.get('bars_held', 0)),
+                float(outcome.get('max_favorable', 0)),
+                float(outcome.get('max_adverse', 0)),
                 symbol_key,
                 side_key,
-                bucket_key
+                float(bucket_key)
             ))
             
             await db_conn.execute("""
@@ -2818,15 +2829,15 @@ async def store_outcome(symbol: str, outcome: Dict):
                 WHERE symbol = ? AND side = ? AND score = ? AND status = 'active'
             """, (
                 now,
-                outcome.get('price', 0),
+                float(outcome.get('price', 0)),
                 outcome.get('type', ''),
-                outcome.get('pnl_pct', 0),
-                outcome.get('bars_held', 0),
-                outcome.get('max_favorable', 0),
-                outcome.get('max_adverse', 0),
+                float(outcome.get('pnl_pct', 0)),
+                int(outcome.get('bars_held', 0)),
+                float(outcome.get('max_favorable', 0)),
+                float(outcome.get('max_adverse', 0)),
                 symbol_key,
                 side_key,
-                bucket_key
+                float(bucket_key)
             ))
             
             await db_conn.commit()
@@ -3190,6 +3201,8 @@ async def main():
         
     except Exception as e:
         log.error(f"Fatal error: {e}")
+        import traceback
+        log.error(f"Traceback: {traceback.format_exc()}")
     finally:
         if db_conn:
             await db_conn.close()
