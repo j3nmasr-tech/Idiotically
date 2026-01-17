@@ -107,7 +107,7 @@ class Config:
     TP3_ALLOCATION = 0.2
     
     # Signal Confidence Threshold (from env or default)
-    MIN_CONFIDENCE = int(os.getenv('MIN_CONFIDENCE', '6'))
+    MIN_CONFIDENCE = int(os.getenv('MIN_CONFIDENCE', '1'))
 
 # ==================== LOGGING SETUP ====================
 logging.basicConfig(
