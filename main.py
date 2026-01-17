@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CONFLUENCE SCANNER v6.0 - BTC-CENTRIC STRATEGY
+CONFLUENCE SCANNER v6.0 - BTC-CENTRIC STRATEGY (MODIFIED)
 BITCOIN AS PRIMARY STRUCTURE - Alts must follow BTC direction
 When BTC moves, everything moves with it - Trade accordingly
+When BTC is neutral, both LONG and SHORT allowed
 OKX EXCHANGE INTEGRATION - No geographical restrictions
 """
 
@@ -432,9 +433,10 @@ class BitcoinStructure:
         strength = btc_structure["trend_strength"]
         regime = btc_structure["regime"]
         
-        # NEVER trade alts when BTC has no clear direction
+        # MODIFIED: Allow trading when BTC is neutral (both sides allowed)
         if direction == "NEUTRAL":
-            return False
+            # Only require minimum strength, not specific direction
+            return strength >= 2.0  # Lower threshold for neutral periods
         
         # Only trade alts when BTC has sufficient trend strength
         if strength < BTC_MIN_TREND_STRENGTH:
@@ -449,15 +451,20 @@ class BitcoinStructure:
     def get_recommended_alt_side(self, btc_structure: Dict) -> str:
         """Get recommended side for altcoin trades based on BTC"""
         btc_direction = btc_structure["direction"]
+        btc_strength = btc_structure["trend_strength"]
         btc_momentum = btc_structure["momentum"]["direction"]
         
-        # BTC direction overrides everything
-        if btc_direction == "BULLISH":
+        # BTC has strong direction - MUST follow
+        if btc_direction == "BULLISH" and btc_strength >= 4.0:
             return "LONG"
-        elif btc_direction == "BEARISH":
+        elif btc_direction == "BEARISH" and btc_strength >= 4.0:
             return "SHORT"
         
-        # If BTC is neutral, check momentum
+        # MODIFIED: BTC is neutral - allow BOTH sides
+        elif btc_direction == "NEUTRAL":
+            return "BOTH"  # Special value indicating both sides allowed
+        
+        # If BTC has weak direction, check momentum
         if btc_momentum == "BULLISH":
             return "LONG"
         elif btc_momentum == "BEARISH":
@@ -473,7 +480,12 @@ class BitcoinStructure:
         base_score = alt_signal.confluence_score
         
         # CRITICAL: Score multiplier based on BTC alignment
-        if alt_side == btc_recommended_side:
+        # MODIFIED: Handle BOTH sides when BTC is neutral
+        if btc_recommended_side == "BOTH":  
+            # BTC neutral - no penalty or bonus (1.0x multiplier)
+            alignment_multiplier = 1.0
+            
+        elif alt_side == btc_recommended_side:
             # STRONG ALIGNMENT - major bonus
             alignment_multiplier = 1.3
             
@@ -640,6 +652,7 @@ class BTCConfluenceScanner:
             "rejected_counter_btc": 0,
             "rejected_btc_neutral": 0,
             "btc_aligned_signals": 0,
+            "btc_neutral_signals": 0,  # NEW: Signals during BTC neutral
             "btc_direction": "NEUTRAL"
         }
     
@@ -1418,6 +1431,7 @@ class BTCConfluenceScanner:
         """
         Generate BTC-CENTRIC confluence signal
         Bitcoin structure is PRIMARY, altcoin must align
+        When BTC is neutral, both LONG and SHORT allowed
         """
         
         # === STEP 1: ANALYZE BITCOIN FIRST (CRITICAL) ===
@@ -1425,10 +1439,10 @@ class BTCConfluenceScanner:
             self.btc_structure = await self.bitcoin_structure.analyze_bitcoin_structure(exchange)
             self.daily_stats["btc_direction"] = self.btc_structure["direction"]
         
-        # If no BTC structure or BTC is neutral, can't proceed
-        if not self.btc_structure or self.btc_structure["direction"] == "NEUTRAL":
+        # MODIFIED: Allow scanning even when BTC is neutral
+        if not self.btc_structure:
             self.daily_stats["rejected_btc_neutral"] += 1
-            log.debug(f"{symbol}: BTC has no clear direction")
+            log.debug(f"{symbol}: BTC structure not available")
             return None
         
         # Check if we should trade alts in this BTC regime
@@ -1492,16 +1506,22 @@ class BTCConfluenceScanner:
                 log.debug(f"{symbol}: No clear altcoin side from confluence")
                 return None
             
-            # === STEP 5: ENFORCE BTC ALIGNMENT ===
-            # CRITICAL: Altcoin side MUST match BTC direction
-            if alt_side != btc_recommended_side:
+            # === STEP 5: MODIFIED BTC ALIGNMENT RULES ===
+            # BTC neutral - allow both LONG and SHORT
+            if btc_recommended_side == "BOTH":
+                self.daily_stats["btc_neutral_signals"] += 1
+                log.debug(f"{symbol}: BTC neutral - allowing both sides ({alt_side})")
+                
+            # BTC has clear direction - must align
+            elif alt_side != btc_recommended_side:
                 self.daily_stats["rejected_counter_btc"] += 1
                 log.debug(f"{symbol}: Rejected - {alt_side} vs BTC {btc_recommended_side}")
                 return None
             
-            # Perfect BTC alignment - proceed
-            self.daily_stats["btc_aligned_signals"] += 1
-            log.debug(f"{symbol}: Perfect BTC alignment - {alt_side}")
+            else:
+                # Perfect BTC alignment - proceed
+                self.daily_stats["btc_aligned_signals"] += 1
+                log.debug(f"{symbol}: Perfect BTC alignment - {alt_side}")
             
             # === STEP 6: Check consecutive failures ===
             consecutive_failures = self.signal_manager.get_consecutive_failures(symbol, alt_side)
@@ -1597,7 +1617,10 @@ class BTCConfluenceScanner:
             )
             
             # Add BTC alignment condition
-            conditions_met.append("BTC_ALIGNED")
+            if btc_recommended_side == "BOTH":
+                conditions_met.append("BTC_NEUTRAL_BOTH_SIDES")
+            elif btc_recommended_side == alt_side:
+                conditions_met.append("BTC_ALIGNED")
             
             # === STEP 13: Probability score ===
             probability_score = min(btc_adjusted_score / 10.0 * 1.2, 0.95)
@@ -1646,7 +1669,8 @@ class BTCConfluenceScanner:
                     "recommended_side": btc_recommended_side,
                     "original_score": confluence_score,
                     "btc_adjusted_score": btc_adjusted_score,
-                    "alignment_multiplier": btc_adjusted_score / confluence_score if confluence_score > 0 else 1.0
+                    "alignment_multiplier": btc_adjusted_score / confluence_score if confluence_score > 0 else 1.0,
+                    "btc_state": "NEUTRAL_BOTH_ALLOWED" if btc_recommended_side == "BOTH" else "ALIGNED"
                 }
             )
             
@@ -1658,8 +1682,14 @@ class BTCConfluenceScanner:
             if btc_adjusted_score >= 8.0:
                 self.daily_stats["high_quality_signals"] += 1
             
-            log.info(f"🎯 BTC-ALIGNED SIGNAL: {symbol} {alt_side} @ {entry_price:.4f}")
-            log.info(f"   BTC Direction: {self.btc_structure['direction']} | Regime: {self.btc_structure['regime']}")
+            # Log appropriate message based on BTC state
+            if btc_recommended_side == "BOTH":
+                log.info(f"⚖️ BTC-NEUTRAL SIGNAL: {symbol} {alt_side} @ {entry_price:.4f}")
+                log.info(f"   BTC Direction: NEUTRAL | Both sides allowed")
+            else:
+                log.info(f"🎯 BTC-ALIGNED SIGNAL: {symbol} {alt_side} @ {entry_price:.4f}")
+                log.info(f"   BTC Direction: {self.btc_structure['direction']} | Regime: {self.btc_structure['regime']}")
+            
             log.info(f"   Original Score: {confluence_score:.1f} | BTC-Adjusted: {btc_adjusted_score:.1f}")
             log.info(f"   Expected: {expected_move_pct:.1f}% | R:R: {risk_reward:.1f}:1")
             
@@ -1995,13 +2025,14 @@ class BTCConfluenceMoveScanner:
     async def initialize(self):
         """Initialize the scanner"""
         log.info("=" * 70)
-        log.info("🎯 BTC-CENTRIC CONFLUENCE SCANNER v6.0")
-        log.info("BITCOIN IS PRIMARY - Alts must follow BTC direction")
+        log.info("🎯 BTC-CENTRIC CONFLUENCE SCANNER v6.0 (MODIFIED)")
+        log.info("BITCOIN IS PRIMARY - When BTC has direction, follow it")
+        log.info("When BTC is neutral, both LONG and SHORT allowed")
         log.info("=" * 70)
         log.info("EXCHANGE: OKX")
         log.info("STRATEGY: BTC structure + Alt confluence")
         log.info("TARGET: 3-5% BTC-aligned moves")
-        log.info("PHILOSOPHY: When BTC moves, everything moves with it")
+        log.info("PHILOSOPHY: Trade with BTC trend, both sides when neutral")
         log.info("=" * 70)
         
         await self._init_database()
@@ -2065,6 +2096,7 @@ class BTCConfluenceMoveScanner:
                 date DATE PRIMARY KEY,
                 total_signals INTEGER,
                 btc_aligned_signals INTEGER,
+                btc_neutral_signals INTEGER,
                 avg_btc_strength REAL,
                 avg_confluence_score REAL,
                 avg_btc_adjusted_score REAL,
@@ -2130,18 +2162,20 @@ class BTCConfluenceMoveScanner:
             return
         
         try:
-            message = """🎯 <b>BTC-CENTRIC CONFLUENCE SCANNER v6.0 - ONLINE</b>
+            message = """🎯 <b>BTC-CENTRIC CONFLUENCE SCANNER v6.0 (MODIFIED) - ONLINE</b>
 
-<b>₿ PRIMARY:</b> Bitcoin structure determines ALL trades
-<b>🎯 TARGET:</b> 3-5% BTC-aligned moves
-<b>📊 LOGIC:</b> Alts MUST follow BTC direction
-<b>⚡ SIGNALS:</b> Only when BTC has clear trend (strength ≥4/10)
-<b>🛡️ SAFETY:</b> No counter-BTC trades allowed
+<b>₿ PRIMARY:</b> Bitcoin structure determines trades
+<b>🎯 MODIFIED RULES:</b>
+   • When BTC has clear direction (≥4/10 strength): Alts MUST follow
+   • When BTC is NEUTRAL: Both LONG and SHORT allowed
+<b>📊 LOGIC:</b> Trade with BTC trend, both sides when neutral
+<b>⚡ SIGNALS:</b> Confluence + BTC context
+<b>🛡️ SAFETY:</b> No counter-BTC trades when BTC has direction
 
-Scanner actively hunting for BTC-aligned setups.
-When BTC moves, we move with it.
+Scanner actively hunting for BTC-context setups.
+BTC direction informs, doesn't always dictate.
 
-#BTCFirst #ConfluenceTrading #OKX #Ready"""
+#BTCContext #ConfluenceTrading #OKX #ModifiedRules #Ready"""
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             async with httpx.AsyncClient(timeout=10) as client:
@@ -2384,8 +2418,10 @@ When BTC moves, we move with it.
         btc_direction = btc_info.get("btc_direction", "UNKNOWN")
         btc_regime = btc_info.get("btc_regime", "UNKNOWN")
         btc_strength = btc_info.get("btc_strength", 0.0)
+        btc_recommended = btc_info.get("recommended_side", "UNKNOWN")
         original_score = btc_info.get("original_score", signal.confluence_score)
         btc_adjusted_score = btc_info.get("btc_adjusted_score", signal.confluence_score)
+        btc_state = btc_info.get("btc_state", "UNKNOWN")
         
         # Confluence score color coding
         if btc_adjusted_score >= 8.5:
@@ -2402,7 +2438,15 @@ When BTC moves, we move with it.
             score_text = "FAIR"
         
         # BTC alignment status
-        btc_emoji = "✅" if btc_direction == signal.side else "⚠️"
+        if btc_state == "NEUTRAL_BOTH_ALLOWED":
+            btc_emoji = "⚖️"  # Scale emoji for neutral
+            alignment_text = "BTC NEUTRAL - BOTH SIDES ALLOWED"
+        elif btc_direction == signal.side:
+            btc_emoji = "✅"
+            alignment_text = "PERFECT BTC ALIGNMENT"
+        else:
+            btc_emoji = "⚠️"
+            alignment_text = "COUNTER BTC (should be rejected)"
         
         # Structure summary
         structure_details = [
@@ -2417,7 +2461,7 @@ When BTC moves, we move with it.
             f"₿ BTC Direction: <b>{btc_direction}</b>",
             f"🏋️ BTC Strength: {btc_strength:.1f}/10",
             f"📈 BTC Regime: {btc_regime}",
-            f"⚖️ Alignment: {btc_emoji} {'PERFECT' if btc_direction == signal.side else 'COUNTER'}"
+            f"⚖️ Alignment: {btc_emoji} {alignment_text}"
         ]
         
         # Order flow summary
@@ -2456,7 +2500,7 @@ When BTC moves, we move with it.
         ]
         
         # Build the message
-        message = f"""{side_emoji} <b>BTC-ALIGNED CONFLUENCE SIGNAL - {signal.side}</b>
+        message = f"""{side_emoji} <b>BTC-CONTEXT CONFLUENCE SIGNAL - {signal.side}</b>
 
 {btc_emoji} <b>₿ BITCOIN CONTEXT:</b>
 {chr(10).join(btc_details)}
@@ -2487,7 +2531,7 @@ When BTC moves, we move with it.
 
 <b>📋 CONDITIONS:</b>
 • Met: {len(signal.conditions_met)} conditions
-• BTC Aligned: {'YES ✅' if 'BTC_ALIGNED' in signal.conditions_met else 'NO ❌'}
+• BTC State: {'NEUTRAL (BOTH SIDES)' if 'BTC_NEUTRAL_BOTH_SIDES' in signal.conditions_met else 'ALIGNED'}
 • Probability: {signal.probability_score:.0%}
 
 #BTC{btc_direction} #{clean_symbol} #{signal.side}
@@ -2509,6 +2553,7 @@ When BTC moves, we move with it.
                 side_emoji = "🟢" if signal.side == "LONG" else "🔴"
                 btc_info = signal.btc_alignment or {}
                 btc_direction = btc_info.get("btc_direction", "UNKNOWN")
+                btc_state = btc_info.get("btc_state", "UNKNOWN")
                 
                 message = f"""{side_emoji} <b>BTC-{btc_direction} | {signal.side} {signal.symbol}</b>
 
@@ -2516,7 +2561,7 @@ When BTC moves, we move with it.
 • Entry: {signal.entry_price:.6f}
 • Target: {signal.expected_move_pct:.1f}%
 • R:R: {signal.risk_reward:.1f}:1
-• BTC Alignment: ✅ PERFECT
+• BTC Context: {'NEUTRAL (BOTH)' if btc_state == 'NEUTRAL_BOTH_ALLOWED' else 'ALIGNED'}
 
 <b>KEY:</b>
 • BTC: {btc_direction} ({btc_info.get('btc_strength', 0):.1f}/10)
@@ -2563,7 +2608,7 @@ SL: {signal.stop_loss:.6f} | TP: {signal.take_profit:.6f}
             side_emoji = "🟢" if side == "LONG" else "🔴"
             clean_symbol = symbol.replace('/', '').replace('-', '').replace('.', '')
             
-            message = f"""✅ <b>BTC-ALIGNED POSITION TRIGGERED - {side} {side_emoji}</b>
+            message = f"""✅ <b>BTC-CONTEXT POSITION TRIGGERED - {side} {side_emoji}</b>
 
 <b>Symbol:</b> {symbol}
 <b>Trigger Price:</b> {trigger_price:.6f}
@@ -2620,7 +2665,7 @@ Position auto-closes at SL/TP.
             
             clean_symbol = symbol.replace('/', '').replace('-', '').replace('.', '')
             
-            message = f"""{pnl_emoji} <b>BTC-ALIGNED POSITION CLOSED - {side} {side_emoji}</b>
+            message = f"""{pnl_emoji} <b>BTC-CONTEXT POSITION CLOSED - {side} {side_emoji}</b>
 
 <b>Symbol:</b> {symbol}
 <b>Side:</b> {side}
@@ -2659,7 +2704,7 @@ Position auto-closes at SL/TP.
     
     async def monitor_positions(self):
         """Monitor and close positions"""
-        log.info("👀 Starting BTC-aligned position monitoring...")
+        log.info("👀 Starting BTC-context position monitoring...")
         
         while True:
             try:
@@ -2671,7 +2716,7 @@ Position auto-closes at SL/TP.
                     positions = await cursor.fetchall()
                 
                 if positions:
-                    log.debug(f"📊 Monitoring {len(positions)} BTC-aligned positions")
+                    log.debug(f"📊 Monitoring {len(positions)} BTC-context positions")
                 
                 for pos_id, symbol, side, entry, sl, tp, status in positions:
                     try:
@@ -2693,7 +2738,7 @@ Position auto-closes at SL/TP.
                                 
                                 await self.send_triggered_position_alert(symbol, side, current_price)
                                 
-                                log.info(f"✅ BTC-aligned position triggered: {symbol} {side} @ {current_price:.4f}")
+                                log.info(f"✅ BTC-context position triggered: {symbol} {side} @ {current_price:.4f}")
                                 continue
                         
                         pnl_percent = 0
@@ -2735,7 +2780,7 @@ Position auto-closes at SL/TP.
                                 symbol, side, entry, current_price, pnl_percent, close_reason
                             )
                             
-                            log.info(f"📤 BTC-aligned position closed: {symbol} {side} {pnl_percent:+.2f}% ({close_reason})")
+                            log.info(f"📤 BTC-context position closed: {symbol} {side} {pnl_percent:+.2f}% ({close_reason})")
                     
                     except Exception as e:
                         log.error(f"Monitor error for {symbol}: {e}")
@@ -2788,14 +2833,14 @@ Position auto-closes at SL/TP.
     
     async def btc_confluence_scanning(self):
         """Main BTC-centric scanning loop"""
-        log.info("🚀 Starting BTC-centric confluence scanning...")
+        log.info("🚀 Starting BTC-context confluence scanning...")
         
         while True:
             try:
                 self.scan_cycle += 1
                 start_time = time.time()
                 
-                log.info(f"🔄 BTC-confluence scan #{self.scan_cycle}")
+                log.info(f"🔄 BTC-context scan #{self.scan_cycle}")
                 
                 pairs = await self.get_active_pairs()
                 
@@ -2804,7 +2849,7 @@ Position auto-closes at SL/TP.
                     await asyncio.sleep(SCAN_INTERVAL)
                     continue
                 
-                log.info(f"Analyzing {len(pairs)} pairs for BTC-aligned confluence")
+                log.info(f"Analyzing {len(pairs)} pairs for BTC-context confluence")
                 
                 signals_found = 0
                 
@@ -2827,16 +2872,17 @@ Position auto-closes at SL/TP.
                 stats = self.scanner.get_daily_stats()
                 active_count = len(self.scanner.signal_manager.active_signals)
                 
-                log.info(f"📊 BTC-CENTRIC STATS:")
+                log.info(f"📊 BTC-CONTEXT STATS:")
                 log.info(f"   Found: {signals_found} | Active: {active_count}")
                 log.info(f"   Total signals: {stats['confluence_signals']}")
                 log.info(f"   BTC-aligned: {stats['btc_aligned_signals']}")
+                log.info(f"   BTC-neutral (both sides): {stats['btc_neutral_signals']}")
                 log.info(f"   Rejected (counter-BTC): {stats['rejected_counter_btc']}")
-                log.info(f"   Rejected (BTC neutral): {stats['rejected_btc_neutral']}")
+                log.info(f"   Rejected (BTC neutral/weak): {stats['rejected_btc_neutral']}")
                 log.info(f"   BTC direction: {stats['btc_direction']}")
                 
                 scan_duration = time.time() - start_time
-                log.info(f"Scan #{self.scan_cycle}: {signals_found} BTC-aligned signals in {scan_duration:.2f}s")
+                log.info(f"Scan #{self.scan_cycle}: {signals_found} BTC-context signals in {scan_duration:.2f}s")
                 
                 wait_time = max(1.0, SCAN_INTERVAL - scan_duration)
                 await asyncio.sleep(wait_time)
@@ -2856,7 +2902,7 @@ Position auto-closes at SL/TP.
             )
             
         except KeyboardInterrupt:
-            log.info("BTC-centric scanner stopped by user")
+            log.info("BTC-context scanner stopped by user")
             await self.send_final_stats()
             
         except Exception as e:
@@ -2874,13 +2920,14 @@ Position auto-closes at SL/TP.
             stats = self.scanner.get_daily_stats()
             active_count = len(self.scanner.signal_manager.active_signals)
             
-            message = f"""🛑 <b>BTC-CENTRIC CONFLUENCE SCANNER v6.0 STOPPED</b>
+            message = f"""🛑 <b>BTC-CONTEXT CONFLUENCE SCANNER v6.0 STOPPED</b>
 
-<b>📊 FINAL BTC-CENTRIC STATS:</b>
+<b>📊 FINAL BTC-CONTEXT STATS:</b>
 • Exchange: OKX
 • Total scans: {stats['scans']}
 • Total pairs analyzed: {stats['pairs_analyzed']}
 • BTC-aligned signals: {stats['btc_aligned_signals']}
+• BTC-neutral signals (both sides): {stats['btc_neutral_signals']}
 • High quality (8+): {stats['high_quality_signals']}
 
 <b>🚫 REJECTIONS:</b>
@@ -2891,14 +2938,14 @@ Position auto-closes at SL/TP.
 
 <b>₿ BTC PERFORMANCE:</b>
 • Final BTC direction: {stats['btc_direction']}
-• Active BTC-aligned signals: {active_count}
+• Active BTC-context signals: {active_count}
 
-<b>🎯 STRATEGY SUCCESS:</b>
-• Only traded with BTC trend
-• No counter-BTC trades allowed
-• Higher win rate expected
+<b>🎯 MODIFIED STRATEGY:</b>
+• Traded with BTC trend when clear
+• Allowed both sides when BTC neutral
+• Higher opportunity capture
 
-#BTCFirst #FinalStats #OKX"""
+#BTCContext #FinalStats #OKX #ModifiedRules"""
             
             url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
             async with httpx.AsyncClient(timeout=10) as client:
@@ -2950,15 +2997,16 @@ async def start_confluence_server(scanner, port=8000):
                 
                 response = json.dumps({
                     "status": "running",
-                    "scanner": "BTC-Centric Confluence Scanner v6.0",
+                    "scanner": "BTC-Context Confluence Scanner v6.0 (Modified)",
                     "exchange": "OKX",
-                    "primary_structure": "Bitcoin",
-                    "strategy": "Trade alts only in BTC direction",
+                    "primary_structure": "Bitcoin (context, not dictator)",
+                    "strategy": "Trade with BTC trend, both sides when neutral",
                     "btc_min_trend": BTC_MIN_TREND_STRENGTH,
                     "scan_cycle": scanner.scan_cycle,
                     "active_signals": active_count,
                     "btc_direction": stats["btc_direction"],
                     "btc_aligned_signals": stats["btc_aligned_signals"],
+                    "btc_neutral_signals": stats["btc_neutral_signals"],
                     "rejected_counter_btc": stats["rejected_counter_btc"],
                     "daily_stats": stats
                 }, indent=2)
@@ -2993,15 +3041,18 @@ async def start_confluence_server(scanner, port=8000):
             
             elif path == '/strategy':
                 response = json.dumps({
-                    "name": "BTC-Centric Confluence Trading",
-                    "philosophy": "Bitcoin is the primary market structure. Altcoins must follow BTC direction.",
+                    "name": "BTC-Context Confluence Trading (Modified)",
+                    "philosophy": "Bitcoin provides context. When BTC has clear direction, follow it. When BTC is neutral, trade both sides.",
                     "rules": [
                         "1. Analyze BTC structure first (Daily, 4H, 1H)",
-                        "2. Only trade when BTC trend strength ≥ 4.0/10",
-                        "3. Altcoin must align with BTC direction",
-                        "4. Reject all counter-BTC trades",
-                        "5. Apply confluence analysis to aligned alts",
-                        "6. Use BTC-adjusted confluence scores"
+                        "2. If BTC trend strength ≥ 4.0/10 and has clear direction:",
+                        "   - Altcoin MUST align with BTC direction",
+                        "   - Reject all counter-BTC trades",
+                        "3. If BTC is NEUTRAL (strength < 4.0):",
+                        "   - Both LONG and SHORT trades allowed",
+                        "   - No BTC alignment bonus/penalty (1.0x multiplier)",
+                        "4. Apply confluence analysis to all alts",
+                        "5. Use BTC-adjusted confluence scores"
                     ],
                     "parameters": {
                         "btc_min_trend_strength": BTC_MIN_TREND_STRENGTH,
@@ -3013,7 +3064,7 @@ async def start_confluence_server(scanner, port=8000):
                     "btc_alignment_multipliers": {
                         "perfect_alignment": "1.3x-1.5x score bonus",
                         "counter_btc": "0.5x score penalty (rejected)",
-                        "btc_neutral": "1.0x (no bonus/penalty)"
+                        "btc_neutral_both_sides": "1.0x (neutral, both sides allowed)"
                     }
                 }, indent=2)
             
@@ -3031,7 +3082,7 @@ async def start_confluence_server(scanner, port=8000):
             writer.close()
     
     server = await asyncio.start_server(handle_request, '0.0.0.0', port)
-    log.info(f"🌐 BTC-centric HTTP server started on port {port}")
+    log.info(f"🌐 BTC-context HTTP server started on port {port}")
     
     async with server:
         await server.serve_forever()
