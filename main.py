@@ -29,8 +29,8 @@ MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 1))
 RISK_PER_TRADE_PCT = float(os.getenv("RISK_PER_TRADE_PCT", 1.0))
 RISK_PER_DAY_PCT = float(os.getenv("RISK_PER_DAY_PCT", 2.0))
 RISK_PER_WEEK_PCT = float(os.getenv("RISK_PER_WEEK_PCT", 5.0))
-MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", 3))
-MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", 2))
+MAX_TRADES_PER_DAY = int(os.getenv("MAX_TRADES_PER_DAY", 100))
+MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", 50))
 CRYPTO_REDUCE_SIZE = int(os.getenv("CRYPTO_REDUCE_SIZE", 1)) == 1
 
 # Time filters (UTC key hours – crypto)
