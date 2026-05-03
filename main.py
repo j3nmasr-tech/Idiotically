@@ -98,7 +98,7 @@ OI_ACCUMULATION_THRESHOLD = float(os.getenv("OI_ACCUMULATION_THRESHOLD", 0.15))
 MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 0.1))
 
 # Deduplication settings
-SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 10))
+SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 15))
 SIGNAL_VALIDITY_HOURS = int(os.getenv("SIGNAL_VALIDITY_HOURS", 48))
 
 # Rate limiting settings
@@ -2310,7 +2310,7 @@ async def perform_deep_analysis() -> str:
     msg.append(f"\n<i>{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</i>")
     return "\n".join(msg)
 
-# ============ TELEGRAM COMMAND LISTENER ============
+# ============ TELEGRAM COMMAND LISTENER (FIXED) ============
 TELEGRAM_UPDATE_OFFSET = 0
 
 async def telegram_listener():
@@ -2337,7 +2337,8 @@ async def telegram_listener():
                     msg_obj = update.get("message")
                     if not msg_obj:
                         continue
-                    text = msg_obj.get("text", "").strip()
+                    # SAFE TEXT EXTRACTION – FIX FOR NON-TEXT MESSAGES
+                    text = (msg_obj.get("text") or "").strip()
                     chat_id = str(msg_obj["chat"]["id"])
 
                     # Only react to /analyze command
