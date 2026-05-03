@@ -98,7 +98,7 @@ OI_ACCUMULATION_THRESHOLD = float(os.getenv("OI_ACCUMULATION_THRESHOLD", 0.15))
 MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 0.1))
 
 # Deduplication settings
-SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 15))
+SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 10))
 SIGNAL_VALIDITY_HOURS = int(os.getenv("SIGNAL_VALIDITY_HOURS", 48))
 
 # Rate limiting settings
@@ -2083,27 +2083,31 @@ async def scan_symbol_v6(exchange, symbol: str) -> Optional[Dict]:
         # ======= STEP 1: MACRO DIRECTION (SMA 50/200) =======
         trend_bias, trend_score = wave_detector.detect_trend_bias(df_daily, df_4h)
         
-        if trend_bias == TrendBias.NEUTRAL:
-            log.debug(f"{symbol}: NEUTRAL trend - skipped")
-            return None
+        # HARD FILTER #4 (trend neutral) -> REMOVED (now just passes through)
+        # if trend_bias == TrendBias.NEUTRAL:
+        #     log.debug(f"{symbol}: NEUTRAL trend - skipped")
+        #     return None
         
         # ======= STEP 2: WAVE RANGE (ABC Correction Detection) =======
         wave = wave_detector.identify_abc_correction(df_4h, trend_bias)
         
-        if wave.pattern == WavePattern.NONE:
-            log.debug(f"{symbol}: No ABC correction pattern")
-            return None
+        # HARD FILTER #5 (no wave pattern) -> REMOVED
+        # if wave.pattern == WavePattern.NONE:
+        #     log.debug(f"{symbol}: No ABC correction pattern")
+        #     return None
         
-        if wave.pattern_confidence < 0.3:
-            log.debug(f"{symbol}: Low wave confidence ({wave.pattern_confidence:.2f})")
-            return None
+        # HARD FILTER #6 (low wave confidence) -> REMOVED
+        # if wave.pattern_confidence < 0.3:
+        #     log.debug(f"{symbol}: Low wave confidence ({wave.pattern_confidence:.2f})")
+        #     return None
         
         # ======= STEP 3: MOMENTUM (RSI Divergence + MACD) =======
         momentum = momentum_engine.analyze_momentum(df_1h, df_15m, trend_bias, wave)
         
-        if momentum.divergence_type == DivergenceType.NONE and momentum.momentum_score < 0.3:
-            log.debug(f"{symbol}: No divergence and low momentum")
-            return None
+        # HARD FILTER #7 (no divergence & low momentum) -> REMOVED
+        # if momentum.divergence_type == DivergenceType.NONE and momentum.momentum_score < 0.3:
+        #     log.debug(f"{symbol}: No divergence and low momentum")
+        #     return None
         
         # ======= STEP 4: VOLUME BREAKOUT (Entry Trigger) =======
         entry_price = current_price
@@ -2126,15 +2130,16 @@ async def scan_symbol_v6(exchange, symbol: str) -> Optional[Dict]:
         
         if sl_price <= 0 or not tp_targets:
             log.debug(f"{symbol}: No valid TP/SL from liquidity")
-            return None
+            return None  # this filter remains (not removed)
         
         risk = abs(entry_price - sl_price)
         reward = abs(tp_targets[0] - entry_price) if tp_targets else 0
         rr_ratio = reward / risk if risk > 0 else 0
         
-        if rr_ratio < 1.5:
-            log.debug(f"{symbol}: Low RR ratio ({rr_ratio:.1f})")
-            return None
+        # HARD FILTER #9 (RR < 1.5) -> REMOVED
+        # if rr_ratio < 1.5:
+        #     log.debug(f"{symbol}: Low RR ratio ({rr_ratio:.1f})")
+        #     return None
         
         # ======= STEP 6: DIRECTION ENGINE (Confluence) =======
         direction_metrics = await direction_engine.analyze_direction(
@@ -2175,7 +2180,7 @@ async def scan_symbol_v6(exchange, symbol: str) -> Optional[Dict]:
         else:
             tier = "C"
         
-        # Minimum quality threshold
+        # Minimum quality threshold (still active, but default 0.1 means all pass)
         if quality_score < MIN_QUALITY_SCORE:
             return None
         
@@ -2226,6 +2231,133 @@ async def scan_symbol_v6(exchange, symbol: str) -> Optional[Dict]:
         import traceback
         log.error(f"Traceback: {traceback.format_exc()}")
         return None
+
+# ============ DEEP ANALYSIS FUNCTION ============
+async def perform_deep_analysis() -> str:
+    """Analyse closed signals and find the edge for winners."""
+    async with db_lock:
+        cursor = await db_conn.execute("""
+            SELECT side, trend_bias, wave_pattern, wave_confidence, fib_retracement,
+                   in_optimal_zone, divergence_type, divergence_strength, momentum_score,
+                   macd_crossed, momentum_aligned, volume_triggered, volume_ratio,
+                   direction_tier, direction_score, trapped_side, quality_score,
+                   outcome, pnl_pct, rr_ratio
+            FROM signals_v6_0
+            WHERE status = 'closed' AND outcome IS NOT NULL
+        """)
+        rows = await cursor.fetchall()
+
+    if not rows:
+        return "No closed signals with outcomes yet."
+
+    winners = [r for r in rows if r[-2] and "TP" in r[-2]]   # outcome field
+    losers  = [r for r in rows if r[-2] and "SL" in r[-2]]
+
+    def avg(vals):
+        return sum(vals) / len(vals) if vals else 0
+
+    def pct(vals, pred):
+        return (sum(1 for v in vals if pred(v)) / len(vals) * 100) if vals else 0
+
+    msg = ["<b>🧠 DEEP ANALYSIS – Winners vs Losers</b>", ""]
+    msg.append(f"Total closed: {len(rows)} | 🟢 Winners: {len(winners)} | 🔴 Losers: {len(losers)}")
+    msg.append("")
+
+    # Feature comparisons
+    features = [
+        ("Wave Confidence",            lambda r: r[3],  None),
+        ("Fib Retracement",            lambda r: r[4],  None),
+        ("In Optimal Zone",            lambda r: bool(r[5]), "bool"),
+        ("Divergence Strength",        lambda r: r[7],  None),
+        ("Momentum Score",             lambda r: r[8],  None),
+        ("MACD Crossed",               lambda r: bool(r[9]),  "bool"),
+        ("Momentum Aligned",           lambda r: bool(r[10]), "bool"),
+        ("Volume Triggered",           lambda r: bool(r[11]), "bool"),
+        ("Volume Ratio",               lambda r: r[12], None),
+        ("Direction Score (abs)",      lambda r: abs(r[14]), None),
+        ("Quality Score",              lambda r: r[16], None),
+        ("RR Ratio",                   lambda r: r[18], None),
+    ]
+
+    for name, extract, ftype in features:
+        w_vals = [extract(r) for r in winners]
+        l_vals = [extract(r) for r in losers]
+        if ftype == "bool":
+            w_pct = pct(winners, extract)
+            l_pct = pct(losers, extract)
+            msg.append(f"<b>{name}</b>:  🟢 {w_pct:.1f}%  🔴 {l_pct:.1f}%  (Δ {w_pct-l_pct:+.1f}%)")
+        else:
+            w_avg = avg(w_vals)
+            l_avg = avg(l_vals)
+            msg.append(f"<b>{name}</b>:  🟢 avg {w_avg:.3f}  🔴 avg {l_avg:.3f}  (Δ {w_avg-l_avg:+.3f})")
+
+    # Common traits
+    msg.append("\n<b>🔍 Most shared traits among winners:</b>")
+    traits = {
+        "ABC_CORRECTION": sum(1 for r in winners if r[2] == "ABC_CORRECTION"),
+        "Divergence BULLISH_REGULAR": sum(1 for r in winners if r[6] == "BULLISH_REGULAR"),
+        "In Optimal Zone": sum(1 for r in winners if r[5]),
+        "MACD Crossed": sum(1 for r in winners if r[9]),
+        "Momentum Aligned": sum(1 for r in winners if r[10]),
+        "Volume Triggered": sum(1 for r in winners if r[11]),
+        "Direction HIGH": sum(1 for r in winners if r[13] == "HIGH"),
+    }
+    for desc, count in sorted(traits.items(), key=lambda x: x[1], reverse=True):
+        p = count / len(winners) * 100 if winners else 0
+        if p > 50:
+            msg.append(f"• {desc}: {p:.0f}% of winners")
+
+    msg.append(f"\n<i>{datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</i>")
+    return "\n".join(msg)
+
+# ============ TELEGRAM COMMAND LISTENER ============
+TELEGRAM_UPDATE_OFFSET = 0
+
+async def telegram_listener():
+    global TELEGRAM_UPDATE_OFFSET
+    if not TELEGRAM_TOKEN:
+        log.warning("TELEGRAM_BOT_TOKEN not set – analysis listener disabled")
+        return
+
+    base_url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
+    async with httpx.AsyncClient(timeout=25) as client:
+        while True:
+            try:
+                resp = await client.get(
+                    f"{base_url}/getUpdates",
+                    params={"offset": TELEGRAM_UPDATE_OFFSET, "timeout": 30}
+                )
+                data = resp.json()
+                if not data.get("ok"):
+                    await asyncio.sleep(5)
+                    continue
+
+                for update in data["result"]:
+                    TELEGRAM_UPDATE_OFFSET = update["update_id"] + 1
+                    msg_obj = update.get("message")
+                    if not msg_obj:
+                        continue
+                    text = msg_obj.get("text", "").strip()
+                    chat_id = str(msg_obj["chat"]["id"])
+
+                    # Only react to /analyze command
+                    if text.lower().startswith("/analyze"):
+                        log.info(f"Deep analysis requested from chat {chat_id}")
+                        analysis_text = await perform_deep_analysis()
+                        # Send result back to the same chat
+                        await client.post(
+                            f"{base_url}/sendMessage",
+                            json={
+                                "chat_id": chat_id,
+                                "text": analysis_text,
+                                "parse_mode": "HTML",
+                                "disable_web_page_preview": True
+                            }
+                        )
+                await asyncio.sleep(1)
+            except Exception as e:
+                log.error(f"Telegram listener error: {e}")
+                await asyncio.sleep(5)
 
 # ============ MAIN SCANNER LOOP ============
 async def v6_scanner_main(exchange):
@@ -2295,8 +2427,7 @@ Volume Spike: {VOLUME_SPIKE_MULTIPLIER}x average"""
             
             signal_tracker.cleanup_old_signals()
             
-            # ==================== NEW: OUTCOME CHECK ====================
-            # Check if any active signal has hit TP/SL
+            # ==================== OUTCOME CHECK ====================
             active_keys = list(signal_tracker.active_signals.keys())
             for key in active_keys:
                 sig_data = signal_tracker.active_signals.get(key)
@@ -2420,6 +2551,9 @@ async def main():
         log.info(f"Fibonacci Zone: {OPTIMAL_FIB_ZONE_MIN}-{OPTIMAL_FIB_ZONE_MAX}")
         log.info(f"Volume Spike Threshold: {VOLUME_SPIKE_MULTIPLIER}x")
         log.info(f"Scan: {SCAN_INTERVAL}s | Top {TOP_N} symbols")
+        
+        # Start the deep‑analysis command listener
+        asyncio.create_task(telegram_listener())
         
         await v6_scanner_main(exchange)
         
