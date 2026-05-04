@@ -71,7 +71,7 @@ DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v6_1_mexc.db")
 
 # Scanner settings
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 45))
-TOP_N = int(os.getenv("TOP_N", 100))
+TOP_N = int(os.getenv("TOP_N", 300))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 2))
 
 # Wave Momentum Engine thresholds
@@ -87,7 +87,7 @@ FUNDING_EXTREME_THRESHOLD = float(os.getenv("FUNDING_EXTREME_THRESHOLD", 0.03))
 OI_ACCUMULATION_THRESHOLD = float(os.getenv("OI_ACCUMULATION_THRESHOLD", 0.15))
 
 # Signal thresholds
-MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 0.0))
+MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 1.0))
 
 # Deduplication settings
 SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 15))
@@ -1057,7 +1057,8 @@ class FastMomentumScalper:
     async def scan(self, exchange, symbol, current_price, trend_bias_hint=TrendBias.NEUTRAL):
         log.debug(f"Fast scalp scan start for {symbol}")
         try:
-            df_3m = create_dataframe(await fetch_ohlcv(exchange, symbol, "3m", 50))
+            # FIXED: use "5m" instead of unsupported "3m"
+            df_3m = create_dataframe(await fetch_ohlcv(exchange, symbol, "5m", 50))
             if df_3m is None or len(df_3m) < 30:
                 return None
             closes = df_3m['close'].values
