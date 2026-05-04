@@ -72,7 +72,7 @@ DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v6_1_mexc.db")
 
 # Scanner settings
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 45))
-TOP_N = int(os.getenv("TOP_N", 300))
+TOP_N = int(os.getenv("TOP_N", 100))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 2))
 
 # Wave Momentum Engine thresholds
