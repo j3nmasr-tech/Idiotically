@@ -7,6 +7,7 @@ PRIMARY METHOD: SMA Trend → Wave ABC Correction → RSI Divergence → MACD �
 + Fast Scalp Engine + Order‑Book Filter + Live Outcome Alerts
 Exchange: MEXC USDT Perpetual Futures
 Top 300 coins scanned every cycle
+FULL CYCLE DEBUG LOGGING
 """
 
 import os
@@ -71,7 +72,7 @@ DB_PATH = os.getenv("DB_PATH", "/app/data/romeopt_v6_1_mexc.db")
 
 # Scanner settings
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 45))
-TOP_N = int(os.getenv("TOP_N", 100))
+TOP_N = int(os.getenv("TOP_N", 300))
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT", 2))
 
 # Wave Momentum Engine thresholds
@@ -283,14 +284,13 @@ rate_limiter = EnhancedRateLimiter()
 
 # ---------------- UTILS ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit: int = 100):
-    log.debug(f"Fetching OHLCV {symbol} {timeframe}")
     try:
         result = await rate_limiter.execute_with_backoff(
             exchange.fetch_ohlcv, symbol, timeframe=timeframe, limit=limit
         )
         return result
     except Exception as e:
-        log.warning(f"Failed to fetch {symbol} {timeframe}: {e}")
+        log.warning(f"OHLCV fetch failed for {symbol} {timeframe}: {e}")
         return None
 
 def create_dataframe(ohlcv):
@@ -305,14 +305,14 @@ async def safe_fetch_ticker(exchange, symbol: str):
     try:
         return await rate_limiter.execute_with_backoff(exchange.fetch_ticker, symbol)
     except Exception as e:
-        log.debug(f"Failed to fetch ticker for {symbol}: {e}")
+        log.debug(f"Ticker fetch failed for {symbol}: {e}")
         return None
 
 async def safe_fetch_tickers(exchange):
     try:
         return await rate_limiter.execute_with_backoff(exchange.fetch_tickers)
     except Exception as e:
-        log.error(f"Failed to fetch tickers: {e}")
+        log.error(f"Failed to fetch all tickers: {e}")
         return {}
 
 # ============ WAVE RANGE DETECTOR ============
@@ -950,7 +950,7 @@ class InstitutionalDataFetcher:
             if now - ts < 300:
                 return data
         try:
-            fsym = symbol  # already swap
+            fsym = symbol
             tasks = [self._fetch_funding(exchange, fsym), self._fetch_oi(exchange, fsym)]
             fd, oi = await asyncio.gather(*tasks, return_exceptions=True)
             data = InstitutionalData()
@@ -1055,23 +1055,24 @@ class FastMomentumScalper:
         self.ema_slow = 21
 
     async def scan(self, exchange, symbol, current_price, trend_bias_hint=TrendBias.NEUTRAL):
-        log.debug(f"Fast scalp scan start for {symbol}")
+        log.debug(f"Fast scalp: checking {symbol}")
         try:
-            # FIXED: use "5m" instead of unsupported "3m"
-            df_3m = create_dataframe(await fetch_ohlcv(exchange, symbol, "5m", 50))
-            if df_3m is None or len(df_3m) < 30:
+            df_5m_fast = create_dataframe(await fetch_ohlcv(exchange, symbol, "5m", 50))
+            if df_5m_fast is None or len(df_5m_fast) < 30:
+                log.debug(f"Fast scalp: {symbol} insufficient 5m data")
                 return None
-            closes = df_3m['close'].values
-            highs = df_3m['high'].values
-            lows = df_3m['low'].values
-            vols = df_3m['volume'].values
-            opens = df_3m['open'].values
+            closes = df_5m_fast['close'].values
+            highs = df_5m_fast['high'].values
+            lows = df_5m_fast['low'].values
+            vols = df_5m_fast['volume'].values
+            opens = df_5m_fast['open'].values
             if len(vols) >= 22:
                 avg_vol = np.mean(vols[-22:-2])
             else:
                 avg_vol = np.mean(vols[:-2])
             last_vol = vols[-1]
             if avg_vol <= 0 or last_vol < avg_vol * self.min_vol_ratio:
+                log.debug(f"Fast scalp: {symbol} volume condition failed ({last_vol:.1f} < {avg_vol*self.min_vol_ratio:.1f})")
                 return None
             ema9 = pd.Series(closes).ewm(span=self.ema_fast).mean().iloc[-1]
             ema21 = pd.Series(closes).ewm(span=self.ema_slow).mean().iloc[-1]
@@ -1093,6 +1094,7 @@ class FastMomentumScalper:
                 if tp / current_price - 1 < 0.02:
                     tp = current_price * 1.025
                 if (tp - current_price) / (current_price - sl) < self.min_rr:
+                    log.debug(f"Fast scalp: {symbol} BUY RR too low")
                     return None
                 side = "BUY"
                 sl_price = sl
@@ -1104,11 +1106,13 @@ class FastMomentumScalper:
                 if 1 - tp / current_price < 0.02:
                     tp = current_price * 0.975
                 if (current_price - tp) / (sl - current_price) < self.min_rr:
+                    log.debug(f"Fast scalp: {symbol} SELL RR too low")
                     return None
                 side = "SELL"
                 sl_price = sl
                 tp_price = tp
             if side is None:
+                log.debug(f"Fast scalp: {symbol} no directional bias")
                 return None
             rr_ratio = abs(tp_price - current_price) / abs(current_price - sl_price) if abs(current_price - sl_price) > 0 else 0
             log.info(f"Fast scalp signal: {symbol} {side} entry={current_price:.6f} sl={sl_price:.6f} tp={tp_price:.6f}")
@@ -1461,7 +1465,7 @@ async def store_signal(setup: Dict):
 
 # ============ SCANNER ============
 async def scan_symbol_v6(exchange, symbol: str) -> Optional[Dict]:
-    log.debug(f"Scanning {symbol} with primary method")
+    log.debug(f"--- Primary scan start: {symbol} ---")
     try:
         df_d = create_dataframe(await fetch_ohlcv(exchange, symbol, "1d", 150))
         df_4h = create_dataframe(await fetch_ohlcv(exchange, symbol, "4h", 100))
@@ -1469,27 +1473,27 @@ async def scan_symbol_v6(exchange, symbol: str) -> Optional[Dict]:
         df_15m = create_dataframe(await fetch_ohlcv(exchange, symbol, "15m", 100))
         df_5m = create_dataframe(await fetch_ohlcv(exchange, symbol, "5m", 50))
         if df_d is None or df_4h is None or df_1h is None:
-            log.debug(f"{symbol}: insufficient OHLCV data")
+            log.debug(f"{symbol}: insufficient OHLCV data (skipped)")
             return None
         ticker = await safe_fetch_ticker(exchange, symbol)
         if not ticker:
-            log.debug(f"{symbol}: no ticker")
+            log.debug(f"{symbol}: no ticker (skipped)")
             return None
         cp = ticker.get('last', 0)
         if cp <= 0:
-            log.debug(f"{symbol}: invalid price")
+            log.debug(f"{symbol}: invalid price (skipped)")
             return None
         trend_bias, trend_score = wave_detector.detect_trend_bias(df_d, df_4h)
         if trend_bias == TrendBias.NEUTRAL:
-            log.debug(f"{symbol}: neutral trend")
+            log.debug(f"{symbol}: neutral trend (skipped)")
             return None
         wave = wave_detector.identify_abc_correction(df_4h, trend_bias)
         if wave.pattern == WavePattern.NONE or wave.pattern_confidence < 0.3:
-            log.debug(f"{symbol}: no valid wave pattern")
+            log.debug(f"{symbol}: no valid wave (conf={wave.pattern_confidence:.2f}) (skipped)")
             return None
         momentum = momentum_engine.analyze_momentum(df_1h, df_15m, trend_bias, wave)
         if momentum.divergence_type == DivergenceType.NONE and momentum.momentum_score < 0.3:
-            log.debug(f"{symbol}: insufficient momentum")
+            log.debug(f"{symbol}: insufficient momentum (score={momentum.momentum_score:.2f}) (skipped)")
             return None
         side = "BUY" if trend_bias == TrendBias.BULLISH else "SELL"
         entry_type = "DISCOUNT_FIB_ZONE" if side == "BUY" else "PREMIUM_FIB_ZONE"
@@ -1501,13 +1505,13 @@ async def scan_symbol_v6(exchange, symbol: str) -> Optional[Dict]:
             vol_breakout.volume_score = min(1.0, vol_breakout.volume_score + 0.1)
         sl_price, tp_targets, tp_sources, liq_analysis = await calculate_liquidity_tp_sl(exchange, symbol, side, cp, entry_type)
         if sl_price <= 0 or not tp_targets:
-            log.debug(f"{symbol}: no valid TP/SL")
+            log.debug(f"{symbol}: no valid TP/SL (skipped)")
             return None
         risk = abs(cp - sl_price)
         reward = abs(tp_targets[0] - cp) if tp_targets else 0
         rr = reward / risk if risk > 0 else 0
         if rr < 1.5:
-            log.debug(f"{symbol}: RR {rr:.1f} too low")
+            log.debug(f"{symbol}: RR {rr:.1f} too low (skipped)")
             return None
         dir_metrics = await direction_engine.analyze_direction(exchange, symbol, side, cp)
         qs = 0.0
@@ -1519,7 +1523,7 @@ async def scan_symbol_v6(exchange, symbol: str) -> Optional[Dict]:
         elif dir_metrics.confidence_tier == DirectionTier.MEDIUM:
             qs += 0.3
         if qs < MIN_QUALITY_SCORE:
-            log.debug(f"{symbol}: quality {qs:.2f} below minimum")
+            log.debug(f"{symbol}: quality {qs:.2f} below minimum (skipped)")
             return None
         tier = "S+" if qs >= 4.5 else "A+" if qs >= 4.0 else "A" if qs >= 3.0 else "B" if qs >= 2.5 else "C"
         log.info(f"✅ Signal found: {symbol} {side} Tier={tier} Quality={qs:.2f}")
@@ -1533,7 +1537,7 @@ async def scan_symbol_v6(exchange, symbol: str) -> Optional[Dict]:
             "method": "WAVE_MOMENTUM"
         }
     except Exception as e:
-        log.error(f"scan error {symbol}: {e}")
+        log.error(f"Primary scan error {symbol}: {e}")
         return None
 
 async def main_scan_with_fallback(exchange, symbol):
@@ -1577,10 +1581,8 @@ class OutcomeMonitor:
                     cur = await db_conn.execute("SELECT symbol,side,entry_price,sl_price,tp1,tp2,tp3,id FROM signals_v6_1 WHERE status='active'")
                     rows = await cur.fetchall()
                 if not rows:
-                    log.debug("No active signals to monitor")
                     await asyncio.sleep(self.interval)
                     continue
-                log.debug(f"Monitoring {len(rows)} active signals")
                 syms = set(r[0] for r in rows)
                 tickers = {}
                 for s in syms:
@@ -1606,8 +1608,8 @@ class OutcomeMonitor:
                         tp_lv = 3
                     if outcome:
                         pnl = (price - entry) / entry * 100 if side == "BUY" else (entry - price) / entry * 100
-                        em = "✅" if outcome != "SL_HIT" else "❌"
-                        msg = f"{em} <b>OUTCOME ALERT</b>\n<b>{sym}</b> | {side}\n<b>{outcome}</b> at <code>{price:.8f}</code>\nProfit: <b>{pnl:+.2f}%</b>\nEntry: <code>{entry:.8f}</code> | SL: <code>{sl:.8f}</code>"
+                        emoji = "✅" if outcome != "SL_HIT" else "❌"
+                        msg = f"{emoji} <b>OUTCOME ALERT</b>\n<b>{sym}</b> | {side}\n<b>{outcome}</b> at <code>{price:.8f}</code>\nProfit: <b>{pnl:+.2f}%</b>\nEntry: <code>{entry:.8f}</code> | SL: <code>{sl:.8f}</code>"
                         if tp_lv:
                             tp_price = [tp1, tp2, tp3][tp_lv - 1]
                             msg += f"\nTP{tp_lv}: <code>{tp_price:.8f}</code>"
@@ -1629,7 +1631,7 @@ async def v6_scanner_main(exchange):
     while True:
         scan_cycle += 1
         cycle_start = time.time()
-        log.info(f"🔄 Scan cycle #{scan_cycle} started")
+        log.info(f"=== CYCLE #{scan_cycle} START ===")
         try:
             tickers = await safe_fetch_tickers(exchange)
             usdt_pairs = []
@@ -1646,7 +1648,7 @@ async def v6_scanner_main(exchange):
             usdt_pairs.sort(key=lambda x: x[1], reverse=True)
             symbols = [s[0] for s in usdt_pairs[:TOP_N]]
             stats = signal_tracker.get_stats()
-            log.info(f"Scanning top {len(symbols)} symbols (active signals: {stats['active_signals']})")
+            log.info(f"Scanning {len(symbols)} symbols (active signals: {stats['active_signals']})")
             alerts_this = 0
             tasks = []
             for sym in symbols:
@@ -1662,7 +1664,7 @@ async def v6_scanner_main(exchange):
                                 alerts_this += 1
                             await store_signal(r)
                     tasks = []
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)
             if tasks:
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 for r in results:
@@ -1674,7 +1676,7 @@ async def v6_scanner_main(exchange):
                         await store_signal(r)
             signal_tracker.cleanup_old_signals()
             cycle_duration = time.time() - cycle_start
-            log.info(f"Cycle #{scan_cycle} completed in {cycle_duration:.1f}s, alerts sent: {alerts_this}")
+            log.info(f"=== CYCLE #{scan_cycle} END ({cycle_duration:.1f}s) – Alerts sent: {alerts_this} ===")
             if scan_cycle % 5 == 0:
                 os_stat = stats.get('outcome_stats', {})
                 wins = os_stat.get('tp1_hits', 0) + os_stat.get('tp2_hits', 0) + os_stat.get('tp3_hits', 0)
@@ -1688,16 +1690,10 @@ async def v6_scanner_main(exchange):
 
 # ============ FASTAPI ============
 app = FastAPI()
-
 @app.get("/health")
 async def health():
     stats = signal_tracker.get_stats()
-    return {
-        "status": "healthy",
-        "version": "6.1 MEXC Futures",
-        "active_signals": stats['active_signals'],
-        "outcome_stats": stats['outcome_stats']
-    }
+    return {"status": "healthy", "version": "6.1 MEXC", "active_signals": stats['active_signals'], "outcome_stats": stats['outcome_stats']}
 
 @app.get("/signals/active")
 async def get_active():
@@ -1707,15 +1703,7 @@ async def get_active():
             sym, side, bucket = k
             st = v.get('setup', {})
             tp_list = st.get('tp_targets', [])
-            act.append({
-                "symbol": sym,
-                "side": side,
-                "quality_score": st.get('quality', {}).get('total_score', 0),
-                "entry": st.get('entry_price', 0),
-                "sl": st.get('sl_price', 0),
-                "tp1": tp_list[0] if len(tp_list) > 0 else 0,
-                "rr": st.get('rr_ratio', 0)
-            })
+            act.append({"symbol": sym, "side": side, "quality_score": st.get('quality', {}).get('total_score', 0), "entry": st.get('entry_price', 0), "sl": st.get('sl_price', 0), "tp1": tp_list[0] if len(tp_list) > 0 else 0, "rr": st.get('rr_ratio', 0)})
     return {"active_signals": act, "count": len(act)}
 
 # ============ MAIN ============
@@ -1727,19 +1715,16 @@ async def main():
         exchange = ccxt.mexc({
             'enableRateLimit': True,
             'options': {'defaultType': 'swap', 'fetchFundingRateHistory': True, 'fetchOpenInterest': True},
-            'rateLimit': 50,
-            'timeout': 30000,
-            'verbose': False,
+            'rateLimit': 50, 'timeout': 30000, 'verbose': False,
         })
-        log.info("🚀 ROMEOTPT v6.1 MEXC Futures starting")
+        log.info("🚀 ROMEOTPT v6.1 MEXC Futures")
         monitor = OutcomeMonitor(exchange)
         asyncio.create_task(monitor.monitor_loop())
         await v6_scanner_main(exchange)
     except Exception as e:
-        log.critical(f"Fatal startup error: {e}", exc_info=True)
+        log.critical(f"Fatal: {e}", exc_info=True)
     finally:
-        if db_conn:
-            await db_conn.close()
+        if db_conn: await db_conn.close()
         log.info("Shutdown complete")
 
 if __name__ == "__main__":
