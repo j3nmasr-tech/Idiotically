@@ -42,8 +42,8 @@ class Config:
     SCORE_FUNDING_CONTRARIAN = True     #  5 pts
 
     # Score thresholds
-    TBS_MIN_SCORE = 75
-    TWS_MIN_SCORE = 90
+    TBS_MIN_SCORE = 0
+    TWS_MIN_SCORE = 0
 
     # Risk Management
     MAX_TRADES_PER_DAY = 3
