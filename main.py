@@ -87,7 +87,7 @@ FUNDING_EXTREME_THRESHOLD = float(os.getenv("FUNDING_EXTREME_THRESHOLD", 0.03))
 OI_ACCUMULATION_THRESHOLD = float(os.getenv("OI_ACCUMULATION_THRESHOLD", 0.15))
 
 # Signal thresholds
-MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 0.5))
+MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 1.0))
 
 # Deduplication settings
 SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 15))
@@ -603,16 +603,27 @@ class MomentumDivergenceEngine:
         return highs
     
     def _mom_score(self, mom, trend_bias):
-        score=0.0; max_score=0.0
-        max_score+=0.4; if mom.divergence_type!=DivergenceType.NONE: score+=0.4*mom.divergence_strength
-        max_score+=0.3; if mom.macd_crossed:
-            if (trend_bias==TrendBias.BULLISH and mom.macd_cross_direction=="BULLISH") or (trend_bias==TrendBias.BEARISH and mom.macd_cross_direction=="BEARISH"): score+=0.3
-            else: score+=0.1
-        max_score+=0.2; if mom.macd_histogram_reversal: score+=0.2
-        max_score+=0.1;
-        if trend_bias==TrendBias.BULLISH and mom.rsi_current>40: score+=0.1
-        elif trend_bias==TrendBias.BEARISH and mom.rsi_current<60: score+=0.1
-        return score/max_score if max_score>0 else 0.0
+        score = 0.0
+        max_score = 0.0
+        max_score += 0.4
+        if mom.divergence_type != DivergenceType.NONE:
+            score += 0.4 * mom.divergence_strength
+        max_score += 0.3
+        if mom.macd_crossed:
+            if (trend_bias == TrendBias.BULLISH and mom.macd_cross_direction == "BULLISH") or \
+               (trend_bias == TrendBias.BEARISH and mom.macd_cross_direction == "BEARISH"):
+                score += 0.3
+            else:
+                score += 0.1
+        max_score += 0.2
+        if mom.macd_histogram_reversal:
+            score += 0.2
+        max_score += 0.1
+        if trend_bias == TrendBias.BULLISH and mom.rsi_current > 40:
+            score += 0.1
+        elif trend_bias == TrendBias.BEARISH and mom.rsi_current < 60:
+            score += 0.1
+        return score / max_score if max_score > 0 else 0.0
 
 momentum_engine = MomentumDivergenceEngine()
 
