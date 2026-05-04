@@ -87,7 +87,7 @@ FUNDING_EXTREME_THRESHOLD = float(os.getenv("FUNDING_EXTREME_THRESHOLD", 0.03))
 OI_ACCUMULATION_THRESHOLD = float(os.getenv("OI_ACCUMULATION_THRESHOLD", 0.15))
 
 # Signal thresholds
-MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 0.0))
+MIN_QUALITY_SCORE = float(os.getenv("MIN_QUALITY_SCORE", 1.0))
 
 # Deduplication settings
 SIGNAL_COOLDOWN_MINUTES = int(os.getenv("SIGNAL_COOLDOWN_MINUTES", 15))
@@ -102,8 +102,9 @@ RATE_LIMIT_BACKOFF_FACTOR = float(os.getenv("RATE_LIMIT_BACKOFF_FACTOR", 2.5))
 OUTCOME_CHECK_INTERVAL = int(os.getenv("OUTCOME_CHECK_INTERVAL", 30))
 
 # ---------------- LOGGING ----------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=logging.INFO,
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
@@ -282,13 +283,14 @@ rate_limiter = EnhancedRateLimiter()
 
 # ---------------- UTILS ----------------
 async def fetch_ohlcv(exchange, symbol: str, timeframe: str, limit: int = 100):
+    log.debug(f"Fetching OHLCV {symbol} {timeframe}")
     try:
         result = await rate_limiter.execute_with_backoff(
             exchange.fetch_ohlcv, symbol, timeframe=timeframe, limit=limit
         )
         return result
     except Exception as e:
-        log.debug(f"Failed to fetch {symbol} {timeframe}: {e}")
+        log.warning(f"Failed to fetch {symbol} {timeframe}: {e}")
         return None
 
 def create_dataframe(ohlcv):
@@ -310,7 +312,7 @@ async def safe_fetch_tickers(exchange):
     try:
         return await rate_limiter.execute_with_backoff(exchange.fetch_tickers)
     except Exception as e:
-        log.debug(f"Failed to fetch tickers: {e}")
+        log.error(f"Failed to fetch tickers: {e}")
         return {}
 
 # ============ WAVE RANGE DETECTOR ============
@@ -1053,6 +1055,7 @@ class FastMomentumScalper:
         self.ema_slow = 21
 
     async def scan(self, exchange, symbol, current_price, trend_bias_hint=TrendBias.NEUTRAL):
+        log.debug(f"Fast scalp scan start for {symbol}")
         try:
             df_3m = create_dataframe(await fetch_ohlcv(exchange, symbol, "3m", 50))
             if df_3m is None or len(df_3m) < 30:
@@ -1107,6 +1110,7 @@ class FastMomentumScalper:
             if side is None:
                 return None
             rr_ratio = abs(tp_price - current_price) / abs(current_price - sl_price) if abs(current_price - sl_price) > 0 else 0
+            log.info(f"Fast scalp signal: {symbol} {side} entry={current_price:.6f} sl={sl_price:.6f} tp={tp_price:.6f}")
             return {
                 "symbol": symbol,
                 "timestamp": datetime.datetime.utcnow().isoformat(),
@@ -1125,7 +1129,7 @@ class FastMomentumScalper:
                 "method": "MOMENTUM_SCALP"
             }
         except Exception as e:
-            log.debug(f"fast scalp error {symbol}: {e}")
+            log.warning(f"fast scalp error {symbol}: {e}")
             return None
 
     def _rsi(self, prices, period=14):
@@ -1156,6 +1160,7 @@ class SignalTracker:
         if key in self.active_signals and self.active_signals[key].get('status') == 'active':
             age = (datetime.datetime.utcnow() - self.active_signals[key]['first_seen']).total_seconds() / 60
             if age > SIGNAL_VALIDITY_HOURS * 60:
+                log.debug(f"Signal expired for {setup['symbol']}")
                 self.remove_signal_by_key(key)
                 return True
             return False
@@ -1178,6 +1183,8 @@ class SignalTracker:
             }
             self.outcome_stats['total_signals'] += 1
             self.outcome_stats['active'] += 1
+            if alerted:
+                log.info(f"New signal stored: {setup['symbol']} {setup['side']}")
         else:
             cp = setup.get('current_price', 0)
             self.active_signals[key]['highest_price'] = max(self.active_signals[key]['highest_price'], cp)
@@ -1224,6 +1231,7 @@ class SignalTracker:
             total = wins + self.outcome_stats['sl_hits']
             if total > 0:
                 self.outcome_stats['win_rate'] = wins / total * 100
+            log.info(f"Outcome recorded: {setup['symbol']} {outcome['type']} PnL={outcome['pnl_pct']:.2f}%")
         return outcome
     def remove_signal_by_key(self, key, reason=""):
         if key in self.active_signals:
@@ -1238,6 +1246,8 @@ class SignalTracker:
                 expired.append(k)
         for k in expired:
             self.remove_signal_by_key(k)
+        if expired:
+            log.debug(f"Cleaned {len(expired)} expired signals")
     def get_stats(self):
         active = sum(1 for v in self.active_signals.values() if v.get('status') == 'active')
         return {'active_signals': active, 'outcome_stats': self.outcome_stats}
@@ -1254,7 +1264,7 @@ async def send_telegram(msg: str, parse_mode="HTML"):
         try:
             await client.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": parse_mode, "disable_web_page_preview": True})
         except Exception as e:
-            log.warning(f"Telegram fail: {e}")
+            log.warning(f"Telegram send failed: {e}")
 
 async def send_v6_alert(setup: Dict):
     try:
@@ -1353,9 +1363,10 @@ Entry: <code>{entry_price:.8f}</code> | Now: <code>{current_price:.8f}</code>
 
 🏆 Quality: {qs:.1f}/5.0 ({quality.get('tier', 'C')}) | Forced Move: {setup.get('forced_move_probability', 'LOW')}
 <i>Wave+Momentum+Volume Method | {datetime.datetime.utcnow().strftime('%H:%M:%S UTC')}</i>"""
+        log.info(f"📤 Alert sent: {symbol} {side} Tier={tier}")
         await send_telegram(msg)
     except Exception as e:
-        log.error(f"alert error: {e}")
+        log.error(f"alert formatting error: {e}")
 
 async def send_deduped_v6_alert(setup):
     if signal_tracker.should_send_alert(setup):
@@ -1382,6 +1393,7 @@ async def init_database():
         UNIQUE(symbol, side, score))""")
     await db_conn.execute("CREATE INDEX IF NOT EXISTS idx_v6_1_status ON signals_v6_1 (status)")
     await db_conn.commit()
+    log.info("Database initialized/verified")
 
 async def store_signal(setup: Dict):
     async with db_lock:
@@ -1444,9 +1456,11 @@ async def store_signal(setup: Dict):
              dt, float(ds), float(ms), 1 if mc else 0, 1 if ma else 0,
              1 if vt else 0, float(vr), 1 if sw else 0, dtier, float(dscore), trap, 'active', 1))
         await db_conn.commit()
+    log.debug(f"Stored signal in DB: {setup['symbol']}")
 
 # ============ SCANNER ============
 async def scan_symbol_v6(exchange, symbol: str) -> Optional[Dict]:
+    log.debug(f"Scanning {symbol} with primary method")
     try:
         df_d = create_dataframe(await fetch_ohlcv(exchange, symbol, "1d", 150))
         df_4h = create_dataframe(await fetch_ohlcv(exchange, symbol, "4h", 100))
@@ -1454,21 +1468,27 @@ async def scan_symbol_v6(exchange, symbol: str) -> Optional[Dict]:
         df_15m = create_dataframe(await fetch_ohlcv(exchange, symbol, "15m", 100))
         df_5m = create_dataframe(await fetch_ohlcv(exchange, symbol, "5m", 50))
         if df_d is None or df_4h is None or df_1h is None:
+            log.debug(f"{symbol}: insufficient OHLCV data")
             return None
         ticker = await safe_fetch_ticker(exchange, symbol)
         if not ticker:
+            log.debug(f"{symbol}: no ticker")
             return None
         cp = ticker.get('last', 0)
         if cp <= 0:
+            log.debug(f"{symbol}: invalid price")
             return None
         trend_bias, trend_score = wave_detector.detect_trend_bias(df_d, df_4h)
         if trend_bias == TrendBias.NEUTRAL:
+            log.debug(f"{symbol}: neutral trend")
             return None
         wave = wave_detector.identify_abc_correction(df_4h, trend_bias)
         if wave.pattern == WavePattern.NONE or wave.pattern_confidence < 0.3:
+            log.debug(f"{symbol}: no valid wave pattern")
             return None
         momentum = momentum_engine.analyze_momentum(df_1h, df_15m, trend_bias, wave)
         if momentum.divergence_type == DivergenceType.NONE and momentum.momentum_score < 0.3:
+            log.debug(f"{symbol}: insufficient momentum")
             return None
         side = "BUY" if trend_bias == TrendBias.BULLISH else "SELL"
         entry_type = "DISCOUNT_FIB_ZONE" if side == "BUY" else "PREMIUM_FIB_ZONE"
@@ -1480,11 +1500,13 @@ async def scan_symbol_v6(exchange, symbol: str) -> Optional[Dict]:
             vol_breakout.volume_score = min(1.0, vol_breakout.volume_score + 0.1)
         sl_price, tp_targets, tp_sources, liq_analysis = await calculate_liquidity_tp_sl(exchange, symbol, side, cp, entry_type)
         if sl_price <= 0 or not tp_targets:
+            log.debug(f"{symbol}: no valid TP/SL")
             return None
         risk = abs(cp - sl_price)
         reward = abs(tp_targets[0] - cp) if tp_targets else 0
         rr = reward / risk if risk > 0 else 0
         if rr < 1.5:
+            log.debug(f"{symbol}: RR {rr:.1f} too low")
             return None
         dir_metrics = await direction_engine.analyze_direction(exchange, symbol, side, cp)
         qs = 0.0
@@ -1496,8 +1518,10 @@ async def scan_symbol_v6(exchange, symbol: str) -> Optional[Dict]:
         elif dir_metrics.confidence_tier == DirectionTier.MEDIUM:
             qs += 0.3
         if qs < MIN_QUALITY_SCORE:
+            log.debug(f"{symbol}: quality {qs:.2f} below minimum")
             return None
         tier = "S+" if qs >= 4.5 else "A+" if qs >= 4.0 else "A" if qs >= 3.0 else "B" if qs >= 2.5 else "C"
+        log.info(f"✅ Signal found: {symbol} {side} Tier={tier} Quality={qs:.2f}")
         return {
             "symbol": symbol, "timestamp": datetime.datetime.utcnow().isoformat(), "side": side, "current_price": cp,
             "entry_price": cp, "entry_type": entry_type, "sl_price": sl_price, "tp_targets": tp_targets, "tp_sources": tp_sources,
@@ -1529,6 +1553,7 @@ async def main_scan_with_fallback(exchange, symbol):
             hint = TrendBias.BEARISH
     else:
         hint = TrendBias.NEUTRAL
+    # Fallback to fast scalp
     scalp = await fast_scalper.scan(exchange, symbol, cp, hint)
     if scalp:
         try:
@@ -1544,15 +1569,17 @@ class OutcomeMonitor:
         self.interval = interval
 
     async def monitor_loop(self):
-        log.info("OUTCOME MONITOR STARTED")
+        log.info("🔄 Outcome Monitor started")
         while True:
             try:
                 async with db_lock:
                     cur = await db_conn.execute("SELECT symbol,side,entry_price,sl_price,tp1,tp2,tp3,id FROM signals_v6_1 WHERE status='active'")
                     rows = await cur.fetchall()
                 if not rows:
+                    log.debug("No active signals to monitor")
                     await asyncio.sleep(self.interval)
                     continue
+                log.debug(f"Monitoring {len(rows)} active signals")
                 syms = set(r[0] for r in rows)
                 tickers = {}
                 for s in syms:
@@ -1583,20 +1610,25 @@ class OutcomeMonitor:
                         if tp_lv:
                             tp_price = [tp1, tp2, tp3][tp_lv - 1]
                             msg += f"\nTP{tp_lv}: <code>{tp_price:.8f}</code>"
+                        log.info(f"📤 Outcome alert: {sym} {outcome} PnL={pnl:.2f}%")
                         await send_telegram(msg)
                         async with db_lock:
                             await db_conn.execute("UPDATE signals_v6_1 SET status='closed',outcome=?,closed_at=?,closed_price=?,pnl_pct=? WHERE id=?",
                                                   (outcome, datetime.datetime.utcnow().isoformat(), price, pnl, sig_id))
                             await db_conn.commit()
             except Exception as e:
-                log.error(f"outcome monitor error: {e}")
+                log.error(f"Outcome monitor error: {e}")
             await asyncio.sleep(self.interval)
 
 async def v6_scanner_main(exchange):
-    await send_telegram(f"🚀 <b>ROMEOTPT v6.1 – MEXC FUTURES</b>\nScan: {SCAN_INTERVAL}s | Top {TOP_N} | Quality ≥{MIN_QUALITY_SCORE}\n<b>Primary Method: Wave + Momentum + Volume</b> + Fast Scalp + Outcome Alerts")
+    startup_msg = f"🚀 <b>ROMEOTPT v6.1 – MEXC FUTURES</b>\nScan: {SCAN_INTERVAL}s | Top {TOP_N} | Quality ≥{MIN_QUALITY_SCORE}\n<b>Primary Method: Wave + Momentum + Volume</b> + Fast Scalp + Outcome Alerts"
+    log.info("Scanner starting...")
+    await send_telegram(startup_msg)
     scan_cycle = 0
     while True:
         scan_cycle += 1
+        cycle_start = time.time()
+        log.info(f"🔄 Scan cycle #{scan_cycle} started")
         try:
             tickers = await safe_fetch_tickers(exchange)
             usdt_pairs = []
@@ -1613,7 +1645,7 @@ async def v6_scanner_main(exchange):
             usdt_pairs.sort(key=lambda x: x[1], reverse=True)
             symbols = [s[0] for s in usdt_pairs[:TOP_N]]
             stats = signal_tracker.get_stats()
-            log.info(f"🔄 Scan #{scan_cycle}: {len(symbols)} symbols | Active: {stats['active_signals']}")
+            log.info(f"Scanning top {len(symbols)} symbols (active signals: {stats['active_signals']})")
             alerts_this = 0
             tasks = []
             for sym in symbols:
@@ -1622,6 +1654,7 @@ async def v6_scanner_main(exchange):
                     results = await asyncio.gather(*tasks, return_exceptions=True)
                     for r in results:
                         if isinstance(r, Exception):
+                            log.warning(f"Task exception: {r}")
                             continue
                         if r:
                             if await send_deduped_v6_alert(r):
@@ -1639,15 +1672,17 @@ async def v6_scanner_main(exchange):
                             alerts_this += 1
                         await store_signal(r)
             signal_tracker.cleanup_old_signals()
+            cycle_duration = time.time() - cycle_start
+            log.info(f"Cycle #{scan_cycle} completed in {cycle_duration:.1f}s, alerts sent: {alerts_this}")
             if scan_cycle % 5 == 0:
                 os_stat = stats.get('outcome_stats', {})
                 wins = os_stat.get('tp1_hits', 0) + os_stat.get('tp2_hits', 0) + os_stat.get('tp3_hits', 0)
                 losses = os_stat.get('sl_hits', 0)
                 if wins + losses > 0:
-                    log.info(f"📈 WR={os_stat.get('win_rate', 0):.1f}% Active={os_stat.get('active', 0)}")
-            await asyncio.sleep(SCAN_INTERVAL)
+                    log.info(f"📈 Cumulative WR={os_stat.get('win_rate', 0):.1f}% Total={wins+losses}")
+            await asyncio.sleep(max(0, SCAN_INTERVAL - cycle_duration))
         except Exception as e:
-            log.error(f"Scanner loop error: {e}")
+            log.error(f"Fatal scanner loop error: {e}", exc_info=True)
             await asyncio.sleep(SCAN_INTERVAL * 2)
 
 # ============ FASTAPI ============
@@ -1700,11 +1735,11 @@ async def main():
         asyncio.create_task(monitor.monitor_loop())
         await v6_scanner_main(exchange)
     except Exception as e:
-        log.error(f"Fatal: {e}")
+        log.critical(f"Fatal startup error: {e}", exc_info=True)
     finally:
         if db_conn:
             await db_conn.close()
-        log.info("Shutdown")
+        log.info("Shutdown complete")
 
 if __name__ == "__main__":
     import argparse
@@ -1717,4 +1752,4 @@ if __name__ == "__main__":
         try:
             asyncio.run(main())
         except KeyboardInterrupt:
-            log.info("Stopped")
+            log.info("Stopped by user")
